@@ -61,6 +61,7 @@ impl FieldIndices {
     }
 
     /// 全拼下标对应的名字字符下标（同上，空表为恒等映射）
+    #[allow(dead_code)]
     pub fn name_idx_for_full(&self, idx: usize) -> Option<usize> {
         match self.entries.is_empty() {
             true => Some(idx),
@@ -177,7 +178,16 @@ pub fn build_highlight_spans(name: &str, matched_indices: &[usize]) -> Vec<TextS
     spans
 }
 
-/// 命中的名字字符下标（高亮层用）。按 原名 -> 首字母 -> 全拼 依次尝试。
+/// 命中的名字字符下标（高亮层用）。
+///
+/// 匹配策略（按优先级）：
+/// 1. **原名**：模糊子序列匹配（容忍拉丁名跳字，如 `qute` → `qutebrowser`）；
+/// 2. **首字母**：模糊子序列匹配（容忍跳过中间字，如 `wym` → 网易云音乐）；
+/// 3. **全拼**：**连续子串**匹配。
+///
+/// 全拼之所以不用模糊匹配：字母级子序列会把 `aa` 匹配到 `「kaishi」caidan`
+/// 这类毫不相干的名字（`a...a` 跨越多个音节），产生大量误判。
+/// 子串匹配保证 `wangyi` → 网易 仍然成立，同时 `aa` 只命中真正含 `aa` 的拼音。
 pub fn highlight_indices(
     entry: &MatchEntry,
     query: &str,
@@ -190,12 +200,15 @@ pub fn highlight_indices(
     }
 
     let mut indices: Vec<u32> = Vec::new();
-    let (name_buf, abbr_buf, full_buf, query_buf) = scratch.buffers_mut();
+    let (name_buf, abbr_buf, _full_buf, query_buf) = scratch.buffers_mut();
 
     // 1. 原名（拉丁名，或直接输入汉字）
     let name_utf = Utf32Str::new(&entry.name, name_buf);
     let query_utf = Utf32Str::new(query, query_buf);
-    if matcher.fuzzy_indices(name_utf, query_utf, &mut indices).is_some() {
+    if matcher
+        .fuzzy_indices(name_utf, query_utf, &mut indices)
+        .is_some()
+    {
         return dedup_sorted(indices.into_iter().map(|i| i as usize));
     }
 
@@ -203,7 +216,10 @@ pub fn highlight_indices(
     if !entry.pinyin_abbr.is_empty() {
         let abbr_utf = Utf32Str::new(&entry.pinyin_abbr, abbr_buf);
         let query_utf = Utf32Str::new(query, query_buf);
-        if matcher.fuzzy_indices(abbr_utf, query_utf, &mut indices).is_some() {
+        if matcher
+            .fuzzy_indices(abbr_utf, query_utf, &mut indices)
+            .is_some()
+        {
             let mut out = Vec::with_capacity(indices.len());
             let mut last = usize::MAX;
             for i in indices {
@@ -218,26 +234,40 @@ pub fn highlight_indices(
         }
     }
 
-    // 3. 全拼（异读字多个音节均可命中，映射后去重）
+    // 3. 全拼：连续子串匹配
     if !entry.pinyin_full.is_empty() {
-        let full_utf = Utf32Str::new(&entry.pinyin_full, full_buf);
-        let query_utf = Utf32Str::new(query, query_buf);
-        if matcher.fuzzy_indices(full_utf, query_utf, &mut indices).is_some() {
-            let mut out = Vec::with_capacity(indices.len());
-            let mut last = usize::MAX;
-            for i in indices {
-                if let Some(name_idx) = entry.indices.name_idx_for_full(i as usize) {
-                    if name_idx != last {
-                        out.push(name_idx);
-                        last = name_idx;
-                    }
+        if let Some(start) = find_ignore_case(&entry.pinyin_full, query) {
+            let end = start + query.chars().count();
+            let mut out = Vec::new();
+            for e in &entry.indices.entries {
+                // 命中区间 [start, end) 与每个字的拼音区间有交集即高亮该字
+                let (s, t) = (e.full_start as usize, e.full_end as usize);
+                if s < end && start < t && !out.contains(&(e.name_idx as usize)) {
+                    out.push(e.name_idx as usize);
                 }
             }
+            out.sort_unstable();
             return out;
         }
     }
 
     Vec::new()
+}
+
+/// 忽略大小写的子串查找，返回字符下标
+fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
+    let needle_lower: String = needle.chars().flat_map(|c| c.to_lowercase()).collect();
+    if needle_lower.is_empty() {
+        return Some(0);
+    }
+    let needle_len = needle_lower.chars().count();
+    for (index, _) in haystack.char_indices() {
+        let slice: String = haystack[index..].chars().take(needle_len).collect();
+        if slice.to_lowercase() == needle_lower {
+            return Some(haystack[..index].chars().count());
+        }
+    }
+    None
 }
 
 /// 是否匹配（用于过滤，内部复用 `highlight_indices`）
@@ -326,6 +356,30 @@ mod tests {
     fn heteronym_matches_alternate_reading() {
         // 乐 默认 le，异读 yue
         assert!(!highlighted("网易云音乐", "yue").is_empty());
+    }
+
+    #[test]
+    fn no_false_positive_on_pinyin_full() {
+        // 「kaishi」caidan 中并不存在连续的 "aa"，不应命中
+        assert!(highlighted("「开始」菜单", "aa").is_empty());
+    }
+
+    #[test]
+    fn still_matches_full_pinyin_substring() {
+        assert_eq!(highlighted("网易云音乐", "wangyi"), vec![0, 1]);
+    }
+
+    #[test]
+    fn still_matches_full_pinyin_prefix() {
+        assert!(!highlighted("网易云音乐", "wangyiyun").is_empty());
+    }
+
+    #[test]
+    fn ascii_substring_still_matches() {
+        // 纯 ASCII 名走原名模糊匹配（子序列），命中即可
+        let idx = highlighted("AppData", "aa");
+        assert!(idx.contains(&0), "got {idx:?}");
+        assert!(idx.len() >= 2, "got {idx:?}");
     }
 
     #[test]

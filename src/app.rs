@@ -847,6 +847,7 @@ impl App {
             })
             .collect();
         self.search_active = true;
+        self.request_hit_thumbnails();
         self.sync_ui();
         self.set_status(&format!(
             "搜索 \"{}\" · {} 项",
@@ -882,6 +883,7 @@ impl App {
         }
         self.search_hits = hits;
         self.search_active = true;
+        self.request_hit_thumbnails();
         self.sync_ui();
         self.set_status(&format!(
             "搜索 \"{}\" 内容 · {} 项",
@@ -931,6 +933,7 @@ impl App {
     /// 定时器回调：取回全盘索引结果
     fn apply_search_results(&mut self, hits: Vec<SearchHit>) {
         self.search_hits = hits;
+        self.request_hit_thumbnails();
         self.sync_ui();
         self.set_status(&format!(
             "搜索 \"{}\" · {} 项",
@@ -1847,11 +1850,13 @@ impl App {
                 id: "desktop".into(),
                 label: "桌面".into(),
                 detail: "".into(),
+                tint: slint::Color::from_rgb_u8(0x1a, 0x73, 0xe8),
             },
             SideItem {
                 id: "downloads".into(),
                 label: "下载".into(),
                 detail: "".into(),
+                tint: slint::Color::from_rgb_u8(0x18, 0x7a, 0x4d),
             },
             SideItem {
                 id: "recycle".into(),
@@ -1861,6 +1866,7 @@ impl App {
                     .map(|count| format!("{count} 项"))
                     .unwrap_or_default()
                     .into(),
+                tint: slint::Color::from_rgb_u8(0x9a, 0xa0, 0xa6),
             },
         ];
         #[cfg(not(windows))]
@@ -1931,6 +1937,7 @@ impl App {
 
     fn hits_to_model(&self) -> Vec<FileEntry> {
         let query = self.search_query.clone();
+        let cache = self.thumb_cache.borrow();
         self.search_hits
             .iter()
             .map(|hit| {
@@ -1938,7 +1945,9 @@ impl App {
                     .parent()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
-                let (badge, color) = badge_for(&hit.name, hit.is_dir);
+                let (badge, badge_color) = badge_for(&hit.name, hit.is_dir);
+                // 搜索结果与普通目录项共用同一套缩略图缓存
+                let cached = cache.get(Path::new(&hit.path));
                 FileEntry {
                     name: hit.name.clone().into(),
                     path: hit.path.clone().into(),
@@ -1946,10 +1955,10 @@ impl App {
                     size: browse::format_size(hit.size).into(),
                     modified: "-".to_string().into(),
                     is_dir: hit.is_dir,
-                    has_image: false,
-                    image: slint::Image::default(),
+                    has_image: cached.is_some(),
+                    image: cached.cloned().unwrap_or_default(),
                     badge: badge.into(),
-                    badge_color: color,
+                    badge_color,
                     spans: ModelRc::new(VecModel::from(spans_for(
                         &hit.name,
                         &query,
@@ -1959,6 +1968,20 @@ impl App {
                 }
             })
             .collect()
+    }
+
+    /// 搜索结果为命中项申请缩略图（走同一套后台管线）
+    fn request_hit_thumbnails(&mut self) {
+        let mut ready: Vec<(PathBuf, slint::Image)> = Vec::new();
+        for hit in &self.search_hits {
+            let path = PathBuf::from(&hit.path);
+            if let Some(image) = thumbnails::global().request(&path) {
+                ready.push((path, image));
+            }
+        }
+        for (path, image) in ready {
+            self.apply_thumbnail(&path, image);
+        }
     }
 
     fn set_status(&mut self, text: &str) {
@@ -1991,7 +2014,9 @@ fn tab_title(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
-/// 面包屑：此电脑 / 盘符 / 各级目录
+/// 面包屑：此电脑 / 盘符 / 各级目录。
+/// `Path::components()` 会把根目录的 `\` 单独产出一个 RootDir 组件，
+/// 直接合并进盘符那一级，避免出现「D: > \ >」的诡异切分。
 fn build_breadcrumbs(path: &Path) -> Vec<Breadcrumb> {
     let mut crumbs = Vec::new();
     crumbs.push(Breadcrumb {
@@ -1999,27 +2024,37 @@ fn build_breadcrumbs(path: &Path) -> Vec<Breadcrumb> {
         path: "".into(),
     });
 
-    let components: Vec<String> = path
-        .components()
-        .map(|component| component.as_os_str().to_string_lossy().to_string())
-        .filter(|component| !component.is_empty())
-        .collect();
-
     let mut accumulated = String::new();
-    for (index, component) in components.iter().enumerate() {
-        if index == 0 {
-            // 盘符 "C:"
-            accumulated = component.clone();
-            crumbs.push(Breadcrumb {
-                name: accumulated.clone().into(),
-                path: format!("{accumulated}\\").into(),
-            });
-        } else {
-            accumulated = format!("{accumulated}\\{component}");
-            crumbs.push(Breadcrumb {
-                name: component.clone().into(),
-                path: accumulated.clone().into(),
-            });
+    for component in path.components() {
+        use std::path::Component;
+        match component {
+            Component::Prefix(prefix) => {
+                // 盘符 "C:"
+                accumulated = prefix.as_os_str().to_string_lossy().to_string();
+                crumbs.push(Breadcrumb {
+                    name: accumulated.clone().into(),
+                    path: format!("{accumulated}\\").into(),
+                });
+            }
+            Component::RootDir => {
+                // 根目录斜杠：合并进上一级（盘符），不单独成层
+                if let Some(last) = crumbs.last_mut() {
+                    last.path = format!("{}\\", accumulated).into();
+                }
+            }
+            Component::Normal(part) => {
+                let part = part.to_string_lossy().to_string();
+                if !accumulated.is_empty() {
+                    accumulated = format!("{accumulated}\\{part}");
+                } else {
+                    accumulated = part.clone();
+                }
+                crumbs.push(Breadcrumb {
+                    name: part.into(),
+                    path: accumulated.clone().into(),
+                });
+            }
+            _ => {}
         }
     }
     crumbs
