@@ -58,6 +58,8 @@ pub struct SearchHit {
     pub path: String,
     pub is_dir: bool,
     pub size: u64,
+    /// 修改时间（MFT 索引不记录，目录枚举与内容搜索有值）
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// 全局结果通道（主线程定时器轮询用）
@@ -344,6 +346,7 @@ fn search(volumes: &[Arc<Mutex<Volume>>], query: &str) -> Vec<SearchHit> {
                     path,
                     is_dir,
                     size,
+                    modified: None,
                 });
                 if hits.len() >= limit {
                     return hits;
@@ -360,6 +363,7 @@ fn search(volumes: &[Arc<Mutex<Volume>>], query: &str) -> Vec<SearchHit> {
                     path: entry.path.clone(),
                     is_dir: entry.is_dir,
                     size: entry.size,
+                    modified: None,
                 });
                 if hits.len() >= limit {
                     return hits;

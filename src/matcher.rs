@@ -183,11 +183,12 @@ pub fn build_highlight_spans(name: &str, matched_indices: &[usize]) -> Vec<TextS
 /// 匹配策略（按优先级）：
 /// 1. **原名**：模糊子序列匹配（容忍拉丁名跳字，如 `qute` → `qutebrowser`）；
 /// 2. **首字母**：模糊子序列匹配（容忍跳过中间字，如 `wym` → 网易云音乐）；
-/// 3. **全拼**：**连续子串**匹配。
+/// 3. **全拼**：**音节边界对齐的前缀匹配**。
 ///
-/// 全拼之所以不用模糊匹配：字母级子序列会把 `aa` 匹配到 `「kaishi」caidan`
-/// 这类毫不相干的名字（`a...a` 跨越多个音节），产生大量误判。
-/// 子串匹配保证 `wangyi` → 网易 仍然成立，同时 `aa` 只命中真正含 `aa` 的拼音。
+/// 全拼不能用字母级模糊/子串匹配：`kai` 中间的 `a`、`mian` 中间的 `a` 会被
+/// 单字母查询命中，导致搜 `a` 出「开始」「桌面」这类杂讯。
+/// 音节前缀匹配保证查询只能从音节边界开始，`k`/`ka`/`kai` 命中开，
+/// 而 `a` 只命中阿、鞍这类首字母为 `a` 的字。
 pub fn highlight_indices(
     entry: &MatchEntry,
     query: &str,
@@ -234,40 +235,108 @@ pub fn highlight_indices(
         }
     }
 
-    // 3. 全拼：连续子串匹配
+    // 3. 全拼：**音节边界对齐**的前缀匹配
     if !entry.pinyin_full.is_empty() {
-        if let Some(start) = find_ignore_case(&entry.pinyin_full, query) {
-            let end = start + query.chars().count();
-            let mut out = Vec::new();
-            for e in &entry.indices.entries {
-                // 命中区间 [start, end) 与每个字的拼音区间有交集即高亮该字
-                let (s, t) = (e.full_start as usize, e.full_end as usize);
-                if s < end && start < t && !out.contains(&(e.name_idx as usize)) {
-                    out.push(e.name_idx as usize);
-                }
-            }
-            out.sort_unstable();
-            return out;
+        if let Some((begin, finish)) = match_pinyin_readings(&entry.indices, &entry.pinyin_full, query)
+        {
+            return (begin..finish).collect();
         }
     }
 
     Vec::new()
 }
 
-/// 忽略大小写的子串查找，返回字符下标
-fn find_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
-    let needle_lower: String = needle.chars().flat_map(|c| c.to_lowercase()).collect();
-    if needle_lower.is_empty() {
-        return Some(0);
+/// 按名字字符聚合拼音读音，返回 `(name_idx, [读音...])`，按名字顺序排列。
+///
+/// `full_start/full_end` 是**字符**下标（不是字节下标）；多音字会为每个读音
+/// 各产出一条 entry，因此这里按 `name_idx` 归并去重。
+fn pinyin_readings(indices: &FieldIndices, full: &str) -> Vec<(usize, Vec<String>)> {
+    let chars: Vec<char> = full.chars().collect();
+    let mut groups: Vec<(usize, Vec<String>)> = Vec::new();
+    for entry in &indices.entries {
+        let begin = (entry.full_start as usize).min(chars.len());
+        let finish = (entry.full_end as usize).min(chars.len());
+        if begin >= finish {
+            continue;
+        }
+        let syllable: String = chars[begin..finish].iter().collect();
+        let name_idx = entry.name_idx as usize;
+        if let Some(slot) = groups.iter_mut().find(|(idx, _)| *idx == name_idx) {
+            if !slot.1.contains(&syllable) {
+                slot.1.push(syllable);
+            }
+        } else {
+            groups.push((name_idx, vec![syllable]));
+        }
     }
-    let needle_len = needle_lower.chars().count();
-    for (index, _) in haystack.char_indices() {
-        let slice: String = haystack[index..].chars().take(needle_len).collect();
-        if slice.to_lowercase() == needle_lower {
-            return Some(haystack[..index].chars().count());
+    groups.sort_by_key(|(idx, _)| *idx);
+    groups
+}
+
+/// 音节边界对齐的前缀匹配，返回命中的**名字字符**区间 `[begin, finish)`。
+///
+/// 查询串必须能被切成「完整读音 + 末尾可以是某个读音的前缀」的序列，
+/// 且起始位置必须落在读音边界上：
+///
+/// * `k` / `ka` / `kai` → 开 ✓
+/// * `kaish` / `kaishi` → 开始 ✓
+/// * `a` → 开 ✗（`a` 不是 `kai` 的前缀，避免把韵母中间的字母当匹配目标）
+/// * `aa` → 「开始」菜单 ✗（不存在以 `aa` 开头的读音序列）
+///
+/// 多音字会尝试每一种读音（如 `hang` / `xing`）。
+fn match_pinyin_readings(
+    indices: &FieldIndices,
+    full: &str,
+    query: &str,
+) -> Option<(usize, usize)> {
+    let groups = pinyin_readings(indices, full);
+    if groups.is_empty() {
+        return None;
+    }
+    let query: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+    if query.is_empty() {
+        return None;
+    }
+
+    for start in 0..groups.len() {
+        if let Some(finish) = match_from(&groups, start, &query) {
+            return Some((groups[start].0, groups[finish - 1].0 + 1));
         }
     }
     None
+}
+
+/// 从第 `start` 个名字字符开始，尝试把查询串消费完。
+/// 返回消耗到的名字字符下标（不含）。
+fn match_from(groups: &[(usize, Vec<String>)], start: usize, query: &[char]) -> Option<usize> {
+    let mut cursor = 0usize; // 查询串消费位置
+    let mut index = start; // 当前名字字符下标
+    while cursor < query.len() {
+        if index >= groups.len() {
+            return None;
+        }
+        let mut advanced = false;
+        for reading in &groups[index].1 {
+            let syllable: Vec<char> = reading.chars().collect();
+            let remaining = query.len() - cursor;
+            if remaining <= syllable.len() {
+                // 查询剩余部分必须是当前读音的前缀（只能停在末尾读音的中间）
+                if syllable.starts_with(&query[cursor..]) {
+                    return Some(index + 1);
+                }
+            } else if query[cursor..cursor + syllable.len()] == syllable[..] {
+                // 查询更长：当前读音必须被完整消费
+                cursor += syllable.len();
+                index += 1;
+                advanced = true;
+                break;
+            }
+        }
+        if !advanced {
+            return None;
+        }
+    }
+    Some(index)
 }
 
 /// 是否匹配（用于过滤，内部复用 `highlight_indices`）
@@ -360,13 +429,33 @@ mod tests {
 
     #[test]
     fn no_false_positive_on_pinyin_full() {
-        // 「kaishi」caidan 中并不存在连续的 "aa"，不应命中
+        // 「kaishi」caidan 中不存在以 aa 开头的音节序列，不应命中
         assert!(highlighted("「开始」菜单", "aa").is_empty());
+    }
+
+    #[test]
+    fn single_letter_only_matches_syllable_start() {
+        // 单字母 a 不应命中「开」(kai) 与「面」(mian) 中间的韵母
+        assert!(highlighted("开始", "a").is_empty());
+        assert!(highlighted("桌面", "a").is_empty());
+        // 但应命中首字母为 a 的字
+        assert_eq!(highlighted("阿里", "a"), vec![0]);
+        assert_eq!(highlighted("鞍山", "a"), vec![0]);
+    }
+
+    #[test]
+    fn syllable_prefix_matches() {
+        assert_eq!(highlighted("开始", "k"), vec![0]);
+        assert_eq!(highlighted("开始", "ka"), vec![0]);
+        assert_eq!(highlighted("开始", "kai"), vec![0]);
+        assert_eq!(highlighted("开始", "kaish"), vec![0, 1]);
+        assert_eq!(highlighted("开始", "kaishi"), vec![0, 1]);
     }
 
     #[test]
     fn still_matches_full_pinyin_substring() {
         assert_eq!(highlighted("网易云音乐", "wangyi"), vec![0, 1]);
+        assert_eq!(highlighted("网易云音乐", "wangy"), vec![0, 1]);
     }
 
     #[test]

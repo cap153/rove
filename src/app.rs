@@ -755,6 +755,13 @@ impl App {
 
     // ---------------------------------------------------------------- 搜索
 
+    /// 搜索框重新获取焦点（数据刷新后调用，避免焦点被弹窗/列表抢走）
+    fn refocus_search(&mut self) {
+        if let Some(window) = self.window.as_ref() {
+            window.set_search_focus_trigger(window.get_search_focus_trigger() + 1);
+        }
+    }
+
     fn search_focus(&mut self) {
         self.ensure_window();
         if let Some(window) = self.window.as_ref() {
@@ -774,10 +781,12 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             window.set_search_active(true);
             window.set_search_popup_open(true);
-            window.set_show_path_column(false);
+            window.set_show_path_column(true);
         }
         self.run_current_dir_search();
         self.sync_suggestions();
+        // 模型刷新后把焦点还给搜索框，保证可以连续输入
+        self.refocus_search();
     }
 
     fn search_submit(&mut self, scope: i32) {
@@ -789,7 +798,7 @@ impl App {
         if let Some(window) = self.window.as_ref() {
             window.set_search_active(true);
             window.set_search_popup_open(false);
-            window.set_show_path_column(scope == SCOPE_GLOBAL || scope == SCOPE_DIR_CONTENT);
+            window.set_show_path_column(true);
         }
         match scope {
             SCOPE_DIR_CONTENT => self.run_content_search(),
@@ -802,12 +811,10 @@ impl App {
             }
             _ => self.run_current_dir_search(),
         }
+        self.refocus_search();
     }
 
     fn close_search(&mut self) {
-        if !self.search_active {
-            return;
-        }
         self.search_active = false;
         self.search_hits.clear();
         self.search_query.clear();
@@ -844,6 +851,7 @@ impl App {
                 path: entry.path.display().to_string(),
                 is_dir: entry.is_dir,
                 size: entry.size,
+                modified: entry.modified,
             })
             .collect();
         self.search_active = true;
@@ -878,6 +886,7 @@ impl App {
                     path: entry.path.display().to_string(),
                     is_dir: false,
                     size: entry.size,
+                    modified: entry.modified,
                 });
             }
         }
@@ -1850,13 +1859,13 @@ impl App {
                 id: "desktop".into(),
                 label: "桌面".into(),
                 detail: "".into(),
-                tint: slint::Color::from_rgb_u8(0x1a, 0x73, 0xe8),
+                icon_kind: "folder".into(),
             },
             SideItem {
                 id: "downloads".into(),
                 label: "下载".into(),
                 detail: "".into(),
-                tint: slint::Color::from_rgb_u8(0x18, 0x7a, 0x4d),
+                icon_kind: "folder".into(),
             },
             SideItem {
                 id: "recycle".into(),
@@ -1866,7 +1875,7 @@ impl App {
                     .map(|count| format!("{count} 项"))
                     .unwrap_or_default()
                     .into(),
-                tint: slint::Color::from_rgb_u8(0x9a, 0xa0, 0xa6),
+                icon_kind: "bin".into(),
             },
         ];
         #[cfg(not(windows))]
@@ -1952,8 +1961,17 @@ impl App {
                     name: hit.name.clone().into(),
                     path: hit.path.clone().into(),
                     kind: parent.into(),
-                    size: browse::format_size(hit.size).into(),
-                    modified: "-".to_string().into(),
+                    size: if hit.is_dir {
+                        String::new()
+                    } else {
+                        browse::format_size(hit.size)
+                    }
+                    .into(),
+                    modified: hit
+                        .modified
+                        .map(browse::format_time)
+                        .unwrap_or_else(|| "-".to_string())
+                        .into(),
                     is_dir: hit.is_dir,
                     has_image: cached.is_some(),
                     image: cached.cloned().unwrap_or_default(),
@@ -2014,6 +2032,15 @@ fn tab_title(path: &Path) -> String {
         .unwrap_or_else(|| path.display().to_string())
 }
 
+/// 估算面包屑一段的像素宽度（12px 字号：ASCII 约 7px，CJK 约 13px，含留白与箭头）
+fn crumb_width(name: &str) -> i32 {
+    let mut width = 14;
+    for ch in name.chars() {
+        width += if ch.is_ascii() { 7 } else { 13 };
+    }
+    width
+}
+
 /// 面包屑：此电脑 / 盘符 / 各级目录。
 /// `Path::components()` 会把根目录的 `\` 单独产出一个 RootDir 组件，
 /// 直接合并进盘符那一级，避免出现「D: > \ >」的诡异切分。
@@ -2022,6 +2049,7 @@ fn build_breadcrumbs(path: &Path) -> Vec<Breadcrumb> {
     crumbs.push(Breadcrumb {
         name: "此电脑".into(),
         path: "".into(),
+        width: crumb_width("此电脑"),
     });
 
     let mut accumulated = String::new();
@@ -2034,6 +2062,7 @@ fn build_breadcrumbs(path: &Path) -> Vec<Breadcrumb> {
                 crumbs.push(Breadcrumb {
                     name: accumulated.clone().into(),
                     path: format!("{accumulated}\\").into(),
+                    width: crumb_width(&accumulated),
                 });
             }
             Component::RootDir => {
@@ -2050,8 +2079,9 @@ fn build_breadcrumbs(path: &Path) -> Vec<Breadcrumb> {
                     accumulated = part.clone();
                 }
                 crumbs.push(Breadcrumb {
-                    name: part.into(),
+                    name: part.clone().into(),
                     path: accumulated.clone().into(),
+                    width: crumb_width(&part),
                 });
             }
             _ => {}

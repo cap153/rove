@@ -43,6 +43,7 @@ export struct MenuNode {
 export struct Breadcrumb {
     name: string,
     path: string,
+    width: int,
 }
 
 export struct DriveItem {
@@ -56,7 +57,7 @@ export struct SideItem {
     id: string,
     label: string,
     detail: string,
-    tint: color,
+    icon-kind: string,
 }
 
 export struct SearchSuggestion {
@@ -169,6 +170,62 @@ component IconChevron inherits Path {
     MoveTo { x: 4.5; y: 2.5; }
     LineTo { x: 8.5; y: 6; }
     LineTo { x: 4.5; y: 9.5; }
+}
+
+component IconSideFolder inherits Path {
+    width: 16px;
+    height: 16px;
+    stroke: #5f6368;
+    stroke-width: 1.2px;
+    fill: #eef1f4;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    MoveTo { x: 2; y: 4.5; }
+    LineTo { x: 2; y: 12.5; }
+    LineTo { x: 14; y: 12.5; }
+    LineTo { x: 14; y: 6.5; }
+    LineTo { x: 7.5; y: 6.5; }
+    LineTo { x: 6; y: 4.5; }
+    Close { }
+}
+
+component IconSideBin inherits Path {
+    width: 16px;
+    height: 16px;
+    stroke: #5f6368;
+    stroke-width: 1.2px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    MoveTo { x: 3.5; y: 4.5; }
+    LineTo { x: 12.5; y: 4.5; }
+    MoveTo { x: 6.2; y: 4.5; }
+    LineTo { x: 6.8; y: 12.8; }
+    LineTo { x: 9.2; y: 12.8; }
+    LineTo { x: 9.8; y: 4.5; }
+    MoveTo { x: 6.8; y: 2.6; }
+    LineTo { x: 9.2; y: 2.6; }
+}
+
+component IconSideGlobe inherits Path {
+    width: 16px;
+    height: 16px;
+    stroke: #5f6368;
+    stroke-width: 1.1px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    MoveTo { x: 8; y: 1.8; }
+    QuadraticTo { control-x: 14.2; control-y: 1.8; x: 14.2; y: 8; }
+    QuadraticTo { control-x: 14.2; control-y: 14.2; x: 8; y: 14.2; }
+    QuadraticTo { control-x: 1.8; control-y: 14.2; x: 1.8; y: 8; }
+    QuadraticTo { control-x: 1.8; control-y: 1.8; x: 8; y: 1.8; }
+    MoveTo { x: 1.8; y: 8; }
+    LineTo { x: 14.2; y: 8; }
+    MoveTo { x: 8; y: 1.8; }
+    QuadraticTo { control-x: 11.4; control-y: 5.4; x: 11.4; y: 8; }
+    QuadraticTo { control-x: 11.4; control-y: 10.6; x: 8; y: 14.2; }
+    MoveTo { x: 8; y: 1.8; }
+    QuadraticTo { control-x: 4.6; control-y: 5.4; x: 4.6; y: 8; }
+    QuadraticTo { control-x: 4.6; control-y: 10.6; x: 8; y: 14.2; }
 }
 
 component IconFolder inherits Path {
@@ -438,40 +495,59 @@ component MenuRow inherits Rectangle {
 component SideRow inherits Rectangle {
     in property <string> label;
     in property <string> detail;
-    in property <color> tint;
+    in property <string> icon-kind: "folder";
     callback activated();
 
     height: 30px;
     background: #f7f8fa;
+
     TouchArea {
         width: 100%;
         height: 100%;
         clicked => { root.activated(); }
     }
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 8px;
-        spacing: 8px;
-        Rectangle {
-            width: 8px;
-            height: 8px;
-            background: root.tint;
-            border-radius: 2px;
-        }
-        Text {
-            text: root.label;
-            vertical-alignment: center;
-            horizontal-stretch: 1;
-            font-size: 12px;
-            color: #1a1a1a;
-            overflow: TextOverflow.elide;
-        }
-        Text {
-            text: root.detail;
-            vertical-alignment: center;
-            font-size: 10px;
-            color: #80868b;
-        }
+
+    // 图标（绝对定位，保证与文字垂直居中对齐）
+    if root.icon-kind == "folder": IconSideFolder {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+    }
+    if root.icon-kind == "bin": IconSideBin {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+    }
+    if root.icon-kind == "network": IconSideGlobe {
+        x: 12px;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+    }
+
+    Text {
+        x: 36px;
+        y: 0px;
+        width: root.detail == "" ? parent.width - 36px - 8px : parent.width - 36px - 56px;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.label;
+        font-size: 12px;
+        color: #1a1a1a;
+        overflow: TextOverflow.elide;
+    }
+    Text {
+        x: parent.width - 48px;
+        y: 0px;
+        width: 40px;
+        height: parent.height;
+        vertical-alignment: center;
+        horizontal-alignment: right;
+        text: root.detail;
+        font-size: 10px;
+        color: #80868b;
     }
 }
 
@@ -552,9 +628,9 @@ component SideNavItem inherits Rectangle {
 export component MainWindow inherits Window {
     title: "Rove";
     min-width: 1000px;
-    min-height: 620px;
+    min-height: 400px;
     preferred-width: 1280px;
-    preferred-height: 800px;
+    preferred-height: 460px;
     background: #f2f2f2;
 
     // 中文字体回退（Slint 只接受单字族名）
@@ -599,6 +675,8 @@ export component MainWindow inherits Window {
     in property <string> search-count: "";
     in property <[SearchSuggestion]> search-suggestions: [];
     in-out property <bool> search-popup-open: false;
+    // 数据刷新后把焦点还给搜索框（递增触发）
+    in-out property <int> search-focus-trigger: 0;
 
     // ---- 右键菜单 ----
     in property <[MenuNode]> menu-items: [];
@@ -699,6 +777,8 @@ export component MainWindow inherits Window {
     // ============================================================ 布局
 
     FocusScope {
+        width: 100%;
+        height: 100%;
         key-pressed(event) => {
             if (event.modifiers.control && event.text == "f") {
                 root.search-focus();
@@ -712,6 +792,8 @@ export component MainWindow inherits Window {
         }
 
         VerticalLayout {
+            width: 100%;
+            height: 100%;
             spacing: 0px;
 
             // ===== 第 1 行：标签栏（最顶层） =====
@@ -855,7 +937,7 @@ export component MainWindow inherits Window {
                             width: 14px;
                             height: 14px;
                         }
-                        LineEdit {
+                        search-input := LineEdit {
                             text <=> root.search-text;
                             horizontal-stretch: 1;
                             placeholder-text: "搜索（支持拼音首字母）";
@@ -935,8 +1017,8 @@ export component MainWindow inherits Window {
             }
 
             // ===== 第 3 行：动作工具条（仅浏览模式） =====
-            if root.active-tab-kind != "settings": Rectangle {
-                height: 38px;
+            Rectangle {
+                height: root.active-tab-kind != "settings" ? 38px : 0px;
                 background: #ffffff;
                 border-width: 1px;
                 border-color: #e4e6eb;
@@ -982,8 +1064,8 @@ export component MainWindow inherits Window {
                         color: #5f6368;
                     }
                     ComboBox {
-                        width: 104px;
                         height: 26px;
+                        width: 104px;
                         model: ["名称", "修改时间", "大小", "类型"];
                         current-index <=> root.sort-mode;
                         selected(value) => { root.sort-by(self.current-index); }
@@ -996,16 +1078,23 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // ===== 第 4 行：主内容区（视图互斥） =====
+            // ===== 第 4 行：主内容区（视图互斥）=====
+            // vertical-stretch: 1 撑满标签栏/工具条之外的剩余空间，
+            // 状态栏因此被固定在窗口最底部，不会随内容高度漂移。
             Rectangle {
                 horizontal-stretch: 1;
+                // 关键：内容区高度 = 窗口高度 - 顶部三栏(36+42+38=116) - 底部状态栏(24)。
+                // 因为顶层 VerticalLayout 已 height:100% 充满 Window，root.height 是固定值（800），
+                // 不会出现“高度依赖布局、布局又依赖高度”的绑定环。
+                // 这样无论列表多长，内容区都被钉死在“三栏之下、状态栏之上”，
+                // 状态栏因此永远停靠窗口最底部（设置页时状态栏为 0，内容区自动补满）。
+                height: root.height - 116px - (root.active-tab-kind != "settings" ? 24px : 0px);
                 clip: true;
 
                 // ---- 设置标签：独占工作区，无主侧边栏 ----
                 if root.active-tab-kind == "settings": HorizontalLayout {
-                    width: 100%;
-                    height: 100%;
 
+                    // 左侧：设置导航
                     Rectangle {
                         width: 176px;
                         background: #fafafa;
@@ -1045,8 +1134,11 @@ export component MainWindow inherits Window {
                         }
                     }
 
+                    // 右侧：设置内容（固定 860px，避免控件横跨全屏）
                     ScrollView {
                         horizontal-stretch: 1;
+                        vertical-stretch: 1;
+                        min-height: 0px;
                         HorizontalLayout {
                             Rectangle {
                                 width: 28px;
@@ -1059,302 +1151,301 @@ export component MainWindow inherits Window {
                                 padding-right: 18px;
                                 spacing: 12px;
 
-                            // 通用
-                            if root.settings-page == 0: VerticalLayout {
-                                spacing: 14px;
-                                Text {
-                                    text: "通用";
-                                    font-size: 20px;
-                                    font-weight: 700;
-                                    color: #1a1a1a;
-                                }
-
-                                Rectangle {
-                                    background: #ffffff;
-                                    border-width: 1px;
-                                    border-color: #e4e6eb;
-                                    border-radius: 6px;
-                                    VerticalLayout {
-                                        padding: 16px;
-                                        spacing: 14px;
-                                        Text { text: "外观"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
-                                        Text { text: "主题"; font-size: 11px; color: #5f6368; }
-                                        ComboBox {
-                                            width: 220px;
-                                            model: ["浅色", "深色", "跟随系统"];
-                                            current-index <=> root.opt-theme;
-                                        }
-                                        CheckBox {
-                                            text: "关闭所有标签后销毁 UI，保持后台常驻";
-                                            checked <=> root.opt-destroy-ui;
-                                        }
-                                        CheckBox {
-                                            text: "显示系统托盘图标";
-                                            checked <=> root.opt-tray;
-                                        }
-                                        HorizontalLayout {
-                                            alignment: end;
-                                            GhostButton {
-                                                text: "保存";
-                                                btn-min-width: 64;
-                                                clicked => { root.save-general(); }
-                                            }
-                                        }
+                                if root.settings-page == 0: VerticalLayout {
+                                    spacing: 14px;
+                                    Text {
+                                        text: "通用";
+                                        font-size: 20px;
+                                        font-weight: 700;
+                                        color: #1a1a1a;
                                     }
-                                }
 
-                                Rectangle {
-                                    background: #ffffff;
-                                    border-width: 1px;
-                                    border-color: #e4e6eb;
-                                    border-radius: 6px;
-                                    VerticalLayout {
-                                        padding: 16px;
-                                        spacing: 10px;
-                                        Text { text: "默认文件管理器"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
-                                        Text { text: "接管后，双击文件夹 / 盘符 / 「此电脑」时由 Rove 打开"; font-size: 11px; color: #5f6368; }
-                                        CheckBox {
-                                            text: "接管文件夹和磁盘";
-                                            checked <=> root.opt-takeover-folders;
-                                        }
-                                        CheckBox {
-                                            text: "接管桌面上的「此电脑」";
-                                            checked <=> root.opt-takeover-this-pc;
-                                        }
-                                        CheckBox {
-                                            text: "接管盘符双击";
-                                            checked <=> root.opt-takeover-drives;
-                                        }
-                                        HorizontalLayout {
-                                            alignment: end;
-                                            GhostButton {
-                                                text: "应用接管设置";
-                                                btn-min-width: 96;
-                                                clicked => { root.takeover-changed(); }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 搜索与索引
-                            if root.settings-page == 1: VerticalLayout {
-                                spacing: 14px;
-                                Text {
-                                    text: "搜索与索引";
-                                    font-size: 20px;
-                                    font-weight: 700;
-                                    color: #1a1a1a;
-                                }
-                                Rectangle {
-                                    background: #ffffff;
-                                    border-width: 1px;
-                                    border-color: #e4e6eb;
-                                    border-radius: 6px;
-                                    VerticalLayout {
-                                        padding: 16px;
-                                        spacing: 10px;
-                                        Text { text: "MFT 实时索引"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
-                                        Text {
-                                            text: root.index-status;
-                                            font-size: 12px;
-                                            color: #1a1a1a;
-                                            wrap: TextWrap.word-wrap;
-                                        }
-                                        Text {
-                                            text: "全盘搜索基于 NTFS $MFT 内存索引 + USN Journal 增量更新；未提权时自动回退为目录枚举索引。";
-                                            font-size: 11px;
-                                            color: #5f6368;
-                                            wrap: TextWrap.word-wrap;
-                                        }
-                                    }
-                                }
-                                Rectangle {
-                                    background: #ffffff;
-                                    border-width: 1px;
-                                    border-color: #e4e6eb;
-                                    border-radius: 6px;
-                                    VerticalLayout {
-                                        padding: 16px;
-                                        spacing: 10px;
-                                        Text { text: "压缩软件探测"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
-                                        Text {
-                                            text: root.archiver-summary;
-                                            font-size: 12px;
-                                            color: #1a1a1a;
-                                            wrap: TextWrap.word-wrap;
-                                        }
-                                        Text { text: "探测结果写入 actions.toml，可在「本地右键菜单」页管理。"; font-size: 11px; color: #5f6368; }
-                                    }
-                                }
-                            }
-
-                            // 本地右键菜单
-                            if root.settings-page == 2: VerticalLayout {
-                                spacing: 14px;
-                                Text {
-                                    text: "本地右键菜单";
-                                    font-size: 20px;
-                                    font-weight: 700;
-                                    color: #1a1a1a;
-                                }
-                                Rectangle {
-                                    background: #ffffff;
-                                    border-width: 1px;
-                                    border-color: #e4e6eb;
-                                    border-radius: 6px;
-                                    HorizontalLayout {
-                                        padding: 14px;
-                                        spacing: 14px;
-
+                                    Rectangle {
+                                        background: #ffffff;
+                                        border-width: 1px;
+                                        border-color: #e4e6eb;
+                                        border-radius: 6px;
                                         VerticalLayout {
-                                            width: 300px;
-                                            spacing: 8px;
-                                            Rectangle {
-                                                vertical-stretch: 1;
-                                                border-width: 1px;
-                                                border-color: #d4d4d4;
-                                                border-radius: 4px;
-                                                ListView {
-                                                    width: 100%;
-                                                    height: 100%;
-                                                    for row[i] in root.actions: Rectangle {
-                                                        height: 34px;
-                                                        background: i == root.selected-action ? #d3e6fa : #ffffff;
-                                                        HorizontalLayout {
-                                                            padding-left: 8px;
-                                                            padding-right: 8px;
-                                                            spacing: 8px;
-                                                            CheckBox {
-                                                                width: 20px;
-                                                                checked: row.enabled;
-                                                                toggled => { root.toggle-action(i, self.checked); }
-                                                            }
-                                                            VerticalLayout {
-                                                                horizontal-stretch: 1;
-                                                                Text {
-                                                                    text: row.label;
-                                                                    vertical-alignment: center;
-                                                                    font-size: 12px;
-                                                                    color: #1a1a1a;
-                                                                    overflow: TextOverflow.elide;
+                                            padding: 16px;
+                                            spacing: 14px;
+                                            Text { text: "外观"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
+                                            Text { text: "主题"; font-size: 11px; color: #5f6368; }
+                                            ComboBox {
+                                                height: 32px;
+                                                width: 220px;
+                                                model: ["浅色", "深色", "跟随系统"];
+                                                current-index <=> root.opt-theme;
+                                            }
+                                            CheckBox {
+                                                text: "关闭所有标签后销毁 UI，保持后台常驻";
+                                                checked <=> root.opt-destroy-ui;
+                                            }
+                                            CheckBox {
+                                                text: "显示系统托盘图标";
+                                                checked <=> root.opt-tray;
+                                            }
+                                            HorizontalLayout {
+                                                alignment: end;
+                                                GhostButton {
+                                                    text: "保存";
+                                                    btn-min-width: 64;
+                                                    clicked => { root.save-general(); }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        background: #ffffff;
+                                        border-width: 1px;
+                                        border-color: #e4e6eb;
+                                        border-radius: 6px;
+                                        VerticalLayout {
+                                            padding: 16px;
+                                            spacing: 10px;
+                                            Text { text: "默认文件管理器"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
+                                            Text { text: "接管后，双击文件夹 / 盘符 / 「此电脑」时由 Rove 打开"; font-size: 11px; color: #5f6368; }
+                                            CheckBox {
+                                                text: "接管文件夹和磁盘";
+                                                checked <=> root.opt-takeover-folders;
+                                            }
+                                            CheckBox {
+                                                text: "接管桌面上的「此电脑」";
+                                                checked <=> root.opt-takeover-this-pc;
+                                            }
+                                            CheckBox {
+                                                text: "接管盘符双击";
+                                                checked <=> root.opt-takeover-drives;
+                                            }
+                                            HorizontalLayout {
+                                                alignment: end;
+                                                GhostButton {
+                                                    text: "应用接管设置";
+                                                    btn-min-width: 96;
+                                                    clicked => { root.takeover-changed(); }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if root.settings-page == 1: VerticalLayout {
+                                    spacing: 14px;
+                                    Text {
+                                        text: "搜索与索引";
+                                        font-size: 20px;
+                                        font-weight: 700;
+                                        color: #1a1a1a;
+                                    }
+                                    Rectangle {
+                                        background: #ffffff;
+                                        border-width: 1px;
+                                        border-color: #e4e6eb;
+                                        border-radius: 6px;
+                                        VerticalLayout {
+                                            padding: 16px;
+                                            spacing: 10px;
+                                            Text { text: "MFT 实时索引"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
+                                            Text {
+                                                text: root.index-status;
+                                                font-size: 12px;
+                                                color: #1a1a1a;
+                                                wrap: TextWrap.word-wrap;
+                                            }
+                                            Text {
+                                                text: "全盘搜索基于 NTFS $MFT 内存索引 + USN Journal 增量更新；未提权时自动回退为目录枚举索引。";
+                                                font-size: 11px;
+                                                color: #5f6368;
+                                                wrap: TextWrap.word-wrap;
+                                            }
+                                        }
+                                    }
+                                    Rectangle {
+                                        background: #ffffff;
+                                        border-width: 1px;
+                                        border-color: #e4e6eb;
+                                        border-radius: 6px;
+                                        VerticalLayout {
+                                            padding: 16px;
+                                            spacing: 10px;
+                                            Text { text: "压缩软件探测"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
+                                            Text {
+                                                text: root.archiver-summary;
+                                                font-size: 12px;
+                                                color: #1a1a1a;
+                                                wrap: TextWrap.word-wrap;
+                                            }
+                                            Text { text: "探测结果写入 actions.toml，可在「本地右键菜单」页管理。"; font-size: 11px; color: #5f6368; }
+                                        }
+                                    }
+                                }
+
+                                if root.settings-page == 2: VerticalLayout {
+                                    spacing: 14px;
+                                    Text {
+                                        text: "本地右键菜单";
+                                        font-size: 20px;
+                                        font-weight: 700;
+                                        color: #1a1a1a;
+                                    }
+                                    Rectangle {
+                                        background: #ffffff;
+                                        border-width: 1px;
+                                        border-color: #e4e6eb;
+                                        border-radius: 6px;
+                                        HorizontalLayout {
+                                            padding: 14px;
+                                            spacing: 14px;
+
+                                            VerticalLayout {
+                                                width: 300px;
+                                                spacing: 8px;
+                                                Rectangle {
+                                                    vertical-stretch: 1;
+                                                    min-height: 0px;
+                                                    border-width: 1px;
+                                                    border-color: #d4d4d4;
+                                                    border-radius: 4px;
+                                                    ListView {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        for row[i] in root.actions: Rectangle {
+                                                            height: 34px;
+                                                            background: i == root.selected-action ? #d3e6fa : #ffffff;
+                                                            HorizontalLayout {
+                                                                padding-left: 8px;
+                                                                padding-right: 8px;
+                                                                spacing: 8px;
+                                                                CheckBox {
+                                                                    width: 20px;
+                                                                    checked: row.enabled;
+                                                                    toggled => { root.toggle-action(i, self.checked); }
                                                                 }
-                                                                Text {
-                                                                    text: row.detail;
-                                                                    vertical-alignment: center;
-                                                                    font-size: 10px;
-                                                                    color: #777777;
-                                                                    overflow: TextOverflow.elide;
+                                                                VerticalLayout {
+                                                                    horizontal-stretch: 1;
+                                                                    Text {
+                                                                        text: row.label;
+                                                                        vertical-alignment: center;
+                                                                        font-size: 12px;
+                                                                        color: #1a1a1a;
+                                                                        overflow: TextOverflow.elide;
+                                                                    }
+                                                                    Text {
+                                                                        text: row.detail;
+                                                                        vertical-alignment: center;
+                                                                        font-size: 10px;
+                                                                        color: #777777;
+                                                                        overflow: TextOverflow.elide;
+                                                                    }
                                                                 }
                                                             }
-                                                        }
-                                                        TouchArea {
-                                                            width: 100%;
-                                                            height: 100%;
-                                                            clicked => { root.select-action(i); }
+                                                            TouchArea {
+                                                                width: 100%;
+                                                                height: 100%;
+                                                                clicked => { root.select-action(i); }
+                                                            }
                                                         }
                                                     }
                                                 }
-                                            }
-                                            HorizontalLayout {
-                                                spacing: 8px;
-                                                GhostButton {
-                                                    text: "添加动作";
-                                                    btn-min-width: 72;
-                                                    clicked => { root.add-action(); }
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    GhostButton {
+                                                        text: "添加动作";
+                                                        btn-min-width: 72;
+                                                        clicked => { root.add-action(); }
+                                                    }
+                                                    GhostButton {
+                                                        text: "删除";
+                                                        btn-min-width: 56;
+                                                        enabled: root.edit-enabled;
+                                                        clicked => { root.delete-action(); }
+                                                    }
                                                 }
-                                                GhostButton {
-                                                    text: "删除";
-                                                    btn-min-width: 56;
+                                            }
+
+                                            VerticalLayout {
+                                                horizontal-stretch: 1;
+                                                spacing: 8px;
+                                                Text { text: "动作属性"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
+                                                Text { text: "名称"; font-size: 11px; color: #5f6368; }
+                                                LineEdit {
+                                                    text <=> root.edit-label;
                                                     enabled: root.edit-enabled;
-                                                    clicked => { root.delete-action(); }
+                                                    placeholder-text: "菜单显示名称";
+                                                }
+                                                Text { text: "执行程序"; font-size: 11px; color: #5f6368; }
+                                                LineEdit {
+                                                    text <=> root.edit-program;
+                                                    enabled: root.edit-enabled;
+                                                    placeholder-text: "C:\\Program Files\\...\\app.exe";
+                                                }
+                                                Text { text: "参数（支持 {target_path} {target_dir} {name} {stem} {ext}）"; font-size: 11px; color: #5f6368; }
+                                                LineEdit {
+                                                    text <=> root.edit-args;
+                                                    enabled: root.edit-enabled;
+                                                    placeholder-text: "--flag \"{target_path}\"";
+                                                }
+                                                Text { text: "工作目录"; font-size: 11px; color: #5f6368; }
+                                                LineEdit {
+                                                    text <=> root.edit-working-dir;
+                                                    enabled: root.edit-enabled;
+                                                }
+                                                Text { text: "生效目标"; font-size: 11px; color: #5f6368; }
+                                                ComboBox {
+                                                    height: 30px;
+                                                    width: 160px;
+                                                    model: ["不限", "仅文件", "仅文件夹"];
+                                                    current-index <=> root.edit-target-index;
+                                                    enabled: root.edit-enabled;
+                                                }
+                                                Text { text: "后缀名白名单（逗号分隔，留空不限制）"; font-size: 11px; color: #5f6368; }
+                                                LineEdit {
+                                                    text <=> root.edit-extensions;
+                                                    enabled: root.edit-enabled;
+                                                    placeholder-text: "zip, 7z, rar";
+                                                }
+                                                HorizontalLayout {
+                                                    spacing: 8px;
+                                                    GhostButton {
+                                                        text: "应用修改";
+                                                        btn-min-width: 76;
+                                                        enabled: root.edit-enabled;
+                                                        clicked => { root.apply-edit(); }
+                                                    }
+                                                    GhostButton {
+                                                        text: "重置";
+                                                        btn-min-width: 56;
+                                                        enabled: root.edit-enabled;
+                                                        clicked => { root.select-action(root.selected-action); }
+                                                    }
                                                 }
                                             }
                                         }
+                                    }
+                                }
 
+                                if root.settings-page == 3: VerticalLayout {
+                                    spacing: 14px;
+                                    Text {
+                                        text: "关于与诊断";
+                                        font-size: 20px;
+                                        font-weight: 700;
+                                        color: #1a1a1a;
+                                    }
+                                    Rectangle {
+                                        background: #ffffff;
+                                        border-width: 1px;
+                                        border-color: #e4e6eb;
+                                        border-radius: 6px;
                                         VerticalLayout {
-                                            horizontal-stretch: 1;
+                                            padding: 16px;
                                             spacing: 8px;
-                                            Text { text: "动作属性"; font-size: 13px; font-weight: 700; color: #1a1a1a; }
-                                            Text { text: "名称"; font-size: 11px; color: #5f6368; }
-                                            LineEdit {
-                                                text <=> root.edit-label;
-                                                enabled: root.edit-enabled;
-                                                placeholder-text: "菜单显示名称";
-                                            }
-                                            Text { text: "执行程序"; font-size: 11px; color: #5f6368; }
-                                            LineEdit {
-                                                text <=> root.edit-program;
-                                                enabled: root.edit-enabled;
-                                                placeholder-text: "C:\\Program Files\\...\\app.exe";
-                                            }
-                                            Text { text: "参数（支持 {target_path} {target_dir} {name} {stem} {ext}）"; font-size: 11px; color: #5f6368; }
-                                            LineEdit {
-                                                text <=> root.edit-args;
-                                                enabled: root.edit-enabled;
-                                                placeholder-text: "--flag \"{target_path}\"";
-                                            }
-                                            Text { text: "工作目录"; font-size: 11px; color: #5f6368; }
-                                            LineEdit {
-                                                text <=> root.edit-working-dir;
-                                                enabled: root.edit-enabled;
-                                            }
-                                            Text { text: "生效目标"; font-size: 11px; color: #5f6368; }
-                                            ComboBox {
-                                                width: 160px;
-                                                model: ["不限", "仅文件", "仅文件夹"];
-                                                current-index <=> root.edit-target-index;
-                                                enabled: root.edit-enabled;
-                                            }
-                                            Text { text: "后缀名白名单（逗号分隔，留空不限制）"; font-size: 11px; color: #5f6368; }
-                                            LineEdit {
-                                                text <=> root.edit-extensions;
-                                                enabled: root.edit-enabled;
-                                                placeholder-text: "zip, 7z, rar";
-                                            }
-                                            HorizontalLayout {
-                                                spacing: 8px;
-                                                GhostButton {
-                                                    text: "应用修改";
-                                                    btn-min-width: 76;
-                                                    enabled: root.edit-enabled;
-                                                    clicked => { root.apply-edit(); }
-                                                }
-                                                GhostButton {
-                                                    text: "重置";
-                                                    btn-min-width: 56;
-                                                    enabled: root.edit-enabled;
-                                                    clicked => { root.select-action(root.selected-action); }
-                                                }
-                                            }
+                                            Text { text: "Rove"; font-size: 14px; font-weight: 700; color: #1a1a1a; }
+                                            Text { text: "高性能轻量级 Windows 文件管理器 · Rust + Slint"; font-size: 12px; color: #1a1a1a; }
+                                            Text { text: "配置文件目录：%APPDATA%\\Rove"; font-size: 11px; color: #5f6368; }
+                                            Text { text: "actions.toml 由压缩软件探测器自动维护，手写内容与注释会被保留。"; font-size: 11px; color: #5f6368; }
                                         }
                                     }
-                                }
-                            }
-
-                            // 关于与诊断
-                            if root.settings-page == 3: VerticalLayout {
-                                spacing: 14px;
-                                Text {
-                                    text: "关于与诊断";
-                                    font-size: 20px;
-                                    font-weight: 700;
-                                    color: #1a1a1a;
-                                }
-                                Rectangle {
-                                    background: #ffffff;
-                                    border-width: 1px;
-                                    border-color: #e4e6eb;
-                                    border-radius: 6px;
-                                    VerticalLayout {
-                                        padding: 16px;
-                                        spacing: 8px;
-                                        Text { text: "Rove"; font-size: 14px; font-weight: 700; color: #1a1a1a; }
-                                        Text { text: "高性能轻量级 Windows 文件管理器 · Rust + Slint"; font-size: 12px; color: #1a1a1a; }
-                                        Text { text: "配置文件目录：%APPDATA%\\Rove"; font-size: 11px; color: #5f6368; }
-                                        Text { text: "actions.toml 由压缩软件探测器自动维护，手写内容与注释会被保留。"; font-size: 11px; color: #5f6368; }
-                                    }
-                                }
                                 }
                             }
                             Rectangle {
@@ -1367,40 +1458,47 @@ export component MainWindow inherits Window {
 
                 // ---- 浏览标签：侧边栏 + 文件列表 ----
                 if root.active-tab-kind != "settings": HorizontalLayout {
-                    width: 100%;
-                    height: 100%;
 
                     // 左侧资源管理器侧边栏
                     Rectangle {
                         width: 224px;
+                        vertical-stretch: 1;
                         background: #f7f8fa;
                         VerticalLayout {
                             spacing: 0px;
 
                             ScrollView {
                                 vertical-stretch: 1;
+                                min-height: 0px;
                                 VerticalLayout {
-                                    padding: 8px;
+                                    padding-top: 8px;
+                                    padding-bottom: 8px;
                                     spacing: 2px;
 
                                     Text {
+                                        x: 12px;
+                                        height: 26px;
                                         text: "快速访问";
                                         font-size: 11px;
                                         font-weight: 700;
                                         color: #5f6368;
+                                        vertical-alignment: center;
                                     }
                                     for item in root.quick-items: SideRow {
                                         label: item.label;
                                         detail: item.detail;
-                                        tint: item.tint;
+                                        icon-kind: item.icon-kind;
                                         activated => { root.side-activate(item.id); }
                                     }
 
                                     Text {
+                                        x: 12px;
+                                        height: 26px;
                                         text: "此电脑";
                                         font-size: 11px;
                                         font-weight: 700;
                                         color: #5f6368;
+                                        vertical-alignment: center;
                                     }
                                     for drive in root.drives: DriveRow {
                                         drive: drive;
@@ -1408,15 +1506,18 @@ export component MainWindow inherits Window {
                                     }
 
                                     Text {
+                                        x: 12px;
+                                        height: 26px;
                                         text: "网络位置";
                                         font-size: 11px;
                                         font-weight: 700;
                                         color: #5f6368;
+                                        vertical-alignment: center;
                                     }
                                     if root.network-expanded: SideRow {
                                         label: "网络";
                                         detail: "";
-                                        tint: #9aa0a6;
+                                        icon-kind: "network";
                                         activated => { root.side-activate("network"); }
                                     }
                                 }
@@ -1470,6 +1571,7 @@ export component MainWindow inherits Window {
                                     }
                                     if root.staging-visible: Rectangle {
                                         vertical-stretch: 1;
+                                        min-height: 0px;
                                         border-width: 1px;
                                         border-color: #e4e6eb;
                                         border-radius: 4px;
@@ -1521,6 +1623,7 @@ export component MainWindow inherits Window {
                     // 文件列表
                     Rectangle {
                         horizontal-stretch: 1;
+                        vertical-stretch: 1;
                         background: #ffffff;
                         clip: true;
                         VerticalLayout {
@@ -1582,15 +1685,20 @@ export component MainWindow inherits Window {
                                 }
                             }
 
-                            // 列表
+                            // 列表（含分栏）：vertical-stretch 撑满列头之外的空间，
+                            // 否则 ListView 的首选高度（所有行高之和）会撑爆整个垂直布局
                             Rectangle {
                                 horizontal-stretch: 1;
+                                vertical-stretch: 1;
+                                min-height: 0px;
                                 background: #ffffff;
                                 clip: true;
                                 HorizontalLayout {
                                     spacing: 1px;
                                     Rectangle {
                                         horizontal-stretch: 1;
+                                        vertical-stretch: 1;
+                                        min-height: 0px;
                                         clip: true;
                                         ListView {
                                             width: 100%;
@@ -1612,6 +1720,8 @@ export component MainWindow inherits Window {
                                     }
                                     if root.split-view: Rectangle {
                                         horizontal-stretch: 1;
+                                        vertical-stretch: 1;
+                                        min-height: 0px;
                                         clip: true;
                                         ListView {
                                             width: 100%;
@@ -1632,20 +1742,19 @@ export component MainWindow inherits Window {
                                         }
                                     }
                                 }
-
-                                // 右键菜单
-                                }
                             }
                         }
                     }
                 }
             }
 
-            // ===== 第 5 行：状态栏（横跨整个窗口最底部） =====
+            // ===== 第 5 行：状态栏（横跨整个窗口最底部，设置页不显示） =====
+            // 注意：不能用 `if` 包裹——条件元素在 taffy 布局中的高度贡献为 0，
+            // 会把 24px 让给内容区、把状态栏挤出窗口。这里用条件高度实现显隐。
             Rectangle {
-                height: 24px;
+                height: root.active-tab-kind != "settings" ? 24px : 0px;
                 background: #f7f8fa;
-                border-width: 1px;
+                border-width: root.active-tab-kind != "settings" ? 1px : 0px;
                 border-color: #e4e6eb;
                 HorizontalLayout {
                     padding-left: 10px;
@@ -1666,6 +1775,7 @@ export component MainWindow inherits Window {
                 }
             }
         }
+    }
 
     menu-popup := PopupWindow {
         x: root.menu-x;
