@@ -1,0 +1,782 @@
+import { Theme, FileRow, HighlightName } from "common.slint";
+
+// 可排序表头单元格（公共部分）。
+component SortCell inherits Rectangle {
+    in property <string> key;
+    in property <string> label;
+    in property <string> active-key;
+    in property <bool> ascending;
+    callback clicked(string);
+
+    height: 100%;
+
+    Text {
+        x: 12px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.label;
+        color: root.active_key == root.key ? Theme.accent : Theme.text-secondary;
+        font-size: 12px;
+        font-weight: root.active_key == root.key ? 600 : 400;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    // 当前排序列显示方向箭头。
+    if (root.active_key == root.key) : Text {
+        x: root.width - 16px;
+        width: 12px;
+        height: parent.height;
+        text: root.ascending ? "▲" : "▼";
+        color: Theme.accent;
+        font-size: 8px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.clicked(root.key);
+        }
+    }
+}
+
+// 文件列表：表头（可排序）+ 虚拟化主体。
+// 虚拟化原理：Rust 侧只把当前可见窗口（视口行数 + 上下过扫描）的 FileRow
+// 放入 `rows` 模型；每行按 `row.index * row-h` 绝对定位，因此无论目录
+// 有多大，UI 元素数量恒定（约 40 个），滚动/搜索均不随文件数劣化。
+export component FileList inherits Rectangle {
+    background: Theme.bg-list;
+    // 关键：横向滚动时表头/行会向左偏移，必须整体裁剪，
+    // 否则会绘制到侧边栏区域之上。
+    clip: true;
+
+    /// 可见窗口的行数据（由 Rust 维护）。
+    in-out property <[FileRow]> rows: [];
+    /// 完整条目数（虚拟视口高度 = total-count * row-h）。
+    in-out property <int> total-count: 0;
+    in-out property <string> sort-key: "name"; // "name" | "size" | "modified" | "type"
+    in-out property <bool> sort-ascending: true;
+    /// 非空时，对应路径的行进入内联重命名态。
+    in-out property <string> rename-path: "";
+    /// 目录读取中。
+    in-out property <bool> loading: false;
+
+    callback row-pointer-event(index: int, event: PointerEvent, x: length, y: length);
+    callback row-double-clicked(index: int);
+    callback header-clicked(key: string);
+    callback scroll-changed(offset: length);
+    callback background-pointer-event(event: PointerEvent, x: length, y: length);
+    callback rename-committed(path: string, new_name: string);
+    callback rename-cancelled();
+
+    /// 列表可视高度（供 Rust 计算虚拟窗口行数）。
+    out property <length> view-height: root.height;
+
+    /// 视图模式（Pulse 式）：details | list | icons-small | icons-medium | icons-large | icons-xl。
+    in-out property <string> view-mode: "details";
+    /// 单元格几何（icons 系视图）：宽 / 高 / 缩略图边长。
+    private property <length> cell-w: root.view-mode == "icons-xl" ? 196px
+        : root.view-mode == "icons-large" ? 132px
+        : root.view-mode == "icons-medium" ? 96px
+        : root.view-mode == "icons-small" ? 190px
+        : 0px;
+    private property <length> cell-h: root.view-mode == "icons-xl" ? 212px
+        : root.view-mode == "icons-large" ? 148px
+        : root.view-mode == "icons-medium" ? 108px
+        : root.view-mode == "icons-small" ? 52px
+        : 0px;
+    private property <length> cell-thumb: root.view-mode == "icons-xl" ? 132px
+        : root.view-mode == "icons-large" ? 88px
+        : root.view-mode == "icons-medium" ? 60px
+        : 44px;
+    /// 行高：details 30 / list 24 / icons = cell-h。
+    private property <length> view-row-h: root.view-mode == "details" ? 30px
+        : root.view-mode == "list" ? 24px
+        : root.cell-h;
+    /// 每行单元格数：details/list = 1；icons = 网格列数。
+    out property <int> cells-per-row: root.view-mode == "details" || root.view-mode == "list"
+        ? 1
+        : max(1, floor((flick.width - 8px) / root.cell-w));
+    out property <length> row-height-out: root.view-row-h;
+    /// 列表可视宽度（icons 网格列数计算用，供调试观测）。
+    out property <length> view-width: flick.width;
+    /// 当前视图是否为图标网格。
+    out property <bool> is-icons-view: root.view-mode != "details" && root.view-mode != "list";
+
+    /// 滚动到顶端（导航/过滤变化时由 Rust 调用）。
+    public function scroll-to-top() {
+        flick.content-y = 0px;
+    }
+
+    private property <length> row-h: root.view-row-h;
+    /// 虚拟行数：icons 网格按每行 cells-per-row 折算。
+    private property <int> total-rows: root.view-mode == "details" || root.view-mode == "list"
+        ? root.total-count
+        : ceil(root.total-count / max(root.cells-per-row, 1));
+    private property <length> w-icon: 40px;
+    private property <length> w-modified: 150px;
+    private property <length> w-type: 116px;
+    private property <length> w-size: 96px;
+    /// 滚动条轨道宽（含内边距）。
+    private property <length> sb-width: 12px;
+    /// 滚动条按下时记录的滑块 y，用于计算拖拽增量。
+    private property <length> sb-drag-start-thumb-y: 0px;
+    /// 横向滚动条按下时记录的滑块 x。
+    private property <length> hsb-drag-start-thumb-x: 0px;
+
+    // 视口纵向边界，供滚轮/滚动条钳制。
+    private property <length> min-content-y: min(0px, flick.height - flick.content-height);
+    private property <length> max-content-y: 0px;
+    // 横向：所有列的最小总宽（窄窗口时出现横向滚动）。
+    private property <length> min-list-width: 8px + root.w-icon + 140px + root.w-modified + root.w-type + root.w-size + 240px + 10px;
+    private property <length> min-content-x: min(0px, flick.width - flick.content-width);
+    private property <length> max-content-x: 0px;
+    // 列几何（表头与行共用，保证像素级对齐）。
+    private property <length> col-icon-x: 8px;
+    private property <length> col-name-x: 8px + root.w-icon;
+    private property <length> col-avail: max(root.min-list-width, flick.width) - (8px + root.w-icon + root.w-modified + root.w-type + root.w-size + 10px);
+    private property <length> col-extra: max(0px, root.col-avail - 140px - 240px);
+    private property <length> col-name-w: root.view-mode == "list"
+        ? max(140px, flick.width - root.col-name-x - 10px)
+        : 140px + root.col-extra * 5 / 8;
+    private property <length> col-path-w: 240px + root.col-extra * 3 / 8;
+    private property <length> col-modified-x: root.col-name-x + root.col-name-w;
+    private property <length> col-type-x: root.col-modified-x + root.w-modified;
+    private property <length> col-size-x: root.col-type-x + root.w-type;
+    private property <length> col-path-x: root.col-size-x + root.w-size;
+
+    /// 滚动偏移（content-y 的负值）。任何滚动来源（拖拽、惯性、滚轮、
+    /// 滚动条、程序重置）都会改变它，从而通知 Rust 更新虚拟窗口。
+    private property <length> scroll-pos: -flick.content-y;
+    changed scroll-pos => {
+        root.scroll-changed(self.scroll-pos);
+    }
+
+    // 注意：Rectangle 不是布局，直接子元素必须显式给出几何，否则尺寸为 0。
+    VerticalLayout {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        spacing: 0px;
+
+        // ---- 表头（仅详细信息视图） ----
+        header := Rectangle {
+            height: 30px;
+            background: Theme.bg-toolbar;
+            clip: true;
+            visible: root.view-mode == "details";
+
+            // 表头单元格：显式列定位，与行共用列几何；横向滚动时随内容移动。
+            Rectangle {
+                x: flick.content-x;
+                y: 0px;
+                width: max(flick.content-width, parent.width);
+                height: parent.height;
+
+                Rectangle {
+                    x: root.col-icon-x;
+                    width: root.w-icon;
+                    height: parent.height;
+                }
+                SortCell {
+                    x: root.col-name-x;
+                    width: root.col-name-w;
+                    key: "name";
+                    label: "名称";
+                    active-key: root.sort-key;
+                    ascending: root.sort-ascending;
+                    clicked(k) => {
+                        root.header-clicked(k);
+                    }
+                }
+                SortCell {
+                    x: root.col-modified-x;
+                    width: root.w-modified;
+                    key: "modified";
+                    label: "修改时间";
+                    active-key: root.sort-key;
+                    ascending: root.sort-ascending;
+                    clicked(k) => {
+                        root.header-clicked(k);
+                    }
+                }
+                SortCell {
+                    x: root.col-type-x;
+                    width: root.w-type;
+                    key: "type";
+                    label: "类型";
+                    active-key: root.sort-key;
+                    ascending: root.sort-ascending;
+                    clicked(k) => {
+                        root.header-clicked(k);
+                    }
+                }
+                SortCell {
+                    x: root.col-size-x;
+                    width: root.w-size;
+                    key: "size";
+                    label: "大小";
+                    active-key: root.sort-key;
+                    ascending: root.sort-ascending;
+                    clicked(k) => {
+                        root.header-clicked(k);
+                    }
+                }
+                SortCell {
+                    x: root.col-path-x;
+                    width: root.col-path-w;
+                    key: "path";
+                    label: "路径";
+                    active-key: root.sort-key;
+                    ascending: root.sort-ascending;
+                    clicked(k) => {
+                        root.header-clicked(k);
+                    }
+                }
+            }
+
+            // 底部分隔线。
+            Rectangle {
+                x: 0px;
+                y: parent.height - 1px;
+                width: 100%;
+                height: 1px;
+                background: Theme.divider;
+            }
+        }
+
+        // ---- 主体 ----
+        flick := Flickable {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            content-height: max(root.total-rows * root.row-h, self.height);
+            // 横向：内容最小宽度不小于列宽总和，窄窗口可左右滚动。
+            content-width: max(root.min-list-width, self.width);
+
+            // 空白处点击 / 右键。
+            TouchArea {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
+
+                scroll-event(event) => {
+                    if (event.delta-y != 0px) {
+                        flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
+                        root.scroll-changed(-flick.content-y);
+                        return EventResult.accept;
+                    }
+                    if (event.delta-x != 0px) {
+                        flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-x));
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
+
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.down) {
+                        root.background-pointer-event(event, self.mouse-x, self.mouse-y);
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
+            }
+
+            for row[i] in root.rows : Rectangle {
+                visible: !root.is-icons-view;
+                y: row.index * root.row-h;
+                x: 0px;
+                width: flick.content-width;
+                height: root.row-h;
+                background: row.selected
+                    ? Theme.bg-selected
+                    : (ta.has-hover ? Theme.bg-hover : transparent);
+
+                ta := TouchArea {
+                    width: 100%;
+                    height: 100%;
+
+                    scroll-event(event) => {
+                        if (event.delta-y != 0px) {
+                            flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
+                            root.scroll-changed(-flick.content-y);
+                            return EventResult.accept;
+                        }
+                        if (event.delta-x != 0px) {
+                            flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-x));
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
+                    }
+
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.down) {
+                            root.row-pointer-event(row.index, event, self.mouse-x, row.index * root.row-h + self.mouse-y);
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
+                    }
+
+                    double-clicked => {
+                        root.row-double-clicked(row.index);
+                    }
+                }
+
+                // 图标：真实缩略图（异步加载完成后）或彩色圆角方块 + 扩展名角标。
+                Rectangle {
+                    x: root.col-icon-x;
+                    y: 0px;
+                    width: root.w-icon;
+                    height: parent.height;
+
+                    if (row.thumb.width > 0) : Image {
+                        x: 8px;
+                        y: (parent.height - 24px) / 2;
+                        width: 24px;
+                        height: 24px;
+                        source: row.thumb;
+                        image-fit: contain;
+                    }
+                    if (row.thumb.width <= 0) : Rectangle {
+                        x: 8px;
+                        y: (parent.height - 22px) / 2;
+                        width: 22px;
+                        height: 22px;
+                        border-radius: 5px;
+                        background: row.icon-color.transparentize(row.is-dir ? 0.82 : 0.84);
+
+                        Text {
+                            text: row.icon-text;
+                            color: row.icon-color;
+                            font-size: 8.5px;
+                            font-weight: 700;
+                            font-family: Theme.mono-font-family;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+                    }
+                }
+
+                // 名称 / 内联重命名
+                if (root.rename-path == row.path) : TextInput {
+                    x: root.col-name-x;
+                    width: root.col-name-w;
+                    height: parent.height;
+                    text: row.name;
+                    vertical-alignment: center;
+                    font-size: 13px;
+                    selection-background-color: Theme.accent;
+                    selection-foreground-color: Theme.accent-text;
+
+                    init => {
+                        self.select-all();
+                        self.focus();
+                    }
+
+                    accepted => {
+                        root.rename-committed(row.path, self.text);
+                    }
+
+                    key-pressed(event) => {
+                        if (event.text == Key.Escape) {
+                            root.rename-cancelled();
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
+                    }
+                }
+                // 名称(普通):无高亮查询时的默认渲染,保持 elide。
+                if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
+                    x: root.col-name-x;
+                    width: root.col-name-w;
+                    height: parent.height;
+                    text: row.name;
+                    color: Theme.text-primary;
+                    font-size: 13px;
+                    font-weight: row.is-dir ? 500 : 400;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    // 剪切态文件整体淡出。
+                    opacity: row.cut ? 0.55 : 1.0;
+                }
+                // 名称(搜索命中高亮):命中片段用强调色。
+                if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
+                    x: root.col-name-x;
+                    width: root.col-name-w;
+                    height: parent.height;
+                    parts: row.name-parts;
+                    font-size: 13px;
+                    is-dir: row.is-dir;
+                    opacity: row.cut ? 0.55 : 1.0;
+                }
+
+                // 修改时间
+                Rectangle {
+                    visible: root.view-mode == "details";
+                    x: root.col-modified-x;
+                    y: 0px;
+                    width: root.w-modified;
+                    height: parent.height;
+
+                    Text {
+                        x: 12px;
+                        width: parent.width - 18px;
+                        height: parent.height;
+                        text: row.modified-text;
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                // 类型徽标
+                Rectangle {
+                    visible: root.view-mode == "details";
+                    x: root.col-type-x;
+                    y: 0px;
+                    width: root.w-type;
+                    height: parent.height;
+
+                    Rectangle {
+                        x: 12px;
+                        y: (parent.height - 18px) / 2;
+                        width: min(badge-text.preferred-width + 14px, parent.width - 16px);
+                        height: 18px;
+                        border-radius: 4px;
+                        background: row.icon-color.transparentize(row.is-dir ? 0.86 : 0.88);
+
+                        badge-text := Text {
+                            text: row.type-text;
+                            color: row.icon-color;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                            overflow: elide;
+                        }
+                    }
+                }
+
+                // 大小（左对齐，与表头一致）
+                Rectangle {
+                    visible: root.view-mode == "details";
+                    x: root.col-size-x;
+                    y: 0px;
+                    width: root.w-size;
+                    height: parent.height;
+
+                    Text {
+                        x: 12px;
+                        width: parent.width - 18px;
+                        height: parent.height;
+                        text: row.size-text;
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        font-family: Theme.mono-font-family;
+                    }
+                }
+
+                // 路径
+                Rectangle {
+                    visible: root.view-mode == "details";
+                    x: root.col-path-x;
+                    y: 0px;
+                    width: root.col-path-w;
+                    height: parent.height;
+
+                    Text {
+                        x: 12px;
+                        width: parent.width - 18px;
+                        height: parent.height;
+                        text: row.path;
+                        color: Theme.text-secondary;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            // ---- 图标网格（icons-* 视图）：单元格 = 缩略图 + 名称 ----
+            for row[i] in root.rows : Rectangle {
+                visible: root.is-icons-view;
+                x: Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px;
+                y: floor(row.index / root.cells-per-row) * root.cell-h + 4px;
+                width: root.cell-w - 8px;
+                height: root.cell-h - 8px;
+                border-radius: 8px;
+                background: row.selected
+                    ? Theme.bg-selected
+                    : (ta-icons.has-hover ? Theme.bg-hover : transparent);
+
+                ta-icons := TouchArea {
+                    width: 100%;
+                    height: 100%;
+
+                    scroll-event(event) => {
+                        if (event.delta-y != 0px) {
+                            flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
+                            root.scroll-changed(-flick.content-y);
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
+                    }
+
+                    clicked => {
+                        root.row-pointer-event(row.index, { kind: PointerEventKind.down, button: PointerEventButton.left }, self.mouse-x, self.mouse-y);
+                    }
+
+                    double-clicked => {
+                        root.row-double-clicked(row.index);
+                    }
+
+                    pointer-event(event) => {
+                        root.row-pointer-event(row.index, event, self.mouse-x, self.mouse-y);
+                    }
+                }
+
+                // 小图标：横排（图标左 + 名称右，垂直居中）。
+                if (root.view-mode == "icons-small") : HorizontalLayout {
+                    x: 4px;
+                    y: (parent.height - 44px) / 2;
+                    width: parent.width - 8px;
+                    height: 44px;
+                    spacing: 6px;
+
+                    Rectangle {
+                        width: 44px;
+                        border-radius: 6px;
+                        background: transparent;
+
+                        if (row.thumb.width > 0) : Image {
+                            width: 100%;
+                            height: 100%;
+                            source: row.thumb;
+                            image-fit: contain;
+                        }
+                    }
+
+                    // 名称:搜索命中时高亮,否则普通 elide。
+                    if (row.name-parts.length > 0) : HighlightName {
+                        width: parent.width - 50px;
+                        height: 44px;
+                        parts: row.name-parts;
+                        font-size: 12px;
+                        is-dir: row.is-dir;
+                    }
+                    if (row.name-parts.length == 0) : Text {
+                        width: parent.width - 50px;
+                        height: 44px;
+                        text: row.name;
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        font-weight: row.is-dir ? 500 : 400;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                // 中/大/超大图标：竖排（缩略图上 + 名称下）。
+                if (root.view-mode != "icons-small") : VerticalLayout {
+                    x: 4px;
+                    y: 4px;
+                    width: parent.width - 8px;
+                    height: parent.height - 8px;
+                    spacing: 4px;
+
+                    Rectangle {
+                        height: root.cell-thumb;
+                        border-radius: 6px;
+                        background: Theme.bg-input;
+                        clip: true;
+
+                        if (row.thumb.width > 0) : Image {
+                            width: 100%;
+                            height: 100%;
+                            source: row.thumb;
+                            image-fit: contain;
+                        }
+                    }
+
+                    Text {
+                        height: parent.height - root.cell-thumb - 4px;
+                        text: row.name;
+                        color: Theme.text-primary;
+                        font-size: 11.5px;
+                        font-weight: row.is-dir ? 500 : 400;
+                        vertical-alignment: top;
+                        wrap: word-wrap;
+                        overflow: elide;
+                        max-lines: 2;
+                    }
+                }
+
+                // 剪切态淡出。
+                opacity: row.cut ? 0.55 : 1.0;
+            }
+        }
+    }
+
+    // ---- 自绘横向滚动条（窗口窄于列宽总和时出现） ----
+    hscrollbar := Rectangle {
+        x: 0px;
+        y: parent.height - 8px;
+        width: parent.width - (scrollbar.visible ? root.sb-width : 0px);
+        height: 8px;
+        visible: flick.content-width > flick.width + 1px;
+
+        property <length> track-w: self.width;
+        property <length> thumb-w: max(28px, min(self.track-w, self.track-w * flick.width / max(flick.content-width, 1px)));
+        property <length> thumb-x: self.track-w * (-flick.content-x / max(flick.content-width - flick.width, 1px));
+
+        htrack := Rectangle {
+            x: 5px;
+            y: 2px;
+            width: hscrollbar.track-w - 10px;
+            height: 3px;
+            background: Theme.border;
+            border-radius: 2px;
+        }
+
+        hthumb := Rectangle {
+            x: 5px + hscrollbar.thumb-x * (hscrollbar.track-w - 10px - hscrollbar.thumb-w) / max(hscrollbar.track-w - hscrollbar.thumb-w, 1px);
+            y: 2px;
+            width: hscrollbar.thumb-w;
+            height: 3px;
+            border-radius: 2px;
+            background: hscrollbar-ta.has-hover ? Theme.text-disabled : Theme.border;
+        }
+
+        hscrollbar-ta := TouchArea {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    hsb-drag-start-thumb-x = hthumb.x - self.mouse-x;
+                }
+            }
+
+            moved => {
+                if (self.pressed) {
+                    let target = self.mouse-x + hsb-drag-start-thumb-x;
+                    let ratio = (target - 5px) / max(hscrollbar.track-w - 10px - hscrollbar.thumb-w, 1px);
+                    flick.content-x = max(root.min-content-x, min(root.max-content-x, -ratio * (flick.content-width - flick.width)));
+                }
+            }
+        }
+    }
+
+    // ---- 自绘垂直滚动条（避开样式 ScrollBar 的差异） ----
+    scrollbar := Rectangle {
+        x: parent.width - root.sb-width + 2px;
+        y: 0px;
+        width: root.sb-width;
+        height: parent.height;
+        visible: flick.content-height > flick.height + 1px;
+
+        // 滑块几何：高度按视口占比，位置按滚动偏移。
+        // 注意：元素自身属性的绑定里 `root` 指代本元素，故用 self。
+        property <length> track-h: self.height;
+        property <length> thumb-h: max(28px, min(self.track-h, self.track-h * flick.height / max(flick.content-height, 1px)));
+        property <length> thumb-y: self.track-h * (-flick.content-y / max(flick.content-height - flick.height, 1px));
+
+        track := Rectangle {
+            x: 5px;
+            y: 0px;
+            width: 3px;
+            height: scrollbar.track-h;
+            background: Theme.border;
+            border-radius: 2px;
+        }
+
+        thumb := Rectangle {
+            x: 3px;
+            y: scrollbar.thumb-y;
+            width: 7px;
+            height: scrollbar.thumb-h;
+            border-radius: 4px;
+            background: scrollbar-ta.has-hover ? Theme.text-disabled : Theme.border;
+        }
+
+        scrollbar-ta := TouchArea {
+            width: 100%;
+            height: 100%;
+
+            moved => {
+                if (self.pressed) {
+                    let ratio = (self.mouse-y - sb-drag-start-thumb-y) / max(scrollbar.track-h - scrollbar.thumb-h, 1px);
+                    let offset = max(root.min-content-y, min(root.max-content-y, -ratio * (flick.content-height - flick.height)));
+                    flick.content-y = offset;
+                    root.scroll-changed(-offset);
+                }
+            }
+
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    sb-drag-start-thumb-y = scrollbar.thumb-y;
+                }
+            }
+
+            scroll-event(event) => {
+                if (event.delta-y != 0px) {
+                    flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
+                    root.scroll-changed(-flick.content-y);
+                    return EventResult.accept;
+                }
+                return EventResult.reject;
+            }
+        }
+    }
+
+    // ---- 空目录 / 加载占位 ----
+    if (root.loading) : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        background: Theme.bg-list;
+
+        Text {
+            text: "正在读取…";
+            color: Theme.text-secondary;
+            font-size: 13px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            width: 100%;
+            height: 100%;
+        }
+    }
+    if (!root.loading && root.total-count == 0) : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        background: Theme.bg-list;
+
+        VerticalLayout {
+            alignment: center;
+            spacing: 8px;
+            width: 100%;
+
+            Text {
+                text: "此文件夹为空";
+                color: Theme.text-secondary;
+                font-size: 14px;
+                horizontal-alignment: center;
+            }
+        }
+    }
+}

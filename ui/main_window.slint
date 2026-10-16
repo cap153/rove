@@ -1,0 +1,726 @@
+import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh } from "common.slint";
+import { TabBar } from "tab_bar.slint";
+import { Sidebar } from "sidebar.slint";
+import { FileList } from "file_list.slint";
+import { StagingTray } from "staging_tray.slint";
+import { ContextMenu, SubMenuPopover, MenuItem } from "context_menu.slint";
+
+// 将 common.slint 中的 Theme 全局从根文件再导出——
+// Slint 规定：全局单例只有从根文件（或 slint! 宏）导出，Rust 侧才能通过
+// ui.global::<Theme>() 访问，否则其值会被编译期内联。
+export { Theme } from "common.slint";
+
+// 工具栏导航按钮（前进 / 后退 / 向上）。
+component nav-btn inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> enabled;
+    callback clicked();
+
+    width: 30px;
+    height: 30px;
+    border-radius: 6px;
+    background: (root.enabled && nav-ta.has-hover) ? Theme.bg-hover : transparent;
+
+    Text {
+        text: root.glyph;
+        color: root.enabled ? Theme.text-primary : Theme.text-disabled;
+        font-size: 15px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        width: 100%;
+        height: 100%;
+    }
+
+    nav-ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Rove 主窗口。
+//
+// 布局（复刻 Pulse）：
+//   ┌──────────────────────────────────────────┐
+//   │ 标签栏（多标签、+ 新建、中键关闭）            │
+//   │ 工具栏（前进/后退/向上 | 面包屑 | 新建/刷新 | 过滤）│
+//   │ ┌────────┐ ┌───────────────────────────┐ │
+//   │ │ 侧边栏  │ │ 虚拟文件列表               │ │
+//   │ │  + 暂存 │ │                           │ │
+//   │ └────────┘ └───────────────────────────┘ │
+//   │ 状态栏                                    │
+//   └──────────────────────────────────────────┘
+export component MainWindow inherits Window {
+    title: "Rove";
+    min-width: 880px;
+    min-height: 560px;
+    preferred-width: 1200px;
+    preferred-height: 760px;
+    background: Theme.bg-main;
+    default-font-family: Theme.font-family;
+
+    // ---- 状态（Rust 驱动） ----
+    in-out property <[TabInfo]> tabs: [];
+    in-out property <int> active-tab: 0;
+    in-out property <bool> tab-loading: false;
+    in-out property <[SidebarItem]> sidebar-items: [];
+    in-out property <string> sidebar-active-id: "";
+    in-out property <[FileRow]> file-rows: [];
+    in-out property <int> file-total: 0;
+    in-out property <bool> file-loading: false;
+    in-out property <string> sort-key: "name";
+    in-out property <bool> sort-ascending: true;
+    in-out property <string> rename-path: "";
+    in-out property <[StagingItem]> staging-items: [];
+    in-out property <bool> staging-expanded: true;
+    in-out property <[BreadcrumbSegment]> breadcrumbs: [];
+    in-out property <string> filter-text: "";
+    in-out property <bool> can-go-back: false;
+    in-out property <bool> can-go-forward: false;
+    in-out property <bool> can-go-up: false;
+    in-out property <string> status-left: "";
+    in-out property <string> status-right: "";
+    in-out property <string> status-job: "";
+    /// 面包屑路径编辑态（点击地址栏空白处进入，Enter 确认 / Esc 取消）。
+    in-out property <bool> path-editing: false;
+    in-out property <string> path-edit-text: "";
+    /// 侧栏分区拖拽排序指示器（Rust 计算落点）。
+    in-out property <bool> sidebar-drop-visible: false;
+    in-out property <length> sidebar-drop-y: 0px;
+    /// 文件列表可视高度（Rust 只读，用于虚拟窗口计算；由 FileList 绑定）。
+    in-out property <length> list-height;
+/// 视图模式（Pulse 式视图切换）。直通 FileList。
+in-out property <string> view-mode <=> file-list.view-mode;
+out property <int> cells-per-row: file-list.cells-per-row;
+    out property <length> view-width: file-list.view-width;
+out property <length> row-height-out: file-list.row-height-out;
+    /// 过滤输入框是否持有焦点（焦点在内时不响应应用级快捷键）。
+    in-out property <bool> filter-has-focus;
+    filter-has-focus: filter-input.has-focus;
+    /// 文件列表可视高度（Rust 只读，用于虚拟窗口计算）。
+    list-height: file-list.view-height;
+
+    // ---- 右键菜单状态 ----
+    in-out property <[MenuItem]> menu-items: [];
+    in-out property <length> menu-items-height: 0px;
+    in-out property <[MenuItem]> submenu-items: [];
+    in-out property <length> submenu-items-height: 0px;
+    in-out property <bool> menu-open: false;
+    property <length> click-x;
+    property <length> click-y;
+
+    // ---- 回调（Rust 处理） ----
+    callback new_tab_requested();
+    callback tab_activated(id: int);
+    callback tab_closed(id: int);
+    callback nav_back();
+    callback nav_forward();
+    callback nav_up();
+    callback breadcrumb_clicked(path: string);
+    callback path_edit_committed(path: string);
+    callback sidebar_header_drag(index: int, phase: int, y: length);
+    callback sidebar_item_activated(id: string);
+    callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length);
+    callback file_row_double_clicked(index: int);
+    callback file_header_clicked(key: string);
+    callback file_scroll_changed(offset: length);
+    callback file_background_pointer_event(event: PointerEvent, x: length, y: length);
+    callback file_rename_committed(path: string, new_name: string);
+    callback file_rename_cancelled();
+    callback staging_item_removed(index: int);
+    callback staging_clear_requested();
+    callback staging_copy_here_requested();
+    callback staging_move_here_requested();
+    callback menu_item_triggered(id: string);
+    callback menu_submenu_hovered(index: int, entered: bool);
+    callback filter_edited(text: string);
+    callback new_folder_requested();
+    callback refresh_requested();
+    callback paste_requested();
+    callback view_picker_requested();
+    in-out property <bool> can-paste: false;
+
+    // ---- 布局常量 ----
+    private property <length> sidebar-w: 236px;
+    private property <length> topbar-h: 82px; // 标签栏 38 + 工具栏 44
+    private property <length> statusbar-h: 28px;
+
+    // 面包屑变化后滚到最右端（显示最深路径）。
+    changed breadcrumbs => {
+        crumbs-flick.content-x = -10000px;
+    }
+
+    /// 文件列表滚动到顶端（Rust 调用）。
+    public function scroll-list-to-top() {
+        file-list.scroll-to-top();
+    }
+
+    VerticalLayout {
+        spacing: 0px;
+
+        // ---- 标签栏 ----
+        TabBar {
+            tabs: root.tabs;
+            active-tab: root.active-tab;
+            loading: root.tab-loading;
+            tab_activated(id) => {
+                root.tab_activated(id);
+            }
+            tab_closed(id) => {
+                root.tab_closed(id);
+            }
+            new_tab_requested() => {
+                root.new_tab_requested();
+            }
+        }
+
+        // ---- 工具栏 ----
+        Rectangle {
+            height: 44px;
+            background: Theme.bg-main;
+
+            HorizontalLayout {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: parent.height;
+                spacing: 4px;
+                padding-left: 8px;
+                padding-right: 10px;
+
+                // 导航按钮组。
+                nav-btn {
+                    glyph: "←";
+                    enabled: root.can-go-back;
+                    clicked => {
+                        root.nav_back();
+                    }
+                }
+                nav-btn {
+                    glyph: "→";
+                    enabled: root.can-go-forward;
+                    clicked => {
+                        root.nav_forward();
+                    }
+                }
+                nav-btn {
+                    glyph: "↑";
+                    enabled: root.can-go-up;
+                    clicked => {
+                        root.nav_up();
+                    }
+                }
+
+                // 分隔竖线。
+                Rectangle {
+                    width: 1px;
+                    height: 20px;
+                    y: (parent.height - 20px) / 2;
+                    background: Theme.border;
+                }
+
+                // 面包屑导航。
+                Rectangle {
+                    horizontal-stretch: 1;
+                    height: parent.height;
+                    clip: true;
+
+                    // 编辑态：路径输入框替换面包屑。
+                    if (root.path-editing) : Rectangle {
+                        x: 0px;
+                        y: (parent.height - 28px) / 2;
+                        width: parent.width - 4px;
+                        height: 28px;
+                        border-radius: 6px;
+                        background: Theme.bg-input;
+                        border-width: 1px;
+                        border-color: Theme.accent;
+
+                        path-input := TextInput {
+                            x: 8px;
+                            width: parent.width - 16px;
+                            height: parent.height;
+                            text: root.path-edit-text;
+                            font-size: 12px;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                            single-line: true;
+
+                            accepted => {
+                                root.path_editing = false;
+                                root.path_edit_committed(self.text);
+                            }
+
+                            key-pressed(event) => {
+                                if (event.text == Key.Escape) {
+                                    root.path-editing = false;
+                                    return EventResult.accept;
+                                }
+                                return EventResult.reject;
+                            }
+
+                            changed has-focus => {
+                                // 失焦即退出编辑（视为取消）。
+                                if (!self.has-focus && root.path-editing) {
+                                    root.path-editing = false;
+                                }
+                            }
+
+                            init => {
+                                self.focus();
+                                self.select-all();
+                            }
+                        }
+                    }
+
+                    // 非编辑态：面包屑条。点击空白处进入路径编辑。
+                    crumbs-flick := Flickable {
+                        visible: !root.path-editing;
+                        width: 100%;
+                        height: parent.height;
+                        content-width: max(crumbs-layout.preferred-width, self.width);
+                        interactive: true;
+
+                        // 空白区背景：整条面包屑区域的点击兜底（位于面包屑下层）。
+                        crumb-bg-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.path-editing = true;
+                                root.path-edit-text = root.breadcrumbs[root.breadcrumbs.length - 1].path;
+                            }
+                        }
+
+                        crumbs-layout := HorizontalLayout {
+                                x: 0px;
+                                y: 0px;
+                                height: parent.height;
+                                spacing: 0px;
+                                padding-left: 2px;
+
+                                for seg[i] in root.breadcrumbs : Rectangle {
+                                    height: parent.height;
+                                    width: crumb-text.preferred-width + (i == 0 ? 14px : 26px);
+
+                                    // 分隔箭头（第一段除外）。
+                                    if (i > 0) : Text {
+                                        x: 0px;
+                                        width: 14px;
+                                        height: parent.height;
+                                        text: "›";
+                                        color: Theme.text-disabled;
+                                        font-size: 13px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+
+                                    Rectangle {
+                                        x: i == 0 ? 0px : 14px;
+                                        width: parent.width - (i == 0 ? 0px : 14px);
+                                        height: 26px;
+                                        y: (parent.height - 26px) / 2;
+                                        border-radius: 5px;
+                                        background: crumb-ta.has-hover ? Theme.bg-hover : transparent;
+
+                                        crumb-text := Text {
+                                            text: seg.label;
+                                            color: i == root.breadcrumbs.length - 1 ? Theme.text-primary : Theme.text-secondary;
+                                            font-size: 12.5px;
+                                            font-weight: i == root.breadcrumbs.length - 1 ? 600 : 400;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                            overflow: elide;
+                                        }
+
+                                        crumb-ta := TouchArea {
+                                            width: 100%;
+                                            height: 100%;
+                                            clicked => {
+                                                root.breadcrumb_clicked(seg.path);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                // 新建文件夹。
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    y: (parent.height - 30px) / 2;
+                    border-radius: 6px;
+                    background: newfolder-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    Text {
+                        text: "＋";
+                        color: Theme.text-secondary;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    newfolder-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.new_folder_requested();
+                        }
+                    }
+                }
+
+                // 视图切换（Pulse 式下拉）。
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    y: (parent.height - 30px) / 2;
+                    border-radius: 6px;
+                    background: view-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    Text {
+                        text: "▦";
+                        color: Theme.text-secondary;
+                        font-family: Theme.symbol-font-family;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    view-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.view_picker_requested();
+                        }
+                    }
+                }
+
+                // 粘贴（剪贴板有内容时可用）。
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    y: (parent.height - 30px) / 2;
+                    border-radius: 6px;
+                    background: paste-ta.has-hover && root.can-paste ? Theme.bg-hover : transparent;
+
+                    Text {
+                        text: "⧉";
+                        color: root.can-paste ? Theme.text-primary : Theme.text-disabled;
+                        font-family: Theme.symbol-font-family;
+                        font-size: 14px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    paste-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        enabled: root.can-paste;
+                        clicked => {
+                            root.paste_requested();
+                        }
+                    }
+                }
+
+                // 刷新。
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    y: (parent.height - 30px) / 2;
+                    border-radius: 6px;
+                    background: refresh-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    IconRefresh {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        size: 15px;
+                    }
+
+                    refresh-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.refresh_requested();
+                        }
+                    }
+                }
+
+                // 当前目录过滤搜索（全局 MFT 搜索为后续阶段）。
+                Rectangle {
+                    width: 200px;
+                    height: 28px;
+                    y: (parent.height - 28px) / 2;
+                    border-radius: 6px;
+                    background: Theme.bg-input;
+                    border-width: 1px;
+                    border-color: Theme.border;
+
+                    HorizontalLayout {
+                        spacing: 4px;
+                        padding-left: 8px;
+                        padding-right: 6px;
+                        height: parent.height;
+
+                        IconSearch {
+                            width: 14px;
+                            height: 14px;
+                            y: (parent.height - self.height) / 2;
+                            size: 13px;
+                        }
+
+                        filter-input := TextInput {
+                            horizontal-stretch: 1;
+                            height: parent.height;
+                            text: root.filter-text;
+                            font-size: 12px;
+                            color: Theme.text-primary;
+                            vertical-alignment: center;
+                            single-line: true;
+
+                            edited => {
+                                root.filter_edited(self.text);
+                            }
+
+                            key-pressed(event) => {
+                                if (event.text == Key.Escape) {
+                                    root.filter_edited("");
+                                    return EventResult.accept;
+                                }
+                                return EventResult.reject;
+                            }
+                        }
+
+                        // 占位提示（TextInput 无原生 placeholder，空文本时覆盖显示）。
+                        if (root.filter-text == "") : Text {
+                            text: "搜索当前文件夹";
+                            color: Theme.text-disabled;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+
+                        if (root.filter-text != "") : Rectangle {
+                            width: 16px;
+                            height: 16px;
+                            y: (parent.height - 16px) / 2;
+                            border-radius: 4px;
+                            background: filter-clear-ta.has-hover ? Theme.bg-hover : transparent;
+
+                            IconClose {
+                                x: (parent.width - self.width) / 2;
+                                y: (parent.height - self.height) / 2;
+                                size: 8px;
+                            }
+
+                            filter-clear-ta := TouchArea {
+                                width: 100%;
+                                height: 100%;
+                                clicked => {
+                                    root.filter_edited("");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 主体：侧边栏 + 文件列表 ----
+        HorizontalLayout {
+            spacing: 0px;
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+
+            // 侧栏列：纵向布局（侧栏滚动区 + 底部固定暂存托盘）。
+            VerticalLayout {
+                width: root.sidebar-w;
+                horizontal-stretch: 0;
+                spacing: 0px;
+
+                Sidebar {
+                    vertical-stretch: 1;
+                    items: root.sidebar-items;
+                    active-id: root.sidebar-active-id;
+                    loading: root.file-loading;
+                    staging-items: root.staging-items;
+                    staging-expanded: root.staging-expanded;
+                    drop-visible: root.sidebar-drop-visible;
+                    drop-y: root.sidebar-drop-y;
+                    item_activated(id) => {
+                        root.sidebar_item_activated(id);
+                    }
+                    header_drag(index, phase, y) => {
+                        root.sidebar_header_drag(index, phase, y);
+                    }
+                    staging_item_removed(index) => {
+                        root.staging_item_removed(index);
+                    }
+                    staging_clear_requested() => {
+                        root.staging_clear_requested();
+                    }
+                    staging_copy_here_requested() => {
+                        root.staging_copy_here_requested();
+                    }
+                    staging_move_here_requested() => {
+                        root.staging_move_here_requested();
+                    }
+                }
+            }
+
+            file-list := FileList {
+                horizontal-stretch: 1;
+                rows: root.file-rows;
+                total-count: root.file-total;
+                sort-key: root.sort-key;
+                sort-ascending: root.sort-ascending;
+                rename-path: root.rename-path;
+                loading: root.file-loading;
+                row_pointer_event(index, event, x, y) => {
+                    root.file_row_pointer_event(index, event, x, y);
+                }
+                row_double_clicked(index) => {
+                    root.file_row_double_clicked(index);
+                }
+                header_clicked(key) => {
+                    root.file_header_clicked(key);
+                }
+                scroll_changed(offset) => {
+                    root.file_scroll_changed(offset);
+                }
+                background_pointer_event(event, x, y) => {
+                    root.file_background_pointer_event(event, x, y);
+                }
+                rename_committed(path, new-name) => {
+                    root.file_rename_committed(path, new-name);
+                }
+                rename_cancelled() => {
+                    root.file_rename_cancelled();
+                }
+            }
+        }
+
+        // ---- 状态栏 ----
+        Rectangle {
+            height: root.statusbar-h;
+            background: Theme.bg-statusbar;
+
+            Rectangle {
+                y: 0px;
+                width: 100%;
+                height: 1px;
+                background: Theme.divider;
+            }
+
+            HorizontalLayout {
+                x: 0px;
+                y: 0px;
+                width: 100%;
+                height: parent.height;
+                spacing: 12px;
+                padding-left: 12px;
+                padding-right: 12px;
+
+                Text {
+                    text: root.status-left;
+                    color: Theme.text-secondary;
+                    font-size: 11.5px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+
+                if (root.status-job != "") : Text {
+                    text: root.status-job;
+                    color: Theme.accent;
+                    font-size: 11.5px;
+                    vertical-alignment: center;
+                }
+
+                Text {
+                    text: root.status-right;
+                    color: Theme.text-secondary;
+                    font-size: 11.5px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+
+    // ---- 右键菜单（含遮罩：点击空白处关闭） ----
+    if (root.menu-open) : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        z: 90;
+        background: transparent;
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    root.close-menu();
+                    return EventResult.accept;
+                }
+                return EventResult.reject;
+            }
+        }
+    }
+
+    ContextMenu {
+        x: min(root.sidebar-w + root.click-x, root.width - self.width - 8px);
+        y: min(root.topbar-h + root.click-y, root.height - self.height - 8px);
+        visible: root.menu-open;
+        items: root.menu-items;
+        items-height: root.menu-items-height;
+        item_triggered(id) => {
+            root.menu_item_triggered(id);
+        }
+        submenu_hovered(index, entered) => {
+            root.menu_submenu_hovered(index, entered);
+        }
+    }
+
+    SubMenuPopover {
+        x: min(root.sidebar-w + root.click-x + 224px, root.width - self.width - 8px);
+        y: min(root.topbar-h + root.click-y + 4px, root.height - self.height - 8px);
+        visible: root.menu-open && root.submenu-items.length > 0;
+        items: root.submenu-items;
+        items-height: root.submenu-items-height;
+        item_triggered(id) => {
+            root.menu_item_triggered(id);
+        }
+    }
+
+    // 供 Rust 调用的公开函数。
+    public function close-menu() {
+        root.menu-open = false;
+        root.menu-items = [];
+        root.submenu-items = [];
+        root.click-x = 0px;
+        root.click-y = 0px;
+    }
+
+    // 打开右键菜单：记录窗口坐标，Rust 随后填充模型。
+    public function open-menu(x: length, y: length) {
+        root.click-x = x;
+        root.click-y = y;
+        root.menu-open = true;
+    }
+
+}

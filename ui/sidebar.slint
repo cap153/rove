@@ -1,0 +1,275 @@
+import { Theme, SidebarItem, StagingItem } from "common.slint";
+import { StagingTray } from "staging_tray.slint";
+
+// 左侧导航栏。数据完全由 Rust 驱动（SidebarItem 平铺模型，kind = "header"
+// 的条目作为分区标题渲染）。分区自上而下：快速访问 / 最近使用 /
+// 此电脑 / 网络位置；底部固定为临时暂存托盘（见 staging_tray.slint）。
+export component Sidebar inherits Rectangle {
+    in-out property <[SidebarItem]> items: [];
+    in-out property <string> active-id: "";
+    in-out property <bool> loading: false;
+    in-out property <[StagingItem]> staging-items: [];
+    in-out property <bool> staging-expanded: true;
+
+    callback item_activated(id: string);
+    callback item_pointer_event(id: string, event: PointerEvent, x: length, y: length);
+    // 分区标题拖拽排序：phase 0=按下 1=拖动 2=松开，y 为指针相对行内的偏移。
+    callback header_drag(index: int, phase: int, y: length);
+    in property <bool> drop-visible: false;
+    in property <length> drop-y: 0px;
+    callback staging_item_removed(index: int);
+    callback staging_clear_requested();
+    callback staging_copy_here_requested();
+    callback staging_move_here_requested();
+
+    // 暂存托盘高度（折叠时仅标题栏）。
+    property <length> tray-h: root.staging-expanded ? 224px : 36px;
+
+    background: Theme.bg-sidebar;
+    min-width: 180px;
+    max-width: 320px;
+    horizontal-stretch: 0;
+    // 允许纵向被压缩（内容在 Flickable 内滚动），把底部空间让给暂存托盘。
+    min-height: 0px;
+
+    // 右侧 1px 分隔线。
+    Rectangle {
+        x: parent.width - 1px;
+        y: 0px;
+        width: 1px;
+        height: parent.height;
+        background: Theme.divider;
+    }
+
+    Flickable {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height - root.tray-h;
+        // 关键：允许外层布局压缩侧栏，否则 min-height 会撑满整个
+        // 纵向空间，把底部固定的暂存托盘挤出窗口。
+        min-height: 0px;
+        content-height: max(items-layout.preferred-height, self.height);
+        interactive: true;
+
+        // 拖拽排序落点指示线（内容坐标系，绘制在条目之上）。
+        if (root.drop-visible) : Rectangle {
+            x: 2px;
+            y: root.drop-y - 1.5px;
+            width: parent.width - 4px;
+            height: 3px;
+            border-radius: 1.5px;
+            background: Theme.accent;
+        }
+
+        items-layout := VerticalLayout {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            spacing: 2px;
+            padding-top: 8px;
+            padding-bottom: 12px;
+
+            for item[i] in root.items : Rectangle {
+                width: parent.width;
+                height: item.kind == "header" ? 30px : (item.kind == "drive" ? 52px : 32px);
+                background: (root.active-id == item.id) ? Theme.bg-selected : (item-ta.has-hover ? Theme.bg-hover : transparent);
+
+                // 选中态左侧主题色竖条。
+                Rectangle {
+                    x: 0px;
+                    y: 0px;
+                    width: 3px;
+                    height: parent.height;
+                    background: (root.active-id == item.id) ? Theme.accent : transparent;
+                }
+
+                item-ta := TouchArea {
+                    width: 100%;
+                    height: 100%;
+
+                    clicked => {
+                        root.item_activated(item.id);
+                    }
+
+                    // 分区标题支持拖拽排序（按下/拖动/松开三阶段上报）。
+                    pointer-event(event) => {
+                        if (item.kind == "header") {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.header_drag(i, 0, self.mouse-y);
+                            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                root.header_drag(i, 2, self.mouse-y);
+                            }
+                        }
+                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                            root.item_pointer_event(item.id, event, self.mouse-x, self.mouse-y);
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
+                    }
+                    moved => {
+                        if (item.kind == "header" && self.pressed) {
+                            root.header_drag(i, 1, self.mouse-y);
+                        }
+                    }
+                }
+
+                if (item.kind == "header") : Text {
+                    x: 14px;
+                    width: parent.width - 24px;
+                    height: parent.height;
+                    text: item.label;
+                    color: Theme.text-secondary;
+                    font-size: 11.5px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                }
+
+                if (item.kind != "header" && item.kind != "drive") : HorizontalLayout {
+                    x: 10px;
+                    width: parent.width - 18px;
+                    height: parent.height;
+                    spacing: 8px;
+
+                    // 图标方块：单字符标识。
+                    Rectangle {
+                        width: 20px;
+                        height: 20px;
+                        y: (parent.height - 20px) / 2;
+                        border-radius: 5px;
+                        background: item.icon-color.transparentize(0.84);
+
+                        Text {
+                            text: item.icon-text;
+                            color: item.icon-color;
+                            font-size: 10px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+                    }
+
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 0px;
+                        height: parent.height;
+
+                        Text {
+                            text: item.label;
+                            color: (root.active-id == item.id) ? Theme.accent : Theme.text-primary;
+                            font-size: 12.5px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            height: item.detail == "" ? parent.height : parent.height / 2;
+                        }
+
+                        if (item.detail != "") : Text {
+                            text: item.detail;
+                            color: Theme.text-secondary;
+                            font-size: 10.5px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            height: parent.height / 2;
+                        }
+                    }
+                }
+
+                // 驱动器行：名称 + 容量进度条 + 剩余/总量文本。
+                if (item.kind == "drive") : VerticalLayout {
+                    x: 10px;
+                    width: parent.width - 18px;
+                    height: parent.height;
+                    spacing: 3px;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        height: 20px;
+
+                        Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            y: 0px;
+                            border-radius: 5px;
+                            background: item.icon-color.transparentize(0.84);
+
+                            Text {
+                                text: item.icon-text;
+                                color: item.icon-color;
+                                font-size: 10px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
+                        }
+
+                        Text {
+                            text: item.label;
+                            color: (root.active-id == item.id) ? Theme.accent : Theme.text-primary;
+                            font-size: 12.5px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        height: 12px;
+
+                        // 容量条：底色轨道 + 已用填充（按类型着色）。
+                        Rectangle {
+                            width: 64px;
+                            height: 6px;
+                            y: 3px;
+                            border-radius: 3px;
+                            background: Theme.border;
+
+                            Rectangle {
+                                width: parent.width * (item.usage < 0 ? 0 : min(max(item.usage, 0), 1));
+                                height: parent.height;
+                                border-radius: 3px;
+                                background: item.icon-color;
+                            }
+                        }
+
+                        Text {
+                            text: item.detail;
+                            color: Theme.text-secondary;
+                            font-size: 10.5px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- 底部固定：临时暂存托盘（在 Flickable 之外，始终贴住左下角，
+        // 不随侧栏内容滚动） ----
+    }
+
+    tray := StagingTray {
+        x: 0px;
+        y: parent.height - self.height;
+        width: parent.width;
+        items: root.staging-items;
+        expanded: root.staging-expanded;
+        item_removed(index) => {
+            root.staging_item_removed(index);
+        }
+        clear_requested() => {
+            root.staging_clear_requested();
+        }
+        copy_here_requested() => {
+            root.staging_copy_here_requested();
+        }
+        move_here_requested() => {
+            root.staging_move_here_requested();
+        }
+    }
+}

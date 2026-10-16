@@ -1,0 +1,235 @@
+// 共享数据结构与主题令牌。
+// 结构体经 `export` 后可被其他 .slint 文件 import，也可由 Rust 端构造后注入模型。
+
+// 名称高亮片段：hl = 命中搜索词，以强调色显示。
+export struct NamePart {
+    text: string,
+    hl: bool,
+}
+
+export struct FileRow {
+    // 绝对行号（在完整排序后的列表中的下标），用于虚拟列表定位。
+    index: int,
+    name: string,
+    path: string,
+    is-dir: bool,
+    size-text: string,
+    modified-text: string,
+    type-text: string,
+    icon-color: color,
+    // 图标角标：文件夹显示空，文件显示扩展名（如 PNG / EXE）。
+    icon-text: string,
+    selected: bool,
+    // 剪切态（半透明 + 虚线感）。
+    cut: bool,
+    // 缩略图（图片/视频行由后台管线填充；空 = 未加载，显示色块图标）。
+    thumb: image,
+    // 名称高亮片段（搜索命中时由 Rust 计算填充）；
+    // 空数组 = 无高亮查询，UI 回落显示 name。
+    name-parts: [NamePart],
+}
+
+export struct TabInfo {
+    id: int,
+    title: string,
+    active: bool,
+}
+
+export struct SidebarItem {
+    id: string,
+    label: string,
+    detail: string,
+    // "quick" | "recent" | "drive" | "network" | "action"
+    kind: string,
+    icon-color: color,
+    icon-text: string,
+    // 容量占用 0..1；< 0 表示不显示进度条。
+    usage: float,
+}
+
+export struct StagingItem {
+    path: string,
+    name: string,
+    is-dir: bool,
+    icon-color: color,
+    icon-text: string,
+}
+
+export struct BreadcrumbSegment {
+    label: string,
+    path: string,
+}
+
+export global Theme {
+    in-out property <color> bg-main: #F3F4F5;
+    in-out property <color> bg-sidebar: #EBECEE;
+    in-out property <color> bg-list: #FFFFFF;
+    in-out property <color> bg-toolbar: #F6F7F8;
+    in-out property <color> bg-tabstrip: #E7E8EB;
+    in-out property <color> bg-hover: #0000000B;
+    in-out property <color> bg-selected: #0E8A4A24;
+    in-out property <color> bg-active-tab: #FFFFFF;
+    in-out property <color> bg-statusbar: #F6F7F8;
+    in-out property <color> bg-popup: #FFFFFF;
+    in-out property <color> bg-input: #FFFFFF;
+    in-out property <color> bg-badge: #0000000D;
+
+    in-out property <color> text-primary: #191A1C;
+    in-out property <color> text-secondary: #6C7078;
+    in-out property <color> text-disabled: #A6AAB1;
+
+    in-out property <color> border: #DCDDE1;
+    in-out property <color> divider: #E5E6E9;
+
+    in-out property <color> accent: #0E8A4A;
+    in-out property <color> accent-hover: #0B7A41;
+    in-out property <color> accent-text: #FFFFFF;
+    in-out property <color> danger: #C42B1C;
+
+    in-out property <bool> dark: false;
+    in-out property <string> font-family: "Microsoft YaHei UI";
+    in-out property <string> mono-font-family: "Cascadia Mono";
+    // 符号图标专用（⧉ ▦ ▣ ✎ 🗑 ⇄ ➤ 等在雅黑中缺字形）。
+    in-out property <string> symbol-font-family: "Segoe UI Symbol";
+}
+
+// 搜索命中高亮名称：按片段流式拼接，命中片段用强调色。
+// 单行；总宽超出容器时由 clip 裁掉尾部（无省略号）。
+export component HighlightName inherits Rectangle {
+    in property <[NamePart]> parts: [];
+    in property <length> font-size: 13px;
+    in property <bool> is-dir: false;
+    clip: true;
+    background: transparent;
+
+    HorizontalLayout {
+        spacing: 0px;
+
+        for part in root.parts : Text {
+            width: self.preferred-width;
+            height: 100%;
+            text: part.text;
+            color: part.hl ? Theme.accent : Theme.text-primary;
+            font-size: root.font-size;
+            font-weight: root.is-dir ? 500 : 400;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// ---- 绘制图标：用图形拼装而非字体字形，避免在缺少对应字体的
+// ---- 环境下（✕ / ⌕ / ⟳ / ▣ 等）显示为方块。
+
+// 关闭（×）图标：两条对角平行四边形棒（Path 填充，不依赖旋转/字体）。
+export component IconClose inherits Rectangle {
+    in property <length> size: 10px;
+    in property <color> icon-color: Theme.text-secondary;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    Path {
+        width: root.size;
+        height: root.size;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        fill: root.icon-color;
+        commands: "M 0.6 1.6 L 1.6 0.6 L 9.4 8.4 L 8.4 9.4 Z";
+    }
+    Path {
+        width: root.size;
+        height: root.size;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        fill: root.icon-color;
+        commands: "M 8.4 0.6 L 9.4 1.6 L 1.6 9.4 L 0.6 8.4 Z";
+    }
+}
+
+// 放大镜（搜索）图标：圆环 + 斜柄（柄用 Path 平行四边形）。
+export component IconSearch inherits Rectangle {
+    in property <length> size: 14px;
+    in property <color> icon-color: Theme.text-secondary;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    property <length> lens: root.size * 0.64;
+
+    Rectangle {
+        x: 0px;
+        y: 0px;
+        width: root.lens;
+        height: root.lens;
+        border-radius: root.lens / 2;
+        border-width: 1.6px;
+        border-color: root.icon-color;
+        background: transparent;
+    }
+    Path {
+        width: root.size;
+        height: root.size;
+        viewbox-width: 14;
+        viewbox-height: 14;
+        fill: root.icon-color;
+        commands: "M 7.5 8.7 L 8.7 7.5 L 13.4 12.2 L 12.2 13.4 Z";
+    }
+}
+
+// 刷新图标：圆环 + 箭头三角。
+export component IconRefresh inherits Rectangle {
+    in property <length> size: 15px;
+    in property <color> icon-color: Theme.text-secondary;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    property <length> ring: root.size * 0.74;
+
+    Rectangle {
+        x: 0px;
+        y: (root.size - root.ring) / 2;
+        width: root.ring;
+        height: root.ring;
+        border-radius: root.ring / 2;
+        border-width: 1.8px;
+        border-color: root.icon-color;
+        background: transparent;
+    }
+    Path {
+        x: root.ring - 2px;
+        y: (root.size - root.ring) / 2 - 1px;
+        width: 7px;
+        height: 6px;
+        fill: root.icon-color;
+        commands: "M 0 0 L 7 3 L 0 6 Z";
+    }
+}
+
+// 标签页图标：圆角方框描边。
+export component IconTab inherits Rectangle {
+    in property <length> size: 13px;
+    in property <color> icon-color: Theme.accent;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    Rectangle {
+        x: 0.5px;
+        y: 0.5px;
+        width: parent.width - 1px;
+        height: parent.height - 1px;
+        border-radius: 3px;
+        border-width: 1.6px;
+        border-color: root.icon-color;
+        background: transparent;
+    }
+    Rectangle {
+        width: 4px;
+        height: 4px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        border-radius: 1px;
+        background: root.icon-color;
+    }
+}

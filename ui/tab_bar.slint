@@ -1,0 +1,175 @@
+import { Theme, TabInfo, IconClose, IconTab } from "common.slint";
+
+// 顶部标签栏：复刻 Pulse 的扁平标签样式（激活标签白底 + 主题色下边线），
+// 支持点击切换、悬停/激活显示关闭按钮、中键关闭、双击空白新建。
+export component TabBar inherits Rectangle {
+    in-out property <[TabInfo]> tabs: [];
+    in-out property <int> active-tab: 0;
+    in-out property <bool> loading: false;
+
+    callback tab_activated(id: int);
+    callback tab_closed(id: int);
+    callback new_tab_requested();
+
+    height: 38px;
+    background: Theme.bg-tabstrip;
+
+    HorizontalLayout {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        spacing: 3px;
+        padding-left: 8px;
+        padding-right: 4px;
+
+        for tab[i] in root.tabs : Rectangle {
+            min-width: 80px;
+            max-width: 220px;
+            horizontal-stretch: 0;
+            height: 34px;
+            border-top-left-radius: 6px;
+            border-top-right-radius: 6px;
+            background: tab.active ? Theme.bg-active-tab : (ta.has-hover ? Theme.bg-hover : transparent);
+
+            // 激活标签的主题色下边线。
+            Rectangle {
+                y: parent.height - 2px;
+                x: 0px;
+                width: parent.width;
+                height: 2px;
+                background: tab.active ? Theme.accent : transparent;
+            }
+
+            HorizontalLayout {
+                spacing: 6px;
+                padding-left: 10px;
+                padding-right: 6px;
+                height: parent.height;
+
+                // 标签图标（加载时脉冲，否则为文件夹标识）。
+                if (tab.active && root.loading) : Rectangle {
+                    width: 14px;
+                    height: 14px;
+                    y: (parent.height - 14px) / 2;
+                    border-radius: 7px;
+                    background: Math.mod(animation-tick(), 800ms) < 400ms
+                        ? Theme.accent.transparentize(0.55)
+                        : Theme.accent;
+                }
+                if (!(tab.active && root.loading)) : Rectangle {
+                    width: 14px;
+                    height: 14px;
+                    y: (parent.height - 14px) / 2;
+                    border-radius: 3px;
+                    background: Theme.accent.transparentize(0.82);
+
+                    Text {
+                        text: "▣";
+                        color: Theme.accent;
+                        font-size: 9px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                }
+
+                Text {
+                    text: tab.title;
+                    color: tab.active ? Theme.text-primary : Theme.text-secondary;
+                    font-size: 12.5px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                    horizontal-stretch: 1;
+                }
+
+                // 关闭按钮：悬停或激活时可见。
+                close-btn := Rectangle {
+                    width: 18px;
+                    height: 18px;
+                    y: (parent.height - 18px) / 2;
+                    border-radius: 4px;
+                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
+                    opacity: (tab.active || ta.has-hover) ? 1.0 : 0.35;
+
+                    IconClose {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        size: 8px;
+                    }
+                }
+            }
+
+            ta := TouchArea {
+                width: 100%;
+                height: 100%;
+
+                clicked => {
+                    root.tab_activated(tab.id);
+                }
+
+                pointer-event(event) => {
+                    // 中键关闭标签。
+                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
+                        root.tab_closed(tab.id);
+                        return EventResult.accept;
+                    }
+                    return EventResult.reject;
+                }
+            }
+
+            close-ta := TouchArea {
+                x: parent.width - 34px;
+                y: 8px;
+                width: 26px;
+                height: 18px;
+
+                clicked => {
+                    root.tab_closed(tab.id);
+                }
+            }
+        }
+
+        // 新建标签按钮。
+        Rectangle {
+            width: 30px;
+            height: 30px;
+            y: 2px;
+            border-radius: 6px;
+            background: new-ta.has-hover ? Theme.bg-hover : transparent;
+
+            Text {
+                text: "＋";
+                color: Theme.text-secondary;
+                font-size: 15px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: 100%;
+                height: 100%;
+            }
+
+            new-ta := TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => {
+                    root.new_tab_requested();
+                }
+            }
+        }
+
+        // 剩余空白区域：双击新建标签。
+        Rectangle {
+            horizontal-stretch: 1;
+            height: parent.height;
+
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                double-clicked => {
+                    root.new_tab_requested();
+                }
+            }
+        }
+    }
+}

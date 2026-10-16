@@ -1,0 +1,70 @@
+[package]
+name = "rove"
+version = "0.1.0"
+edition = "2021"
+description = "Rove — 极速响应、极低内存的 Windows 文件管理器 (Rust + Slint)"
+
+[dependencies]
+slint = { version = "1.11", default-features = false, features = [
+    # GPU 渲染（femtovg/OpenGL）；软件渲染作为后端备选，
+    # 运行时用 SLINT_BACKEND=winit-software 切换。
+    "backend-winit",
+    "renderer-femtovg",
+    "renderer-software",
+    # 暴露 raw-window-handle，供 Win32 辅助（前景窗口/显示器查询）使用。
+    "raw-window-handle-06",
+    # 暴露 slint::winit_030::{WinitWindowAccessor, winit}，供窗口事件钩子
+    # （应用级快捷键、原生消息拦截）使用。
+    "unstable-winit-030",
+    # Slint 1.18 的前向兼容特性（官方要求显式启用）。
+    "compat-1-18",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+trash = "5"
+open = "5"
+raw-window-handle = "0.6"
+toml_edit = "0.22"
+nucleo-matcher = "0.3"
+pinyin = { version = "0.10", features = ["plain", "heteronym"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.21"
+windows = { version = "0.59", features = [
+    "Win32_UI_Shell",
+    "Win32_System_Com",
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_System_Time",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_NetworkManagement_WNet",
+    "Win32_Security",
+] }
+
+[build-dependencies]
+slint-build = "1.11"
+# 写入 exe 图标与版本信息（见 build.rs）。
+winresource = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
