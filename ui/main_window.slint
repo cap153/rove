@@ -111,6 +111,11 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <bool> menu-open: false;
     property <length> click-x;
     property <length> click-y;
+    // 主菜单最终位置(窗口坐标,四向钳制到内容区),供二级菜单对齐引用。
+    property <length> menu-x: max(sidebar-w + 8px, min(sidebar-w + click-x, root.width - 232px));
+    property <length> menu-y: max(topbar-h + 8px, min(topbar-h + click-y, root.height - menu-items-height - 8px));
+    // 悬停的子菜单项相对主菜单顶部的 y(Rust 按行高累计),二级菜单顶部对齐该项。
+    in-out property <length> submenu-row-y: 0px;
 
     // ---- 回调（Rust 处理） ----
     callback new_tab_requested();
@@ -699,8 +704,8 @@ out property <length> row-height-out: file-list.row-height-out;
     }
 
     ContextMenu {
-        x: min(root.sidebar-w + root.click-x, root.width - self.width - 8px);
-        y: min(root.topbar-h + root.click-y, root.height - self.height - 8px);
+        x: root.menu-x;
+        y: root.menu-y;
         visible: root.menu-open;
         items: root.menu-items;
         items-height: root.menu-items-height;
@@ -713,8 +718,12 @@ out property <length> row-height-out: file-list.row-height-out;
     }
 
     SubMenuPopover {
-        x: min(root.sidebar-w + root.click-x + 224px, root.width - self.width - 8px);
-        y: min(root.topbar-h + root.click-y + 4px, root.height - self.height - 8px);
+        // 优先展开在主菜单右侧;窗口右缘放不下时翻转到主菜单左侧。
+        x: (root.menu-x + 224px + self.width > root.width - 8px)
+            ? max(root.sidebar-w + 8px, root.menu-x - self.width - 4px)
+            : (root.menu-x + 224px);
+        // 顶部与主菜单中悬停的项对齐,越界时钳回窗口内。
+        y: max(8px, min(root.menu-y + root.submenu-row-y, root.height - self.height - 8px));
         visible: root.menu-open && root.submenu-items.length > 0;
         items: root.submenu-items;
         items-height: root.submenu-items-height;

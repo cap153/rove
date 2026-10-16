@@ -1450,8 +1450,9 @@ impl App {
         self.ui.set_menu_items(ModelRc::new(VecModel::from(items)));
         self.ui.set_menu_items_height(height);
         // 弹在工具栏视图按钮下方（按钮在窗口右侧区域，取搜索框左侧固定区起点）。
+        // y = 工具栏底部（topbar 44px 之下），菜单顶贴住按钮。
         let x = self.ui.get_view_width() - 220.0;
-        self.ui.invoke_open_menu(x, 96.0);
+        self.ui.invoke_open_menu(x, 44.0);
     }
 
     /// 面包屑路径编辑提交（点击地址栏输入路径后回车）。
@@ -2654,7 +2655,19 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let app = app.borrow_mut();
             if index < 0 {
                 app.ui.set_submenu_items(ModelRc::new(VecModel::from(Vec::<MenuItem>::new())));
+                app.ui.set_submenu_row_y(0.0);
                 return;
+            }
+            // 二级菜单顶部与悬停项对齐:累计该项之前的行高(含菜单 padding-top)。
+            {
+                let model = app.ui.get_menu_items();
+                let mut row_y = 4.0f32;
+                for i in 0..(index as usize).min(model.row_count()) {
+                    if let Some(it) = model.row_data(i) {
+                        row_y += if it.kind == "separator" { 9.0 } else { 28.0 };
+                    }
+                }
+                app.ui.set_submenu_row_y(row_y);
             }
             // 仅当悬停的是带子菜单的项时展开（按 id 分发内容）。
             let hover_id = app

@@ -533,7 +533,11 @@ export component FileList inherits Rectangle {
                     }
 
                     clicked => {
-                        root.row-pointer-event(row.index, { kind: PointerEventKind.down, button: PointerEventButton.left }, self.mouse-x, self.mouse-y);
+                        // 坐标换算为 FileList 内容坐标(列/行偏移 + 单元格内偏移),
+                        // 供右键菜单在窗口中正确定位。
+                        root.row-pointer-event(row.index, { kind: PointerEventKind.down, button: PointerEventButton.left },
+                            Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px + self.mouse-x,
+                            floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y);
                     }
 
                     double-clicked => {
@@ -541,7 +545,9 @@ export component FileList inherits Rectangle {
                     }
 
                     pointer-event(event) => {
-                        root.row-pointer-event(row.index, event, self.mouse-x, self.mouse-y);
+                        root.row-pointer-event(row.index, event,
+                            Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px + self.mouse-x,
+                            floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y);
                     }
                 }
 
