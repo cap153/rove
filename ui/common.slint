@@ -99,6 +99,8 @@ export component HighlightName inherits Rectangle {
     in property <[NamePart]> parts: [];
     in property <length> font-size: 13px;
     in property <bool> is-dir: false;
+    // true = 文本顶部对齐（图标网格两行区域的单行场景）。
+    in property <bool> align-top: false;
     clip: true;
     background: transparent;
 
@@ -112,7 +114,7 @@ export component HighlightName inherits Rectangle {
             color: part.hl ? Theme.accent : Theme.text-primary;
             font-size: root.font-size;
             font-weight: root.is-dir ? 500 : 400;
-            vertical-alignment: center;
+            vertical-alignment: root.align-top ? top : center;
         }
     }
 }

@@ -608,7 +608,15 @@ export component FileList inherits Rectangle {
                         }
                     }
 
-                    Text {
+                    // 名称:搜索命中时单行高亮;否则保持两行换行原样。
+                    if (row.name-parts.length > 0) : HighlightName {
+                        height: parent.height - root.cell-thumb - 4px;
+                        parts: row.name-parts;
+                        font-size: 11.5px;
+                        is-dir: row.is-dir;
+                        align-top: true;
+                    }
+                    if (row.name-parts.length == 0) : Text {
                         height: parent.height - root.cell-thumb - 4px;
                         text: row.name;
                         color: Theme.text-primary;
