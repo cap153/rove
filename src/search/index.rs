@@ -76,11 +76,20 @@ fn spawn_builder(idx: SharedIndex) {
         .spawn(move || {
             let mut count = 0usize;
             let roots = list_roots();
-            for root in roots {
-                if count >= MAX_ENTRIES {
-                    break;
+            // 任务 3.2：优先用 NTFS $MFT 加速全盘索引；无管理员权限或全盘
+            // 失败时回退到原有 std::fs 递归 walker。
+            if crate::search::mft::build_via_mft(&idx, &stop).is_none() {
+                for root in roots {
+                    if count >= MAX_ENTRIES {
+                        break;
+                    }
+                    count += walk(&root, &idx, count, &stop);
                 }
-                count += walk(&root, &idx, count, &stop);
+            } else {
+                // MFT 路径：重新统计条目数（build_via_mft 已写入）。
+                if let Ok(w) = idx.read() {
+                    count = w.entries.len();
+                }
             }
             if let Ok(mut w) = idx.write() {
                 w.ready = true;
@@ -91,7 +100,7 @@ fn spawn_builder(idx: SharedIndex) {
 }
 
 /// 枚举固定驱动器根目录。
-fn list_roots() -> Vec<PathBuf> {
+pub(crate) fn list_roots() -> Vec<PathBuf> {
     crate::fs::list_drives()
         .into_iter()
         .filter(|d| matches!(d.drive_type, crate::fs::drives::DriveType::Fixed))

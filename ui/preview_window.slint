@@ -1,0 +1,71 @@
+// 任务 3.1：QuickLook 预览窗口（独立 Slint Window）。
+//
+// - 图片 / 视频（首帧）显示缩略大图（preview-kind == 0）；
+// - 文本 / 代码显示只读文本框（preview-kind == 1）；
+// - 其他类型或加载失败时显示基本元数据卡片（preview-kind == 2）。
+// 由 Rust 侧经 Space 键触发、Esc/Space 关闭。
+
+import { Theme } from "common.slint";
+import { ScrollView, TextEdit } from "std-widgets.slint";
+
+export component PreviewWindow inherits Window {
+    in-out property <image> preview-image;
+    in-out property <int> preview-kind: 2; // 0 图片/视频, 1 文本, 2 元数据
+    in-out property <string> text-content: "";
+    in-out property <string> meta-text: "";
+    in-out property <string> title-text: "";
+    in-out property <string> sub-title: "";
+
+    width: 720px;
+    height: 540px;
+    background: Theme.bg-main;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+
+        Text {
+            text: root.title-text;
+            font-size: 15px;
+            font-weight: 700;
+            color: Theme.text-primary;
+        }
+        Text {
+            text: root.sub-title;
+            font-size: 12px;
+            color: Theme.text-secondary;
+        }
+
+        Rectangle {
+            clip: true;
+            background: Theme.bg-input;
+            border-radius: 8px;
+
+            if (root.preview-kind == 0) : Image {
+                source: root.preview-image;
+                width: 100%;
+                height: 100%;
+                image-fit: contain;
+            }
+
+            if (root.preview-kind == 1) : ScrollView {
+                TextEdit {
+                    text: root.text-content;
+                    read-only: true;
+                    width: 100%;
+                    height: 100%;
+                    font-family: "monospace";
+                    font-size: 13px;
+                }
+            }
+
+            if (root.preview-kind == 2) : ScrollView {
+                Text {
+                    text: root.meta-text;
+                    color: Theme.text-primary;
+                    font-size: 13px;
+                }
+            }
+        }
+    }
+}

@@ -405,3 +405,4 @@ mod tests {
 }
 
 pub mod index;
+pub mod mft;

@@ -1,9 +1,13 @@
-import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh } from "common.slint";
+import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, SettingsNavItem, SettingsActionGroup } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
 import { StagingTray } from "staging_tray.slint";
 import { ContextMenu, SubMenuPopover, MenuItem } from "context_menu.slint";
+import { SettingsPage } from "settings_page.slint";
+import { ActionEditorDialog } from "action_editor.slint";
+import { PreviewWindow } from "preview_window.slint";
+export { PreviewWindow } from "preview_window.slint";
 
 // 将 common.slint 中的 Theme 全局从根文件再导出——
 // Slint 规定：全局单例只有从根文件（或 slint! 宏）导出，Rust 侧才能通过
@@ -66,6 +70,28 @@ export component MainWindow inherits Window {
     in-out property <[TabInfo]> tabs: [];
     in-out property <int> active-tab: 0;
     in-out property <bool> tab-loading: false;
+    /// 当前激活的是否为设置页标签。
+    in-out property <bool> settings-open: false;
+    // 设置页数据。
+    in-out property <[SettingsNavItem]> settings-nav-items: [];
+    in-out property <[SettingsActionGroup]> settings-action-groups: [];
+    // 设置页子页标题 / 描述 / 新增入口 / 内容高度。
+    in-out property <string> settings-page-title: "本地右键菜单";
+    in-out property <string> settings-page-desc: "";
+    in-out property <bool> settings-show-add: true;
+    in-out property <length> settings-content-height: 0px;
+    // 动作编辑器弹窗状态。
+    in-out property <string> settings-editor-title: "";
+    in-out property <bool> settings-editor-open: false;
+    in-out property <string> settings-editor-id: "";
+    in-out property <string> settings-editor-label: "";
+    in-out property <string> settings-editor-group: "";
+    in-out property <string> settings-editor-target: "any";
+    in-out property <string> settings-editor-extensions: "";
+    in-out property <string> settings-editor-program: "";
+    in-out property <string> settings-editor-args: "";
+    // 编辑器「层级归属」可选分组（含内置的「一级菜单」）。
+    in-out property <[string]> settings-editor-group-options: ["一级菜单"];
     in-out property <[SidebarItem]> sidebar-items: [];
     in-out property <string> sidebar-active-id: "";
     in-out property <[FileRow]> file-rows: [];
@@ -146,6 +172,24 @@ out property <length> row-height-out: file-list.row-height-out;
     callback refresh_requested();
     callback paste_requested();
     callback view_picker_requested();
+    callback settings_requested();
+    callback settings_nav_changed(id: string);
+    callback settings_action_toggled(id: string, enabled: bool);
+    callback settings_group_toggled(name: string, expanded: bool);
+    callback settings_action_add();
+    callback settings_action_edit(id: string);
+    callback settings_action_delete(id: string);
+    callback settings_editor_save(
+        id: string,
+        label: string,
+        group: string,
+        target: string,
+        extensions: string,
+        program: string,
+        args: string
+    );
+    callback settings_editor_cancel();
+    callback settings_editor_browse();
     in-out property <bool> can-paste: false;
 
     // ---- 布局常量 ----
@@ -161,6 +205,16 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 文件列表滚动到顶端（Rust 调用）。
     public function scroll-list-to-top() {
         file-list.scroll-to-top();
+    }
+
+    /// 文件列表行命中测试（外部拖入定位目标文件夹，Rust 调用）。
+    public function row-hit-test(wx: length, wy: length) -> int {
+        file-list.row-hit-test(wx, wy);
+    }
+
+    /// 拖出上膛：行按下时禁用 flick 交互滚动，让拖动只发起 OLE 拖放。
+    public function set-drag-armed(v: bool) {
+        file-list.set-drag-armed(v);
     }
 
     VerticalLayout {
@@ -182,9 +236,10 @@ out property <length> row-height-out: file-list.row-height-out;
             }
         }
 
-        // ---- 工具栏 ----
+        // ---- 工具栏（设置页整体收起，内容从标签栏下方直接开始）----
         Rectangle {
-            height: 44px;
+            visible: !root.settings-open;
+            height: root.settings-open ? 0px : 44px;
             background: Theme.bg-main;
 
             HorizontalLayout {
@@ -462,6 +517,34 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                 }
 
+                // 设置入口齿轮。
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    y: (parent.height - 30px) / 2;
+                    border-radius: 6px;
+                    background: settings-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    Text {
+                        text: "⚙";
+                        color: settings-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                        font-family: Theme.symbol-font-family;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    settings-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.settings_requested();
+                        }
+                    }
+                }
+
                 // 当前目录过滤搜索（全局 MFT 搜索为后续阶段）。
                 Rectangle {
                     width: 200px;
@@ -566,8 +649,10 @@ out property <length> row-height-out: file-list.row-height-out;
             vertical-stretch: 1;
 
             // 侧栏列：纵向布局（侧栏滚动区 + 底部固定暂存托盘）。
+            // 设置页为全屏布局，不渲染文件侧栏（宽度收为 0 以彻底让出布局空间）。
             VerticalLayout {
-                width: root.sidebar-w;
+                visible: !root.settings-open;
+                width: root.settings-open ? 0px : root.sidebar-w;
                 horizontal-stretch: 0;
                 spacing: 0px;
 
@@ -601,41 +686,82 @@ out property <length> row-height-out: file-list.row-height-out;
                 }
             }
 
-            file-list := FileList {
+            // ---- 主体内容区：文件列表 or 设置页 ----
+            // Slint 中 visible:false 的元素仍参与布局占位，因此把两者叠放在
+            // 同一个「弹性容器」内：容器负责吃满剩余宽度（preferred 为 0），
+            // 内部两个子页面各自 100% 填充、互斥显示，谁都不会挤压对方。
+            Rectangle {
                 horizontal-stretch: 1;
-                rows: root.file-rows;
-                total-count: root.file-total;
-                sort-key: root.sort-key;
-                sort-ascending: root.sort-ascending;
-                rename-path: root.rename-path;
-                loading: root.file-loading;
-                row_pointer_event(index, event, x, y) => {
-                    root.file_row_pointer_event(index, event, x, y);
+
+                file-list := FileList {
+                    width: 100%;
+                    height: 100%;
+                    visible: !root.settings-open;
+                    rows: root.file-rows;
+                    total-count: root.file-total;
+                    sort-key: root.sort-key;
+                    sort-ascending: root.sort-ascending;
+                    rename-path: root.rename-path;
+                    loading: root.file-loading;
+                    row_pointer_event(index, event, x, y) => {
+                        root.file_row_pointer_event(index, event, x, y);
+                    }
+                    row_double_clicked(index) => {
+                        root.file_row_double_clicked(index);
+                    }
+                    header_clicked(key) => {
+                        root.file_header_clicked(key);
+                    }
+                    scroll_changed(offset) => {
+                        root.file_scroll_changed(offset);
+                    }
+                    background_pointer_event(event, x, y) => {
+                        root.file_background_pointer_event(event, x, y);
+                    }
+                    rename_committed(path, new-name) => {
+                        root.file_rename_committed(path, new-name);
+                    }
+                    rename_cancelled() => {
+                        root.file_rename_cancelled();
+                    }
                 }
-                row_double_clicked(index) => {
-                    root.file_row_double_clicked(index);
-                }
-                header_clicked(key) => {
-                    root.file_header_clicked(key);
-                }
-                scroll_changed(offset) => {
-                    root.file_scroll_changed(offset);
-                }
-                background_pointer_event(event, x, y) => {
-                    root.file_background_pointer_event(event, x, y);
-                }
-                rename_committed(path, new-name) => {
-                    root.file_rename_committed(path, new-name);
-                }
-                rename_cancelled() => {
-                    root.file_rename_cancelled();
+
+                SettingsPage {
+                    width: 100%;
+                    height: 100%;
+                    visible: root.settings-open;
+                    nav-items: root.settings-nav-items;
+                    action-groups: root.settings-action-groups;
+                    page-title: root.settings-page-title;
+                    page-desc: root.settings-page-desc;
+                    show-add: root.settings-show-add;
+                    content-height: root.settings-content-height;
+                    nav_changed(id) => {
+                        root.settings_nav_changed(id);
+                    }
+                    action_toggled(id, enabled) => {
+                        root.settings_action_toggled(id, enabled);
+                    }
+                    group_toggled(name, expanded) => {
+                        root.settings_group_toggled(name, expanded);
+                    }
+                    action_add() => {
+                        root.settings_action_add();
+                    }
+                    action_edit(id) => {
+                        root.settings_action_edit(id);
+                    }
+                    action_delete(id) => {
+                        root.settings_action_delete(id);
+                    }
                 }
             }
         }
 
-        // ---- 状态栏 ----
+        // ---- 状态栏（设置页不显示：计数对设置无意义）----
         Rectangle {
-            height: root.statusbar-h;
+            visible: !root.settings-open;
+            height: root.settings-open ? 0px : root.statusbar-h;
             background: Theme.bg-statusbar;
 
             Rectangle {
@@ -729,6 +855,37 @@ out property <length> row-height-out: file-list.row-height-out;
         items-height: root.submenu-items-height;
         item_triggered(id) => {
             root.menu_item_triggered(id);
+        }
+    }
+
+    // 动作编辑器弹窗（新增 / 编辑自定义右键菜单）。
+    ActionEditorDialog {
+        visible: root.settings-editor-open;
+        title: root.settings-editor-title;
+        group-options: root.settings-editor-group-options;
+        edit-id <=> root.settings-editor-id;
+        edit-label <=> root.settings-editor-label;
+        edit-group <=> root.settings-editor-group;
+        edit-target <=> root.settings-editor-target;
+        edit-extensions <=> root.settings-editor-extensions;
+        edit-program <=> root.settings-editor-program;
+        edit-args <=> root.settings-editor-args;
+        browse => {
+            root.settings_editor_browse();
+        }
+        save => {
+            root.settings_editor_save(
+                root.settings-editor-id,
+                root.settings-editor-label,
+                root.settings-editor-group,
+                root.settings-editor-target,
+                root.settings-editor-extensions,
+                root.settings-editor-program,
+                root.settings-editor-args
+            );
+        }
+        cancel => {
+            root.settings_editor_cancel();
         }
     }
 

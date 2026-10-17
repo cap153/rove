@@ -47,6 +47,146 @@ pub struct ActionEntry {
     /// 适用扩展名（仅 target = file 时生效；空 = 全部）。
     pub extensions: Vec<String>,
     pub enabled: bool,
+    /// 二级菜单分组名（空 = 一级独立菜单项）。
+    pub group: String,
+    /// 是否系统内置（true = 只许开关，不许改命令/删除）。
+    pub builtin: bool,
+}
+
+/// 内置右键动作元数据（与 Rust 内建操作一一对应，由 actions.toml 开关控制显隐）。
+pub fn builtin_actions() -> Vec<ActionEntry> {
+    vec![
+        ActionEntry {
+            id: "builtin.open".into(),
+            label: "打开".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.open_with".into(),
+            label: "打开方式".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "打开方式".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.copy".into(),
+            label: "复制".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.move".into(),
+            label: "移动".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.rename".into(),
+            label: "重命名".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.stage".into(),
+            label: "添加到暂存盘".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.sendto".into(),
+            label: "发送到".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "发送到".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.terminal".into(),
+            label: "在此处打开终端".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "dir".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.delete".into(),
+            label: "删除".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.properties".into(),
+            label: "属性".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+    ]
 }
 
 impl ActionEntry {
@@ -172,7 +312,7 @@ fn program_files_candidates(rel: &str) -> Vec<PathBuf> {
 // 配置生成与自愈
 // ---------------------------------------------------------------------------
 
-/// 首次运行的默认配置（用户 schema：program/working_dir/target）。
+/// 首次运行的默认配置：内置动作 + 探测到的压缩软件动作。
 fn generate_default(detected: &[DetectedTool]) -> String {
     let mut s = String::from(
         "# Rove 右键自定义动作配置\n\
@@ -183,6 +323,8 @@ fn generate_default(detected: &[DetectedTool]) -> String {
          #   - 手动添加的注释与排版会被保留。\n\
          #\n\
          # 字段：kind = \"action\"；target = any | file | dir；\n\
+         # group = 二级菜单分组名（空 = 一级独立项）；\n\
+         # builtin = true 表示系统内置（仅允许开关）；\n\
          # extensions = 适用扩展名（仅 target = file）；\n\
          # 参数模板占位符：\n\
          #   {target_path}  第一个选中路径\n\
@@ -191,6 +333,11 @@ fn generate_default(detected: &[DetectedTool]) -> String {
          #   {name}         第一个选中项的文件名\n\
          #   {stem}         第一个选中项的文件名（不含扩展名）\n\n",
     );
+    // 内置动作（仅允许开关，不显示命令）。
+    for a in builtin_actions() {
+        s.push_str(&action_to_toml(&a));
+    }
+    // 压缩软件动作。
     for tool in detected {
         let (label, compress_args, extract_args) = match tool.id {
             "winrar" => (
@@ -210,36 +357,73 @@ fn generate_default(detected: &[DetectedTool]) -> String {
             ),
         };
         let exe = tool.exe.to_string_lossy().into_owned();
-        s.push_str(&format!(
-            "[[action]]\n\
-             id = \"archive.{id}.compress\"\n\
-             label = \"压缩为 {label}\"\n\
-             enabled = true\n\
-             kind = \"action\"\n\
-             tool = \"{id}\"\n\
-             program = '{exe}'\n\
-             args = '{compress_args}'\n\
-             working_dir = \"{{target_dir}}\"\n\
-             target = \"any\"\n\n\
-             [[action]]\n\
-             id = \"archive.{id}.extract\"\n\
-             label = \"解压到同名文件夹\"\n\
-             enabled = true\n\
-             kind = \"action\"\n\
-             tool = \"{id}\"\n\
-             program = '{exe}'\n\
-             args = '{extract_args}'\n\
-             working_dir = \"{{target_dir}}\"\n\
-             target = \"file\"\n\
-             extensions = [\"zip\", \"7z\", \"rar\", \"tar\", \"gz\", \"tgz\", \"bz2\", \"xz\", \"zst\", \"cab\", \"iso\"]\n\n",
-            id = tool.id,
-            label = label,
-            exe = exe,
-            compress_args = compress_args,
-            extract_args = extract_args,
-        ));
+        let compress = ActionEntry {
+            id: format!("archive.{id}.compress", id = tool.id),
+            label: format!("压缩为 {label}"),
+            tool: tool.id.into(),
+            program: exe.clone(),
+            args: compress_args.into(),
+            working_dir: "{target_dir}".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "压缩与解压".into(),
+            builtin: true,
+        };
+        let extract = ActionEntry {
+            id: format!("archive.{id}.extract", id = tool.id),
+            label: "解压到同名文件夹".into(),
+            tool: tool.id.into(),
+            program: exe,
+            args: extract_args.into(),
+            working_dir: "{target_dir}".into(),
+            target: "file".into(),
+            extensions: vec![
+                "zip".into(), "7z".into(), "rar".into(), "tar".into(), "gz".into(),
+                "tgz".into(), "bz2".into(), "xz".into(), "zst".into(), "cab".into(),
+                "iso".into(),
+            ],
+            enabled: true,
+            group: "压缩与解压".into(),
+            builtin: true,
+        };
+        s.push_str(&action_to_toml(&compress));
+        s.push_str(&action_to_toml(&extract));
     }
     s
+}
+
+/// 把一条动作序列化为 TOML 表。
+fn action_to_toml(a: &ActionEntry) -> String {
+    let mut lines = vec![
+        "[[action]]".into(),
+        format!("id = \"{}\"", a.id),
+        format!("label = \"{}\"", a.label),
+        format!("enabled = {}", a.enabled),
+        format!("builtin = {}", a.builtin),
+    ];
+    if !a.group.is_empty() {
+        lines.push(format!("group = \"{}\"", a.group));
+    }
+    if !a.tool.is_empty() {
+        lines.push(format!("tool = \"{}\"", a.tool));
+    }
+    if !a.program.is_empty() {
+        lines.push(format!("program = '{}'", a.program.replace('\\', "\\\\").replace('\'', "\\'")));
+    }
+    if !a.args.is_empty() {
+        lines.push(format!("args = '{}'", a.args.replace('\\', "\\\\").replace('\'', "\\'")));
+    }
+    if !a.working_dir.is_empty() {
+        lines.push(format!("working_dir = \"{}\"", a.working_dir));
+    }
+    lines.push(format!("target = \"{}\"", a.target));
+    if !a.extensions.is_empty() {
+        let exts: Vec<String> = a.extensions.iter().map(|e| format!("\"{}\"", e)).collect();
+        lines.push(format!("extensions = [{}]", exts.join(", ")));
+    }
+    lines.push(String::new());
+    lines.join("\n")
 }
 /// 加载（必要时生成）并自愈配置，返回全部动作（含禁用）。
 pub fn load_or_create() -> Vec<ActionEntry> {
@@ -274,6 +458,35 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
     let Some(items) = doc.get_mut("action").and_then(|i| i.as_array_of_tables_mut()) else {
         return Vec::new();
     };
+
+    // 一次性修复：早期版本把「无外部程序」的内置动作误判为命令缺失，
+    // 并写回 enabled=false，导致整批内置菜单项被禁用。特征：所有内置项
+    // （program 为空）同时处于禁用态——正常用户几乎不会这么做。
+    let is_builtin_row = |t: &toml_edit::Table| {
+        t.get("builtin").and_then(|v| v.as_bool()).unwrap_or(false)
+            && str_field(t, "program")
+                .or_else(|| str_field(t, "command"))
+                .unwrap_or_default()
+                .is_empty()
+    };
+    let (mut total, mut disabled) = (0usize, 0usize);
+    for t in items.iter() {
+        if !is_builtin_row(t) {
+            continue;
+        }
+        total += 1;
+        if !t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) {
+            disabled += 1;
+        }
+    }
+    if total >= 4 && disabled == total {
+        logln!("heal: 内置菜单项被历史版本批量禁用，恢复启用（{} 项）", total);
+        for t in items.iter_mut() {
+            if is_builtin_row(t) {
+                t["enabled"] = toml_edit::value(true);
+            }
+        }
+    }
 
     let mut entries = Vec::new();
     for table in items.iter_mut() {
@@ -312,12 +525,18 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
                 }
             }
         } else {
-            // 自定义动作：仅校验命令存在性。
-            let exists = !program.is_empty() && Path::new(&program).is_file();
-            if !exists && enabled {
-                logln!("heal {}: command missing, disable", id);
-                enabled = false;
-                table["enabled"] = toml_edit::value(false);
+            // 内置动作由 Rust 内部实现（无外部程序），不做程序存在性校验，
+            // 否则会被误判为「命令缺失」而整批禁用。
+            let builtin = table.get("builtin").and_then(|v| v.as_bool()).unwrap_or(false);
+            if !builtin && !program.is_empty() {
+                // 自定义动作：仅当填写的是绝对路径且已失效时才禁用；
+                // 裸程序名（如 notepad.exe）运行时按 PATH 解析，不予禁用。
+                let is_path = program.contains('\\') || program.contains('/');
+                if is_path && !Path::new(&program).is_file() && enabled {
+                    logln!("heal {}: command missing, disable", id);
+                    enabled = false;
+                    table["enabled"] = toml_edit::value(false);
+                }
             }
         }
 
@@ -341,12 +560,171 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
                 })
                 .unwrap_or_default(),
             enabled,
+            group: str_field(table, "group").unwrap_or_default(),
+            builtin: table
+                .get("builtin")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
         });
     }
 
     // 写回（toml_edit 保留注释与排版）。
     let _ = std::fs::write(path, doc.to_string());
     entries
+}
+
+/// 无损写回全部动作配置（设置页开关 / 新建 / 编辑 / 删除后保存）。
+/// 保留原有注释：先重读原始 DocumentMut，替换 action 数组。
+pub fn save(entries: &[ActionEntry]) -> Result<(), String> {
+    let Some(path) = config_path() else {
+        return Err("无法定位配置目录".into());
+    };
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap_or_else(|_| toml_edit::DocumentMut::new());
+
+    let arr = doc["action"].or_insert(toml_edit::Item::ArrayOfTables(Default::default()));
+    let arr = arr
+        .as_array_of_tables_mut()
+        .ok_or("actions 不是数组")?;
+    arr.clear();
+    for e in entries {
+        let mut t = toml_edit::Table::new();
+        t["id"] = toml_edit::value(&e.id);
+        t["label"] = toml_edit::value(&e.label);
+        t["enabled"] = toml_edit::value(e.enabled);
+        t["builtin"] = toml_edit::value(e.builtin);
+        if !e.group.is_empty() {
+            t["group"] = toml_edit::value(&e.group);
+        }
+        if !e.tool.is_empty() {
+            t["tool"] = toml_edit::value(&e.tool);
+        }
+        if !e.program.is_empty() {
+            t["program"] = toml_edit::value(&e.program);
+        }
+        if !e.args.is_empty() {
+            t["args"] = toml_edit::value(&e.args);
+        }
+        if !e.working_dir.is_empty() {
+            t["working_dir"] = toml_edit::value(&e.working_dir);
+        }
+        t["target"] = toml_edit::value(&e.target);
+        if !e.extensions.is_empty() {
+            let mut a = toml_edit::Array::new();
+            for ext in &e.extensions {
+                a.push(ext.as_str());
+            }
+            t["extensions"] = toml_edit::value(a);
+        }
+        arr.push(t);
+    }
+
+    std::fs::write(&path, doc.to_string())
+        .map_err(|e| format!("actions.toml 写入失败: {e}"))?;
+    Ok(())
+}
+
+/// 用内置动作元数据对现有配置做一次「合并」：保留用户的开关状态，
+/// 新增/重命名内置动作时自动补全，缺失的压缩动作按当前探测结果生成。
+pub fn heal_full(entries: &[ActionEntry]) -> Vec<ActionEntry> {
+    let mut out: Vec<ActionEntry> = Vec::new();
+    let mut by_id: std::collections::HashMap<String, ActionEntry> = entries
+        .iter()
+        .map(|e| (e.id.clone(), e.clone()))
+        .collect();
+
+    // 1) 内置动作：以代码为准，继承用户 enabled。
+    for builtin in builtin_actions() {
+        let mut e = builtin;
+        if let Some(user) = by_id.remove(&e.id) {
+            e.enabled = user.enabled;
+            // 若是自定义把 builtin 设成 true 的条目，同样保留。
+        }
+        out.push(e);
+    }
+
+    // 2) 压缩软件动作：按当前探测结果自愈。
+    let detected = detect_all();
+    for tool in detected {
+        let ids = [
+            format!("archive.{id}.compress", id = tool.id),
+            format!("archive.{id}.extract", id = tool.id),
+        ];
+        for (i, id) in ids.iter().enumerate() {
+            if let Some(user) = by_id.remove(id) {
+                let mut e = user;
+                // program 失效时更新为当前探测路径；enabled 尊重用户开关。
+                let exe = tool.exe.to_string_lossy().into_owned();
+                if e.program.is_empty() || !Path::new(&e.program).is_file() {
+                    e.program = exe.clone();
+                }
+                // 旧版配置无 group 字段：归一化到「压缩与解压」，
+                // 否则设置页里会与一级独立项混在一组。
+                if e.group.is_empty() {
+                    e.group = "压缩与解压".into();
+                }
+                out.push(e);
+            } else {
+                // 新增探测到的压缩动作。
+                let (label, compress_args, extract_args) = match tool.id {
+                    "winrar" => (
+                        "WinRAR",
+                        "a -r -ep1 \"{target_dir}\\{stem}.rar\" \"{target_path}\"",
+                        "x -r \"{target_path}\" \"{target_dir}\\{stem}\"",
+                    ),
+                    "7zip" => (
+                        "7-Zip",
+                        "a -r \"{target_dir}\\{stem}.7z\" \"{target_path}\"",
+                        "x -r \"{target_path}\" -o{target_dir}\\{stem} -y",
+                    ),
+                    _ => (
+                        "Bandizip",
+                        "c -t:zip \"{target_dir}\\{stem}.zip\" \"{target_path}\"",
+                        "bx -y -o:{target_dir}\\{stem} \"{target_path}\"",
+                    ),
+                };
+                out.push(ActionEntry {
+                    id: id.clone(),
+                    label: if i == 0 {
+                        format!("压缩为 {label}")
+                    } else {
+                        "解压到同名文件夹".into()
+                    },
+                    tool: tool.id.into(),
+                    program: tool.exe.to_string_lossy().into_owned(),
+                    args: if i == 0 {
+                        compress_args.into()
+                    } else {
+                        extract_args.into()
+                    },
+                    working_dir: "{target_dir}".into(),
+                    target: if i == 0 { "any".into() } else { "file".into() },
+                    extensions: if i == 0 {
+                        vec![]
+                    } else {
+                        vec![
+                            "zip".into(), "7z".into(), "rar".into(), "tar".into(), "gz".into(),
+                            "tgz".into(), "bz2".into(), "xz".into(), "zst".into(), "cab".into(),
+                            "iso".into(),
+                        ]
+                    },
+                    enabled: true,
+                    group: "压缩与解压".into(),
+                    builtin: true,
+                });
+            }
+        }
+    }
+
+    // 3) 剩余条目：用户自定义动作（非 builtin、非压缩），保留原顺序。
+    for e in entries {
+        if !e.builtin && e.tool.is_empty() && by_id.contains_key(&e.id) {
+            out.push(e.clone());
+        }
+    }
+    out
 }
 
 /// 写字符串字段（兼容 program/command 双字段名）。
@@ -514,8 +892,13 @@ mod tests {
         let text = generate_default(&tools);
         let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
         let arr = doc.get("action").unwrap().as_array_of_tables().unwrap();
-        assert_eq!(arr.len(), 2);
+        // 内置动作 + 每个探测到的压缩工具各 2 条（压缩 / 解压）。
+        assert_eq!(arr.len(), builtin_actions().len() + 2);
         assert!(text.contains("# Rove 右键自定义动作配置"));
+        // 关键条目齐备。
+        assert!(text.contains("id = \"builtin.open\""));
+        assert!(text.contains("id = \"archive.winrar.compress\""));
+        assert!(text.contains("id = \"archive.winrar.extract\""));
     }
 
     #[test]

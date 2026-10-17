@@ -11,6 +11,7 @@
 use std::path::PathBuf;
 
 /// IPC 管道名。
+#[allow(dead_code)]
 pub const PIPE_NAME: &str = "\\\\.\\pipe\\rove_ipc";
 
 /// 从启动参数提取唤醒目标（第一个存在的目录；文件忽略，留给 Phase 3+ 关联打开）。

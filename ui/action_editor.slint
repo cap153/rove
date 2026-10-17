@@ -1,0 +1,398 @@
+// 动作编辑器弹窗（新增 / 编辑自定义右键菜单项）。
+import { Theme } from "common.slint";
+
+// 作用对象单选按钮。
+component RadioDot inherits Rectangle {
+    in-out property <bool> selected: false;
+    in property <string> label: "";
+    callback clicked-cb();
+
+    height: 24px;
+    background: transparent;
+
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: start;
+
+        Rectangle {
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 7px;
+            border-width: 1px;
+            border-color: root.selected ? Theme.accent : Theme.border;
+
+            Rectangle {
+                visible: root.selected;
+                x: 3px;
+                y: 3px;
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: Theme.accent;
+            }
+        }
+
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.clicked-cb();
+        }
+    }
+}
+
+// 层级归属选项（可点击的标签）。
+component GroupChip inherits Rectangle {
+    in-out property <bool> selected: false;
+    in property <string> label: "";
+    callback clicked-cb();
+
+    height: 26px;
+    border-radius: 4px;
+    background: root.selected ? Theme.accent : transparent;
+    border-width: 1px;
+    border-color: root.selected ? Theme.accent : Theme.border;
+
+    // padding 仅布局元素有效：用 HorizontalLayout 承载内边距。
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+
+        Text {
+            text: root.label;
+            color: root.selected ? white : Theme.text-primary;
+            font-size: 12px;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.clicked-cb();
+        }
+    }
+}
+
+// 参数模板占位符按钮：点击追加到参数文本框（前置空格）。
+component TokenChip inherits Rectangle {
+    in property <string> token: "";
+    in-out property <string> target-text;
+    callback append-cb();
+
+    height: 22px;
+    border-radius: 4px;
+    border-width: 1px;
+    border-color: Theme.border;
+    background: token-ta.has-hover ? Theme.bg-hover : transparent;
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+
+        Text {
+            text: root.token;
+            color: Theme.text-secondary;
+            font-size: 11px;
+            vertical-alignment: center;
+        }
+    }
+
+    token-ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            // 已有内容时补一个空格再追加。
+            if (root.target-text != "") {
+                root.target-text += " ";
+            }
+            root.target-text += root.token;
+            root.append-cb();
+        }
+    }
+}
+
+export component ActionEditorDialog inherits Rectangle {
+    in property <string> title: "新建动作";
+    // 可选层级归属（来自已有分组），始终含「一级菜单」。
+    in property <[string]> group-options: ["一级菜单"];
+    in-out property <string> edit-id: "";
+    in-out property <string> edit-label: "";
+    in-out property <string> edit-group: "";
+    in-out property <string> edit-target: "any";
+    in-out property <string> edit-extensions: "";
+    in-out property <string> edit-program: "";
+    in-out property <string> edit-args: "";
+    in-out property <string> edit-working-dir: "";
+
+    callback save();
+    callback cancel();
+    callback browse();
+
+    // 非布局子元素必须显式撑满窗口，否则内部 100% 全为 0。
+    width: 100%;
+    height: 100%;
+    opacity: 1;
+
+    // 半透明遮罩
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000;
+        opacity: 0.45;
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => {
+                root.cancel();
+            }
+        }
+    }
+
+    // 弹窗卡片（高度容纳全部字段 + 底部按钮）。
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: max(8px, (parent.height - self.height) / 2);
+        width: 480px;
+        height: 560px;
+        background: Theme.bg-input;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        VerticalLayout {
+            padding-left: 20px;
+            padding-right: 20px;
+            padding-top: 20px;
+            padding-bottom: 20px;
+            spacing: 10px;
+
+            Text {
+                text: root.title;
+                color: Theme.text-primary;
+                font-size: 16px;
+                font-weight: 600;
+            }
+
+            // 显示名称
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "名称"; color: Theme.text-secondary; font-size: 12px; }
+                TextInput {
+                    text <=> root.edit-label;
+                    height: 32px;
+                    font-size: 13px;
+                    color: Theme.text-primary;
+                    single-line: true;
+                }
+            }
+
+            // 程序路径 + 浏览按钮
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "执行路径"; color: Theme.text-secondary; font-size: 12px; }
+                HorizontalLayout {
+                    height: 32px;
+                    spacing: 8px;
+
+                    TextInput {
+                        horizontal-stretch: 1;
+                        text <=> root.edit-program;
+                        height: 32px;
+                        font-size: 13px;
+                        color: Theme.text-primary;
+                        single-line: true;
+                    }
+
+                    Rectangle {
+                        width: 80px;
+                        height: 32px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: browse-ta.has-hover ? Theme.bg-hover : transparent;
+
+                        Text {
+                            text: "浏览…";
+                            color: Theme.text-primary;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+
+                        browse-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.browse();
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 参数模板
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "参数模板"; color: Theme.text-secondary; font-size: 12px; }
+                TextInput {
+                    text <=> root.edit-args;
+                    height: 32px;
+                    font-size: 13px;
+                    color: Theme.text-primary;
+                    single-line: true;
+                }
+
+                // 点击追加占位符（前置空格）。
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+
+                    for tok in ["{target_path}", "{target_paths}", "{target_dir}", "{name}", "{stem}"] : TokenChip {
+                        token: tok;
+                        target-text <=> root.edit-args;
+                    }
+                }
+            }
+
+            // 作用对象（单选）
+            VerticalLayout {
+                spacing: 2px;
+                Text { text: "作用对象"; color: Theme.text-secondary; font-size: 12px; }
+
+                HorizontalLayout {
+                    spacing: 16px;
+                    alignment: start;
+
+                    RadioDot {
+                        label: "全部";
+                        selected: root.edit-target == "any";
+                        clicked-cb => { root.edit-target = "any"; }
+                    }
+                    RadioDot {
+                        label: "仅文件";
+                        selected: root.edit-target == "file";
+                        clicked-cb => { root.edit-target = "file"; }
+                    }
+                    RadioDot {
+                        label: "仅文件夹";
+                        selected: root.edit-target == "dir";
+                        clicked-cb => { root.edit-target = "dir"; }
+                    }
+                }
+            }
+
+            // 层级归属（选择已有分组）
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "层级归属"; color: Theme.text-secondary; font-size: 12px; }
+
+                // 分组较多时横向滚动，避免溢出卡片。
+                Flickable {
+                    height: 26px;
+                    content-width: chips.preferred-width;
+
+                    chips := HorizontalLayout {
+                        height: 26px;
+                        spacing: 6px;
+                        alignment: start;
+                        padding-right: 4px;
+
+                        for opt in root.group-options : GroupChip {
+                            label: opt;
+                            selected: root.edit-group == (opt == "一级菜单" ? "" : opt);
+                            clicked-cb => {
+                                root.edit-group = opt == "一级菜单" ? "" : opt;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 扩展名
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "适用扩展名（仅「仅文件」，逗号分隔，可空）"; color: Theme.text-secondary; font-size: 12px; }
+                TextInput {
+                    text <=> root.edit-extensions;
+                    height: 32px;
+                    font-size: 13px;
+                    color: Theme.text-primary;
+                    single-line: true;
+                }
+            }
+
+            // 底部按钮
+            HorizontalLayout {
+                height: 36px;
+                spacing: 12px;
+                alignment: end;
+
+                Rectangle {
+                    width: 70px;
+                    height: parent.height;
+                    background: cancel-ta.has-hover ? Theme.bg-hover : transparent;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+
+                    Text {
+                        text: "取消";
+                        color: Theme.text-primary;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    cancel-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.cancel();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 70px;
+                    height: parent.height;
+                    background: save-ta.has-hover ? Theme.accent-hover : Theme.accent;
+                    border-radius: 6px;
+
+                    Text {
+                        text: "保存";
+                        color: white;
+                        font-size: 13px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    save-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.save();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

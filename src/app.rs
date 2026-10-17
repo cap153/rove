@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use slint::language::{PointerEvent, PointerEventButton, PointerEventKind};
 use slint::{
@@ -132,9 +132,23 @@ pub struct App {
     last_click: Option<(PathBuf, std::time::Instant)>,
     /// 侧栏分区拖拽：正在拖动的分区 header 行索引。
     sidebar_drag: Option<usize>,
+    /// 外部拖入缓冲：winit 对一次投放逐文件发事件，聚合后统一处理。
+    drop_buffer: Vec<PathBuf>,
+    /// 任务 3（刷新）：各打开目录的 mtime 快照，轮询检测外部/内部变更。
+    dir_mtimes: HashMap<PathBuf, SystemTime>,
+    /// 拖入聚合定时器（最后一个文件事件后短暂延迟处理）。
+    drop_timer: Timer,
+    /// 拖出待定手势：(按下时行局部 x, y, 待拖路径)。
+    drag_pending: Option<(f32, f32, Vec<PathBuf>)>,
+    /// 任务 3.1：QuickLook 预览窗口（独立 Slint Window）。
+    preview: PreviewWindow,
+    /// 预览窗口是否已 show（首次需 show，之后用 visible 控制）。
+    preview_shown: bool,
     /// actions.toml 驱动的自定义动作（压缩/解压/自定义）。
     actions: Vec<crate::ops::actions::ActionEntry>,
     /// 缩略图 LRU（Phase 5）：(路径, 尺寸) → 已生成的 Slint 图像。
+    /// 缩略图管线暂未在视图中启用，保留基础设施。
+    #[allow(dead_code)]
     thumb_cache: HashMap<(PathBuf, u32), slint::Image>,
     /// 缩略图缓存插入序（容量淘汰用）。
     thumb_order: Vec<(PathBuf, u32)>,
@@ -142,6 +156,7 @@ pub struct App {
     thumb_pending: HashSet<(PathBuf, u32)>,
     /// 失败负缓存（本会话内不再重试，避免反复 COM 调用）。
     thumb_failed: HashSet<(PathBuf, u32)>,
+    #[allow(dead_code)]
     thumb_tx: Sender<(PathBuf, u32)>,
     list_tx: Sender<ListRequest>,
     list_rx: Receiver<ListResult>,
@@ -182,6 +197,12 @@ impl App {
             menu_target: None,
             last_click: None,
             sidebar_drag: None,
+            drop_buffer: Vec::new(),
+            dir_mtimes: HashMap::new(),
+            drop_timer: Timer::default(),
+            drag_pending: None,
+            preview: PreviewWindow::new().expect("failed to create preview window"),
+            preview_shown: false,
             actions: Vec::new(),
             thumb_cache: HashMap::new(),
             thumb_order: Vec::new(),
@@ -216,6 +237,35 @@ impl App {
         };
         tab_loading_flag(&self.ui, tab_index == self.state.active_tab, true);
         self.request_listing(tab.id, tab.generation, tab.path.clone(), tab.sort);
+    }
+
+    /// 任务 3：轮询各打开目录的 mtime，检测外部/内部变更后实时刷新对应标签。
+    fn poll_dir_changes(&mut self) {
+        if self.ui.get_settings_open() {
+            return;
+        }
+        let n = self.state.tabs.len();
+        let mut to_reload: Vec<usize> = Vec::new();
+        for i in 0..n {
+            let path = match self.state.tabs[i].path.clone() {
+                Some(p) => p,
+                None => continue,
+            };
+            let mtime = match std::fs::symlink_metadata(&path).and_then(|m| m.modified()) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            match self.dir_mtimes.get(&path) {
+                Some(prev) if *prev == mtime => {}
+                _ => {
+                    self.dir_mtimes.insert(path.clone(), mtime);
+                    to_reload.push(i);
+                }
+            }
+        }
+        for i in to_reload {
+            self.reload_tab(i);
+        }
     }
 
     /// 重新列举当前标签。
@@ -456,12 +506,57 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
 }
 
 /// BGRA→RGBA 已由 thumbs 模块完成；这里包成 Slint 图像。
+#[allow(dead_code)]
 fn to_slint_image(w: u32, h: u32, rgba: &[u8]) -> Option<slint::Image> {
     if w == 0 || h == 0 || rgba.len() != (w * h * 4) as usize {
         return None;
     }
     let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(rgba, w, h);
     Some(slint::Image::from_rgba8(buffer))
+}
+
+/// 拖出手势判定（纯函数，便于测试）：给定按下点与当前指针位置，
+/// 若位移超过阈值则返回待拖路径（调用方应随后清除 drag_pending 并启动拖出）。
+/// 关键：未越过阈值时必须返回 None 且不消耗 drag_pending，否则首次微小移动
+/// 就会清空待定手势，导致永远无法拖出。
+fn drag_gesture_paths(
+    drag_pending: &Option<(f32, f32, Vec<PathBuf>)>,
+    x: f32,
+    y: f32,
+) -> Option<Vec<PathBuf>> {
+    let (sx, sy, paths) = drag_pending.as_ref()?;
+    let dx = x - sx;
+    let dy = y - sy;
+    if dx * dx + dy * dy > crate::sys::dnd::DRAG_THRESHOLD * crate::sys::dnd::DRAG_THRESHOLD {
+        Some(paths.clone())
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drag_gesture_accumulates_until_threshold() {
+        let paths = vec![PathBuf::from("C:\\a.txt")];
+        let mut dp = Some((0.0f32, 0.0f32, paths.clone()));
+
+        // 首次微小移动（1px）：未越过 4px 阈值，不应触发，且手势保留。
+        assert!(drag_gesture_paths(&dp, 1.0, 1.0).is_none());
+        assert!(dp.is_some(), "手势不应被微小移动清空");
+
+        // 第二次累计到 5px：越过阈值，触发并返回路径。
+        let fired = drag_gesture_paths(&dp, 3.0, 4.0);
+        assert!(fired.is_some());
+        assert_eq!(fired.unwrap(), paths);
+    }
+
+    #[test]
+    fn drag_gesture_none_when_no_pending() {
+        assert!(drag_gesture_paths(&None, 10.0, 10.0).is_none());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -478,11 +573,13 @@ impl App {
                 id: t.id as i32,
                 title: t.title().into(),
                 active: t.id == self.state.active().id,
+                is_settings: t.kind == crate::state::TabKind::Settings,
             })
             .collect();
         self.ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
         self.ui.set_active_tab(self.state.active_tab as i32);
         self.ui.set_tab_loading(self.state.active().loading);
+        self.ui.set_settings_open(self.state.active().kind == crate::state::TabKind::Settings);
     }
 
     fn sync_nav(&self) {
@@ -871,15 +968,18 @@ impl App {
     }
 
     /// 缩略图容量上限。
+    #[allow(dead_code)]
     const THUMB_CACHE_CAP: usize = 512;
 
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
+    #[allow(dead_code)]
     fn fail_thumbnail(&mut self, key: (PathBuf, u32)) {
         self.thumb_pending.remove(&key);
         self.thumb_failed.insert(key);
     }
 
     /// 写入缩略图缓存（事件循环线程），并刷新可见行。
+    #[allow(dead_code)]
     fn store_thumbnail(&mut self, key: (PathBuf, u32), img: slint::Image) {
         self.thumb_pending.remove(&key);
         if self.thumb_cache.contains_key(&key) {
@@ -1121,8 +1221,22 @@ fn apply_theme(ui: &MainWindow, choice: ThemeChoice) {
 // 菜单构建
 // ---------------------------------------------------------------------------
 
+/// 编辑器「层级归属」候选：已有二级分组（去空去重）+ 内置的「一级菜单」。
+fn group_options(actions: &[crate::ops::actions::ActionEntry]) -> Vec<SharedString> {
+    let mut opts: Vec<SharedString> = vec!["一级菜单".into()];
+    for a in actions {
+        let g = a.group.trim();
+        if !g.is_empty() && !opts.iter().any(|o| o == g) {
+            opts.push(g.into());
+        }
+    }
+    opts
+}
+
 impl App {
     /// 依据目标构建右键菜单模型；同时返回内容高度（逻辑像素）。
+    /// 自 Sprint 2 起，Files 视图菜单完全由 actions.toml（含内置动作）驱动，
+    /// 按 group 字段自动组织一级项与二级子菜单。
     fn build_menu(&self, target: &MenuTarget) -> (Vec<MenuItem>, f32) {
         let mut items: Vec<MenuItem> = Vec::new();
         let sep = || MenuItem {
@@ -1173,59 +1287,47 @@ impl App {
         match target {
             MenuTarget::Files(paths) => {
                 let single = paths.len() == 1;
-                let first_is_dir = paths
-                    .first()
-                    .map(|p| p.is_dir())
-                    .unwrap_or(false);
-                items.push(item(ACT_OPEN, "打开", "▸", accent, "normal"));
-                items.push(MenuItem {
-                    id: "openwith".into(),
-                    label: "打开方式".into(),
-                    icon_text: "◈".into(),
-                    icon_color: gray,
-                    kind: "normal".into(),
-                    enabled: false,
-                });
-                items.push(sep());
-                items.push(item(ACT_COPY, "复制", "⧉", blue, "normal"));
-                items.push(item(ACT_CUT, "移动", "✂", blue, "normal"));
-                items.push(MenuItem {
-                    id: ACT_RENAME.into(),
-                    label: "重命名".into(),
-                    icon_text: "✎".into(),
-                    icon_color: gray,
-                    kind: "normal".into(),
-                    enabled: single,
-                });
-                items.push(sep());
-                // 压缩/解压与自定义动作（actions.toml 驱动，Phase 4）。
-                self.append_action_items(&mut items, paths);
-                items.push(item(ACT_STAGE, "添加到暂存盘", "⇄", accent, "normal"));
-                items.push(item(ACT_SENDTO, "发送到", "➤", amber, "submenu"));
-                items.push(sep());
-                items.push(item(
-                    ACT_TERMINAL,
-                    if first_is_dir { "在此处打开终端" } else { "在终端中打开" },
-                    ">_",
-                    gray,
-                    "normal",
-                ));
-                items.push(MenuItem {
-                    id: ACT_DELETE.into(),
-                    label: "删除".into(),
-                    icon_text: "✕".into(),
-                    icon_color: danger,
-                    kind: "danger".into(),
-                    enabled: true,
-                });
-                items.push(MenuItem {
-                    id: "properties".into(),
-                    label: "属性".into(),
-                    icon_text: "☰".into(),
-                    icon_color: gray,
-                    kind: "normal".into(),
-                    enabled: false,
-                });
+                // 从 actions.toml 过滤出适用当前选中的动作，按 group 分组。
+                let mut groups: std::collections::BTreeMap<String, Vec<&crate::ops::actions::ActionEntry>> =
+                    std::collections::BTreeMap::new();
+                let mut root_order: Vec<String> = Vec::new();
+                for a in self.actions.iter().filter(|a| a.enabled && a.matches_selection(paths)) {
+                    let g = a.group.clone();
+                    if !groups.contains_key(&g) {
+                        root_order.push(g.clone());
+                    }
+                    groups.entry(g).or_default().push(a);
+                }
+
+                // group="" 的项作为一级菜单项直接输出。
+                if let Some(root_items) = groups.remove("") {
+                    for a in root_items {
+                        let mut m = self.action_menu_item(a);
+                        // 重命名在单选外置灰。
+                        if a.id == "builtin.rename" && !single {
+                            m.enabled = false;
+                        }
+                        // 终端：非目录时改标签。
+                        if a.id == "builtin.terminal" {
+                            let first_is_dir = paths.first().map(|p| p.is_dir()).unwrap_or(false);
+                            m.label = if first_is_dir { "在此处打开终端".into() } else { "在终端中打开".into() };
+                        }
+                        items.push(m);
+                    }
+                }
+
+                // 非空 group 输出为二级子菜单；顺序保留 actions.toml 中首次出现顺序。
+                for g in root_order.iter().filter(|g| !g.is_empty()) {
+                    let Some(_) = groups.get(g) else { continue };
+                    items.push(MenuItem {
+                        id: format!("group:{g}").into(),
+                        label: g.clone().into(),
+                        icon_text: "▣".into(),
+                        icon_color: amber,
+                        kind: "submenu".into(),
+                        enabled: true,
+                    });
+                }
             }
             MenuTarget::Background => {
                 let has_clipboard = !self.state.clipboard_paths.is_empty();
@@ -1260,51 +1362,6 @@ impl App {
         (items, height)
     }
 
-    /// "发送到" 二级菜单。
-    /// Files 菜单：actions.toml 驱动的动作。
-    /// 按 tool 分组：首个出现的工具动作进一级，其余工具聚合到二级「其他压缩软件」；
-    /// 无 tool 的自定义动作直接进一级。
-    fn append_action_items(&self, items: &mut Vec<MenuItem>, paths: &[PathBuf]) {
-        let applicable: Vec<&crate::ops::actions::ActionEntry> = self
-            .actions
-            .iter()
-            .filter(|a| a.enabled && a.matches_selection(paths))
-            .collect();
-        if applicable.is_empty() {
-            return;
-        }
-        let mut seen_tools: Vec<String> = Vec::new();
-        let mut others: Vec<MenuItem> = Vec::new();
-        for a in &applicable {
-            if a.tool.is_empty() || !seen_tools.contains(&a.tool) {
-                if !a.tool.is_empty() {
-                    seen_tools.push(a.tool.clone());
-                }
-                items.push(self.action_menu_item(a));
-            } else {
-                others.push(self.action_menu_item(a));
-            }
-        }
-        if !others.is_empty() {
-            items.push(MenuItem {
-                id: SharedString::default(),
-                label: SharedString::default(),
-                icon_text: SharedString::default(),
-                icon_color: Color::default(),
-                kind: "separator".into(),
-                enabled: false,
-            });
-            items.push(MenuItem {
-                id: SUBMENU_COMPRESSORS.into(),
-                label: "其他压缩软件".into(),
-                icon_text: "▣".into(),
-                icon_color: Color::from_rgb_u8(0xE8, 0xB3, 0x3C),
-                kind: "submenu".into(),
-                enabled: true,
-            });
-        }
-    }
-
     /// 动作条目 → 菜单项。
     fn action_menu_item(&self, a: &crate::ops::actions::ActionEntry) -> MenuItem {
         let icon = if a.label.contains("解压") { "▾" } else { "▣" };
@@ -1318,7 +1375,7 @@ impl App {
         }
     }
 
-    /// 按子菜单 id 构建二级菜单内容（发送到 / 其他压缩软件）。
+    /// 按子菜单 id 构建二级菜单内容。
     fn build_submenu_for(&self, id: &str) -> (Vec<MenuItem>, f32) {
         if id == ACT_VIEW {
             let current = self.config.view_mode.clone();
@@ -1345,37 +1402,70 @@ impl App {
             let height = items.len() as f32 * 28.0 + 8.0;
             return (items, height);
         }
-        if id == SUBMENU_COMPRESSORS {
+
+        // 动作分组二级菜单（打开方式 / 发送到 / 压缩与解压 / 自定义分组）。
+        if let Some(group_name) = id.strip_prefix("group:") {
             let targets = match &self.menu_target {
                 Some(MenuTarget::Files(p)) => p.clone(),
                 _ => Vec::new(),
             };
-            let applicable: Vec<&crate::ops::actions::ActionEntry> = self
+            let amber = Color::from_rgb_u8(0xE8, 0xB3, 0x3C);
+            let gray = Color::from_rgb_u8(0x8A, 0x8F, 0x98);
+
+            if group_name == "打开方式" {
+                let items = vec![
+                    MenuItem {
+                        id: "act:builtin.open_with".into(),
+                        label: "打开方式...".into(),
+                        icon_text: "◈".into(),
+                        icon_color: gray,
+                        kind: "normal".into(),
+                        enabled: true,
+                    },
+                ];
+                let n = items.len();
+                return (items, n as f32 * 28.0 + 8.0);
+            }
+
+            if group_name == "发送到" {
+                let items = vec![
+                    MenuItem {
+                        id: ACT_SENDTO_DESKTOP.into(),
+                        label: "桌面快捷方式".into(),
+                        icon_text: "\u{2302}".into(),
+                        icon_color: amber,
+                        kind: "normal".into(),
+                        enabled: true,
+                    },
+                    MenuItem {
+                        id: ACT_SENDTO_STARTMENU.into(),
+                        label: "开始菜单快捷方式".into(),
+                        icon_text: "\u{229e}".into(),
+                        icon_color: amber,
+                        kind: "normal".into(),
+                        enabled: true,
+                    },
+                ];
+                let n = items.len();
+                return (items, n as f32 * 28.0 + 8.0);
+            }
+
+            let items: Vec<MenuItem> = self
                 .actions
                 .iter()
-                .filter(|a| a.enabled && a.matches_selection(&targets))
+                .filter(|a| a.enabled && a.group == group_name && a.matches_selection(&targets))
+                .map(|a| self.action_menu_item(a))
                 .collect();
-            // 与一级相同的分组顺序，跳过每个工具的第一个动作。
-            let mut seen_tools: Vec<String> = Vec::new();
-            let mut others: Vec<MenuItem> = Vec::new();
-            for a in &applicable {
-                if a.tool.is_empty() {
-                    continue;
-                }
-                if !seen_tools.contains(&a.tool) {
-                    seen_tools.push(a.tool.clone());
-                } else {
-                    others.push(self.action_menu_item(a));
-                }
-            }
-            let n = others.len();
-            return (others, n as f32 * 28.0 + 8.0);
+            let n = items.len();
+            return (items, n as f32 * 28.0 + 8.0);
         }
-        self.build_submenu()
+
+        // 默认：发送到。
+        self.build_sendto_submenu()
     }
 
-    /// 「发送到」二级菜单。
-    fn build_submenu(&self) -> (Vec<MenuItem>, f32) {
+    /// 「发送到」二级菜单兜底。
+    fn build_sendto_submenu(&self) -> (Vec<MenuItem>, f32) {
         let amber = Color::from_rgb_u8(0xE8, 0xB3, 0x3C);
         let items = vec![
             MenuItem {
@@ -1413,16 +1503,153 @@ impl App {
 }
 
 /// "发送到" 菜单项 ID（在 build_menu 中使用）。
-const ACT_SENDTO: &str = "sendto";
 const ACT_MANAGE_ACTIONS: &str = "manage_actions";
 const ACT_VIEW: &str = "view_menu";
-const SUBMENU_COMPRESSORS: &str = "submenu:compressors";
 
 // ---------------------------------------------------------------------------
 // 其余交互动作（键盘快捷键 / 侧边栏 / 列排序 / 重命名 / 暂存盘）
 // ---------------------------------------------------------------------------
 
 impl App {
+    /// 打开设置页标签（本地右键菜单子页）。
+    fn open_settings_tab(&mut self, subpage: crate::state::SettingsSubpage) {
+        self.state.open_settings(subpage);
+        self.ui.set_settings_open(true);
+        self.ui.set_filter_text(SharedString::default());
+        self.sync_tabs();
+        self.sync_nav();
+        self.sync_breadcrumbs();
+        self.sync_file_list();
+        self.sync_status();
+        self.sync_settings();
+    }
+
+    /// 保存当前 actions 并重新加载（自愈压缩软件路径、合并内置动作）。
+    fn save_actions_and_reload(&mut self) {
+        if let Err(e) = crate::ops::actions::save(&self.actions) {
+            self.set_status_job(e);
+            return;
+        }
+        let raw = crate::ops::actions::load_or_create();
+        self.actions = crate::ops::actions::heal_full(&raw);
+    }
+    /// 同步设置页数据到 UI。
+    fn sync_settings(&self) {
+        use crate::state::{SettingsSubpage, TabKind};
+        let tab = self.state.active();
+        let current = if tab.kind == TabKind::Settings {
+            tab.settings_subpage
+        } else {
+            SettingsSubpage::General
+        };
+
+        let nav_items = vec![
+            SettingsNavItem {
+                id: "general".into(),
+                label: "通用".into(),
+                icon: "⚙".into(),
+                selected: current == SettingsSubpage::General,
+            },
+            SettingsNavItem {
+                id: "search".into(),
+                label: "搜索与索引".into(),
+                icon: "⌕".into(),
+                selected: current == SettingsSubpage::SearchAndIndex,
+            },
+            SettingsNavItem {
+                id: "context".into(),
+                label: "本地右键菜单".into(),
+                icon: "☰".into(),
+                selected: current == SettingsSubpage::ContextMenu,
+            },
+            SettingsNavItem {
+                id: "duplicates".into(),
+                label: "重复文件".into(),
+                icon: "◫".into(),
+                selected: current == SettingsSubpage::Duplicates,
+            },
+            SettingsNavItem {
+                id: "quicklook".into(),
+                label: "快速预览".into(),
+                icon: "⏵".into(),
+                selected: current == SettingsSubpage::QuickLook,
+            },
+        ];
+        self.ui.set_settings_nav_items(ModelRc::new(VecModel::from(nav_items)));
+
+        // 子页标题 / 描述 / 新增入口（未实现子页显示占位提示）。
+        let (title, desc, show_add) = match current {
+            SettingsSubpage::General => ("通用", "应用启动、视图与行为偏好。", false),
+            SettingsSubpage::SearchAndIndex => ("搜索与索引", "拼音检索、索引范围与缓存策略。", false),
+            SettingsSubpage::ContextMenu => (
+                "本地右键菜单",
+                "开关控制菜单项显隐；内置动作仅允许开关，自定义动作可编辑或删除。",
+                true,
+            ),
+            SettingsSubpage::Duplicates => ("重复文件", "重复项扫描规则与清理策略。", false),
+            SettingsSubpage::QuickLook => ("快速预览", "空格键快速预览的行为配置。", false),
+        };
+        self.ui.set_settings_page_title(title.into());
+        self.ui.set_settings_page_desc(desc.into());
+        self.ui.set_settings_show_add(show_add);
+
+        if current != SettingsSubpage::ContextMenu {
+            self.ui.set_settings_action_groups(ModelRc::new(VecModel::from(Vec::<SettingsActionGroup>::new())));
+            self.ui.set_settings_content_height(0.0);
+            return;
+        }
+
+        let mut groups_map: std::collections::BTreeMap<String, Vec<SettingsActionItem>> =
+            std::collections::BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for a in &self.actions {
+            let g = a.group.clone();
+            if !groups_map.contains_key(&g) {
+                order.push(g.clone());
+            }
+            let item = SettingsActionItem {
+                id: a.id.clone().into(),
+                label: a.label.clone().into(),
+                target: a.target.clone().into(),
+                extensions: a.extensions.join(", ").into(),
+                program: a.program.clone().into(),
+                enabled: a.enabled,
+                builtin: a.builtin,
+            };
+            groups_map.entry(g).or_default().push(item);
+        }
+        let groups: Vec<SettingsActionGroup> = order
+            .into_iter()
+            .map(|g| {
+                let name = if g.is_empty() {
+                    "一级独立菜单项".into()
+                } else {
+                    g.clone().into()
+                };
+                SettingsActionGroup {
+                    name,
+                    expanded: true,
+                    items: ModelRc::new(VecModel::from(groups_map.remove(&g).unwrap_or_default())),
+                }
+            })
+            .collect();
+        let groups_model = VecModel::from(groups);
+        // Flickable 滚动范围：按各分组展开状态累加卡片高度（44 头 + 42/行）+ 12 间距。
+        let mut content_h = 0.0f32;
+        let n = groups_model.row_count();
+        for i in 0..n {
+            if let Some(g) = groups_model.row_data(i) {
+                content_h += if g.expanded {
+                    44.0 + g.items.row_count() as f32 * 42.0
+                } else {
+                    44.0
+                } + 12.0;
+            }
+        }
+        self.ui.set_settings_content_height(content_h);
+        self.ui.set_settings_action_groups(ModelRc::new(groups_model));
+    }
+
     /// 打开视图模式下拉菜单（Pulse 式）。
     fn open_view_picker(&mut self) {
         let current = self.config.view_mode.clone();
@@ -1785,28 +2012,99 @@ impl App {
             self.set_view_mode(mode);
             return;
         }
-        // actions.toml 驱动的自定义动作（Phase 4）。
+        // actions.toml 驱动的动作（Phase 4 / Sprint 2）。
         if let Some(action_id) = id.strip_prefix("act:") {
-            let entry = self.actions.iter().find(|a| a.id == action_id).cloned();
-            if let Some(entry) = entry {
-                let targets = match &target {
-                    MenuTarget::Files(p) => p.clone(),
-                    _ => Vec::new(),
-                };
-                match crate::ops::actions::run_action(&entry, &targets) {
-                    Ok(()) => {
-                        self.set_status_job(format!("已执行：{}", entry.label));
-                        self.reload_active();
+            match action_id {
+                "builtin.open" => {
+                    if let MenuTarget::Files(paths) = &target {
+                        if let Some(path) = paths.first() {
+                            self.open_path(path);
+                        }
                     }
-                    Err(e) => self.set_status_job(format!("执行失败：{e}")),
+                    return;
+                }
+                "builtin.open_with" => {
+                    if let MenuTarget::Files(paths) = &target {
+                        if let Some(path) = paths.first() {
+                            let _ = std::process::Command::new("rundll32.exe")
+                                .args(["shell32.dll,OpenAs_RunDLL", &path.to_string_lossy()])
+                                .spawn();
+                        }
+                    }
+                    return;
+                }
+                "builtin.copy" => {
+                    self.copy_selection(false);
+                    return;
+                }
+                "builtin.move" => {
+                    self.copy_selection(true);
+                    return;
+                }
+                "builtin.rename" => {
+                    if let MenuTarget::Files(paths) = &target {
+                        if let Some(path) = paths.first() {
+                            self.ui.set_rename_path(path.to_string_lossy().into_owned().into());
+                        }
+                    }
+                    return;
+                }
+                "builtin.delete" => {
+                    if let MenuTarget::Files(paths) = &target {
+                        self.submit_job(JobKind::Delete {
+                            paths: paths.clone(),
+                            to_trash: true,
+                        });
+                    }
+                    return;
+                }
+                "builtin.stage" => {
+                    if let MenuTarget::Files(paths) = &target {
+                        let added = self.state.stage_paths(paths);
+                        self.sync_staging();
+                        self.set_status_job(format!("已加入暂存盘 {added} 项"));
+                    }
+                    return;
+                }
+                "builtin.terminal" => {
+                    let dir = match &target {
+                        MenuTarget::Files(paths) => paths
+                            .first()
+                            .and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }),
+                        MenuTarget::Background => self.state.active().path.clone(),
+                    };
+                    if let Some(dir) = dir {
+                        if let Err(e) = ops::open_terminal(&dir) {
+                            self.set_status_job(e);
+                        }
+                    }
+                    return;
+                }
+                "builtin.properties" => {
+                    // 占位：后续可调用 Windows 属性对话框。
+                    return;
+                }
+                _ => {
+                    let entry = self.actions.iter().find(|a| a.id == action_id).cloned();
+                    if let Some(entry) = entry {
+                        let targets = match &target {
+                            MenuTarget::Files(p) => p.clone(),
+                            _ => Vec::new(),
+                        };
+                        match crate::ops::actions::run_action(&entry, &targets) {
+                            Ok(()) => {
+                                self.set_status_job(format!("已执行：{}", entry.label));
+                                self.reload_active();
+                            }
+                            Err(e) => self.set_status_job(format!("执行失败：{e}")),
+                        }
+                    }
+                    return;
                 }
             }
-            return;
         }
         if id == ACT_MANAGE_ACTIONS {
-            if let Some(path) = crate::ops::actions::config_path() {
-                let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
-            }
+            self.open_settings_tab(crate::state::SettingsSubpage::ContextMenu);
             return;
         }
         // 回收站视图动作。
@@ -1853,6 +2151,7 @@ impl App {
             return;
         }
         match id {
+            // 旧硬编码 ID 仍保留，防止外部旧调用；新菜单统一走 act:builtin.*。
             ACT_OPEN => {
                 if let MenuTarget::Files(paths) = &target {
                     if let Some(path) = paths.first() {
@@ -2161,6 +2460,23 @@ const VK_CONTROL: i32 = 0x11;
 
 impl App {
     fn row_pointer_event(&mut self, index: usize, event: &PointerEvent, x: f32, y: f32) {
+        // 任务 2.3：拖出手势（按下 → 位移超阈值 → OLE 拖放循环）。
+        match event.kind {
+            PointerEventKind::Up | PointerEventKind::Cancel => {
+                self.drag_pending = None;
+                self.ui.invoke_set_drag_armed(false);
+            }
+            PointerEventKind::Move => {
+                // 仅当位移越过阈值才取走待定手势并启动拖出；否则保留，
+                // 否则首次微小移动就会清空 drag_pending 导致永远拖不出（见 #2 缺陷）。
+                if let Some(paths) = drag_gesture_paths(&self.drag_pending, x, y) {
+                    self.drag_pending = None;
+                    self.ui.invoke_set_drag_armed(false);
+                    self.begin_drag_out(paths);
+                }
+            }
+            _ => {}
+        }
         if event.kind != PointerEventKind::Down {
             return;
         }
@@ -2244,9 +2560,263 @@ impl App {
                 self.visible_cache = None;
                 self.refresh_visible_rows();
                 self.sync_status();
+                // 登记拖出待定手势：拖动的是选中集（行在选中集中时）或该行。
+                if self.state.active().path.is_some() && !self.ui.get_rename_path().is_empty() {
+                    // 重命名输入态不触发拖出。
+                } else if let Some(row_path) = self.state.active().display_entry(index).map(|e| e.path.clone()) {
+                    let tab = self.state.active();
+                    let paths = if tab.selection.contains(&row_path) && tab.selection.len() > 1 {
+                        tab.selected_paths()
+                    } else if tab.selection.contains(&row_path) {
+                        vec![row_path]
+                    } else {
+                        vec![row_path]
+                    };
+                    self.drag_pending = Some((x, y, paths));
+                    // 上膛：禁用 flick 交互滚动，使行拖动仅用于发起拖出。
+                    self.ui.invoke_set_drag_armed(true);
+                }
             }
             _ => {}
         }
+    }
+
+    /// 任务 2.3：发起 OLE 拖放循环（阻塞至释放）。
+    /// 目标返回「移动」且源文件仍在时，删除源（标准移动协议；优化移动后
+    /// 源路径已不存在，删除为无操作）。
+    fn begin_drag_out(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let moved = matches!(
+            crate::sys::dnd::begin_drag_out(&paths),
+            crate::sys::dnd::DragOutOutcome::Dropped(crate::sys::dnd::DropEffect::Move)
+        );
+        if moved {
+            let mut removed = false;
+            for p in &paths {
+                if p.exists() {
+                    let r = if p.is_dir() {
+                        std::fs::remove_dir_all(p)
+                    } else {
+                        std::fs::remove_file(p)
+                    };
+                    removed |= r.is_ok();
+                }
+            }
+            if removed {
+                self.reload_active();
+            }
+        }
+    }
+
+    /// 任务 2.2：处理外部拖入（winit 聚合完成）。
+    /// 目标 = 光标命中的目录行，否则当前目录；
+    /// Ctrl 强制复制、Shift 强制移动，默认同盘移动 / 跨盘复制。
+    fn process_external_drop(&mut self) {
+        let paths = std::mem::take(&mut self.drop_buffer);
+        if paths.is_empty() || self.ui.get_settings_open() {
+            return;
+        }
+        let Some(base) = self.state.active().path.clone() else {
+            return;
+        };
+
+        // 光标（屏幕物理坐标）→ 窗口逻辑坐标 → 行命中。
+        #[allow(unused_mut)]
+        let mut target = base.clone();
+        #[cfg(windows)]
+        {
+            let scale = self.ui.window().scale_factor() as f32;
+            if let Some((lx, ly)) = cursor_window_logical(&self.ui, scale) {
+                let idx = self.ui.invoke_row_hit_test(lx, ly);
+                if idx >= 0 {
+                    if let Some(e) = self.state.active().display_entry(idx as usize) {
+                        if e.is_dir {
+                            target = e.path.clone();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 拖到自己（或自己的子集）无意义。
+        if paths.iter().any(|p| p == &target) {
+            self.set_status_job("源与目标相同");
+            return;
+        }
+
+        let ctrl = key_down(VK_CONTROL);
+        let shift = key_down(VK_SHIFT);
+        let is_move = if ctrl {
+            false
+        } else if shift {
+            true
+        } else {
+            same_volume(&paths[0], &target)
+        };
+        let kind = if is_move {
+            JobKind::Move { sources: paths, dest_dir: target }
+        } else {
+            JobKind::Copy { sources: paths, dest_dir: target }
+        };
+        self.submit_job(kind);
+    }
+
+    /// 任务 3.1：Space 触发的 QuickLook 预览开关。
+    fn toggle_preview(&mut self) {
+        if self.preview.window().is_visible() {
+            self.close_preview();
+            return;
+        }
+        let Some(path) = self.state.active().selected_paths().into_iter().next() else {
+            self.set_status_job("请先选中一项以预览");
+            return;
+        };
+        self.load_preview(&path);
+    }
+
+    fn close_preview(&mut self) {
+        let _ = self.preview.window().hide();
+        focus_window(&self.ui);
+    }
+
+    /// 显示预览窗口：居中到主窗口并以 show() 显示（hide 后再 show 可重新显示）。
+    fn show_preview_window(&mut self) {
+        let pos = self.ui.window().position();
+        let size = self.ui.window().size();
+        let pw = 720i32;
+        let ph = 540i32;
+        let cx = pos.x + ((size.width as i32) - pw) / 2;
+        let cy = pos.y + ((size.height as i32) - ph) / 2;
+        self.preview
+            .window()
+            .set_position(slint::PhysicalPosition { x: cx, y: cy });
+        let _ = self.preview.window().show();
+        self.preview_shown = true;
+    }
+
+    /// 按类型加载预览内容（图片/视频/文本/元数据）。
+    fn load_preview(&mut self, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.preview.set_title_text(name.into());
+        self.preview.set_sub_title(path.to_string_lossy().into_owned().into());
+
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+
+        let is_image = matches!(
+            ext.as_str(),
+            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico"
+        );
+        let is_video = matches!(
+            ext.as_str(),
+            "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "m4v" | "mpg" | "mpeg"
+        );
+        let is_text = matches!(
+            ext.as_str(),
+            "txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml"
+                | "xml" | "html" | "htm" | "css" | "c" | "cpp" | "h" | "hpp" | "java" | "go"
+                | "log" | "ini" | "bat" | "ps1" | "sh"
+        );
+
+        if is_image || is_video {
+            // 先显示元数据兜底，图片异步加载完成后切换为图片视图。
+            self.set_preview_meta(path, is_video);
+            #[cfg(windows)]
+            self.start_preview_image(path.to_path_buf());
+            self.show_preview_window();
+        } else if is_text {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(200_000)]).into_owned();
+                    self.preview.set_text_content(text.into());
+                    self.preview.set_preview_kind(1);
+                    self.show_preview_window();
+                }
+                Err(e) => {
+                    self.preview.set_meta_text(format!("无法读取：{e}").into());
+                    self.preview.set_preview_kind(2);
+                    self.show_preview_window();
+                }
+            }
+        } else {
+            self.set_preview_meta(path, false);
+            self.show_preview_window();
+        }
+    }
+
+    /// 构造元数据预览文本（文件信息卡片）。
+    fn set_preview_meta(&mut self, path: &Path, is_video: bool) {
+        let meta = std::fs::symlink_metadata(path);
+        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let modified = meta.as_ref().ok().and_then(|m| m.modified().ok());
+        let kind = if is_dir {
+            "文件夹".to_string()
+        } else if is_video {
+            "视频文件".to_string()
+        } else {
+            path.extension()
+                .map(|e| format!("{} 文件", e.to_string_lossy().to_uppercase()))
+                .unwrap_or_else(|| "文件".to_string())
+        };
+        let mut lines = vec![
+            format!("类型：{kind}"),
+            format!("路径：{}", path.to_string_lossy()),
+        ];
+        if !is_dir {
+            lines.push(format!("大小：{}", crate::fs::format_size_bytes(size)));
+        }
+        if let Some(t) = modified {
+            lines.push(format!("修改时间：{}", crate::fs::format_time(Some(t))));
+        }
+        self.preview.set_meta_text(lines.join("\n").into());
+        self.preview.set_preview_kind(2);
+    }
+
+    /// 任务 3.1：异步加载大尺寸缩略图（图片/视频首帧）并切换到图片视图。
+    /// 仅在 Windows 可用（依赖 Shell 缩略图管线），其余平台仅显示元数据兜底。
+    #[cfg(windows)]
+    fn start_preview_image(&mut self, path: PathBuf) {
+        let preview_weak = slint::ComponentHandle::as_weak(&self.preview);
+        std::thread::spawn(move || {
+            unsafe {
+                use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            }
+            match crate::ops::thumbs::get_thumbnail(&path, 640) {
+                Ok((w, h, rgba)) => {
+                    // 仅把可发送的 RGBA 字节送回 UI 线程，Image 在事件循环内构造
+                    // （slint::Image 含裸指针，不可跨线程）。
+                    let path2 = path.clone();
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(preview) = preview_weak.upgrade() {
+                            if let Some(img) = to_slint_image(w, h, &rgba) {
+                                preview.set_preview_image(img);
+                                preview.set_preview_kind(0);
+                                preview.set_sub_title(
+                                    format!(
+                                        "{} · {}",
+                                        path2.to_string_lossy(),
+                                        crate::fs::format_size_bytes(
+                                            std::fs::metadata(&path2).map(|m| m.len()).unwrap_or(0)
+                                        )
+                                    )
+                                    .into(),
+                                );
+                            }
+                        }
+                    });
+                }
+                Err(_) => {}
+            }
+        });
     }
 
     fn background_pointer_event(&mut self, event: &PointerEvent, x: f32, y: f32) {
@@ -2302,6 +2872,17 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 }
             });
     }
+    // 任务 3：目录变更轮询（1s），检测文件被移动/重命名等后实时刷新。
+    {
+        let timer_app = Rc::downgrade(app);
+        app.borrow()
+            .refresh_timer
+            .start(TimerMode::Repeated, Duration::from_millis(1000), move || {
+                let Some(app) = timer_app.upgrade() else { return };
+                let mut app = app.borrow_mut();
+                app.poll_dir_changes();
+            });
+    }
     // 任务进度 + 完成处理（120ms）。
     {
         let timer_app = Rc::downgrade(app);
@@ -2351,6 +2932,25 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         .ui
         .window()
         .on_winit_window_event(move |_window, event| {
+        // 任务 2.2：外部 → Rove 拖入。winit 对一次投放逐文件发 DroppedFile，
+        // 先缓冲，短延迟后统一判定目标并触发移动/复制管线。
+        if let WindowEvent::DroppedFile(path) = event {
+            let Some(key_app) = key_app.upgrade() else {
+                return EventResult::Propagate;
+            };
+            let mut app = key_app.borrow_mut();
+            app.drop_buffer.push(path.to_path_buf());
+            let timer_app = key_app.clone();
+            app.drop_timer.start(
+                TimerMode::SingleShot,
+                Duration::from_millis(120),
+                move || {
+                    timer_app.borrow_mut().process_external_drop();
+                },
+            );
+            return EventResult::PreventDefault;
+        }
+
         let WindowEvent::KeyboardInput {
             event:
                 KeyEvent {
@@ -2387,6 +2987,10 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             Key::Named(named) => {
                 use slint::winit_030::winit::keyboard::NamedKey;
                 match named {
+                    NamedKey::Space => {
+                        // 任务 3.1：QuickLook 预览开关。
+                        app.toggle_preview();
+                    }
                     NamedKey::F2 => {
                         app.start_rename();
                     }
@@ -2725,6 +3329,181 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.borrow_mut().open_view_picker();
         });
     }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_requested(move || {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().open_settings_tab(crate::state::SettingsSubpage::ContextMenu);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_nav_changed(move |id| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let subpage = match id.as_str() {
+                "search" => crate::state::SettingsSubpage::SearchAndIndex,
+                "context" => crate::state::SettingsSubpage::ContextMenu,
+                "duplicates" => crate::state::SettingsSubpage::Duplicates,
+                "quicklook" => crate::state::SettingsSubpage::QuickLook,
+                _ => crate::state::SettingsSubpage::General,
+            };
+            app.state.active_mut().settings_subpage = subpage;
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_action_toggled(move |id, enabled| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let id = id.to_string();
+            if let Some(idx) = app.actions.iter().position(|a| a.id == id) {
+                app.actions[idx].enabled = enabled;
+                app.save_actions_and_reload();
+                app.sync_settings();
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_group_toggled(move |name, expanded| {
+            let Some(app) = app.upgrade() else { return };
+            let app = app.borrow();
+            // 分组展开状态保存在 UI 模型里（重进设置页会重置），
+            // 同时重算 Flickable 滚动范围。
+            let model = app.ui.get_settings_action_groups();
+            for i in 0..model.row_count() {
+                if let Some(mut g) = model.row_data(i) {
+                    if g.name == name {
+                        g.expanded = expanded;
+                        model.set_row_data(i, g);
+                        break;
+                    }
+                }
+            }
+            let mut content_h = 0.0f32;
+            for i in 0..model.row_count() {
+                if let Some(g) = model.row_data(i) {
+                    content_h += if g.expanded {
+                        44.0 + g.items.row_count() as f32 * 42.0
+                    } else {
+                        44.0
+                    } + 12.0;
+                }
+            }
+            app.ui.set_settings_content_height(content_h);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_action_add(move || {
+            let Some(app) = app.upgrade() else { return };
+            let app = app.borrow_mut();
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            app.ui.set_settings_editor_title("新建动作".into());
+            app.ui.set_settings_editor_group_options(
+                ModelRc::new(VecModel::from(group_options(&app.actions))),
+            );
+            app.ui.set_settings_editor_open(true);
+            app.ui.set_settings_editor_id(format!("custom.{stamp}").into());
+            app.ui.set_settings_editor_label("".into());
+            app.ui.set_settings_editor_group("".into());
+            app.ui.set_settings_editor_target("any".into());
+            app.ui.set_settings_editor_extensions("".into());
+            app.ui.set_settings_editor_program("".into());
+            // 参数模板默认给 {target_path}，符合任务书约定。
+            app.ui.set_settings_editor_args("{target_path}".into());
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_action_edit(move |id| {
+            let Some(app) = app.upgrade() else { return };
+            let app = app.borrow();
+            let id = id.to_string();
+            if let Some(a) = app.actions.iter().find(|a| a.id == id) {
+                app.ui.set_settings_editor_title("编辑动作".into());
+                // 层级归属候选：已有二级分组 + 内置「一级菜单」。
+                app.ui.set_settings_editor_group_options(
+                    ModelRc::new(VecModel::from(group_options(&app.actions))),
+                );
+                app.ui.set_settings_editor_open(true);
+                app.ui.set_settings_editor_id(a.id.clone().into());
+                app.ui.set_settings_editor_label(a.label.clone().into());
+                app.ui.set_settings_editor_group(a.group.clone().into());
+                app.ui.set_settings_editor_target(a.target.clone().into());
+                app.ui.set_settings_editor_extensions(a.extensions.join(", ").into());
+                app.ui.set_settings_editor_program(a.program.clone().into());
+                app.ui.set_settings_editor_args(a.args.clone().into());
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_action_delete(move |id| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let id = id.to_string();
+            app.actions.retain(|a| a.id != id);
+            app.save_actions_and_reload();
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_editor_save(move |id, label, group, target, extensions, program, args| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let id = id.to_string();
+            let extensions: Vec<String> = extensions
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let action = crate::ops::actions::ActionEntry {
+                id: id.clone(),
+                label: label.to_string(),
+                tool: "".into(),
+                program: program.to_string(),
+                args: args.to_string(),
+                working_dir: "{target_dir}".into(),
+                target: target.to_string(),
+                extensions,
+                enabled: true,
+                group: group.to_string(),
+                builtin: false,
+            };
+            if let Some(idx) = app.actions.iter().position(|a| a.id == id) {
+                app.actions[idx] = action;
+            } else {
+                app.actions.push(action);
+            }
+            app.save_actions_and_reload();
+            app.ui.set_settings_editor_open(false);
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_editor_cancel(move || {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow().ui.set_settings_editor_open(false);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_editor_browse(move || {
+            let Some(app) = app.upgrade() else { return };
+            // 原生打开对话框（嵌套消息循环，阻塞至用户选择完成）。
+            if let Some(path) = crate::sys::pick::pick_program_path() {
+                app.borrow().ui.set_settings_editor_program(path.into());
+            }
+        });
+    }
 
     // ---- 关闭：保存配置并销毁会话（守护常驻） ----
     {
@@ -2844,6 +3623,46 @@ pub fn run() {
     }
 }
 
+/// 任务 3.1：预览窗口的 Esc/Space 关闭 + 焦点归还主窗口。
+fn setup_preview_keys(app: &Rc<RefCell<App>>) {
+    use slint::winit_030::{
+        EventResult, WinitWindowAccessor,
+    };
+    use slint::winit_030::winit::event::{ElementState, WindowEvent};
+    use slint::winit_030::winit::keyboard::Key;
+
+    let weak = Rc::downgrade(app);
+    app.borrow()
+        .preview
+        .window()
+        .on_winit_window_event(move |_window, event| {
+            let WindowEvent::KeyboardInput {
+                event:
+                    slint::winit_030::winit::event::KeyEvent {
+                        logical_key,
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } = event
+            else {
+                return EventResult::Propagate;
+            };
+            let Some(app) = weak.upgrade() else {
+                return EventResult::Propagate;
+            };
+            let close = match logical_key {
+                Key::Named(slint::winit_030::winit::keyboard::NamedKey::Escape) => true,
+                Key::Named(slint::winit_030::winit::keyboard::NamedKey::Space) => true,
+                _ => false,
+            };
+            if close {
+                app.borrow_mut().close_preview();
+            }
+            EventResult::Propagate
+        });
+}
+
 /// 创建一个 UI 会话（窗口 + 状态 + 回调 + 定时器）。
 /// 回调/定时器均以 Weak 持有 App，销毁时整图释放。
 fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
@@ -2902,7 +3721,10 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         deep_rx,
         thumb_tx,
     )));
-    app.borrow_mut().actions = crate::ops::actions::load_or_create();
+    {
+        let raw = crate::ops::actions::load_or_create();
+        app.borrow_mut().actions = crate::ops::actions::heal_full(&raw);
+    }
 
     // 先入槽再接线：会话槽持有唯一强引用，回调/定时器均为 Weak；
     // 漏掉此行会导致 App 在本函数返回时即被释放（列表收不到数据）。
@@ -2910,6 +3732,7 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     wire_callbacks(&app);
     setup_timers(&app);
     setup_keyboard(&app);
+    setup_preview_keys(&app);
 
     // 初始数据。
     {
@@ -3002,4 +3825,38 @@ fn focus_window(ui: &MainWindow) {
     }
     #[cfg(not(windows))]
     let _ = ui;
+}
+
+/// 光标（屏幕）位置 → 窗口客户区逻辑坐标。
+#[cfg(windows)]
+fn cursor_window_logical(ui: &MainWindow, scale: f32) -> Option<(f32, f32)> {
+    use raw_window_handle::RawWindowHandle;
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::Graphics::Gdi::ScreenToClient;
+    use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+    let binding = ui.window().window_handle();
+    let h = raw_window_handle::HasWindowHandle::window_handle(&binding).ok()?;
+    let RawWindowHandle::Win32(win) = h.as_raw() else {
+        return None;
+    };
+    let hwnd = windows::Win32::Foundation::HWND(win.hwnd.get() as *mut _);
+    unsafe {
+        let mut pt = POINT::default();
+        GetCursorPos(&mut pt).ok()?;
+        let _ = ScreenToClient(hwnd, &mut pt);
+        Some((pt.x as f32 / scale, pt.y as f32 / scale))
+    }
+}
+
+/// 判断两个路径是否位于同一卷（盘符比较，任务 2.1）。
+fn same_volume(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let vol = |p: &std::path::Path| -> String {
+        p.components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().to_uppercase())
+            .unwrap_or_default()
+    };
+    let (va, vb) = (vol(a), vol(b));
+    !va.is_empty() && va == vb
 }

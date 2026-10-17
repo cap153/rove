@@ -5,6 +5,35 @@ use std::path::PathBuf;
 
 use crate::fs::{FileEntry, SortState};
 
+/// 设置页子页面。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SettingsSubpage {
+    General,
+    SearchAndIndex,
+    ContextMenu,
+    Duplicates,
+    QuickLook,
+}
+
+impl Default for SettingsSubpage {
+    fn default() -> Self {
+        SettingsSubpage::General
+    }
+}
+
+/// 标签页类型：普通文件管理器 / 设置页。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TabKind {
+    Explorer,
+    Settings,
+}
+
+impl Default for TabKind {
+    fn default() -> Self {
+        TabKind::Explorer
+    }
+}
+
 /// 一个标签页的完整状态。
 pub struct TabState {
     pub id: u32,
@@ -40,6 +69,10 @@ pub struct TabState {
     pub deep_generation: u64,
     /// 深度搜索进行中（状态栏提示）。
     pub deep_searching: bool,
+    /// 标签页类型：普通文件管理器 / 设置页。
+    pub kind: TabKind,
+    /// 设置页当前子页面（仅 kind = Settings 时有效）。
+    pub settings_subpage: SettingsSubpage,
 }
 
 impl TabState {
@@ -63,7 +96,17 @@ impl TabState {
             deep_pinyin: Vec::new(),
             deep_generation: 0,
             deep_searching: false,
+            kind: TabKind::Explorer,
+            settings_subpage: SettingsSubpage::default(),
         }
+    }
+
+    /// 新建一个设置页标签。
+    pub fn new_settings(id: u32, subpage: SettingsSubpage) -> Self {
+        let mut tab = Self::new(id, None);
+        tab.kind = TabKind::Settings;
+        tab.settings_subpage = subpage;
+        tab
     }
 
     pub fn can_go_back(&self) -> bool {
@@ -248,8 +291,17 @@ impl TabState {
         (dirs, files, selected_size)
     }
 
-    /// 标签标题：当前目录名 / "此电脑"。
+    /// 标签标题：当前目录名 / "此电脑" / 设置页。
     pub fn title(&self) -> String {
+        if self.kind == TabKind::Settings {
+            return match self.settings_subpage {
+                SettingsSubpage::General => "通用设置".to_string(),
+                SettingsSubpage::SearchAndIndex => "搜索与索引".to_string(),
+                SettingsSubpage::ContextMenu => "本地右键菜单".to_string(),
+                SettingsSubpage::Duplicates => "重复文件".to_string(),
+                SettingsSubpage::QuickLook => "快速预览".to_string(),
+            };
+        }
         match &self.path {
             None => "此电脑".to_string(),
             Some(p) if *p == crate::fs::drives::recycle_virtual_path() => "回收站".to_string(),
@@ -320,6 +372,22 @@ impl AppState {
                 tab.history = vec![Some(current)];
             }
         }
+        self.tabs.push(tab);
+        self.active_tab = self.tabs.len() - 1;
+        id
+    }
+
+    /// 打开设置页标签；若已存在同子页面则切换过去，否则新建。
+    pub fn open_settings(&mut self, subpage: SettingsSubpage) -> u32 {
+        if let Some(idx) = self.tabs.iter().position(|t| {
+            t.kind == TabKind::Settings && t.settings_subpage == subpage
+        }) {
+            self.active_tab = idx;
+            return self.tabs[idx].id;
+        }
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let tab = TabState::new_settings(id, subpage);
         self.tabs.push(tab);
         self.active_tab = self.tabs.len() - 1;
         id

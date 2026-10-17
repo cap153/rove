@@ -33,6 +33,34 @@ export struct TabInfo {
     id: int,
     title: string,
     active: bool,
+    // true = 设置页标签（显示齿轮图标，不显示关闭按钮或逻辑不同）。
+    is-settings: bool,
+}
+
+// 设置页左侧导航项。
+export struct SettingsNavItem {
+    id: string,
+    label: string,
+    icon: string,
+    selected: bool,
+}
+
+// 设置页单条动作（本地右键菜单列表项）。
+export struct SettingsActionItem {
+    id: string,
+    label: string,
+    target: string,
+    extensions: string,
+    program: string,
+    enabled: bool,
+    builtin: bool,
+}
+
+// 设置页二级分组卡片。
+export struct SettingsActionGroup {
+    name: string,
+    expanded: bool,
+    items: [SettingsActionItem],
 }
 
 export struct SidebarItem {

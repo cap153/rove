@@ -6,6 +6,8 @@ description = "Rove — 极速响应、极低内存的 Windows 文件管理器 (
 
 [dependencies]
 slint = { version = "1.11", default-features = false, features = [
+    # 标准库支持（TextEdit / ScrollView 等内建控件需要）。
+    "std",
     # GPU 渲染（femtovg/OpenGL）；软件渲染作为后端备选，
     # 运行时用 SLINT_BACKEND=winit-software 切换。
     "backend-winit",
@@ -27,17 +29,29 @@ raw-window-handle = "0.6"
 toml_edit = "0.22"
 nucleo-matcher = "0.3"
 pinyin = { version = "0.10", features = ["plain", "heteronym"] }
+# 任务 3.2：NTFS $MFT 解析加速全盘索引（需管理员权限，失败回退递归遍历）。
+mft = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.21"
 windows = { version = "0.59", features = [
     "Win32_UI_Shell",
+    # IFileDialog / COMDLG_FILTERSPEC（原生文件选择对话框）。
+    "Win32_UI_Shell_Common",
+    # 拖出：Ole 拖放（DoDragDrop/IDropSource）、格式注册、全局内存。
+    "Win32_System_DataExchange",
+    "Win32_System_Ole",
+    "Win32_System_Memory",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_SystemServices",
     "Win32_System_Com",
     "Win32_Graphics_Gdi",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",
 ] }
+# 拖出自定义 IDropSource 需要 implement 宏（windows-core 内置导出）。
+windows-core = { version = "0.59" }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

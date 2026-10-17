@@ -10,6 +10,8 @@ mod fs;
 mod ops;
 mod search;
 mod state;
+// 系统级辅助（原生对话框 / 拖放）。
+mod sys;
 // 托盘仅 Windows（Linux 宿主测试无需 GTK 依赖）。
 #[cfg(windows)]
 mod tray;
