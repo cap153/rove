@@ -2582,37 +2582,18 @@ impl App {
     }
 
     /// 任务 2.3：发起 OLE 拖放循环（阻塞至释放）。
-    /// 目标返回「移动」且源文件仍在时，删除源（标准移动协议；优化移动后
-    /// 源路径已不存在，删除为无操作）。
     fn begin_drag_out(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() {
             return;
         }
-        let moved = matches!(
-            crate::sys::dnd::begin_drag_out(&paths),
-            crate::sys::dnd::DragOutOutcome::Dropped(crate::sys::dnd::DropEffect::Move)
-        );
-        if moved {
-            let mut removed = false;
-            for p in &paths {
-                if p.exists() {
-                    let r = if p.is_dir() {
-                        std::fs::remove_dir_all(p)
-                    } else {
-                        std::fs::remove_file(p)
-                    };
-                    removed |= r.is_ok();
-                }
-            }
-            if removed {
-                self.reload_active();
-            }
+        let outcome = crate::sys::dnd::begin_drag_out(&paths);
+        // 严禁在此手动 remove_file！外部移动由 Windows 系统接管，内部拖放由 process_external_drop 调度。
+        if let crate::sys::dnd::DragOutOutcome::Dropped(_) = outcome {
+            self.reload_active();
         }
     }
 
-    /// 任务 2.2：处理外部拖入（winit 聚合完成）。
-    /// 目标 = 光标命中的目录行，否则当前目录；
-    /// Ctrl 强制复制、Shift 强制移动，默认同盘移动 / 跨盘复制。
+    /// 任务 2.2：处理外部或内部拖入。
     fn process_external_drop(&mut self) {
         let paths = std::mem::take(&mut self.drop_buffer);
         if paths.is_empty() || self.ui.get_settings_open() {
@@ -2622,8 +2603,7 @@ impl App {
             return;
         };
 
-        // 光标（屏幕物理坐标）→ 窗口逻辑坐标 → 行命中。
-        #[allow(unused_mut)]
+        // 光标（屏幕物理坐标）→ 窗口逻辑坐标 → 行命中
         let mut target = base.clone();
         #[cfg(windows)]
         {
@@ -2640,9 +2620,14 @@ impl App {
             }
         }
 
-        // 拖到自己（或自己的子集）无意义。
-        if paths.iter().any(|p| p == &target) {
-            self.set_status_job("源与目标相同");
+        // 1. 如果源文件本来就在目标目录下，说明是同级空白处误放，直接忽略（防止自我移动）
+        if paths.iter().all(|p| p.parent() == Some(&target)) {
+            return;
+        }
+
+        // 2. 严禁将文件夹移动到自身或自身的子文件夹中
+        if paths.iter().any(|p| p == &target || target.starts_with(p)) {
+            self.set_status_job("无法将文件夹移动到自身或其子文件夹中");
             return;
         }
 

@@ -14,6 +14,7 @@ use std::path::PathBuf;
 pub const DRAG_THRESHOLD: f32 = 4.0;
 
 /// 拖出结果。
+#[allow(dead_code)]
 pub enum DragOutOutcome {
     /// 目标接受了文件。
     Dropped(DropEffect),
@@ -63,7 +64,7 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
     };
     use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{DROPFILES, SHCreateDataObject, SHParseDisplayName};
+    use windows::Win32::UI::Shell::{DROPFILES, ILFindChild, SHCreateDataObject, SHParseDisplayName};
     use windows_core::implement;
 
     fn to_wide(s: &str) -> Vec<u16> {
@@ -143,10 +144,17 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
         // 1. 确保当前主线程完全初始化 OLE 拖放子系统
         let _ = OleInitialize(None);
 
-        // 2. 将文件路径转换为绝对 PIDL
+        // 2. 将文件路径转换为绝对 PIDL（清理路径尾部斜杠，防止文件夹解析失败）
         let mut full_pidls: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
         for p in paths {
-            let wide = to_wide(&p.to_string_lossy());
+            let s = p.to_string_lossy();
+            let trimmed = s.trim_end_matches(['\\', '/']);
+            let path_clean = if trimmed.len() == 2 && trimmed.ends_with(':') {
+                format!("{trimmed}\\")
+            } else {
+                trimmed.to_string()
+            };
+            let wide = to_wide(&path_clean);
             let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
             if SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None).is_err() {
                 for f in &full_pidls {
@@ -157,29 +165,52 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
             full_pidls.push(pidl);
         }
 
-        // 3. 构建 Shell 官方数据对象：
-        // 关键：首参数传 None，Shell 会视 apidls 为完全限定（绝对）PIDL 数组！
-        // 彻底消灭原先错误的父子目录截断计算。
-        let apidls: Vec<*const ITEMIDLIST> =
-            full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
-        let data_obj: IDataObject = match SHCreateDataObject::<Option<&IDataObject>, IDataObject>(
-            None,
-            Some(&apidls),
-            None,
-        ) {
-            Ok(d) => d,
-            Err(_) => {
-                for f in &full_pidls {
-                    free_pidl(*f);
-                }
-                return DragOutOutcome::Cancelled;
-            }
-        };
+        // 3. 构建 Shell 官方数据对象（同目录下使用 pparent + ILFindChild，确保文件夹和文件均可被正确识别）
+        let parents: std::collections::HashSet<PathBuf> =
+            paths.iter().filter_map(|p| p.parent().map(|d| d.to_path_buf())).collect();
 
-        // PIDL 已经移交给数据对象，释放本地分配
-        for f in &full_pidls {
-            free_pidl(*f);
-        }
+        let data_obj: IDataObject = if parents.len() == 1 {
+            let parent_s = paths[0].parent().unwrap().to_string_lossy();
+            let parent_clean = parent_s.trim_end_matches(['\\', '/']);
+            let parent_clean = if parent_clean.len() == 2 && parent_clean.ends_with(':') {
+                format!("{parent_clean}\\")
+            } else {
+                parent_clean.to_string()
+            };
+            let parent_wide = to_wide(&parent_clean);
+            let mut pparent: *mut ITEMIDLIST = std::ptr::null_mut();
+
+            if SHParseDisplayName(PCWSTR(parent_wide.as_ptr()), None, &mut pparent, 0, None).is_ok() {
+                let child_ptrs: Vec<*const ITEMIDLIST> = full_pidls
+                    .iter()
+                    .map(|&p| {
+                        let rel = ILFindChild(pparent, p);
+                        if rel.is_null() { p as *const ITEMIDLIST } else { rel as *const ITEMIDLIST }
+                    })
+                    .collect();
+
+                let obj = SHCreateDataObject::<Option<&IDataObject>, IDataObject>(
+                    Some(pparent as *const ITEMIDLIST),
+                    Some(&child_ptrs),
+                    None,
+                );
+                free_pidl(pparent);
+
+                match obj {
+                    Ok(d) => d,
+                    Err(_) => {
+                        let apidls: Vec<*const ITEMIDLIST> = full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
+                        SHCreateDataObject(None, Some(&apidls), None).unwrap()
+                    }
+                }
+            } else {
+                let apidls: Vec<*const ITEMIDLIST> = full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
+                SHCreateDataObject(None, Some(&apidls), None).unwrap()
+            }
+        } else {
+            let apidls: Vec<*const ITEMIDLIST> = full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
+            SHCreateDataObject(None, Some(&apidls), None).unwrap()
+        };
 
         // 4. 显式注入 CF_HDROP 数据（保证跨进程通用兼容性）
         if let Some(medium) = create_hdrop_medium(paths) {
