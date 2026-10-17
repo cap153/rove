@@ -111,15 +111,29 @@ export component FileList inherits Rectangle {
         flick.content-y = 0px;
     }
 
-    /// 命中测试：窗口逻辑坐标 → 行索引（icons 视图或越界返回 -1）。
-    /// 拖入文件时由 Rust 经 GetCursorPos 换算后调用。
+    /// 命中测试：窗口逻辑坐标 → 行索引（修正表头偏移，并完整支持详细信息/列表/图标网格全视图）。
     public function row-hit-test(wx: length, wy: length) -> int {
-        // 行内容 y = (wy - 列表绝对 y) - 滚动偏移(content-y 为负)。
-        (root.is-icons-view
-            || (wy - flick.absolute-position.y - flick.content-y) < 0px
-            || floor((wy - flick.absolute-position.y - flick.content-y) / root.row-h) >= root.total-rows)
-            ? -1
-            : floor((wy - flick.absolute-position.y - flick.content-y) / root.row-h);
+        // 以 FileList (root) 的绝对坐标为基准，扣除表头高度（详细信息视图下 30px）和滚动偏移
+        let header-h = root.view-mode == "details" ? 30px : 0px;
+        let rel-x = wx - root.absolute-position.x - flick.content-x;
+        let rel-y = wy - root.absolute-position.y - header-h - flick.content-y;
+
+        if (rel-x < 0px || rel-y < 0px || rel-x > root.width || rel-y > flick.height) {
+            return -1;
+        }
+
+        if (root.is-icons-view) {
+            let col = floor(rel-x / root.cell-w);
+            let r = floor(rel-y / root.cell-h);
+            if (col < 0 || col >= root.cells-per-row) {
+                return -1;
+            }
+            let idx = r * root.cells-per-row + col;
+            return (idx >= 0 && idx < root.total-count) ? idx : -1;
+        } else {
+            let idx = floor(rel-y / root.row-h);
+            return (idx >= 0 && idx < root.total-rows) ? idx : -1;
+        }
     }
 
     /// 拖出上膛：行被按下、可能即将拖出时置真，禁用 flick 的交互滚动，

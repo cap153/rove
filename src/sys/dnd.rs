@@ -54,7 +54,6 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
     use windows::Win32::System::Com::{
         CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
     };
-    use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
     use windows::Win32::System::Memory::{
         GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
     };
@@ -222,33 +221,6 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
                 ptd: std::ptr::null_mut(),
             };
             let _ = data_obj.SetData(&fmt_hdrop, &medium, true);
-        }
-
-        // 5. 写入「Preferred DropEffect」= COPY | MOVE，由目标根据盘符和按键（Ctrl/Shift）决定
-        let fmt_name = to_wide("Preferred DropEffect");
-        let fmt_id = RegisterClipboardFormatW(PCWSTR(fmt_name.as_ptr()));
-        let fmt_effect = FORMATETC {
-            cfFormat: fmt_id as u16,
-            dwAspect: DVASPECT_CONTENT.0,
-            lindex: -1,
-            tymed: TYMED_HGLOBAL.0 as u32,
-            ptd: std::ptr::null_mut(),
-        };
-        let effects: u32 = DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0;
-        if let Ok(hg) = GlobalAlloc(GMEM_MOVEABLE, std::mem::size_of::<u32>()) {
-            let ptr = GlobalLock(hg);
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(&effects as *const u32, ptr as *mut u32, 1);
-                let _ = GlobalUnlock(hg);
-                let medium = STGMEDIUM {
-                    tymed: TYMED_HGLOBAL.0 as u32,
-                    u: windows::Win32::System::Com::STGMEDIUM_0 { hGlobal: hg },
-                    pUnkForRelease: std::mem::ManuallyDrop::new(None),
-                };
-                let _ = data_obj.SetData(&fmt_effect, &medium, true);
-            } else {
-                let _ = windows::Win32::Foundation::GlobalFree(Some(hg));
-            }
         }
 
         // 6. 发起原生 OLE 拖放
