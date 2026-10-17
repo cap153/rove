@@ -1,17 +1,14 @@
 //! 任务 2：系统级拖放（`src/sys/dnd`）。
 //!
-//! - 拖出（Rove → 桌面/外部）：构造携带 `CF_HDROP` 的 Shell `IDataObject`
-//!   （`SHCreateDataObject`，无需手写 COM 数据对象）+ 自定义 `IDropSource`，
-//!   经 Win32 `DoDragDrop` 广播标准拖放循环。
-//! - 移动语义：写入「Preferred DropEffect」= COPY|MOVE，由放置目标按盘符
-//!   与修饰键决定；目标返回 MOVE 而源文件仍在时，由调用方删除源（标准协议）。
-//! - 拖入（外部 → Rove）：由 winit `DroppedFile` 事件驱动，见 app.rs。
+//! - 拖出（Rove → 桌面/外部）：
+//!   1. 在主 UI 线程同步运行（严禁 spawn 子线程，DoDragDrop 依赖当前线程的鼠标输入捕获与消息循环）。
+//!   2. 必须初始化 OleInitialize（STA 模式）。
+//!   3. 使用 SHCreateDataObject（None, full_pidls）构建标准 Shell 数据对象。
+//!   4. 显式写入 CF_HDROP 数据与 Preferred DropEffect，确保桌面及任意第三方程序均可识别。
 //!
 //! 严禁在此模块操作 Slint UI；仅做 Win32 交互并返回结果。
 
 use std::path::PathBuf;
-#[cfg(windows)]
-use std::time::{Duration, Instant};
 
 /// 拖出判定阈值：按下后位移超过该值（逻辑像素）才触发拖放。
 pub const DRAG_THRESHOLD: f32 = 4.0;
@@ -24,7 +21,7 @@ pub enum DragOutOutcome {
     Cancelled,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DropEffect {
     Copy,
     Move,
@@ -33,28 +30,13 @@ pub enum DropEffect {
 }
 
 /// 发起一次拖出循环。调用方处于左键按下的手势中时调用；
-/// 本函数阻塞至拖放结束（内部为嵌套消息循环）。
-///
-/// `paths`：拖动的源文件列表（非空）。
+/// 本函数在主 UI 线程阻塞至拖放结束（内部为 Windows 模态消息循环，期间正常刷新光标并派发绘制）。
 #[cfg(windows)]
 pub fn begin_drag_out(paths: &[PathBuf]) -> DragOutOutcome {
     if paths.is_empty() {
         return DragOutOutcome::Cancelled;
     }
-    // OLE 拖放必须在 STA 线程执行。主线程可能被其他库初始化为 MTA，
-    // 导致 DoDragDrop 跨进程无法封送数据对象（目标一律拒绝 → 禁止光标）。
-    // 故在独立 STA 线程中运行拖放循环。
-    let paths = paths.to_vec();
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        unsafe {
-            use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-        }
-        let outcome = drag_out_impl(&paths);
-        let _ = tx.send(outcome);
-    });
-    rx.recv().unwrap_or(DragOutOutcome::Cancelled)
+    drag_out_impl(paths)
 }
 
 #[cfg(not(windows))]
@@ -65,47 +47,47 @@ pub fn begin_drag_out(_paths: &[PathBuf]) -> DragOutOutcome {
 #[cfg(windows)]
 fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS};
+    use windows::Win32::Foundation::{
+        BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
+    };
     use windows::Win32::System::Com::{
         CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, STGMEDIUM, TYMED_HGLOBAL,
     };
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
-    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
-    use windows::Win32::System::Ole::{DoDragDrop, IDropSource, DROPEFFECT};
-    use windows::Win32::System::Ole::{DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+    use windows::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
+    };
+    use windows::Win32::System::Ole::{
+        DoDragDrop, IDropSource, IDropSource_Impl, OleInitialize, DROPEFFECT, DROPEFFECT_COPY,
+        DROPEFFECT_LINK, DROPEFFECT_MOVE,
+    };
     use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
-    use windows::Win32::UI::Shell::{ILGetSize, SHCreateDataObject, SHParseDisplayName};
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::System::Ole::IDropSource_Impl;
+    use windows::Win32::UI::Shell::{DROPFILES, SHCreateDataObject, SHParseDisplayName};
     use windows_core::implement;
 
     fn to_wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    // ---- 自定义 IDropSource：左键释放 → DROP；Esc → CANCEL；光标交给系统。----
+    // ---- 自定义 IDropSource：左键释放 → DROP；Esc → CANCEL；光标交给 Windows 原生绘制 ----
     #[implement(IDropSource)]
-    struct DropSource {
-        started: Instant,
-    }
+    struct DropSource;
 
     impl IDropSource_Impl for DropSource_Impl {
         fn QueryContinueDrag(
             &self,
-            escape_pressed: windows::Win32::Foundation::BOOL,
+            escape_pressed: BOOL,
             key_state: MODIFIERKEYS_FLAGS,
         ) -> windows::core::HRESULT {
             if escape_pressed.as_bool() {
                 return DRAGDROP_S_CANCEL;
             }
-            // 左键仍按住 → 继续拖动；释放 → DROP（释放过快视为误触，取消）。
+            // 左键已松开 → 触发放置
             if key_state & MK_LBUTTON == MODIFIERKEYS_FLAGS(0) {
-                if self.started.elapsed() > Duration::from_millis(150) {
-                    return DRAGDROP_S_DROP;
-                }
-                return DRAGDROP_S_CANCEL;
+                return DRAGDROP_S_DROP;
             }
-            windows::core::HRESULT(0)
+            windows::core::HRESULT(0) // S_OK: 继续拖拽
         }
 
         fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
@@ -119,8 +101,49 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
         }
     }
 
+    // 构造标准 CF_HDROP 内存块（适用于桌面、资源管理器及所有普通 Windows 软件）
+    fn create_hdrop_medium(paths: &[PathBuf]) -> Option<STGMEDIUM> {
+        let mut wide_data: Vec<u16> = Vec::new();
+        for p in paths {
+            let s = p.to_string_lossy();
+            wide_data.extend(s.encode_utf16());
+            wide_data.push(0);
+        }
+        wide_data.push(0); // 双空终止符结尾 \0\0
+
+        let dropfiles_size = std::mem::size_of::<DROPFILES>();
+        let total_bytes = dropfiles_size + wide_data.len() * 2;
+
+        unsafe {
+            let hg = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, total_bytes).ok()?;
+            let ptr = GlobalLock(hg);
+            if ptr.is_null() {
+                let _ = windows::Win32::Foundation::GlobalFree(Some(hg));
+                return None;
+            }
+
+            let df = ptr as *mut DROPFILES;
+            (*df).pFiles = dropfiles_size as u32;
+            (*df).fWide = BOOL(1);
+
+            let dest = (ptr as *mut u8).add(dropfiles_size) as *mut u16;
+            std::ptr::copy_nonoverlapping(wide_data.as_ptr(), dest, wide_data.len());
+
+            let _ = GlobalUnlock(hg);
+
+            Some(STGMEDIUM {
+                tymed: TYMED_HGLOBAL.0 as u32,
+                u: windows::Win32::System::Com::STGMEDIUM_0 { hGlobal: hg },
+                pUnkForRelease: std::mem::ManuallyDrop::new(None),
+            })
+        }
+    }
+
     unsafe {
-        // 路径 → 绝对 PIDL（*mut ITEMIDLIST），用于后续生成相对子项 PIDL / 回退。
+        // 1. 确保当前主线程完全初始化 OLE 拖放子系统
+        let _ = OleInitialize(None);
+
+        // 2. 将文件路径转换为绝对 PIDL
         let mut full_pidls: Vec<*mut ITEMIDLIST> = Vec::with_capacity(paths.len());
         for p in paths {
             let wide = to_wide(&p.to_string_lossy());
@@ -134,68 +157,46 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
             full_pidls.push(pidl);
         }
 
-        // 判断所有文件是否同处一个文件夹；是则使用规范形式（父目录 PIDL + 相对子项 PIDL），
-        // 该形式生成的 CF_HDROP 最稳定，可被桌面/资源管理器正确识别。
-        let parents: std::collections::HashSet<String> = paths
-            .iter()
-            .filter_map(|p| p.parent().map(|pp| pp.to_string_lossy().to_string()))
-            .collect();
-        let data_obj: IDataObject = if parents.len() == 1 {
-            let parent = paths[0].parent().unwrap();
-            let parent_wide = to_wide(&parent.to_string_lossy());
-            let mut pparent: *mut ITEMIDLIST = std::ptr::null_mut();
-            if SHParseDisplayName(PCWSTR(parent_wide.as_ptr()), None, &mut pparent, 0, None).is_err()
-            {
+        // 3. 构建 Shell 官方数据对象：
+        // 关键：首参数传 None，Shell 会视 apidls 为完全限定（绝对）PIDL 数组！
+        // 彻底消灭原先错误的父子目录截断计算。
+        let apidls: Vec<*const ITEMIDLIST> =
+            full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
+        let data_obj: IDataObject = match SHCreateDataObject::<Option<&IDataObject>, IDataObject>(
+            None,
+            Some(&apidls),
+            None,
+        ) {
+            Ok(d) => d,
+            Err(_) => {
                 for f in &full_pidls {
                     free_pidl(*f);
                 }
                 return DragOutOutcome::Cancelled;
             }
-            let parent_len = ILGetSize(Some(pparent)) as usize;
-            // 子项相对 PIDL = 绝对 PIDL 去掉父目录前缀。
-            let child_ptrs: Vec<*const ITEMIDLIST> = full_pidls
-                .iter()
-                .map(|&p| (p as *const u8).add(parent_len) as *const ITEMIDLIST)
-                .collect();
-            let obj = SHCreateDataObject::<Option<&IDataObject>, IDataObject>(
-                Some(pparent as *const ITEMIDLIST),
-                Some(&child_ptrs),
-                None,
-            );
-            free_pidl(pparent);
-            match obj {
-                Ok(d) => d,
-                Err(_) => {
-                    for f in &full_pidls {
-                        free_pidl(*f);
-                    }
-                    return DragOutOutcome::Cancelled;
-                }
-            }
-        } else {
-            // 跨多目录：回退到绝对 PIDL 形式。
-            let apidl: Vec<*const ITEMIDLIST> =
-                full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
-            match SHCreateDataObject::<Option<&IDataObject>, IDataObject>(None, Some(&apidl), None)
-            {
-                Ok(d) => d,
-                Err(_) => {
-                    for f in &full_pidls {
-                        free_pidl(*f);
-                    }
-                    return DragOutOutcome::Cancelled;
-                }
-            }
         };
 
+        // PIDL 已经移交给数据对象，释放本地分配
         for f in &full_pidls {
             free_pidl(*f);
         }
 
-        // 「Preferred DropEffect」= COPY|MOVE：由放置目标按盘符/修饰键决定。
+        // 4. 显式注入 CF_HDROP 数据（保证跨进程通用兼容性）
+        if let Some(medium) = create_hdrop_medium(paths) {
+            let fmt_hdrop = FORMATETC {
+                cfFormat: 15, // CF_HDROP = 15
+                dwAspect: DVASPECT_CONTENT.0,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+                ptd: std::ptr::null_mut(),
+            };
+            let _ = data_obj.SetData(&fmt_hdrop, &medium, true);
+        }
+
+        // 5. 写入「Preferred DropEffect」= COPY | MOVE，由目标根据盘符和按键（Ctrl/Shift）决定
         let fmt_name = to_wide("Preferred DropEffect");
         let fmt_id = RegisterClipboardFormatW(PCWSTR(fmt_name.as_ptr()));
-        let fmt = FORMATETC {
+        let fmt_effect = FORMATETC {
             cfFormat: fmt_id as u16,
             dwAspect: DVASPECT_CONTENT.0,
             lindex: -1,
@@ -213,13 +214,14 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
                     u: windows::Win32::System::Com::STGMEDIUM_0 { hGlobal: hg },
                     pUnkForRelease: std::mem::ManuallyDrop::new(None),
                 };
-                let _ = data_obj.SetData(&fmt, &medium, true);
+                let _ = data_obj.SetData(&fmt_effect, &medium, true);
             } else {
                 let _ = windows::Win32::Foundation::GlobalFree(Some(hg));
             }
         }
 
-        let source: IDropSource = DropSource { started: Instant::now() }.into();
+        // 6. 发起原生 OLE 拖放
+        let source: IDropSource = DropSource.into();
         let mut out_effect = DROPEFFECT(0);
         let hr = DoDragDrop(
             &data_obj,
@@ -227,9 +229,11 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
             DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0),
             &mut out_effect,
         );
+
         if hr.is_err() {
             return DragOutOutcome::Cancelled;
         }
+
         if out_effect & DROPEFFECT_MOVE == DROPEFFECT_MOVE {
             DragOutOutcome::Dropped(DropEffect::Move)
         } else if out_effect & DROPEFFECT_COPY == DROPEFFECT_COPY {
