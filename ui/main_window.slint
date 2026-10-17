@@ -209,13 +209,22 @@ out property <length> row-height-out: file-list.row-height-out;
 
     /// 文件列表行命中测试（外部拖入定位目标文件夹，Rust 调用）。
     public function row-hit-test(wx: length, wy: length) -> int {
-        file-list.row-hit-test(wx, wy);
+        file-list.row-hit-test(wx - file-list.absolute-position.x, wy - file-list.absolute-position.y);
+    }
+
+    /// 获取指定行相对主窗口的坐标几何 [x, y, width, height]（用于原生高亮框绘制）。
+    public function get-item-rect(idx: int) -> [length] {
+        let r = file-list.get-item-rect(idx);
+        return [r[0] + file-list.absolute-position.x, r[1] + file-list.absolute-position.y, r[2], r[3]];
     }
 
     /// 拖出上膛：行按下时禁用 flick 交互滚动，让拖动只发起 OLE 拖放。
     public function set-drag-armed(v: bool) {
         file-list.set-drag-armed(v);
     }
+
+    /// 拖拽悬停高亮：把命中的目标行索引暴露给 Rust（拖入/拖出悬停时设置）。
+    in-out property <int> file-drop-hover-index <=> file-list.drop-hover-index;
 
     VerticalLayout {
         spacing: 0px;

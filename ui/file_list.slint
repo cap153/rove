@@ -63,6 +63,8 @@ export component FileList inherits Rectangle {
     in-out property <string> rename-path: "";
     /// 目录读取中。
     in-out property <bool> loading: false;
+    /// 拖拽悬停命中的行索引（-1 为无悬停）
+    in-out property <int> drop-hover-index: -1;
 
     callback row-pointer-event(index: int, event: PointerEvent, x: length, y: length);
     callback row-double-clicked(index: int);
@@ -111,18 +113,21 @@ export component FileList inherits Rectangle {
         flick.content-y = 0px;
     }
 
-    /// 命中测试：窗口逻辑坐标 → 行索引（修正表头偏移，并完整支持详细信息/列表/图标网格全视图）。
-    public function row-hit-test(wx: length, wy: length) -> int {
-        // 以 FileList (root) 的绝对坐标为基准，扣除表头高度（详细信息视图下 30px）和滚动偏移
+    /// 命中测试：接收相对于 FileList 自身的局部坐标 (lx, ly)
+    public function row-hit-test(lx: length, ly: length) -> int {
         let header-h = root.view-mode == "details" ? 30px : 0px;
-        let rel-x = wx - root.absolute-position.x - flick.content-x;
-        let rel-y = wy - root.absolute-position.y - header-h - flick.content-y;
+        let rel-x = lx - flick.content-x;
+        let rel-y = ly - header-h - flick.content-y;
 
-        if (rel-x < 0px || rel-y < 0px || rel-x > root.width || rel-y > flick.height) {
+        // 仅在鼠标位于表头区域上方时返回 -1（其余越界由下方的总行数自然保护）
+        if (rel-y < 0px) {
             return -1;
         }
 
         if (root.is-icons-view) {
+            if (root.cell-w <= 0px || root.cell-h <= 0px || root.cells-per-row <= 0) {
+                return -1;
+            }
             let col = floor(rel-x / root.cell-w);
             let r = floor(rel-y / root.cell-h);
             if (col < 0 || col >= root.cells-per-row) {
@@ -131,8 +136,31 @@ export component FileList inherits Rectangle {
             let idx = r * root.cells-per-row + col;
             return (idx >= 0 && idx < root.total-count) ? idx : -1;
         } else {
+            if (root.row-h <= 0px) {
+                return -1;
+            }
             let idx = floor(rel-y / root.row-h);
             return (idx >= 0 && idx < root.total-rows) ? idx : -1;
+        }
+    }
+
+    /// 获取指定单元格相对于 FileList 的坐标几何 [x, y, width, height]
+    public function get-item-rect(idx: int) -> [length] {
+        let header-h = root.view-mode == "details" ? 30px : 0px;
+        if (root.is-icons-view) {
+            let col = Math.mod(idx, root.cells-per-row);
+            let r = floor(idx / root.cells-per-row);
+            let x = col * root.cell-w + 4px;
+            let y = header-h + r * root.cell-h + flick.content-y + 4px;
+            let w = root.cell-w - 8px;
+            let h = root.cell-h - 8px;
+            return [x, y, w, h];
+        } else {
+            let x = 0px;
+            let y = header-h + idx * root.row-h + flick.content-y;
+            let w = flick.width;
+            let h = root.row-h;
+            return [x, y, w, h];
         }
     }
 
@@ -331,9 +359,12 @@ export component FileList inherits Rectangle {
                 x: 0px;
                 width: flick.content-width;
                 height: root.row-h;
-                background: row.selected
+                background: (row.index == root.drop-hover-index && row.is-dir) || row.selected
                     ? Theme.bg-selected
-                    : (ta.has-hover ? Theme.bg-hover : transparent);
+                    : (row.index == root.drop-hover-index ? Theme.bg-hover : (ta.has-hover ? Theme.bg-hover : transparent));
+                border-width: (row.index == root.drop-hover-index && row.is-dir) ? 2px : 0px;
+                border-color: Theme.accent;
+                border-radius: 4px;
 
                 ta := TouchArea {
                     width: 100%;
@@ -561,9 +592,12 @@ export component FileList inherits Rectangle {
                 width: root.cell-w - 8px;
                 height: root.cell-h - 8px;
                 border-radius: 8px;
-                background: row.selected
+                // 拖拽悬停到文件夹：显示醒目的选中色 + 强调色高亮边框；悬停到普通文件显示弱悬停底色
+                background: (row.index == root.drop-hover-index && row.is-dir) || row.selected
                     ? Theme.bg-selected
-                    : (ta-icons.has-hover ? Theme.bg-hover : transparent);
+                    : (row.index == root.drop-hover-index ? Theme.bg-hover : (ta-icons.has-hover ? Theme.bg-hover : transparent));
+                border-width: (row.index == root.drop-hover-index && row.is-dir) ? 2.5px : (row.index == root.drop-hover-index ? 1px : 0px);
+                border-color: (row.index == root.drop-hover-index && row.is-dir) ? Theme.accent : Theme.border;
 
                 ta-icons := TouchArea {
                     width: 100%;

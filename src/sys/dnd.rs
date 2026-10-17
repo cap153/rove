@@ -33,20 +33,20 @@ pub enum DropEffect {
 /// 发起一次拖出循环。调用方处于左键按下的手势中时调用；
 /// 本函数在主 UI 线程阻塞至拖放结束（内部为 Windows 模态消息循环，期间正常刷新光标并派发绘制）。
 #[cfg(windows)]
-pub fn begin_drag_out(paths: &[PathBuf]) -> DragOutOutcome {
+pub fn begin_drag_out<F: Fn() + 'static>(paths: &[PathBuf], on_feedback: F) -> DragOutOutcome {
     if paths.is_empty() {
         return DragOutOutcome::Cancelled;
     }
-    drag_out_impl(paths)
+    drag_out_impl(paths, Box::new(on_feedback))
 }
 
 #[cfg(not(windows))]
-pub fn begin_drag_out(_paths: &[PathBuf]) -> DragOutOutcome {
+pub fn begin_drag_out<F: Fn() + 'static>(_paths: &[PathBuf], _on_feedback: F) -> DragOutOutcome {
     DragOutOutcome::Cancelled
 }
 
 #[cfg(windows)]
-fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
+fn drag_out_impl(paths: &[PathBuf], on_feedback: Box<dyn Fn()>) -> DragOutOutcome {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{
         BOOL, DRAGDROP_S_CANCEL, DRAGDROP_S_DROP, DRAGDROP_S_USEDEFAULTCURSORS,
@@ -72,7 +72,9 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
 
     // ---- 自定义 IDropSource：左键释放 → DROP；Esc → CANCEL；光标交给 Windows 原生绘制 ----
     #[implement(IDropSource)]
-    struct DropSource;
+    struct DropSource {
+        on_feedback: Box<dyn Fn()>,
+    }
 
     impl IDropSource_Impl for DropSource_Impl {
         fn QueryContinueDrag(
@@ -91,6 +93,7 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
         }
 
         fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
+            (self.on_feedback)();
             DRAGDROP_S_USEDEFAULTCURSORS
         }
     }
@@ -224,7 +227,7 @@ fn drag_out_impl(paths: &[PathBuf]) -> DragOutOutcome {
         }
 
         // 6. 发起原生 OLE 拖放
-        let source: IDropSource = DropSource.into();
+        let source: IDropSource = DropSource { on_feedback }.into();
         let mut out_effect = DROPEFFECT(0);
         let hr = DoDragDrop(
             &data_obj,

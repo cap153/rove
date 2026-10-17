@@ -2586,8 +2586,101 @@ impl App {
         if paths.is_empty() {
             return;
         }
-        let outcome = crate::sys::dnd::begin_drag_out(&paths);
-        // 严禁在此手动 remove_file！外部移动由 Windows 系统接管，内部拖放由 process_external_drop 调度。
+
+        #[cfg(windows)]
+        let ui_weak = self.ui.as_weak();
+        #[cfg(windows)]
+        let scale = self.ui.window().scale_factor() as f32;
+
+        // 原生焦点框高亮（仅 Windows）：DrawFocusRect 对同一矩形二次绘制即为自擦除。
+        #[cfg(windows)]
+        let hwnd: isize = {
+            use raw_window_handle::RawWindowHandle;
+            if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(&self.ui.window().window_handle()) {
+                if let RawWindowHandle::Win32(win) = h.as_raw() {
+                    win.hwnd.get() as _
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        };
+
+        // 定义为嵌套 fn（不捕获环境），避免把借用带入 move 闭包与收尾擦除。
+        #[cfg(windows)]
+        unsafe fn draw_focus(hwnd: isize, rect: &windows_sys::Win32::Foundation::RECT) {
+            use windows_sys::Win32::Graphics::Gdi::{DrawFocusRect, GetDC, ReleaseDC};
+            let hdc = GetDC(hwnd as _);
+            DrawFocusRect(hdc, rect);
+            ReleaseDC(hwnd as _, hdc);
+        }
+
+        // dnd::begin_drag_out 的回调类型是 Fn()（非 FnMut），跨调用保留状态
+        // 必须走内部可变性，否则闭包无法编译通过。
+        #[cfg(windows)]
+        let last_highlight_rect: std::rc::Rc<std::cell::RefCell<Option<windows_sys::Win32::Foundation::RECT>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        #[cfg(windows)]
+        let last_idx: std::rc::Rc<std::cell::Cell<i32>> = std::rc::Rc::new(std::cell::Cell::new(-1));
+
+        let outcome = crate::sys::dnd::begin_drag_out(&paths, {
+            #[cfg(windows)]
+            let last_highlight_rect = last_highlight_rect.clone();
+            #[cfg(windows)]
+            let last_idx = last_idx.clone();
+            move || {
+                #[cfg(windows)]
+                if let Some(ui) = ui_weak.upgrade() {
+                    #[cfg(windows)]
+                    if let Some((lx, ly)) = cursor_window_logical(&ui, scale) {
+                        let idx = ui.invoke_row_hit_test(lx, ly);
+
+                        if idx != last_idx.get() {
+                            last_idx.set(idx);
+
+                            // 1. 擦除上一个高亮框
+                            if let Some(old_rect) = last_highlight_rect.borrow_mut().take() {
+                                if hwnd != 0 {
+                                    unsafe { draw_focus(hwnd, &old_rect) };
+                                }
+                            }
+
+                            // 2. 在当前悬停项绘制原生高亮焦点框
+                            if idx >= 0 && hwnd != 0 {
+                                let rect_arr = ui.invoke_get_item_rect(idx);
+                                if rect_arr.row_count() == 4 {
+                                    let rx = rect_arr.row_data(0).unwrap_or(0.0) * scale;
+                                    let ry = rect_arr.row_data(1).unwrap_or(0.0) * scale;
+                                    let rw = rect_arr.row_data(2).unwrap_or(0.0) * scale;
+                                    let rh = rect_arr.row_data(3).unwrap_or(0.0) * scale;
+
+                                    let new_rect = windows_sys::Win32::Foundation::RECT {
+                                        left: rx as i32,
+                                        top: ry as i32,
+                                        right: (rx + rw) as i32,
+                                        bottom: (ry + rh) as i32,
+                                    };
+                                    unsafe { draw_focus(hwnd, &new_rect) };
+                                    *last_highlight_rect.borrow_mut() = Some(new_rect);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // 拖拽释放：彻底擦除高亮边框
+        #[cfg(windows)]
+        if let Some(old_rect) = last_highlight_rect.borrow_mut().take() {
+            if hwnd != 0 {
+                unsafe { draw_focus(hwnd, &old_rect) };
+            }
+        }
+
+        self.ui.set_file_drop_hover_index(-1);
+        self.ui.window().request_redraw();
         if let crate::sys::dnd::DragOutOutcome::Dropped(_) = outcome {
             self.reload_active();
         }
