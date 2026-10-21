@@ -31,22 +31,105 @@ use crate::state::AppState;
 
 slint::include_modules!();
 
-/// 诊断日志：ROVE_LOG=1 时追加写入 %TEMP%/rove.log。
-/// GUI 子系统进程的 stderr 不可见，文件日志是 WSL 下排查的唯一渠道。
+/// 日志等级判定：`ROVE_LOG` 存在即启用普通级；`ROVE_LOG=2|verbose|debug` 才启用详细级。
+pub(crate) fn log_enabled(level: u8) -> bool {
+    if level < 2 {
+        return std::env::var_os("ROVE_LOG").is_some();
+    }
+    match std::env::var("ROVE_LOG") {
+        Ok(v) => {
+            let v = v.trim();
+            v == "2" || v.eq_ignore_ascii_case("verbose") || v.eq_ignore_ascii_case("debug")
+        }
+        Err(_) => false,
+    }
+}
+
+/// 诊断日志时间戳：本地时间 `YYYY-MM-DD HH:MM:SS.mmm`。
+/// Windows 取本机本地时间；其他平台无时区信息可用，退化为 UTC（后缀 `Z`）。
+pub(crate) fn log_stamp() -> String {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+        let mut st: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
+        unsafe { GetLocalTime(&mut st) };
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+            st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let days = ms.div_euclid(86_400_000);
+        let sod = ms.rem_euclid(86_400_000);
+        let (y, m, d) = civil_from_days(days);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}Z",
+            y,
+            m,
+            d,
+            sod / 3_600_000,
+            (sod / 60_000) % 60,
+            (sod / 1000) % 60,
+            sod % 1000
+        )
+    }
+}
+
+/// Unix 天数 → 公历 `(年, 月, 日)`（Howard Hinnant `civil_from_days` 算法）。
+#[cfg(not(windows))]
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 把一条诊断日志追加写入 exe 同目录的 `rove.log`（自动带本地时间戳）。
+/// GUI 子系统进程的 stderr 不可见，文件日志是 WSL 下排查的唯一渠道；
+/// 写在 exe 同目录（WSL 文件系统上 Windows 进程可写），避免依赖 %TEMP% 解析。
+pub(crate) fn log_write(msg: &str) {
+    use std::io::Write as _;
+    let path = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("rove.log")))
+        .unwrap_or_else(|| std::env::temp_dir().join("rove.log"));
+    // 必须先拼成整行、再一次 write_all：`write_fmt` 会按格式片段分多次
+    // write_all，多个后台线程并发写日志时会把两行交错成一团
+    // （表现为时间戳重复、两行粘成一行）。
+    let line = format!("[rove] {} {}\n", log_stamp(), msg);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 诊断日志：`ROVE_LOG` 存在时写入 `rove.log`（带本地时间戳）。
 #[macro_export]
 macro_rules! logln {
     ($($arg:tt)*) => {{
-        if std::env::var_os("ROVE_LOG").is_some() {
-            use std::io::Write as _;
-            // 日志写在 exe 同目录（WSL 文件系统上 Windows 进程可写），
-            // 避免依赖 %TEMP% 解析与 WSLENV 传递。
-            let path = std::env::current_exe()
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.join("rove.log")))
-                .unwrap_or_else(|| std::env::temp_dir().join("rove.log"));
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-                let _ = writeln!(f, "[rove] {}", format!($($arg)*));
-            }
+        if $crate::app::log_enabled(1) {
+            $crate::app::log_write(&format!($($arg)*));
+        }
+    }};
+}
+
+/// 详细级诊断日志：仅 `ROVE_LOG=2|verbose|debug` 时写入。
+/// 用于高频、仅在排查布局/虚拟窗口问题时才有价值的噪音日志。
+#[macro_export]
+macro_rules! logv {
+    ($($arg:tt)*) => {{
+        if $crate::app::log_enabled(2) {
+            $crate::app::log_write(&format!($($arg)*));
         }
     }};
 }
@@ -56,6 +139,9 @@ macro_rules! logln {
 const ROW_HEIGHT: f32 = 30.0;
 /// 视口上下过扫描行数。
 const OVERSCAN: usize = 4;
+/// 全局索引搜索单次展示上限。命中更多时在状态栏提示「共找到 N 项」，
+/// 避免无限结果把列表刷爆；1000 项在 Slint 虚拟列表下仍可流畅滚动。
+const GLOBAL_SEARCH_LIMIT: usize = 1000;
 
 // ---- 右键菜单动作 ID ----
 const ACT_OPEN: &str = "open";
@@ -287,6 +373,8 @@ impl App {
         tab.entries = result.entries;
         // 拼音缓存随 entries 失效（惰性重建）。
         tab.pinyin_cache.clear();
+        // 新列表到达即失效全局搜索的截断提示。
+        tab.search_total = None;
         // 「此电脑」重载 = 回到驱动器列表，残留的全局搜索词会误过滤空表。
         if tab.path.is_none() {
             tab.filter.clear();
@@ -563,6 +651,23 @@ mod tests {
 // UI 同步
 // ---------------------------------------------------------------------------
 
+/// 全盘索引就绪的跨线程通知入口。
+///
+/// 由后台索引线程（`search::index::spawn_builder`）经
+/// `slint::invoke_from_event_loop` 投递，**必然运行在 UI 线程**，
+/// 因此可以安全地借用 `SESSION` 中的 `App`。
+///
+/// 相比定时器轮询：零空转开销，且就绪与刷新落在同一事件循环 tick。
+pub(crate) fn on_index_ready() {
+    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    let mut app = app.borrow_mut();
+    app.refresh_after_index_ready();
+    // 无论是否重查都同步一次状态栏：把「全盘索引构建中...」摘掉。
+    app.sync_status();
+}
+
 impl App {
     fn sync_tabs(&self) {
         let tabs: Vec<TabInfo> = self
@@ -671,6 +776,7 @@ impl App {
             tab.entries = entries;
             tab.pinyin_cache.clear();
             tab.filter.clear();
+            tab.search_total = None;
             tab.display = (0..n).collect();
             return;
         }
@@ -678,16 +784,55 @@ impl App {
         let Ok(guard) = index.read() else {
             return;
         };
-        let hits = guard.search(query, 200);
-        let entries: Vec<FileEntry> = hits
+        let result = guard.search(query, GLOBAL_SEARCH_LIMIT);
+        let total = result.total;
+        let entries: Vec<FileEntry> = result
+            .hits
             .into_iter()
             .map(|(e, _)| FileEntry::from_path(&e.path, e.is_dir, 0, None))
             .collect();
+        let shown = entries.len();
         let tab = self.state.active_mut();
         tab.entries = entries;
         tab.pinyin_cache.clear();
         tab.filter = query.to_string();
+        // 命中数超过展示上限时记录总数，供状态栏提示截断。
+        tab.search_total = (shown < total).then_some(total);
         tab.rebuild_display();
+    }
+
+    /// 全盘索引刚刚就绪：若当前正处于「此电脑」全局搜索且搜索框非空，
+    /// 静默重查一次，把构建期的部分结果补全为完整结果。
+    ///
+    /// 背景：索引是后台增量填充的，构建中搜索只会命中已扫完的磁盘
+    /// （实测 275 → 302 条）。没有这一步，用户必须手动清空再输入才能拿到全量。
+    fn refresh_after_index_ready(&mut self) {
+        let (is_root, query) = {
+            let tab = self.state.active();
+            (tab.path.is_none(), tab.filter.trim().to_string())
+        };
+        // 仅全局搜索需要补全：目录视图走的是本地过滤 + 深度搜索，与索引无关。
+        if !is_root || query.is_empty() {
+            return;
+        }
+        logln!("index ready: re-query global search {query:?}");
+        self.run_global_search(&query);
+        // 必须清虚拟列表缓存，否则列表命中旧窗口不重渲染（只有状态栏会变）。
+        self.visible_cache = None;
+        self.sync_file_list();
+        self.sync_status();
+    }
+
+    /// 全盘索引构建状态：`Some(true)` 已就绪 / `Some(false)` 正在构建 /
+    /// `None` 索引尚未启动，或读锁被索引线程占用（本次拿不到）。
+    ///
+    /// 直接读真实状态而非缓存字段：状态栏每次同步都准确，不存在
+    /// 「定时器还没跑到所以显示陈旧状态」的空窗；也无需轮询定时器。
+    /// 用 `try_read` 而非 `read`：此函数运行在 UI 线程，而索引线程正高频
+    /// 持写锁推条目，阻塞等待会把卡顿带到界面上。取不到锁时退化为「不提示」，
+    /// 代价仅是偶尔少一行状态文案，远优于卡死主线程。
+    fn index_build_state() -> Option<bool> {
+        crate::search::index::try_shared().and_then(|i| i.try_read().ok().map(|g| g.ready))
     }
 
     fn sync_status(&self) {
@@ -698,6 +843,16 @@ impl App {
         let (dirs, files, selected_size) = tab.stats();
         let total = tab.display.len();
         let mut left = format!("{total} 个项目（{dirs} 个文件夹，{files} 个文件）");
+        // 全盘索引构建中：此电脑视图的全局搜索结果可能只是已扫完那部分磁盘的
+        // 未完成结果（会随构建推进而增多），必须显式告知，否则用户会以为搜漏了。
+        // 判定绑定真实构建状态：仅「已启动但未就绪」才提示，索引未启动不误报。
+        if tab.path.is_none() && matches!(Self::index_build_state(), Some(false)) {
+            left.push_str(" · 全盘索引构建中...");
+        }
+        // 全局索引搜索命中数超过展示上限：明确告知结果被截断。
+        if let Some(found) = tab.search_total.filter(|&n| total < n) {
+            left.push_str(&format!(" · 已展示前 {total} 项（共找到 {found} 项）"));
+        }
         if tab.deep_searching {
             left.push_str(" · 正在搜索子文件夹…");
         }
@@ -1023,7 +1178,8 @@ impl App {
         let first = first_row * cells_per_row;
         let count = (count_rows * cells_per_row).min(total.saturating_sub(first)).max(1);
 
-        logln!("visible_rows h={list_height} total={total} cpr={cells_per_row} first={first} count={count}");
+        // 高频噪音日志：仅在 ROVE_LOG=2 时输出（排查虚拟窗口/布局问题时用）。
+        logv!("visible_rows h={list_height} total={total} cpr={cells_per_row} first={first} count={count}");
         if self.visible_cache == Some((first, count)) && !self.state.active().loading {
             return;
         }
@@ -3807,6 +3963,11 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     // 先入槽再接线：会话槽持有唯一强引用，回调/定时器均为 Weak；
     // 漏掉此行会导致 App 在本函数返回时即被释放（列表收不到数据）。
     SESSION.with(|slot| *slot.borrow_mut() = Some(app.clone()));
+    // 启动即预热全盘索引：懒加载会让首次搜索撞上冷启动（等待扫描），
+    // 且状态栏空等。放在这里可在会话建立瞬间就让后台线程开始静默建库。
+    // shared() 是幂等的（OnceLock），守护进程常驻时重复调用无副作用。
+    let _ = crate::search::index::shared();
+
     wire_callbacks(&app);
     setup_timers(&app);
     setup_keyboard(&app);

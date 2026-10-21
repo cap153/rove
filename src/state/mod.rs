@@ -69,6 +69,9 @@ pub struct TabState {
     pub deep_generation: u64,
     /// 深度搜索进行中（状态栏提示）。
     pub deep_searching: bool,
+    /// 全局索引搜索的未截断命中总数；`Some(n)` 且 `display.len() < n` 时，
+    /// 状态栏提示「结果已截断」。
+    pub search_total: Option<usize>,
     /// 标签页类型：普通文件管理器 / 设置页。
     pub kind: TabKind,
     /// 设置页当前子页面（仅 kind = Settings 时有效）。
@@ -96,6 +99,7 @@ impl TabState {
             deep_pinyin: Vec::new(),
             deep_generation: 0,
             deep_searching: false,
+            search_total: None,
             kind: TabKind::Explorer,
             settings_subpage: SettingsSubpage::default(),
         }
@@ -138,6 +142,7 @@ impl TabState {
         self.generation += 1;
         self.loading = true;
         self.filter.clear();
+        self.search_total = None;
         self.clear_deep();
     }
 
@@ -154,6 +159,7 @@ impl TabState {
         self.generation += 1;
         self.loading = true;
         self.filter.clear();
+        self.search_total = None;
         self.clear_deep();
     }
 

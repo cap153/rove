@@ -29,11 +29,14 @@ raw-window-handle = "0.6"
 toml_edit = "0.22"
 nucleo-matcher = "0.3"
 pinyin = { version = "0.10", features = ["plain", "heteronym"] }
-# 任务 3.2：NTFS $MFT 解析加速全盘索引（需管理员权限，失败回退递归遍历）。
-mft = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.21"
+# 任务 3.2：NTFS 全盘索引加速。通过卷句柄 FSCTL_ENUM_USN_DATA 枚举 MFT 记录
+# 并重构路径（直接 open \\.\X:\$MFT 会被内核独占锁死，任何权限均 Access Denied）。
+# 注意：该 crate 依赖 `windows` 且无平台门控，只能在 Windows 目标下引入，
+# 否则 Linux 宿主构建/测试会失败。
+usn-journal-rs = "0.4.1"
 windows = { version = "0.59", features = [
     "Win32_UI_Shell",
     # IFileDialog / COMDLG_FILTERSPEC（原生文件选择对话框）。
@@ -64,6 +67,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Ole",
     "Win32_System_Threading",
     "Win32_System_Registry",
+    # GetLocalTime：诊断日志本地时间戳。
+    "Win32_System_SystemInformation",
     "Win32_System_Time",
     "Win32_System_Pipes",
     "Win32_System_IO",
