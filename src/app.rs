@@ -627,6 +627,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pulse_size_format_matches_pulse_sidebar() {
+        let kib = 1024u64;
+        let mib = kib * 1024;
+        let gib = mib * 1024;
+        // GB 档：取整到整数 G。注意 Rust 的 `{:.0}` 是银行家舍入（半数取偶），
+        // 6.5 → "6"、7.5 → "8"；故用 6.6 这类无歧义值验证进位。
+        assert_eq!(format_pulse_size(268 * gib), "268G");
+        assert_eq!(format_pulse_size(831 * gib), "831G");
+        assert_eq!(format_pulse_size(6 * gib + 6 * gib / 10), "7G"); // 6.6G → 7G
+        assert_eq!(format_pulse_size(6 * gib + gib / 2), "6G"); // 6.5G → 6G（半数取偶）
+        assert_eq!(format_pulse_size(0), "0G");
+        // TB 档：≥1000GB 才折算；≥10TB 取整，否则一位小数并去掉多余的 .0。
+        assert_eq!(format_pulse_size(1024 * gib), "1TB");
+        assert_eq!(format_pulse_size(6_200 * gib / 10), "620G"); // 620G 仍在 GB 档
+        assert_eq!(format_pulse_size(2 * 1024 * gib + 512 * gib), "2.5TB");
+        assert_eq!(format_pulse_size(12 * 1024 * gib), "12TB");
+    }
+
+    #[test]
+    fn pulse_drive_palette_rotates_and_warns_on_full() {
+        let drive = |used_gib: u64, total_gib: u64| DriveInfo {
+            letter: 'C',
+            label: String::new(),
+            drive_type: fs::drives::DriveType::Fixed,
+            total_bytes: total_gib * 1024 * 1024 * 1024,
+            free_bytes: (total_gib - used_gib) * 1024 * 1024 * 1024,
+        };
+        // 调色盘按序号轮替：蓝 → 薄荷绿 → 琥珀黄 → 紫 → 回到蓝。
+        let expected = [
+            (0x3B, 0x82, 0xF6),
+            (0x10, 0xB9, 0x81),
+            (0xF5, 0x9E, 0x0B),
+            (0xA8, 0x55, 0xF7),
+            (0x3B, 0x82, 0xF6),
+        ];
+        for (i, (r, g, b)) in expected.iter().enumerate() {
+            let c = drive_pulse_color(i, &drive(200, 1000));
+            assert_eq!((c.red(), c.green(), c.blue()), (*r, *g, *b), "index {i}");
+        }
+        // 占用 >90% 一律告警红，覆盖轮替色。
+        let full = drive_pulse_color(0, &drive(950, 1000));
+        assert_eq!((full.red(), full.green(), full.blue()), (0xE0, 0x52, 0x52));
+        // 恰好 90% 不算告急，仍用调色盘。
+        let edge = drive_pulse_color(0, &drive(900, 1000));
+        assert_eq!((edge.red(), edge.green(), edge.blue()), (0x3B, 0x82, 0xF6));
+    }
+
+    #[test]
     fn drag_gesture_accumulates_until_threshold() {
         let paths = vec![PathBuf::from("C:\\a.txt")];
         let mut dp = Some((0.0f32, 0.0f32, paths.clone()));
@@ -955,18 +1003,20 @@ impl App {
         }
 
         let mut computer_items: Vec<SidebarItem> = vec![header("此电脑")];
-        for drive in &self.drives {
+        for (idx, drive) in self.drives.iter().enumerate() {
+            // 已用 = 总量 - 剩余；Pulse 风格紧凑格式（如 "268G / 831G"）。
+            let used_bytes = drive.total_bytes.saturating_sub(drive.free_bytes);
             computer_items.push(SidebarItem {
                 id: format!("drive:{}", drive.letter).into(),
                 label: drive.display_label().into(),
                 detail: format!(
-                    "{} 可用，共 {}",
-                    fs::format_size_bytes(drive.free_bytes),
-                    fs::format_size_bytes(drive.total_bytes)
+                    "{} / {}",
+                    format_pulse_size(used_bytes),
+                    format_pulse_size(drive.total_bytes)
                 )
                 .into(),
                 kind: "drive".into(),
-                icon_color: drive_color(drive),
+                icon_color: drive_pulse_color(idx, drive),
                 icon_text: drive.letter.to_string().into(),
                 usage: drive.usage() as f32,
             });
@@ -1303,15 +1353,41 @@ fn header(label: &str) -> SidebarItem {
     }
 }
 
-fn drive_color(drive: &DriveInfo) -> Color {
-    let (r, g, b) = match drive.drive_type {
-        fs::DriveType::Fixed => (0x3E, 0x7B, 0xC4),
-        fs::DriveType::Removable => (0x4C, 0x9F, 0x70),
-        fs::DriveType::Network => (0x3A, 0xA6, 0xA6),
-        fs::DriveType::Cdrom => (0xB0, 0x7A, 0x2E),
-        fs::DriveType::Ramdisk => (0x8E, 0x6C, 0xC9),
-        fs::DriveType::Unknown => (0x8A, 0x8F, 0x98),
-    };
+/// 复刻 Pulse 的紧凑容量格式（如 `268G`、`6.2TB`、`1TB`）。
+///
+/// 阈值与舍入规则对齐 Pulse 侧栏：≥1000GB 折算为 TB（≥10TB 取整、
+/// 否则一位小数并去掉多余的 `.0`），否则取整到 GB。
+fn format_pulse_size(bytes: u64) -> String {
+    let gb = bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    if gb >= 1000.0 {
+        let tb = gb / 1024.0;
+        if tb >= 10.0 {
+            format!("{tb:.0}TB")
+        } else {
+            // 1.0TB → 1TB，2.5TB 保持原样。
+            format!("{tb:.1}TB").replace(".0TB", "TB")
+        }
+    } else {
+        format!("{gb:.0}G")
+    }
+}
+
+/// 复刻 Pulse 的多色容量条调色盘。
+///
+/// 蓝 / 薄荷绿 / 琥珀黄 / 紫按驱动器序号轮替；占用 >90% 时切换为告警红，
+/// 与 Pulse 的「空间告急」视觉一致。`index` 为驱动器在 `list_drives()`
+/// 中的序号（数据盘优先的顺序，见 `search::index::list_roots` 的同源排序）。
+fn drive_pulse_color(index: usize, drive: &DriveInfo) -> Color {
+    if drive.usage() > 0.90 {
+        return Color::from_rgb_u8(0xE0, 0x52, 0x52); // 空间告急：红
+    }
+    const PALETTE: [(u8, u8, u8); 4] = [
+        (0x3B, 0x82, 0xF6), // 蓝 (win10 C:)
+        (0x10, 0xB9, 0x81), // 薄荷绿 (learn D:)
+        (0xF5, 0x9E, 0x0B), // 琥珀黄 (extend E:)
+        (0xA8, 0x55, 0xF7), // 紫 (move_hard_disk)
+    ];
+    let (r, g, b) = PALETTE[index % PALETTE.len()];
     Color::from_rgb_u8(r, g, b)
 }
 

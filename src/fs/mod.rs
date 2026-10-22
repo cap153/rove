@@ -7,7 +7,7 @@ pub mod time;
 
 pub use dir::{SortKey, SortState, list_directory, sort_entries};
 pub use drives::{
-    DriveInfo, DriveType, list_drives, list_network_locations, recycle_bin_stats, quick_access_dirs,
+    DriveInfo, list_drives, list_network_locations, recycle_bin_stats, quick_access_dirs,
 };
 pub use entry::{
     FileEntry, format_size, format_size_bytes, format_time, icon_color, icon_text_for,

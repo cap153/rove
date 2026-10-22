@@ -72,7 +72,7 @@ export component Sidebar inherits Rectangle {
 
             for item[i] in root.items : Rectangle {
                 width: parent.width;
-                height: item.kind == "header" ? 30px : (item.kind == "drive" ? 52px : 32px);
+                height: item.kind == "header" ? 30px : (item.kind == "drive" ? 46px : 32px);
                 background: (root.active-id == item.id) ? Theme.bg-selected : (item-ta.has-hover ? Theme.bg-hover : transparent);
 
                 // 选中态左侧主题色竖条。
@@ -176,23 +176,24 @@ export component Sidebar inherits Rectangle {
                     }
                 }
 
-                // 驱动器行：名称 + 容量进度条 + 剩余/总量文本。
+                // 驱动器行：复刻 Pulse（第一行：图标 + 卷标 + 右侧紧凑容量；第二行：通栏全宽彩色容量条）
                 if (item.kind == "drive") : VerticalLayout {
                     x: 10px;
-                    width: parent.width - 18px;
+                    width: parent.width - 20px;
                     height: parent.height;
-                    spacing: 3px;
+                    alignment: center;
+                    spacing: 6px;
 
+                    // 第一行：[图标] 驱动器名 ......... [268G / 831G]
                     HorizontalLayout {
                         spacing: 8px;
-                        height: 20px;
+                        // 注意：严禁在此处加 alignment: center，否则会导致整行元素在横向被强行居中挤压
 
                         Rectangle {
-                            width: 20px;
-                            height: 20px;
-                            y: 0px;
-                            border-radius: 5px;
-                            background: item.icon-color.transparentize(0.84);
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 4px;
+                            background: item.icon-color.transparentize(0.85);
 
                             Text {
                                 text: item.icon-text;
@@ -201,8 +202,6 @@ export component Sidebar inherits Rectangle {
                                 font-weight: 700;
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
-                                width: 100%;
-                                height: 100%;
                             }
                         }
 
@@ -210,39 +209,37 @@ export component Sidebar inherits Rectangle {
                             text: item.label;
                             color: (root.active-id == item.id) ? Theme.accent : Theme.text-primary;
                             font-size: 12.5px;
+                            font-weight: 500;
+                            horizontal-alignment: left; // 显式左对齐
                             vertical-alignment: center;
                             overflow: elide;
                             horizontal-stretch: 1;
                         }
-                    }
 
-                    HorizontalLayout {
-                        spacing: 8px;
-                        height: 12px;
-
-                        // 容量条：底色轨道 + 已用填充（按类型着色）。
-                        Rectangle {
-                            width: 64px;
-                            height: 6px;
-                            y: 3px;
-                            border-radius: 3px;
-                            background: Theme.border;
-
-                            Rectangle {
-                                width: parent.width * (item.usage < 0 ? 0 : min(max(item.usage, 0), 1));
-                                height: parent.height;
-                                border-radius: 3px;
-                                background: item.icon-color;
-                            }
-                        }
-
+                        // 右对齐的已用/总量紧凑文本
                         Text {
                             text: item.detail;
                             color: Theme.text-secondary;
-                            font-size: 10.5px;
+                            font-size: 11px;
                             vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    // 第二行：通栏圆角容量条（灰色底槽 + 动态彩色填充）
+                    Rectangle {
+                        width: 100%;
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.text-primary.transparentize(0.88);
+
+                        Rectangle {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width * max(0.0, min(1.0, item.usage));
+                            height: parent.height;
+                            border-radius: 2px;
+                            background: item.icon-color;
                         }
                     }
                 }
