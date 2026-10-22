@@ -16,6 +16,14 @@ pub struct Config {
     pub window_width: u32,
     pub window_height: u32,
     pub staging_expanded: bool,
+    /// 「最近使用」是否展开（默认 false 收起）。
+    pub recent_expanded: bool,
+    /// 「快速访问」是否展开（默认 true 展开）。
+    pub quick_expanded: bool,
+    /// 「此电脑」是否展开（默认 true 展开）。
+    pub computer_expanded: bool,
+    /// 「网络位置」是否展开（默认 true 展开）。
+    pub network_expanded: bool,
     /// 侧栏分区顺序（分区 key：quick / recent / computer / network）。
     pub sidebar_order: Vec<String>,
     /// 视图模式：details | list | icons-small | icons-medium | icons-large | icons-xl。
@@ -38,6 +46,10 @@ impl Default for Config {
             window_width: 1150,
             window_height: 690,
             staging_expanded: true,
+            recent_expanded: false, // 默认收起
+            quick_expanded: true,   // 默认展开
+            computer_expanded: true,// 默认展开
+            network_expanded: true, // 默认展开
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
         }
@@ -86,6 +98,18 @@ impl Config {
         if let Some(expanded) = json.get("staging_expanded").and_then(|v| v.as_bool()) {
             config.staging_expanded = expanded;
         }
+        if let Some(expanded) = json.get("recent_expanded").and_then(|v| v.as_bool()) {
+            config.recent_expanded = expanded;
+        }
+        if let Some(expanded) = json.get("quick_expanded").and_then(|v| v.as_bool()) {
+            config.quick_expanded = expanded;
+        }
+        if let Some(expanded) = json.get("computer_expanded").and_then(|v| v.as_bool()) {
+            config.computer_expanded = expanded;
+        }
+        if let Some(expanded) = json.get("network_expanded").and_then(|v| v.as_bool()) {
+            config.network_expanded = expanded;
+        }
         if let Some(order) = json.get("sidebar_order").and_then(|v| v.as_array()) {
             let keys: Vec<String> = order
                 .iter()
@@ -127,6 +151,10 @@ impl Config {
             "window_width": self.window_width,
             "window_height": self.window_height,
             "staging_expanded": self.staging_expanded,
+            "recent_expanded": self.recent_expanded,
+            "quick_expanded": self.quick_expanded,
+            "computer_expanded": self.computer_expanded,
+            "network_expanded": self.network_expanded,
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
         });

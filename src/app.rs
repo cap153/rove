@@ -937,6 +937,15 @@ impl App {
         for n in &network {
             fingerprint = fingerprint.wrapping_mul(31).wrapping_add(n.len() as u64);
         }
+        // 纳入 4 个分区的展开状态（任一状态切换均触发侧栏重绘）
+        for exp in [
+            self.config.quick_expanded,
+            self.config.recent_expanded,
+            self.config.computer_expanded,
+            self.config.network_expanded,
+        ] {
+            fingerprint = fingerprint.wrapping_mul(31).wrapping_add(exp as u64);
+        }
         if fingerprint == self.sidebar_fingerprint {
             return;
         }
@@ -946,17 +955,21 @@ impl App {
 
         // ---- 各分区内容 ----
         // key → 区块（header + 条目），按 config.sidebar_order 组装。
-        let mut quick_items: Vec<SidebarItem> = vec![header("快速访问")];
-        for (label, id_suffix, dir) in quick_access_dirs() {
-            // 目录不存在时跳过该入口（值本身不使用，仅作存在性探测）。
-            let Some(_dir) = dir else { continue };
-            let (color, icon) = match label {
-                "桌面" => (Color::from_rgb_u8(0xE8, 0xB3, 0x3C), "桌"),
-                "下载" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "下"),
-                "图片" => (Color::from_rgb_u8(0x4C, 0x9F, 0x70), "图"),
-                "文档" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "文"),
-                "音乐" => (Color::from_rgb_u8(0xD9, 0x69, 0x4E), "乐"),
-                "视频" => (Color::from_rgb_u8(0x8E, 0x6C, 0xC9), "视"),
+        let arrow_quick = if self.config.quick_expanded { "∨" } else { "›" };
+        let mut h = header("快速访问");
+        h.icon_text = arrow_quick.into();
+        let mut quick_items: Vec<SidebarItem> = vec![h];
+        if self.config.quick_expanded {
+            for (label, id_suffix, dir) in quick_access_dirs() {
+                // 目录不存在时跳过该入口（值本身不使用，仅作存在性探测）。
+                let Some(_dir) = dir else { continue };
+                let (color, icon) = match label {
+                    "桌面" => (Color::from_rgb_u8(0xE8, 0xB3, 0x3C), "桌"),
+                    "下载" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "下"),
+                    "图片" => (Color::from_rgb_u8(0x4C, 0x9F, 0x70), "图"),
+                    "文档" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "文"),
+                    "音乐" => (Color::from_rgb_u8(0xD9, 0x69, 0x4E), "乐"),
+                    "视频" => (Color::from_rgb_u8(0x8E, 0x6C, 0xC9), "视"),
                 _ => (Color::from_rgb_u8(0x8A, 0x8F, 0x98), "回"),
             };
             let detail = if label == "回收站" {
@@ -977,73 +990,92 @@ impl App {
                 icon_text: icon.into(),
                 usage: -1.0,
             });
+            }
         }
 
         let mut recent_items: Vec<SidebarItem> = Vec::new();
         if !self.state.recent.is_empty() {
-            recent_items.push(header("最近使用"));
-            for path in self.state.recent.iter().take(8) {
-                if !path.exists() {
-                    continue;
+            // 展开与收起箭头
+            let arrow = if self.config.recent_expanded { "∨" } else { "›" };
+            let mut h = header("最近使用");
+            h.icon_text = arrow.into();
+            recent_items.push(h);
+
+            // 仅在展开状态下才推入子条目；收起时仅保留标题栏
+            if self.config.recent_expanded {
+                for path in self.state.recent.iter().take(8) {
+                    if !path.exists() {
+                        continue;
+                    }
+                    let label = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    recent_items.push(SidebarItem {
+                        id: format!("recent:{}", path.to_string_lossy()).into(),
+                        label: label.into(),
+                        detail: String::new().into(),
+                        kind: "recent".into(),
+                        icon_color: Color::from_rgb_u8(0xE8, 0xB3, 0x3C),
+                        icon_text: String::new().into(),
+                        usage: -1.0,
+                    });
                 }
-                let label = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| path.to_string_lossy().into_owned());
-                recent_items.push(SidebarItem {
-                    id: format!("recent:{}", path.to_string_lossy()).into(),
-                    label: label.into(),
-                    detail: String::new().into(),
-                    kind: "recent".into(),
-                    icon_color: Color::from_rgb_u8(0xE8, 0xB3, 0x3C),
-                    icon_text: String::new().into(),
-                    usage: -1.0,
+            }
+        }
+
+        let arrow_computer = if self.config.computer_expanded { "∨" } else { "›" };
+        let mut h = header("此电脑");
+        h.icon_text = arrow_computer.into();
+        let mut computer_items: Vec<SidebarItem> = vec![h];
+        if self.config.computer_expanded {
+            for (idx, drive) in self.drives.iter().enumerate() {
+                // 已用 = 总量 - 剩余；Pulse 风格紧凑格式（如 "268G / 831G"）。
+                let used_bytes = drive.total_bytes.saturating_sub(drive.free_bytes);
+                computer_items.push(SidebarItem {
+                    id: format!("drive:{}", drive.letter).into(),
+                    label: drive.display_label().into(),
+                    detail: format!(
+                        "{} / {}",
+                        format_pulse_size(used_bytes),
+                        format_pulse_size(drive.total_bytes)
+                    )
+                    .into(),
+                    kind: "drive".into(),
+                    icon_color: drive_pulse_color(idx, drive),
+                    icon_text: drive.letter.to_string().into(),
+                    usage: drive.usage() as f32,
                 });
             }
         }
 
-        let mut computer_items: Vec<SidebarItem> = vec![header("此电脑")];
-        for (idx, drive) in self.drives.iter().enumerate() {
-            // 已用 = 总量 - 剩余；Pulse 风格紧凑格式（如 "268G / 831G"）。
-            let used_bytes = drive.total_bytes.saturating_sub(drive.free_bytes);
-            computer_items.push(SidebarItem {
-                id: format!("drive:{}", drive.letter).into(),
-                label: drive.display_label().into(),
-                detail: format!(
-                    "{} / {}",
-                    format_pulse_size(used_bytes),
-                    format_pulse_size(drive.total_bytes)
-                )
-                .into(),
-                kind: "drive".into(),
-                icon_color: drive_pulse_color(idx, drive),
-                icon_text: drive.letter.to_string().into(),
-                usage: drive.usage() as f32,
-            });
-        }
-
-        let mut network_items: Vec<SidebarItem> = vec![header("网络位置")];
-        if network.is_empty() {
-            network_items.push(SidebarItem {
-                id: "net:none".into(),
-                label: "暂无网络位置".into(),
-                detail: String::new().into(),
-                kind: "quick".into(),
-                icon_color: Color::from_rgb_u8(0x8A, 0x8F, 0x98),
-                icon_text: "网".into(),
-                usage: -1.0,
-            });
-        } else {
-            for remote in &network {
+        let arrow_network = if self.config.network_expanded { "∨" } else { "›" };
+        let mut h = header("网络位置");
+        h.icon_text = arrow_network.into();
+        let mut network_items: Vec<SidebarItem> = vec![h];
+        if self.config.network_expanded {
+            if network.is_empty() {
                 network_items.push(SidebarItem {
-                    id: format!("net:{remote}").into(),
-                    label: remote.clone().into(),
+                    id: "net:none".into(),
+                    label: "暂无网络位置".into(),
                     detail: String::new().into(),
-                    kind: "network".into(),
-                    icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
+                    kind: "quick".into(),
+                    icon_color: Color::from_rgb_u8(0x8A, 0x8F, 0x98),
                     icon_text: "网".into(),
                     usage: -1.0,
                 });
+            } else {
+                for remote in &network {
+                    network_items.push(SidebarItem {
+                        id: format!("net:{remote}").into(),
+                        label: remote.clone().into(),
+                        detail: String::new().into(),
+                        kind: "network".into(),
+                        icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
+                        icon_text: "网".into(),
+                        usage: -1.0,
+                    });
+                }
             }
         }
 
@@ -2064,6 +2096,22 @@ impl App {
 
     /// 侧边栏项激活。
     fn sidebar_activated(&mut self, id: &str) {
+        // 分区标题点击：切换展开/收起并持久化保存
+        if let Some(name) = id.strip_prefix("header:") {
+            let toggled = match name {
+                "快速访问" => { self.config.quick_expanded = !self.config.quick_expanded; true }
+                "最近使用" => { self.config.recent_expanded = !self.config.recent_expanded; true }
+                "此电脑" => { self.config.computer_expanded = !self.config.computer_expanded; true }
+                "网络位置" => { self.config.network_expanded = !self.config.network_expanded; true }
+                _ => false,
+            };
+            if toggled {
+                self.config.save();
+                self.sidebar_fingerprint = 0;
+                self.sync_sidebar();
+                return;
+            }
+        }
         if id == "quick:recycle" {
             // 回收站站内浏览：虚拟目录 recycle://。
             self.navigate_active(Some(fs::drives::recycle_virtual_path()));

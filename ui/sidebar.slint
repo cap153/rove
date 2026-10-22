@@ -114,15 +114,29 @@ export component Sidebar inherits Rectangle {
                     }
                 }
 
-                if (item.kind == "header") : Text {
+                if (item.kind == "header") : HorizontalLayout {
                     x: 14px;
-                    width: parent.width - 24px;
+                    width: parent.width - 28px;
                     height: parent.height;
-                    text: item.label;
-                    color: Theme.text-secondary;
-                    font-size: 11.5px;
-                    font-weight: 600;
-                    vertical-alignment: center;
+
+                    Text {
+                        text: item.label;
+                        color: Theme.text-secondary;
+                        font-size: 11.5px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+
+                    // 右侧折叠指示箭头（显式使用 Segoe UI Symbol 避免在微软雅黑中缺字成方块）
+                    if (item.icon-text != "") : Text {
+                        text: item.icon-text;
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                        font-family: Theme.symbol-font-family; // <-- 加上这行即可支持特殊符号
+                        vertical-alignment: center;
+                        horizontal-alignment: right;
+                    }
                 }
 
                 if (item.kind != "header" && item.kind != "drive") : HorizontalLayout {
