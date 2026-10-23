@@ -751,6 +751,9 @@ impl App {
             })
             .collect();
         self.ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
+        // 标签数量/宽度变化会改变标题栏空白拖拽区，同步给命中测试钩子。
+        #[cfg(windows)]
+        sync_drag_bounds(self);
         self.ui.set_active_tab(self.state.active_tab as i32);
         self.ui.set_tab_loading(self.state.active().loading);
         self.ui.set_settings_open(self.state.active().kind == crate::state::TabKind::Settings);
@@ -3228,11 +3231,27 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
         app.borrow()
             .poll_timer
 .start(TimerMode::Repeated, Duration::from_millis(40), move || {
-                let Some(app) = timer_app.upgrade() else {
-                    logln!("poll timer: app gone");
-                    return;
-                };
-                let mut app = app.borrow_mut();
+    let Some(app) = timer_app.upgrade() else {
+        logln!("poll timer: app gone");
+        return;
+    };
+
+    // 无边框标题栏钩子的延迟安装兜底。
+    // show() 刚返回时 winit 窗口往往还没 realize，window_handle()
+    // 取不到 HWND（实测日志确认会走这条分支）；事件循环跑起来后
+    // 窗口必定已渲染，此时重试即可装上。每 40ms 检查一次，装上即止。
+    #[cfg(windows)]
+    {
+        let hwnd = get_window_hwnd(&app.borrow().ui);
+        if let Some(hwnd) = hwnd {
+            if !drag_hittest::is_installed(hwnd) {
+                drag_hittest::install(hwnd);
+                sync_drag_bounds(&app.borrow());
+            }
+        }
+    }
+
+    let mut app = app.borrow_mut();
                 while let Ok(result) = app.list_rx.try_recv() {
                     app.apply_list_result(result);
                 }
@@ -3318,6 +3337,19 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                 },
             );
             return EventResult::PreventDefault;
+        }
+
+        // 窗口尺寸/DPI 缩放变化会改变标题栏空白拖拽区的起止坐标，
+        // 必须刷新给 WM_NCHITTEST 钩子，否则拖拽热区会停在旧位置。
+        #[cfg(windows)]
+        if matches!(
+            event,
+            WindowEvent::Resized(..) | WindowEvent::ScaleFactorChanged { .. }
+        ) {
+            if let Some(evt_app) = key_app.upgrade() {
+                sync_drag_bounds(&evt_app.borrow());
+            }
+            return EventResult::Propagate;
         }
 
         let WindowEvent::KeyboardInput {
@@ -3979,6 +4011,186 @@ fn get_window_hwnd(ui: &MainWindow) -> Option<isize> {
     None
 }
 
+/// 无边框窗口的 `WM_NCHITTEST` 子类化：把标题栏空白拖拽区回报为 `HTCAPTION`。
+///
+/// **目的**：让 Windows **原生**处理该区域的拖拽。winit 的 `drag_window()`
+/// （Slint `WindowMoveArea` 的底座）只支持鼠标；触屏手指拖拽必须经由
+/// 非客户区命中测试走系统路径，否则手指按在标题栏空白处毫无反应。
+///
+/// 设计要点：
+/// - 先透传原窗口过程，仅在它回报 `HTCLIENT`（客户区）时才判定拖拽区，
+///   因此 `resize-border-width` 生成的边缘缩放手柄（`HTLEFT`/`HTTOP`/…）
+///   与原生标题栏语义都不被破坏；
+/// - 用原子量而非 `static mut` 保存边界与前一过程，避免 edition 2021 的
+///   `static_mut_refs` 警告（本项目要求 Windows 零警告）；
+/// - 安装时若当前过程已是自身则跳过，防止守护进程多次建会话时把前一过程
+///   链成自身而造成无限递归。
+#[cfg(windows)]
+mod drag_hittest {
+    use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+
+    /// 前一窗口过程（`SetWindowLongPtrW` 的返回值）。
+    static PREV_WNDPROC: AtomicI64 = AtomicI64::new(0);
+    /// 钩子已安装到的 HWND（0 = 未安装）。
+    ///
+    /// 守护进程常驻时会多次建会话、每次都是新窗口；只有"同一个 HWND 已装过"
+    /// 才允许跳过，否则第二个窗口永远拿不到钩子。
+    static INSTALLED_HWND: AtomicI64 = AtomicI64::new(0);
+    /// 拖拽区起点 x（逻辑像素，以 f32 位模式存放）。
+    static DRAG_X: AtomicU32 = AtomicU32::new(0);
+    /// 拖拽区宽度（逻辑像素，f32 位模式）。
+    static DRAG_W: AtomicU32 = AtomicU32::new(0);
+    /// 窗口缩放系数（物理像素 / 逻辑像素）。
+    static DRAG_SCALE: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+    /// 标签栏高度（逻辑像素）：仅纵向落在此范围内才可能是标题栏拖拽区。
+    const TAB_BAR_H: f32 = 38.0;
+
+    fn bits(v: &AtomicU32) -> f32 {
+        f32::from_bits(v.load(Ordering::Relaxed))
+    }
+
+    /// 更新拖拽区边界；值未变化则跳过写入（调用方可能在热路径上）。
+    pub fn update(x: f32, w: f32, scale: f32) {
+        let (xb, wb, sb) = (x.to_bits(), w.to_bits(), scale.to_bits());
+        if DRAG_X.load(Ordering::Relaxed) == xb
+            && DRAG_W.load(Ordering::Relaxed) == wb
+            && DRAG_SCALE.load(Ordering::Relaxed) == sb
+        {
+            return;
+        }
+        DRAG_X.store(xb, Ordering::Relaxed);
+        DRAG_W.store(wb, Ordering::Relaxed);
+        DRAG_SCALE.store(sb, Ordering::Relaxed);
+    }
+
+    /// 窗口过程拦截。
+    ///
+    /// # Safety
+    /// 只能经 [`install`] 由 `SetWindowLongPtrW` 安装后交由 Windows 调用；
+    /// 调用时 `PREV_WNDPROC` 必须已保存合法的前一过程。
+    pub unsafe extern "system" fn wndproc(
+        hwnd: windows_sys::Win32::Foundation::HWND,
+        msg: u32,
+        wparam: windows_sys::Win32::Foundation::WPARAM,
+        lparam: windows_sys::Win32::Foundation::LPARAM,
+    ) -> windows_sys::Win32::Foundation::LRESULT {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CallWindowProcW, HTCAPTION, HTCLIENT, WNDPROC, WM_NCHITTEST,
+        };
+        let prev: WNDPROC = std::mem::transmute(PREV_WNDPROC.load(Ordering::Relaxed));
+
+        if msg == WM_NCHITTEST {
+            // 先让原过程处理，完整保留其判定（边缘缩放手柄、原生标题栏等）。
+            let hit = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+            if hit != HTCLIENT as isize {
+                return hit;
+            }
+            let (x, w, scale) = (bits(&DRAG_X), bits(&DRAG_W), bits(&DRAG_SCALE));
+            if w > 0.0 && scale > 0.0 {
+                // lparam：低 16 位为屏幕 x、高 16 位为屏幕 y（均按有符号解析）。
+                let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
+                let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
+                let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd as _, &mut pt);
+                let lx = pt.x as f32 / scale;
+                let ly = pt.y as f32 / scale;
+                // 纵向在标签栏内、横向处于空白拖拽区 → 向系统回报标题栏。
+                if (0.0..=TAB_BAR_H).contains(&ly) && lx >= x && lx <= x + w {
+                    return HTCAPTION as isize;
+                }
+            }
+            return HTCLIENT as isize;
+        }
+        CallWindowProcW(prev, hwnd, msg, wparam, lparam)
+    }
+
+    /// 指定窗口是否已装上钩子。
+    pub fn is_installed(hwnd: isize) -> bool {
+        INSTALLED_HWND.load(Ordering::Relaxed) == hwnd as i64
+    }
+
+    /// 在指定窗口上安装子类化钩子（幂等）。
+    ///
+    /// `show()` 刚返回时 winit 窗口可能尚未 realize，`window_handle()` 会失败；
+    /// 因此允许反复调用，由调用方在拿到有效句柄后重试。
+    pub fn install(hwnd: isize) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetWindowLongPtrW, GWLP_WNDPROC, SetWindowLongPtrW,
+        };
+        unsafe {
+            let current = GetWindowLongPtrW(hwnd as _, GWLP_WNDPROC);
+            // 0 = 句柄无效；已是自身 = 重复安装；本窗口已装过 = 跳过。
+            // 二者都必须跳过，否则会把前一过程链成自身 → 无限递归爆栈。
+            if current == 0
+                || current == wndproc as *const () as isize
+                || is_installed(hwnd)
+            {
+                return;
+            }
+            PREV_WNDPROC.store(current as i64, Ordering::Relaxed);
+            let _ = SetWindowLongPtrW(hwnd as _, GWLP_WNDPROC, wndproc as *const () as isize);
+            INSTALLED_HWND.store(hwnd as i64, Ordering::Relaxed);
+            logln!("drag hittest: hooked hwnd={hwnd:#x} prev={current:#x}");
+        }
+    }
+}
+
+/// 估算单个标签的宽度（逻辑像素）。
+///
+/// 依据 `tab_bar.slint` 的真实布局：内层 `HorizontalLayout` 的
+/// `padding-left 10 + 图标 16 + spacing 6 + 关闭钮 18 + padding-right 6`
+/// = 56px 固定开销，其余为标题文本；标签整体钳制在 [80, 220]。
+/// 文本按 CJK / ASCII 分别估宽——Rove 的标题多是中文目录名，
+/// 用单一均值会系统性低估，导致拖拽热区压到最后一个标签上。
+fn estimate_tab_width(title: &str) -> f32 {
+    let text_w: f32 = title
+        .chars()
+        .map(|c| if (c as u32) >= 0x2E80 { 12.5 } else { 7.0 })
+        .sum();
+    (56.0 + text_w).clamp(80.0, 220.0)
+}
+
+/// 把标题栏空白拖拽区边界同步给 Win32 命中测试钩子（仅 Windows）。
+///
+/// 纯 Rust 计算，**不依赖 Slint 布局属性**：`drag-spacer` 的 `x`/`width`
+/// 由 `HorizontalLayout` 在布局期赋值，在窗口 realize 之前读出来恒为 0，
+/// 且读取时机与布局时序耦合，不可靠。这里按标签栏的真实结构反推，
+/// 并对两侧都留安全余量——宁可让热区晚几个像素开始，
+/// 也绝不能压到标签或窗口按钮上（那会把点击变成拖窗口）。
+#[cfg(windows)]
+fn sync_drag_bounds(app: &App) {
+    let scale = app.ui.window().scale_factor() as f32;
+    // size() 是物理像素；窗口未 realize 时为 0，给个下限保证算式有意义。
+    let window_w = (app.ui.window().size().width as f32 / scale).max(400.0);
+
+    // 左侧：8px 内边距 + 各标签（含 3px 间距）+ 「+」按钮 30px。
+    let mut x = 8.0f32;
+    for t in &app.state.tabs {
+        x += estimate_tab_width(&t.title()) + 3.0;
+    }
+    x += 30.0;
+    // 安全边距：实测估算比真实布局起点小约 3.5px（文本宽度按 12.5px/字
+    // 仍略低估），给到 8px，确保热区绝不压到最后一个标签——否则点标签
+    // 会变成拖窗口。
+    x += 8.0;
+
+    // 右侧：三个窗口按钮 44 + 44 + 46 = 134px，再留 6px 余量。
+    let controls_start = window_w - 140.0;
+    let w = (controls_start - x).max(0.0);
+
+    // 同时打印 Slint 侧取值，用于核实「布局属性读出来恒为 0」的判断。
+    logln!(
+        "drag bounds: rust x={:.1} w={:.1} | slint x={:.1} w={:.1} | scale={:.2} win_w={:.1}",
+        x,
+        w,
+        app.ui.get_drag_area_x(),
+        app.ui.get_drag_area_w(),
+        scale,
+        window_w
+    );
+    drag_hittest::update(x, w, scale);
+}
+
 /// 主显示器工作区（逻辑像素），用于把窗口尺寸钳制在屏幕内。
 #[cfg(windows)]
 fn work_area_logical(scale: f32) -> Option<(f32, f32)> {
@@ -4207,7 +4419,25 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     }
 
     // Slint 的窗口在 show() 后才真正创建并可见（new() 仅构建组件树）。
+    // 因此原生窗口操作（HWND 子类化、拖拽热区几何）必须放在 show() 之后：
+    // 提前安装会拿不到有效句柄，或装到随后被重建的窗口上而丢失。
     app.borrow().ui.show().unwrap();
+
+    // 无边框标题栏：尝试安装 WM_NCHITTEST 子类化，使触屏手指也能拖拽移动窗口
+    // （Slint 的 WindowMoveArea 只覆盖鼠标）。
+    // 注意：此刻窗口可能尚未 realize 而取不到 HWND——没关系，poll_timer
+    // 会每 40ms 重试直到装上（见 setup_timers）。
+    #[cfg(windows)]
+    {
+        let hwnd = get_window_hwnd(&app.borrow().ui);
+        match hwnd {
+            Some(h) if !drag_hittest::is_installed(h) => drag_hittest::install(h),
+            Some(_) => {}
+            None => logln!("drag hittest: hwnd not ready after show(); will retry in poll_timer"),
+        }
+        sync_drag_bounds(&app.borrow());
+    }
+
     logln!("session created");
 }
 

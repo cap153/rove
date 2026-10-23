@@ -12,10 +12,15 @@ export component TabBar inherits Rectangle {
     callback new_tab_requested();
 
     // 窗口控制（无边框标题栏整合，详见 main_window.slint 的 no-frame）。
-    // 注意：窗口拖动不使用回调，改用下方原生 WindowMoveArea。
+    // 注意：窗口拖动不使用回调，改用下方原生 WindowMoveArea；
+    // 其几何另行导出给 Win32 WM_NCHITTEST 钩子，以支持触屏手指拖拽。
     callback window_minimize();
     callback window_maximize();
     callback window_close();
+
+    // 导出空白拖拽区的起止位置（供后端 WM_NCHITTEST 判定，见 app.rs drag_hittest）
+    out property <length> drag-x: drag-spacer.x;
+    out property <length> drag-w: drag-spacer.width;
 
     height: 38px;
     background: Theme.bg-tabstrip;
@@ -167,21 +172,14 @@ export component TabBar inherits Rectangle {
             }
         }
 
-        // 剩余空白区域：改用 Slint 原生内置 WindowMoveArea 拖动窗口，
-        // 杜绝 Win32 捕获劫持导致的事件死锁（全窗口变拖拽区）。
-        // 原生实现的额外好处：自带点击/拖动阈值——单击不会误移动窗口，
-        // 子 TouchArea 仍可正常响应双击。
-        WindowMoveArea {
+        // 剩余空白区域：Slint 原生移动区域。
+        // 内部严禁放 TouchArea：触控指针会被其捕获，而手指在非客户区
+        // （HTCAPTION）不会产生对应释放事件，导致指针永久卡在捕获态——
+        // 表现为触屏拖不动，且随后鼠标拖动也一并失效。
+        // 双击最大化由 Windows 原生标题栏语义接管，无需在此处理。
+        drag-spacer := WindowMoveArea {
             horizontal-stretch: 1;
             height: parent.height;
-
-            TouchArea {
-                width: 100%;
-                height: 100%;
-                double-clicked => {
-                    root.window_maximize();
-                }
-            }
         }
 
         // 窗口控制按钮组 (最小化 / 最大化 / 关闭)

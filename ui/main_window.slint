@@ -236,11 +236,15 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 拖拽悬停高亮：把命中的目标行索引暴露给 Rust（拖入/拖出悬停时设置）。
     in-out property <int> file-drop-hover-index <=> file-list.drop-hover-index;
 
+    /// 标题栏空白拖拽区的起止坐标（供 Win32 WM_NCHITTEST 判定，见 app.rs drag_hittest）。
+    out property <length> drag-area-x: tab-bar.drag-x;
+    out property <length> drag-area-w: tab-bar.drag-w;
+
     VerticalLayout {
         spacing: 0px;
 
         // ---- 标签栏 ----
-        TabBar {
+        tab-bar := TabBar {
             tabs: root.tabs;
             active-tab: root.active-tab;
             loading: root.tab-loading;
