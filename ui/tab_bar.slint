@@ -11,6 +11,12 @@ export component TabBar inherits Rectangle {
     callback tab_closed(id: int);
     callback new_tab_requested();
 
+    // 窗口控制（无边框标题栏整合，详见 main_window.slint 的 no-frame）。
+    // 注意：窗口拖动不使用回调，改用下方原生 WindowMoveArea。
+    callback window_minimize();
+    callback window_maximize();
+    callback window_close();
+
     height: 38px;
     background: Theme.bg-tabstrip;
 
@@ -58,20 +64,22 @@ export component TabBar inherits Rectangle {
                         : Theme.accent;
                 }
                 if (!(tab.active && root.loading)) : Rectangle {
-                    width: 14px;
-                    height: 14px;
-                    y: (parent.height - 14px) / 2;
-                    border-radius: 3px;
+                    width: 16px;
+                    height: 16px;
+                    y: (parent.height - 16px) / 2;
+                    border-radius: 4px;
                     background: Theme.accent.transparentize(0.82);
 
                     Text {
-                        text: "▣";
+                        // 动态盘符/标识（C、D、此、⚙）。显式指定符号字体，
+                        // 避免 ⚙/📁 这类非 CJK 符号在微软雅黑里缺字成方块。
+                        text: tab.icon-text;
                         color: Theme.accent;
-                        font-size: 9px;
+                        font-size: 10px;
+                        font-weight: 700;
+                        font-family: Theme.symbol-font-family;
                         horizontal-alignment: center;
                         vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
                     }
                 }
 
@@ -97,6 +105,7 @@ export component TabBar inherits Rectangle {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
                         size: 8px;
+                        stroke-width: 1.1px; // 标签内采用稍微纤细的 1.1px，精致不突兀
                     }
                 }
             }
@@ -158,8 +167,11 @@ export component TabBar inherits Rectangle {
             }
         }
 
-        // 剩余空白区域：双击新建标签。
-        Rectangle {
+        // 剩余空白区域：改用 Slint 原生内置 WindowMoveArea 拖动窗口，
+        // 杜绝 Win32 捕获劫持导致的事件死锁（全窗口变拖拽区）。
+        // 原生实现的额外好处：自带点击/拖动阈值——单击不会误移动窗口，
+        // 子 TouchArea 仍可正常响应双击。
+        WindowMoveArea {
             horizontal-stretch: 1;
             height: parent.height;
 
@@ -167,7 +179,72 @@ export component TabBar inherits Rectangle {
                 width: 100%;
                 height: 100%;
                 double-clicked => {
-                    root.new_tab_requested();
+                    root.window_maximize();
+                }
+            }
+        }
+
+        // 窗口控制按钮组 (最小化 / 最大化 / 关闭)
+        HorizontalLayout {
+            spacing: 0px;
+            height: parent.height;
+
+            // 最小化：精准 10px × 1.1px 纤细横线
+            Rectangle {
+                width: 44px;
+                height: parent.height;
+                background: min-ta.has-hover ? Theme.bg-hover : transparent;
+
+                // 父级是普通 Rectangle（非布局），子元素必须显式居中。
+                Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 10px;
+                    height: 1.1px;
+                    border-radius: 0.5px;
+                    background: min-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                }
+                min-ta := TouchArea {
+                    clicked => { root.window_minimize(); }
+                }
+            }
+
+            // 最大化 / 还原：9.5px × 9.5px、1.1px 框宽、1.5px 柔和微圆角（对标 Sigma 质感）
+            Rectangle {
+                width: 44px;
+                height: parent.height;
+                background: max-ta.has-hover ? Theme.bg-hover : transparent;
+
+                Rectangle {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 9.5px;
+                    height: 9.5px;
+                    border-width: 1.1px;
+                    border-radius: 1.5px; // 柔和微圆角，大幅削减笨重感
+                    border-color: max-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                    background: transparent;
+                }
+                max-ta := TouchArea {
+                    clicked => { root.window_maximize(); }
+                }
+            }
+
+            // 关闭：微调增大到 10.5px，线宽与最大化线框严格一致
+            Rectangle {
+                width: 46px;
+                height: parent.height;
+                background: close-win-ta.has-hover ? #E81123 : transparent;
+
+                IconClose {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    size: 10.5px; // 增大尺寸
+                    stroke-width: 1.15px; // 线宽匹配
+                    icon-color: close-win-ta.has-hover ? #FFFFFF : Theme.text-secondary;
+                }
+                close-win-ta := TouchArea {
+                    clicked => { root.window_close(); }
                 }
             }
         }

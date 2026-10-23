@@ -22,8 +22,10 @@ export component Sidebar inherits Rectangle {
     callback staging_copy_here_requested();
     callback staging_move_here_requested();
 
-    // 暂存托盘高度（折叠时仅标题栏）。
-    property <length> tray-h: root.staging-expanded ? 224px : 36px;
+    // 动态取暂存托盘的真实高度，杜绝预设高度与折叠状态不同步引发的断层。
+    // （曾用 `staging-expanded ? 224px : 36px` 推演，但托盘头部点击只改内部
+    // expanded、不外传，外层算式停在旧值 → 折叠后底部残留一大块幽灵空白。）
+    property <length> tray-h: tray.height;
 
     background: Theme.bg-sidebar;
     min-width: 180px;
@@ -128,12 +130,12 @@ export component Sidebar inherits Rectangle {
                         horizontal-stretch: 1;
                     }
 
-                    // 右侧折叠指示箭头（显式使用 Segoe UI Symbol 避免在微软雅黑中缺字成方块）
+                    // 右侧折叠指示箭头（实心三角风格，与底部暂存托盘一致）
                     if (item.icon-text != "") : Text {
                         text: item.icon-text;
                         color: Theme.text-secondary;
-                        font-size: 11px;
-                        font-family: Theme.symbol-font-family; // <-- 加上这行即可支持特殊符号
+                        font-size: 9.5px; // 实心符号在 9.5px 时与 11.5px 标题比例最协调
+                        font-family: Theme.symbol-font-family;
                         vertical-alignment: center;
                         horizontal-alignment: right;
                     }
@@ -269,7 +271,7 @@ export component Sidebar inherits Rectangle {
         y: parent.height - self.height;
         width: parent.width;
         items: root.staging-items;
-        expanded: root.staging-expanded;
+        expanded <=> root.staging-expanded; // 使用 <=> 双向绑定，确保托盘折叠状态实时传回外层
         item_removed(index) => {
             root.staging_item_removed(index);
         }

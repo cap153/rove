@@ -35,6 +35,8 @@ export struct TabInfo {
     active: bool,
     // true = 设置页标签（显示齿轮图标，不显示关闭按钮或逻辑不同）。
     is-settings: bool,
+    /// 标签对应盘符或标识（如 "C" / "D" / "此" / "⚙"）。
+    icon-text: string,
 }
 
 // 设置页左侧导航项。
@@ -151,28 +153,25 @@ export component HighlightName inherits Rectangle {
 // ---- 环境下（✕ / ⌕ / ⟳ / ▣ 等）显示为方块。
 
 // 关闭（×）图标：两条对角平行四边形棒（Path 填充，不依赖旋转/字体）。
+// 关闭（×）图标：纯矢量对称描边（微调坐标让交叉线充分舒展，消除视觉萎缩感）。
 export component IconClose inherits Rectangle {
     in property <length> size: 10px;
     in property <color> icon-color: Theme.text-secondary;
+    in property <length> stroke-width: 1.15px;
     width: root.size;
     height: root.size;
     background: transparent;
 
     Path {
-        width: root.size;
-        height: root.size;
+        width: 100%;
+        height: 100%;
         viewbox-width: 10;
         viewbox-height: 10;
-        fill: root.icon-color;
-        commands: "M 0.6 1.6 L 1.6 0.6 L 9.4 8.4 L 8.4 9.4 Z";
-    }
-    Path {
-        width: root.size;
-        height: root.size;
-        viewbox-width: 10;
-        viewbox-height: 10;
-        fill: root.icon-color;
-        commands: "M 8.4 0.6 L 9.4 1.6 L 1.6 9.4 L 0.6 8.4 Z";
+        stroke: root.icon-color;
+        stroke-width: root.stroke-width;
+        stroke-line-cap: round;
+        // 坐标由 1.8~8.2 拓展为 1.2~8.8，有效跨度从 6.4 提升至 7.6（viewbox 单位）
+        commands: "M 1.2 1.2 L 8.8 8.8 M 8.8 1.2 L 1.2 8.8";
     }
 }
 

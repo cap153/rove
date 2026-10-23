@@ -59,6 +59,10 @@ component nav-btn inherits Rectangle {
 //   └──────────────────────────────────────────┘
 export component MainWindow inherits Window {
     title: "Rove";
+    no-frame: true; // 移除 Windows 原生黑色标题栏与边框，改由 TabBar 右侧自绘控制按钮
+    // 无边框窗口必须显式给出缩放手柄宽度，否则边缘/四角无法拖动缩放
+    // （只剩最大化/还原可用）。6px 与 Windows 习惯接近又不影响内部布局。
+    resize-border-width: 6px;
     min-width: 880px;
     min-height: 560px;
     preferred-width: 1200px;
@@ -147,6 +151,12 @@ out property <length> row-height-out: file-list.row-height-out;
     callback new_tab_requested();
     callback tab_activated(id: int);
     callback tab_closed(id: int);
+
+    // 窗口控制（无边框标题栏）：由 TabBar 右侧按钮触发；
+    // 窗口移动不使用回调，TabBar 内直接用原生 WindowMoveArea。
+    callback window_minimize();
+    callback window_maximize();
+    callback window_close();
     callback nav_back();
     callback nav_forward();
     callback nav_up();
@@ -243,6 +253,9 @@ out property <length> row-height-out: file-list.row-height-out;
             new_tab_requested() => {
                 root.new_tab_requested();
             }
+            window_minimize => { root.window_minimize(); }
+            window_maximize => { root.window_maximize(); }
+            window_close => { root.window_close(); }
         }
 
         // ---- 工具栏（设置页整体收起，内容从标签栏下方直接开始）----

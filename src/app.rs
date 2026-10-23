@@ -722,11 +722,32 @@ impl App {
             .state
             .tabs
             .iter()
-            .map(|t| TabInfo {
-                id: t.id as i32,
-                title: t.title().into(),
-                active: t.id == self.state.active().id,
-                is_settings: t.kind == crate::state::TabKind::Settings,
+            .map(|t| {
+                // 标签图标：设置页齿轮 / 此电脑 / 回收站 / 盘符字母（大写）。
+                // 取路径首组件（如 "C:"）的首字符，非字母（网络路径等）回落文件夹符号。
+                let icon_text = if t.kind == crate::state::TabKind::Settings {
+                    "⚙".to_string()
+                } else {
+                    match &t.path {
+                        None => "此".to_string(),
+                        Some(p) if *p == fs::drives::recycle_virtual_path() => "回".to_string(),
+                        Some(p) => p
+                            .components()
+                            .next()
+                            .and_then(|c| c.as_os_str().to_str())
+                            .and_then(|s| s.chars().next())
+                            .filter(|c| c.is_ascii_alphabetic())
+                            .map(|c| c.to_ascii_uppercase().to_string())
+                            .unwrap_or_else(|| "📁".to_string()),
+                    }
+                };
+                TabInfo {
+                    id: t.id as i32,
+                    title: t.title().into(),
+                    active: t.id == self.state.active().id,
+                    is_settings: t.kind == crate::state::TabKind::Settings,
+                    icon_text: icon_text.into(),
+                }
             })
             .collect();
         self.ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
@@ -955,7 +976,7 @@ impl App {
 
         // ---- 各分区内容 ----
         // key → 区块（header + 条目），按 config.sidebar_order 组装。
-        let arrow_quick = if self.config.quick_expanded { "∨" } else { "›" };
+        let arrow_quick = if self.config.quick_expanded { "▼" } else { "▶" };
         let mut h = header("快速访问");
         h.icon_text = arrow_quick.into();
         let mut quick_items: Vec<SidebarItem> = vec![h];
@@ -996,7 +1017,7 @@ impl App {
         let mut recent_items: Vec<SidebarItem> = Vec::new();
         if !self.state.recent.is_empty() {
             // 展开与收起箭头
-            let arrow = if self.config.recent_expanded { "∨" } else { "›" };
+            let arrow = if self.config.recent_expanded { "▼" } else { "▶" };
             let mut h = header("最近使用");
             h.icon_text = arrow.into();
             recent_items.push(h);
@@ -1024,7 +1045,7 @@ impl App {
             }
         }
 
-        let arrow_computer = if self.config.computer_expanded { "∨" } else { "›" };
+        let arrow_computer = if self.config.computer_expanded { "▼" } else { "▶" };
         let mut h = header("此电脑");
         h.icon_text = arrow_computer.into();
         let mut computer_items: Vec<SidebarItem> = vec![h];
@@ -1049,7 +1070,7 @@ impl App {
             }
         }
 
-        let arrow_network = if self.config.network_expanded { "∨" } else { "›" };
+        let arrow_network = if self.config.network_expanded { "▼" } else { "▶" };
         let mut h = header("网络位置");
         h.icon_text = arrow_network.into();
         let mut network_items: Vec<SidebarItem> = vec![h];
@@ -2874,18 +2895,8 @@ impl App {
 
         // 原生焦点框高亮（仅 Windows）：DrawFocusRect 对同一矩形二次绘制即为自擦除。
         #[cfg(windows)]
-        let hwnd: isize = {
-            use raw_window_handle::RawWindowHandle;
-            if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(&self.ui.window().window_handle()) {
-                if let RawWindowHandle::Win32(win) = h.as_raw() {
-                    win.hwnd.get() as _
-                } else {
-                    0
-                }
-            } else {
-                0
-            }
-        };
+        // 原生 HWND（供 DrawFocusRect 绘制悬停焦点框；非 Windows 平台为 0）。
+        let hwnd: isize = get_window_hwnd(&self.ui).unwrap_or(0);
 
         // 定义为嵌套 fn（不捕获环境），避免把借用带入 move 闭包与收尾擦除。
         #[cfg(windows)]
@@ -3863,28 +3874,63 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
 
+    // ---- 窗口控制（无边框标题栏：最小化 / 最大化 / 关闭 / 拖拽移动） ----
+    // 原生窗口操作仅 Windows 有意义，其他平台整体不注册（无边框标题栏不启用）。
+    #[cfg(windows)]
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_window_minimize(move || {
+            let Some(app) = app.upgrade() else { return };
+            // 先取 HWND 再进 unsafe 块：避免 `if let`  scrutinee 里的
+            // 临时 RefCell 借用跨块存活，引发 E0597。
+            let hwnd = get_window_hwnd(&app.borrow().ui);
+            if let Some(hwnd) = hwnd {
+                unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::ShowWindow(
+                        hwnd as _,
+                        windows_sys::Win32::UI::WindowsAndMessaging::SW_MINIMIZE,
+                    );
+                }
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_window_maximize(move || {
+            let Some(app) = app.upgrade() else { return };
+            let hwnd = get_window_hwnd(&app.borrow().ui);
+            if let Some(hwnd) = hwnd {
+                unsafe {
+                    use windows_sys::Win32::UI::WindowsAndMessaging::{
+                        IsZoomed, SW_MAXIMIZE, SW_RESTORE, ShowWindow,
+                    };
+                    // 已最大化则还原，否则最大化——与原生标题栏按钮行为一致。
+                    let cmd = if IsZoomed(hwnd as _) != 0 { SW_RESTORE } else { SW_MAXIMIZE };
+                    ShowWindow(hwnd as _, cmd);
+                }
+            }
+        });
+    }
+    {
+        // 关闭：跨平台注册（保存配置 + 销毁会话，与系统关闭请求同一条路径）。
+        let app = Rc::downgrade(app);
+        upgrade().on_window_close(move || {
+            logln!("window close button");
+            close_and_destroy(&app);
+        });
+    }
+
+    // 注：窗口移动不在此接线——TabBar 空白区使用 Slint 原生 WindowMoveArea，
+    // 由后端直接完成移动，无需 Win32 消息劫持（ReleaseCapture + SendMessageW）。
+    // 那套方案会把鼠标捕获全局劫持，曾导致全窗口被误判为拖拽区、事件死锁。
+
     // ---- 关闭：保存配置并销毁会话（守护常驻） ----
     {
         let app = Rc::downgrade(app);
         upgrade().window().on_close_requested(move || {
             logln!("close requested");
-            let Some(app) = app.upgrade() else {
-                return slint::CloseRequestResponse::HideWindow;
-            };
-            let mut app = app.borrow_mut();
-            // 注意：size() 是物理像素，配置里的窗口尺寸按逻辑像素保存，
-            // 否则在高 DPI 下每次会话窗口都会按缩放系数膨胀，
-            // 导致布局超出屏幕（状态栏、暂存托盘被挤到可视区外）。
-            let window = app.ui.window();
-            let scale = window.scale_factor() as f64;
-            let size = window.size();
-            app.config.window_width = (size.width as f64 / scale).round() as u32;
-            app.config.window_height = (size.height as f64 / scale).round() as u32;
-            app.config.save();
-            drop(app);
-            // 不能在关闭回调内同步销毁窗口（正在关闭中）；
-            // 延迟到事件循环下一拍再整体 drop。
-            schedule_destroy();
+            close_and_destroy(&app);
             slint::CloseRequestResponse::HideWindow
         });
     }
@@ -3895,6 +3941,42 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
 /// winit 后端会挂起事件循环，Timer 不再触发，而用户事件能唤醒它。
 fn schedule_destroy() {
     let _ = slint::invoke_from_event_loop(destroy_session);
+}
+
+/// 关闭流程：按**逻辑像素**保存窗口尺寸 → 排定会话销毁（守护进程常驻）。
+///
+/// 系统关闭请求（Alt+F4 / 任务栏）与自绘关闭按钮共用此函数，
+/// 避免两处逻辑各自演化后漂移（尤其 DPI 换算这种易错点）。
+fn close_and_destroy(app_weak: &std::rc::Weak<RefCell<App>>) {
+    let Some(app) = app_weak.upgrade() else { return };
+    {
+        let mut app = app.borrow_mut();
+        // 注意：size() 是物理像素，配置里的窗口尺寸按逻辑像素保存，
+        // 否则在高 DPI 下每次会话窗口都会按缩放系数膨胀，
+        // 导致布局超出屏幕（状态栏、暂存托盘被挤到可视区外）。
+        let window = app.ui.window();
+        let scale = window.scale_factor() as f64;
+        let size = window.size();
+        app.config.window_width = (size.width as f64 / scale).round() as u32;
+        app.config.window_height = (size.height as f64 / scale).round() as u32;
+        app.config.save();
+    }
+    // 不能在关闭回调内同步销毁窗口（正在关闭中）；
+    // 延迟到事件循环下一拍再整体 drop。
+    schedule_destroy();
+}
+
+/// 取窗口的原生 Win32 HWND（仅 Windows）。用于无边框标题栏的
+/// 最小化 / 最大化 / 拖拽移动等原生窗口操作。
+#[cfg(windows)]
+fn get_window_hwnd(ui: &MainWindow) -> Option<isize> {
+    use raw_window_handle::RawWindowHandle;
+    if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(&ui.window().window_handle()) {
+        if let RawWindowHandle::Win32(win) = h.as_raw() {
+            return Some(win.hwnd.get() as _);
+        }
+    }
+    None
 }
 
 /// 主显示器工作区（逻辑像素），用于把窗口尺寸钳制在屏幕内。
