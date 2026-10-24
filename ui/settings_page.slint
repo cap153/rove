@@ -169,7 +169,10 @@ component GroupCard inherits Rectangle {
                 Text {
                     text: root.group.expanded ? "▼" : "▶";
                     color: Theme.text-secondary;
-                    font-size: 10px;
+                    font-size: 9.5px;
+                    // 显式指定符号字体：否则 Windows 字体回退会把 ▶(U+25B6)
+                    // 解析成 Emoji（蓝底白字播放键），与 ▼ 风格严重不一致。
+                    font-family: Theme.symbol-font-family;
                     vertical-alignment: center;
                     width: 14px;
                 }
@@ -226,7 +229,8 @@ export component SettingsPage inherits Rectangle {
     in property <string> page-title: "本地右键菜单";
     in property <string> page-desc: "开关控制菜单项显隐；内置动作仅允许开关，自定义动作可编辑或删除。";
     in property <bool> show-add: true;
-    // 分组列表真实内容高度（Rust 按展开状态计算，驱动 Flickable 滚动范围）。
+    // 分组列表内容高度（Rust 按模型计算）。与 Slint 侧实测值取 max，
+    // 任一来源少报都不会导致内容被裁切后无法滚动到。
     in property <length> content-height: 0px;
 
     callback nav_changed(id: string);
@@ -235,6 +239,8 @@ export component SettingsPage inherits Rectangle {
     callback action_add();
     callback action_edit(id: string);
     callback action_delete(id: string);
+    // 诊断：滚动几何变化时回报（视口 / 内容 / 实测首选高度）。
+    callback scroll_debug(viewport: length, content: length, preferred: length);
 
     background: Theme.bg-main;
 
@@ -293,6 +299,9 @@ export component SettingsPage inherits Rectangle {
         }
 
         // 右侧内容
+        // 注意：不要给这个布局写 height:100%。它是 HorizontalLayout 的子布局，
+        // 交叉轴（纵向）本就会被布局器撑满；显式写高度反而会覆盖该行为、
+        // 把高度链搅成内容驱动（表现为视口随内容收缩、空白顶到页面顶部）。
         VerticalLayout {
             horizontal-stretch: 1;
             padding-left: 24px;
@@ -355,12 +364,23 @@ export component SettingsPage inherits Rectangle {
             Flickable {
                 visible: root.action-groups.length > 0;
                 vertical-stretch: 1;
-                content-height: max(root.content-height, self.height);
+                // self.height 作为保底下限：卡片折叠导致内容不足一屏时，
+                // 保证 content-height >= self.height，把视口偏移量锁死为 0，
+                // 卡片永远自然置顶，杜绝内容向下悬空、顶部露出空白断层。
+                // （与侧栏/文件列表同一手法：max(内容高度, 视口高度)。）
+                content-height: max(self.height, max(root.content-height, groups-layout.preferred-height));
 
-                VerticalLayout {
+                // 诊断：内容高度每次变化时打印三者，便于判断是"内容真的放得下"
+                // 还是"某一路少报"。
+                changed content-height => {
+                    root.scroll_debug(self.height, self.content-height, groups-layout.preferred-height);
+                }
+
+                groups-layout := VerticalLayout {
                     y: 0px;
                     width: 100%;
                     spacing: 12px;
+                    alignment: start; // 显式置顶：卡片向上紧贴，多余空白自然沉在底部
 
                     for group in root.action-groups : GroupCard {
                         group: group;

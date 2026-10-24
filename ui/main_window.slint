@@ -60,9 +60,9 @@ component nav-btn inherits Rectangle {
 export component MainWindow inherits Window {
     title: "Rove";
     no-frame: true; // 移除 Windows 原生黑色标题栏与边框，改由 TabBar 右侧自绘控制按钮
-    // 无边框窗口必须显式给出缩放手柄宽度，否则边缘/四角无法拖动缩放
-    // （只剩最大化/还原可用）。6px 与 Windows 习惯接近又不影响内部布局。
-    resize-border-width: 6px;
+    // 最大化时边框厚度动态归 0，彻底关停 Slint 内部的缩放光标与点击拦截；还原时恢复 6px 正常缩放。
+    // （仅靠 WM_NCHITTEST 拦截不够：Slint 自己也会按该厚度返回 HTLEFT 等。）
+    resize-border-width: root.win-maximized ? 0px : 6px;
     min-width: 880px;
     min-height: 560px;
     preferred-width: 1200px;
@@ -184,6 +184,8 @@ out property <length> row-height-out: file-list.row-height-out;
     callback view_picker_requested();
     callback settings_requested();
     callback settings_nav_changed(id: string);
+    // 诊断：设置页滚动几何（视口 / 内容 / 实测首选高度）。
+    callback settings_scroll_debug(viewport: length, content: length, preferred: length);
     callback settings_action_toggled(id: string, enabled: bool);
     callback settings_group_toggled(name: string, expanded: bool);
     callback settings_action_add();
@@ -239,6 +241,14 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 标题栏空白拖拽区的起止坐标（供 Win32 WM_NCHITTEST 判定，见 app.rs drag_hittest）。
     out property <length> drag-area-x: tab-bar.drag-x;
     out property <length> drag-area-w: tab-bar.drag-w;
+
+    /// 窗口是否处于最大化（Rust 经 IsZoomed 实时同步）。
+    ///
+    /// 刻意不用 Slint 内置的 `maximized`：那个是**命令属性**（置 true 会真的
+    /// 下发最大化），拿它回传 OS 状态会形成命令回路——例如最小化一个已最大化
+    /// 的窗口时 IsZoomed 返回 0，回传就会把用户的最大化状态误还原。故用独立的
+    /// 无副作用属性，仅用于驱动 resize-border-width 动态归零。
+    in-out property <bool> win-maximized: false;
 
     VerticalLayout {
         spacing: 0px;
@@ -716,6 +726,10 @@ out property <length> row-height-out: file-list.row-height-out;
             // Slint 中 visible:false 的元素仍参与布局占位，因此把两者叠放在
             // 同一个「弹性容器」内：容器负责吃满剩余宽度（preferred 为 0），
             // 内部两个子页面各自 100% 填充、互斥显示，谁都不会挤压对方。
+            //
+            // 切勿在此写 `height: parent.height`：容器高度 ← HorizontalLayout
+            // ← 根布局 ← 窗口布局信息，而子页面又是 height:100%，会构成 Slint
+            // 明令禁止的绑定循环（编译期告警、运行期可能 panic）。
             Rectangle {
                 horizontal-stretch: 1;
 
@@ -762,6 +776,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     page-desc: root.settings-page-desc;
                     show-add: root.settings-show-add;
                     content-height: root.settings-content-height;
+                    scroll_debug(viewport, content, preferred) => {
+                        root.settings_scroll_debug(viewport, content, preferred);
+                    }
                     nav_changed(id) => {
                         root.settings_nav_changed(id);
                     }

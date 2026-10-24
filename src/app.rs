@@ -1798,6 +1798,25 @@ const ACT_VIEW: &str = "view_menu";
 // 其余交互动作（键盘快捷键 / 侧边栏 / 列排序 / 重命名 / 暂存盘）
 // ---------------------------------------------------------------------------
 
+/// 累加各分组卡片高度，得到内容总高（与 `GroupCard` 的 Slint 侧公式一致：
+/// 44px 头 + 42px/行，收起仅留头部，外加 12px 卡片间距）。
+///
+/// 与 Slint 的 `groups-layout.preferred-height` 取 max 使用：两路独立计算，
+/// 任一少报都不会让底部内容被裁在视口外又滚不到。
+fn sum_group_heights<M: Model<Data = SettingsActionGroup>>(model: &M) -> f32 {
+    let mut h = 0.0f32;
+    for i in 0..model.row_count() {
+        if let Some(g) = model.row_data(i) {
+            h += if g.expanded {
+                44.0 + g.items.row_count() as f32 * 42.0
+            } else {
+                44.0
+            } + 12.0;
+        }
+    }
+    h
+}
+
 impl App {
     /// 打开设置页标签（本地右键菜单子页）。
     fn open_settings_tab(&mut self, subpage: crate::state::SettingsSubpage) {
@@ -1922,19 +1941,7 @@ impl App {
             })
             .collect();
         let groups_model = VecModel::from(groups);
-        // Flickable 滚动范围：按各分组展开状态累加卡片高度（44 头 + 42/行）+ 12 间距。
-        let mut content_h = 0.0f32;
-        let n = groups_model.row_count();
-        for i in 0..n {
-            if let Some(g) = groups_model.row_data(i) {
-                content_h += if g.expanded {
-                    44.0 + g.items.row_count() as f32 * 42.0
-                } else {
-                    44.0
-                } + 12.0;
-            }
-        }
-        self.ui.set_settings_content_height(content_h);
+        self.ui.set_settings_content_height(sum_group_heights(&groups_model));
         self.ui.set_settings_action_groups(ModelRc::new(groups_model));
     }
 
@@ -3347,7 +3354,16 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             WindowEvent::Resized(..) | WindowEvent::ScaleFactorChanged { .. }
         ) {
             if let Some(evt_app) = key_app.upgrade() {
-                sync_drag_bounds(&evt_app.borrow());
+                let app = evt_app.borrow();
+                // 实时同步实际最大化状态给 Slint：无论点击按钮、双击标题栏，
+                // 还是拖拽到屏幕顶端 Aero 贴靠，尺寸一变就读 IsZoomed 回填，
+                // 驱动 resize-border-width 动态归零/恢复。
+                if let Some(hwnd) = get_window_hwnd(&app.ui) {
+                    let is_zoomed =
+                        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd as _) != 0 };
+                    app.ui.set_win_maximized(is_zoomed);
+                }
+                sync_drag_bounds(&app);
             }
             return EventResult::Propagate;
         }
@@ -3771,8 +3787,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_settings_group_toggled(move |name, expanded| {
             let Some(app) = app.upgrade() else { return };
             let app = app.borrow();
-            // 分组展开状态保存在 UI 模型里（重进设置页会重置），
-            // 同时重算 Flickable 滚动范围。
+            // 分组展开状态保存在 UI 模型里（重进设置页会重置）。
             let model = app.ui.get_settings_action_groups();
             for i in 0..model.row_count() {
                 if let Some(mut g) = model.row_data(i) {
@@ -3783,17 +3798,21 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                     }
                 }
             }
-            let mut content_h = 0.0f32;
-            for i in 0..model.row_count() {
-                if let Some(g) = model.row_data(i) {
-                    content_h += if g.expanded {
-                        44.0 + g.items.row_count() as f32 * 42.0
-                    } else {
-                        44.0
-                    } + 12.0;
-                }
-            }
-            app.ui.set_settings_content_height(content_h);
+            // 同步内容高度（与 Slint 实测值取 max，见 settings_page.slint）。
+            app.ui.set_settings_content_height(sum_group_heights(&model));
+        });
+    }
+    {
+        // 诊断用（ROVE_LOG=2 才输出）：打印设置页滚动几何，用于区分
+        // 「内容真的放得下」与「某路高度少报」。
+        upgrade().on_settings_scroll_debug(move |viewport, content, preferred| {
+            logv!(
+                "settings scroll: viewport={:.1} content={:.1} preferred={:.1} scrollable={:.1}",
+                viewport,
+                content,
+                preferred,
+                content - viewport
+            );
         });
     }
     {
@@ -3940,6 +3959,11 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                     // 已最大化则还原，否则最大化——与原生标题栏按钮行为一致。
                     let cmd = if IsZoomed(hwnd as _) != 0 { SW_RESTORE } else { SW_MAXIMIZE };
                     ShowWindow(hwnd as _, cmd);
+                    // 立即回传最大化状态，驱动 resize-border-width 归零/恢复。
+                    // 用独立的 win-maximized 而非 Slint 内置 maximized：后者是
+                    // 命令属性，回传会形成最大化/还原的回路。
+                    let was_zoomed = IsZoomed(hwnd as _) != 0;
+                    app.borrow().ui.set_win_maximized(!was_zoomed);
                 }
             }
         });
@@ -4075,14 +4099,20 @@ mod drag_hittest {
         lparam: windows_sys::Win32::Foundation::LPARAM,
     ) -> windows_sys::Win32::Foundation::LRESULT {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CallWindowProcW, HTCAPTION, HTCLIENT, WNDPROC, WM_NCHITTEST,
+            CallWindowProcW, HTCAPTION, HTCLIENT, IsZoomed, WNDPROC, WM_NCHITTEST,
         };
         let prev: WNDPROC = std::mem::transmute(PREV_WNDPROC.load(Ordering::Relaxed));
 
         if msg == WM_NCHITTEST {
-            // 先让原过程处理，完整保留其判定（边缘缩放手柄、原生标题栏等）。
+            // 先让原过程处理，拿它的判定（边缘缩放手柄、原生标题栏等）。
             let hit = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
-            if hit != HTCLIENT as isize {
+            let is_maximized = IsZoomed(hwnd as _) != 0;
+
+            // 未最大化：透传原判定，保留 6px 边缘缩放手柄（HTLEFT/HTTOP/…）。
+            // 已最大化：一律不再透传非客户区结果——最大化时窗口紧贴屏幕边缘，
+            // 那 6px 手柄会把最右/上边缘变成缩放光标，导致鼠标甩到右上角
+            // 点不中关闭按钮。此时强制把边缘收归客户区，只保留拖拽热区。
+            if !is_maximized && hit != HTCLIENT as isize {
                 return hit;
             }
             let (x, w, scale) = (bits(&DRAG_X), bits(&DRAG_W), bits(&DRAG_SCALE));
@@ -4135,13 +4165,14 @@ mod drag_hittest {
     }
 }
 
-/// 估算单个标签的宽度（逻辑像素）。
+/// 估算单个标签的宽度（逻辑像素）。仅 Windows 的拖拽热区计算使用。
 ///
 /// 依据 `tab_bar.slint` 的真实布局：内层 `HorizontalLayout` 的
 /// `padding-left 10 + 图标 16 + spacing 6 + 关闭钮 18 + padding-right 6`
 /// = 56px 固定开销，其余为标题文本；标签整体钳制在 [80, 220]。
 /// 文本按 CJK / ASCII 分别估宽——Rove 的标题多是中文目录名，
 /// 用单一均值会系统性低估，导致拖拽热区压到最后一个标签上。
+#[cfg(windows)]
 fn estimate_tab_width(title: &str) -> f32 {
     let text_w: f32 = title
         .chars()
@@ -4178,8 +4209,8 @@ fn sync_drag_bounds(app: &App) {
     let controls_start = window_w - 140.0;
     let w = (controls_start - x).max(0.0);
 
-    // 同时打印 Slint 侧取值，用于核实「布局属性读出来恒为 0」的判断。
-    logln!(
+    // 诊断用（ROVE_LOG=2 才输出）：同时打印 Slint 侧取值，用于核实拖拽热区几何。
+    logv!(
         "drag bounds: rust x={:.1} w={:.1} | slint x={:.1} w={:.1} | scale={:.2} win_w={:.1}",
         x,
         w,

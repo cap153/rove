@@ -32,7 +32,7 @@ export component TabBar inherits Rectangle {
         height: 100%;
         spacing: 3px;
         padding-left: 8px;
-        padding-right: 4px;
+        padding-right: 0px; // 关闭按钮贴死右边界：最大化时甩到最右上角可盲点关闭
 
         for tab[i] in root.tabs : Rectangle {
             min-width: 80px;
