@@ -124,6 +124,8 @@ export component MainWindow inherits Window {
     in-out property <length> list-height;
 /// 视图模式（Pulse 式视图切换）。直通 FileList。
 in-out property <string> view-mode <=> file-list.view-mode;
+/// 「路径」列显隐（仅回收站开启）。直通 FileList。
+in-out property <bool> show-path-column <=> file-list.show-path-column;
 out property <int> cells-per-row: file-list.cells-per-row;
     out property <length> view-width: file-list.view-width;
 out property <length> row-height-out: file-list.row-height-out;

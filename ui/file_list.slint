@@ -79,6 +79,10 @@ export component FileList inherits Rectangle {
 
     /// 视图模式（Pulse 式）：details | list | icons-small | icons-medium | icons-large | icons-xl。
     in-out property <string> view-mode: "details";
+    /// 是否显示「路径」列（details 视图）。仅回收站开启：回收站里各条目
+    /// 来源不同，路径列是判断来源的唯一途径；普通目录的路径与地址栏一致，
+    /// 没有展示价值，隐藏后把该列宽度让给名称列。
+    in-out property <bool> show-path-column: false;
     /// 单元格几何（icons 系视图）：宽 / 高 / 缩略图边长。
     private property <length> cell-w: root.view-mode == "icons-xl" ? 196px
         : root.view-mode == "icons-large" ? 132px
@@ -190,19 +194,22 @@ export component FileList inherits Rectangle {
     // 视口纵向边界，供滚轮/滚动条钳制。
     private property <length> min-content-y: min(0px, flick.height - flick.content-height);
     private property <length> max-content-y: 0px;
-    // 横向：所有列的最小总宽（窄窗口时出现横向滚动）。
-    private property <length> min-list-width: 8px + root.w-icon + 140px + root.w-modified + root.w-type + root.w-size + 240px + 10px;
+    // 横向：所有列的最小总宽（窄窗口时出现横向滚动）。「路径」列隐藏时
+    // 其 240px 基宽不计入，避免窄窗口出现无意义的横向滚动。
+    private property <length> min-list-width: 8px + root.w-icon + 140px + root.w-modified + root.w-type + root.w-size + root.path-w-base + 10px;
     private property <length> min-content-x: min(0px, flick.width - flick.content-width);
     private property <length> max-content-x: 0px;
+    // 「路径」列基宽：隐藏时为 0，列宽分配随之全部让给名称列。
+    private property <length> path-w-base: root.show-path-column ? 240px : 0px;
     // 列几何（表头与行共用，保证像素级对齐）。
     private property <length> col-icon-x: 8px;
     private property <length> col-name-x: 8px + root.w-icon;
     private property <length> col-avail: max(root.min-list-width, flick.width) - (8px + root.w-icon + root.w-modified + root.w-type + root.w-size + 10px);
-    private property <length> col-extra: max(0px, root.col-avail - 140px - 240px);
+    private property <length> col-extra: max(0px, root.col-avail - 140px - root.path-w-base);
     private property <length> col-name-w: root.view-mode == "list"
         ? max(140px, flick.width - root.col-name-x - 10px)
-        : 140px + root.col-extra * 5 / 8;
-    private property <length> col-path-w: 240px + root.col-extra * 3 / 8;
+        : 140px + root.col-extra * (root.show-path-column ? 5 : 8) / 8;
+    private property <length> col-path-w: root.path-w-base + root.col-extra * (root.show-path-column ? 3 : 0) / 8;
     private property <length> col-modified-x: root.col-name-x + root.col-name-w;
     private property <length> col-type-x: root.col-modified-x + root.w-modified;
     private property <length> col-size-x: root.col-type-x + root.w-type;
@@ -287,6 +294,7 @@ export component FileList inherits Rectangle {
                     }
                 }
                 SortCell {
+                    visible: root.show-path-column;
                     x: root.col-path-x;
                     width: root.col-path-w;
                     key: "path";
@@ -563,9 +571,9 @@ export component FileList inherits Rectangle {
                     }
                 }
 
-                // 路径
+                // 路径（仅回收站显示，见 show-path-column）
                 Rectangle {
-                    visible: root.view-mode == "details";
+                    visible: root.view-mode == "details" && root.show-path-column;
                     x: root.col-path-x;
                     y: 0px;
                     width: root.col-path-w;

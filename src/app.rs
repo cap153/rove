@@ -1185,6 +1185,11 @@ impl App {
         self.ui.set_file_loading(self.state.active().loading);
         self.ui
             .set_file_total(self.state.active().display.len() as i32);
+        // 「路径」列仅回收站显示：站内条目来源各异，路径列是唯一来源线索；
+        // 普通目录的路径与地址栏一致，隐藏以让出宽度给名称列。
+        let is_recycle = self.state.active().path.as_deref()
+            == Some(&fs::drives::recycle_virtual_path());
+        self.ui.set_show_path_column(is_recycle);
         self.refresh_visible_rows();
     }
 
