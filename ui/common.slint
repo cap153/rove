@@ -205,33 +205,73 @@ export component IconSearch inherits Rectangle {
     }
 }
 
-// 刷新图标：圆环 + 箭头三角。
+// 刷新图标：标准工业级正圆顺时针刷新（24x24 视口，纯正正圆轮廓 + 顺时针箭头，绝对居中）
 export component IconRefresh inherits Rectangle {
-    in property <length> size: 15px;
+    in property <length> size: 14px;
     in property <color> icon-color: Theme.text-secondary;
     width: root.size;
     height: root.size;
     background: transparent;
 
-    property <length> ring: root.size * 0.74;
-
-    Rectangle {
-        x: 0px;
-        y: (root.size - root.ring) / 2;
-        width: root.ring;
-        height: root.ring;
-        border-radius: root.ring / 2;
-        border-width: 1.8px;
-        border-color: root.icon-color;
-        background: transparent;
-    }
     Path {
-        x: root.ring - 2px;
-        y: (root.size - root.ring) / 2 - 1px;
-        width: 7px;
-        height: 6px;
-        fill: root.icon-color;
-        commands: "M 0 0 L 7 3 L 0 6 Z";
+        width: 100%;
+        height: 100%;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        stroke: root.icon-color;
+        stroke-width: 1.25px; // 由 2.2px 降为 1.25px，与导航箭头线宽完全对齐
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        // 国际标准正圆矢量：从 (21, 12) 顺时针正圆绕行至右上角 (21, 8)，并顺势画出标准顺时针箭头
+        commands: "M 21 12 A 9 9 0 1 1 12 3 C 14.52 3 16.93 4 18.74 5.74 L 21 8 M 21 3 L 21 8 L 16 8";
+    }
+}
+
+// 导航箭头：统一 1.25px 纯矢量居中骨架（整像素对齐，杜绝模糊）
+export component IconNavArrow inherits Rectangle {
+    in property <string> direction: "left";
+    in property <length> size: 12px;
+    in property <color> icon-color: Theme.text-secondary;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 14;
+        viewbox-height: 14;
+        stroke: root.icon-color;
+        stroke-width: 1.25px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        commands: root.direction == "left"
+            ? "M 11 7 L 3 7 M 7 3 L 3 7 L 7 11"
+            : (root.direction == "right"
+                ? "M 3 7 L 11 7 M 7 3 L 11 7 L 7 11"
+                : "M 7 11 L 7 3 M 3 7 L 7 3 L 11 7");
+    }
+}
+
+// 新建（+）图标：纯矢量 1.25px 对称十字（绝对中心对齐，杜绝字体基线导致的偏下偏沉）
+export component IconPlus inherits Rectangle {
+    in property <length> size: 12px;
+    in property <color> icon-color: Theme.text-secondary;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        stroke: root.icon-color;
+        stroke-width: 1.25px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        // 严格中心对称的十字（中心位于 6, 6）
+        commands: "M 6 1.8 L 6 10.2 M 1.8 6 L 10.2 6";
     }
 }
 

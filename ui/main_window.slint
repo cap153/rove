@@ -1,4 +1,4 @@
-import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, SettingsNavItem, SettingsActionGroup } from "common.slint";
+import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, SettingsNavItem, SettingsActionGroup } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
@@ -14,25 +14,33 @@ export { PreviewWindow } from "preview_window.slint";
 // ui.global::<Theme>() 访问，否则其值会被编译期内联。
 export { Theme } from "common.slint";
 
-// 工具栏导航按钮（前进 / 后退 / 向上）。
+// 工具栏导航按钮（内部自居中，高度适应工具栏，杜绝偏上问题）
 component nav-btn inherits Rectangle {
-    in property <string> glyph;
+    in property <string> direction; // "left" | "right" | "up"
     in property <bool> enabled;
     callback clicked();
 
-    width: 30px;
-    height: 30px;
-    border-radius: 6px;
-    background: (root.enabled && nav-ta.has-hover) ? Theme.bg-hover : transparent;
+    width: 28px;
+    height: 100%; // 占满工具栏 44px 高度
 
-    Text {
-        text: root.glyph;
-        color: root.enabled ? Theme.text-primary : Theme.text-disabled;
-        font-size: 15px;
-        horizontal-alignment: center;
-        vertical-alignment: center;
-        width: 100%;
-        height: 100%;
+    // 内部视觉方块：精准 28px x 28px，完美垂直居中。
+    // parent 即外层 44px 高的 nav-btn，引用合法且绝对居中。
+    Rectangle {
+        width: 28px;
+        height: 28px;
+        y: (parent.height - self.height) / 2;
+        border-radius: 5px;
+        background: (root.enabled && nav-ta.has-hover) ? Theme.bg-hover : transparent;
+
+        IconNavArrow {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            direction: root.direction;
+            size: 12px;
+            icon-color: root.enabled
+                ? (nav-ta.has-hover ? Theme.text-primary : Theme.text-secondary)
+                : Theme.text-disabled;
+        }
     }
 
     nav-ta := TouchArea {
@@ -287,30 +295,25 @@ out property <length> row-height-out: file-list.row-height-out;
                 width: 100%;
                 height: parent.height;
                 spacing: 4px;
+                // ⚠️ 严禁在此处加 alignment: center！那是水平居中，会导致整行被挤压缩在屏幕中央！
                 padding-left: 8px;
                 padding-right: 10px;
 
-                // 导航按钮组。
+                // 导航按钮组（间距收拢至 2px，紧凑协调）
                 nav-btn {
-                    glyph: "←";
+                    direction: "left";
                     enabled: root.can-go-back;
-                    clicked => {
-                        root.nav_back();
-                    }
+                    clicked => { root.nav_back(); }
                 }
                 nav-btn {
-                    glyph: "→";
+                    direction: "right";
                     enabled: root.can-go-forward;
-                    clicked => {
-                        root.nav_forward();
-                    }
+                    clicked => { root.nav_forward(); }
                 }
                 nav-btn {
-                    glyph: "↑";
+                    direction: "up";
                     enabled: root.can-go-up;
-                    clicked => {
-                        root.nav_up();
-                    }
+                    clicked => { root.nav_up(); }
                 }
 
                 // 分隔竖线。
@@ -449,18 +452,19 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                     }
 
-                // 刷新（置于新建文件夹左侧）。
+                // 刷新按钮（28px x 28px，与左侧导航按钮尺寸完全对称）
                 Rectangle {
-                    width: 30px;
-                    height: 30px;
-                    y: (parent.height - 30px) / 2;
-                    border-radius: 6px;
+                    width: 28px;
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 5px;
                     background: refresh-ta.has-hover ? Theme.bg-hover : transparent;
 
                     IconRefresh {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
-                        size: 15px;
+                        size: 14px;
+                        icon-color: refresh-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
                     }
 
                     refresh-ta := TouchArea {
@@ -472,22 +476,19 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                 }
 
-                // 新建文件夹。
+                // 新建文件夹按钮（改用矢量十字，高度绝对与刷新按钮水平对齐）
                 Rectangle {
-                    width: 30px;
-                    height: 30px;
-                    y: (parent.height - 30px) / 2;
-                    border-radius: 6px;
+                    width: 28px;
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 5px;
                     background: newfolder-ta.has-hover ? Theme.bg-hover : transparent;
 
-                    Text {
-                        text: "＋";
-                        color: Theme.text-secondary;
-                        font-size: 14px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
+                    IconPlus {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        size: 12px;
+                        icon-color: newfolder-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
                     }
 
                     newfolder-ta := TouchArea {
@@ -501,10 +502,10 @@ out property <length> row-height-out: file-list.row-height-out;
 
                 // 视图切换（Pulse 式下拉）。
                 Rectangle {
-                    width: 30px;
-                    height: 30px;
-                    y: (parent.height - 30px) / 2;
-                    border-radius: 6px;
+                    width: 28px;
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 5px;
                     background: view-ta.has-hover ? Theme.bg-hover : transparent;
 
                     Text {
@@ -516,6 +517,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         vertical-alignment: center;
                         width: 100%;
                         height: 100%;
+                        y: -0.3px;
                     }
 
                     view-ta := TouchArea {
