@@ -4210,8 +4210,8 @@ fn sync_drag_bounds(app: &App) {
     // 会变成拖窗口。
     x += 8.0;
 
-    // 右侧：三个窗口按钮 44 + 44 + 46 = 134px，再留 6px 余量。
-    let controls_start = window_w - 140.0;
+    // 右侧：设置齿轮(36) + 三个窗口按钮(44+44+46=134) = 170px，再留 6px 余量。
+    let controls_start = window_w - 176.0;
     let w = (controls_start - x).max(0.0);
 
     // 诊断用（ROVE_LOG=2 才输出）：同时打印 Slint 侧取值，用于核实拖拽热区几何。

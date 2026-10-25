@@ -17,6 +17,7 @@ export component TabBar inherits Rectangle {
     callback window_minimize();
     callback window_maximize();
     callback window_close();
+    callback settings_requested(); // 标题栏设置齿轮入口
 
     // 导出空白拖拽区的起止位置（供后端 WM_NCHITTEST 判定，见 app.rs drag_hittest）
     out property <length> drag-x: drag-spacer.x;
@@ -182,10 +183,31 @@ export component TabBar inherits Rectangle {
             height: parent.height;
         }
 
-        // 窗口控制按钮组 (最小化 / 最大化 / 关闭)
+        // 窗口控制按钮组 (设置 / 最小化 / 最大化 / 关闭)
         HorizontalLayout {
             spacing: 0px;
             height: parent.height;
+
+            // 设置齿轮（排在最小化左侧，36px）
+            Rectangle {
+                width: 36px;
+                height: parent.height;
+                background: settings-ta.has-hover ? Theme.bg-hover : transparent;
+
+                Text {
+                    text: "⚙";
+                    color: settings-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                    font-family: Theme.symbol-font-family;
+                    font-size: 13px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+                settings-ta := TouchArea {
+                    clicked => { root.settings_requested(); }
+                }
+            }
 
             // 最小化：精准 10px × 1.1px 纤细横线
             Rectangle {

@@ -272,6 +272,7 @@ out property <length> row-height-out: file-list.row-height-out;
             window_minimize => { root.window_minimize(); }
             window_maximize => { root.window_maximize(); }
             window_close => { root.window_close(); }
+            settings_requested => { root.settings_requested(); }
         }
 
         // ---- 工具栏（设置页整体收起，内容从标签栏下方直接开始）----
@@ -448,6 +449,29 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                     }
 
+                // 刷新（置于新建文件夹左侧）。
+                Rectangle {
+                    width: 30px;
+                    height: 30px;
+                    y: (parent.height - 30px) / 2;
+                    border-radius: 6px;
+                    background: refresh-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    IconRefresh {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        size: 15px;
+                    }
+
+                    refresh-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.refresh_requested();
+                        }
+                    }
+                }
+
                 // 新建文件夹。
                 Rectangle {
                     width: 30px;
@@ -499,86 +523,6 @@ out property <length> row-height-out: file-list.row-height-out;
                         height: 100%;
                         clicked => {
                             root.view_picker_requested();
-                        }
-                    }
-                }
-
-                // 粘贴（剪贴板有内容时可用）。
-                Rectangle {
-                    width: 30px;
-                    height: 30px;
-                    y: (parent.height - 30px) / 2;
-                    border-radius: 6px;
-                    background: paste-ta.has-hover && root.can-paste ? Theme.bg-hover : transparent;
-
-                    Text {
-                        text: "⧉";
-                        color: root.can-paste ? Theme.text-primary : Theme.text-disabled;
-                        font-family: Theme.symbol-font-family;
-                        font-size: 14px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
-                    }
-
-                    paste-ta := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        enabled: root.can-paste;
-                        clicked => {
-                            root.paste_requested();
-                        }
-                    }
-                }
-
-                // 刷新。
-                Rectangle {
-                    width: 30px;
-                    height: 30px;
-                    y: (parent.height - 30px) / 2;
-                    border-radius: 6px;
-                    background: refresh-ta.has-hover ? Theme.bg-hover : transparent;
-
-                    IconRefresh {
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2;
-                        size: 15px;
-                    }
-
-                    refresh-ta := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        clicked => {
-                            root.refresh_requested();
-                        }
-                    }
-                }
-
-                // 设置入口齿轮。
-                Rectangle {
-                    width: 30px;
-                    height: 30px;
-                    y: (parent.height - 30px) / 2;
-                    border-radius: 6px;
-                    background: settings-ta.has-hover ? Theme.bg-hover : transparent;
-
-                    Text {
-                        text: "⚙";
-                        color: settings-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
-                        font-family: Theme.symbol-font-family;
-                        font-size: 13px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
-                    }
-
-                    settings-ta := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        clicked => {
-                            root.settings_requested();
                         }
                     }
                 }
