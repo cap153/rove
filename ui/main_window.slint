@@ -897,4 +897,12 @@ out property <length> row-height-out: file-list.row-height-out;
         root.menu-open = true;
     }
 
+    // 供 Rust 调用的公开函数：绝对坐标弹出菜单（用于工具栏下拉，消除侧栏与工具栏的叠加偏移）。
+    // x/y 为窗口绝对坐标，内部换算为内容区坐标（减去侧栏与顶栏），与 open-menu 同一体系。
+    public function open-menu-absolute(x: length, y: length) {
+        root.click-x = x - root.sidebar-w;
+        root.click-y = y - root.topbar-h;
+        root.menu-open = true;
+    }
+
 }

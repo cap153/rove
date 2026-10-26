@@ -1976,10 +1976,19 @@ impl App {
         let height = items.len() as f32 * 28.0 + 8.0;
         self.ui.set_menu_items(ModelRc::new(VecModel::from(items)));
         self.ui.set_menu_items_height(height);
-        // 弹在工具栏视图按钮下方（按钮在窗口右侧区域，取搜索框左侧固定区起点）。
-        // y = 工具栏底部（topbar 44px 之下），菜单顶贴住按钮。
-        let x = self.ui.get_view_width() - 220.0;
-        self.ui.invoke_open_menu(x, 44.0);
+
+        // 设置菜单目标兜底
+        self.menu_target = Some(MenuTarget::Background);
+
+        // 精准对齐 ▦ 按钮下方：
+        // ▦ 按钮在搜索框左侧约 220px 处，菜单宽 224px
+        // x 计算为对齐 ▦ 按钮中心，y 严格落在 44px 工具栏下边缘 (84px)
+        let scale = self.ui.window().scale_factor() as f32;
+        let win_w = self.ui.window().size().width as f32 / scale;
+        let x = (win_w - 330.0).max(10.0);
+        let y = 84.0f32; // 38px 标签栏 + 44px 工具栏 + 2px 间隙
+
+        self.ui.invoke_open_menu_absolute(x, y);
     }
 
     /// 面包屑路径编辑提交（点击地址栏输入路径后回车）。
@@ -2319,15 +2328,18 @@ impl App {
 impl App {
     /// 执行右键菜单动作。
     fn run_menu_action(&mut self, id: &str) {
-        let Some(target) = self.menu_target.clone() else {
-            return;
-        };
         self.close_menu();
-        // 视图模式切换（Phase 5）。
+
+        // 1. 视图模式切换（优先执行！不依赖选中的文件 target，杜绝工具栏调用被拦截）
         if let Some(mode) = id.strip_prefix("view:") {
             self.set_view_mode(mode);
             return;
         }
+
+        // 2. 需要操作目标的常规文件动作
+        let Some(target) = self.menu_target.clone() else {
+            return;
+        };
         // actions.toml 驱动的动作（Phase 4 / Sprint 2）。
         if let Some(action_id) = id.strip_prefix("act:") {
             match action_id {
