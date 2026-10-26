@@ -1,5 +1,41 @@
 // 动作编辑器弹窗（新增 / 编辑自定义右键菜单项）。
-import { Theme } from "common.slint";
+import { Theme, IconClose } from "common.slint";
+
+// 标准风格化文本输入框（带背景底槽、1px 边框、聚焦高亮与占位提示）
+component StyledInput inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+    in property <bool> enabled: true;
+
+    height: 32px;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    background: Theme.bg-main;
+    border-width: 1px;
+    border-color: ti.has-focus ? Theme.accent : Theme.border;
+
+    ti := TextInput {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text <=> root.text;
+        font-size: 12.5px;
+        color: Theme.text-primary;
+        vertical-alignment: center;
+        single-line: true;
+        enabled: root.enabled;
+    }
+
+    if (root.text == "" && !ti.has-focus && root.placeholder != "") : Text {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.placeholder;
+        font-size: 12px;
+        color: Theme.text-disabled;
+        vertical-alignment: center;
+    }
+}
 
 // 作用对象单选按钮。
 component RadioDot inherits Rectangle {
@@ -50,41 +86,7 @@ component RadioDot inherits Rectangle {
     }
 }
 
-// 层级归属选项（可点击的标签）。
-component GroupChip inherits Rectangle {
-    in-out property <bool> selected: false;
-    in property <string> label: "";
-    callback clicked-cb();
-
-    height: 26px;
-    border-radius: 4px;
-    background: root.selected ? Theme.accent : transparent;
-    border-width: 1px;
-    border-color: root.selected ? Theme.accent : Theme.border;
-
-    // padding 仅布局元素有效：用 HorizontalLayout 承载内边距。
-    HorizontalLayout {
-        padding-left: 10px;
-        padding-right: 10px;
-
-        Text {
-            text: root.label;
-            color: root.selected ? white : Theme.text-primary;
-            font-size: 12px;
-            vertical-alignment: center;
-        }
-    }
-
-    TouchArea {
-        width: 100%;
-        height: 100%;
-        clicked => {
-            root.clicked-cb();
-        }
-    }
-}
-
-// 参数模板占位符按钮：点击追加到参数文本框（前置空格）。
+// 参数模板占位符按钮：点击自动追加双引号包裹的参数
 component TokenChip inherits Rectangle {
     in property <string> token: "";
     in-out property <string> target-text;
@@ -112,11 +114,11 @@ component TokenChip inherits Rectangle {
         width: 100%;
         height: 100%;
         clicked => {
-            // 已有内容时补一个空格再追加。
+            let quoted = "\"" + root.token + "\"";
             if (root.target-text != "") {
                 root.target-text += " ";
             }
-            root.target-text += root.token;
+            root.target-text += quoted;
             root.append-cb();
         }
     }
@@ -124,7 +126,6 @@ component TokenChip inherits Rectangle {
 
 export component ActionEditorDialog inherits Rectangle {
     in property <string> title: "新建动作";
-    // 可选层级归属（来自已有分组），始终含「一级菜单」。
     in property <[string]> group-options: ["一级菜单"];
     in-out property <string> edit-id: "";
     in-out property <string> edit-label: "";
@@ -139,12 +140,13 @@ export component ActionEditorDialog inherits Rectangle {
     callback cancel();
     callback browse();
 
-    // 非布局子元素必须显式撑满窗口，否则内部 100% 全为 0。
+    // 内部控制层级下拉框展开状态
+    property <bool> dropdown-open: false;
+
     width: 100%;
     height: 100%;
-    opacity: 1;
 
-    // 半透明遮罩
+    // 1. 半透明黑色遮罩：仅吸收点击拦截穿透，不触发关闭（彻底防止误触丢失输入）
     Rectangle {
         width: 100%;
         height: 100%;
@@ -154,69 +156,91 @@ export component ActionEditorDialog inherits Rectangle {
         TouchArea {
             width: 100%;
             height: 100%;
-            clicked => {
-                root.cancel();
-            }
+            // 点击遮罩空白区不执行 cancel()
         }
     }
 
-    // 弹窗卡片（高度容纳全部字段 + 底部按钮）。
+    // 2. 弹窗卡片：自适应内容高度，拒绝硬编码拉伸造成的空白错位
     Rectangle {
         x: (parent.width - self.width) / 2;
-        y: max(8px, (parent.height - self.height) / 2);
+        y: max(16px, (parent.height - self.height) / 2);
         width: 480px;
-        height: 560px;
+        height: card-layout.preferred-height;
         background: Theme.bg-input;
         border-radius: 10px;
         border-width: 1px;
         border-color: Theme.border;
 
-        VerticalLayout {
-            padding-left: 20px;
-            padding-right: 20px;
+        card-layout := VerticalLayout {
+            padding-left: 24px;
+            padding-right: 24px;
             padding-top: 20px;
             padding-bottom: 20px;
-            spacing: 10px;
+            spacing: 14px; // 严格统一的行间距节奏！
+            alignment: start;
 
-            Text {
-                text: root.title;
-                color: Theme.text-primary;
-                font-size: 16px;
-                font-weight: 600;
-            }
+            // 标题行 + 右上角关闭叉号
+            HorizontalLayout {
+                height: 24px;
 
-            // 显示名称
-            VerticalLayout {
-                spacing: 4px;
-                Text { text: "名称"; color: Theme.text-secondary; font-size: 12px; }
-                TextInput {
-                    text <=> root.edit-label;
-                    height: 32px;
-                    font-size: 13px;
+                Text {
+                    text: root.title;
                     color: Theme.text-primary;
-                    single-line: true;
+                    font-size: 16px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 4px;
+                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    IconClose {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        size: 9px;
+                        stroke-width: 1.1px;
+                        icon-color: Theme.text-secondary;
+                    }
+
+                    close-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.cancel();
+                        }
+                    }
                 }
             }
 
-            // 程序路径 + 浏览按钮
+            // 字段 1：显示名称
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "名称"; color: Theme.text-secondary; font-size: 12px; }
+                StyledInput {
+                    text <=> root.edit-label;
+                    placeholder: "例如：用 VS Code 打开";
+                }
+            }
+
+            // 字段 2：程序路径 + 浏览按钮
             VerticalLayout {
                 spacing: 4px;
                 Text { text: "执行路径"; color: Theme.text-secondary; font-size: 12px; }
                 HorizontalLayout {
-                    height: 32px;
                     spacing: 8px;
 
-                    TextInput {
+                    StyledInput {
                         horizontal-stretch: 1;
                         text <=> root.edit-program;
-                        height: 32px;
-                        font-size: 13px;
-                        color: Theme.text-primary;
-                        single-line: true;
+                        placeholder: "可执行程序绝对路径，或环境变量中的命令";
                     }
 
                     Rectangle {
-                        width: 80px;
+                        width: 76px;
                         height: 32px;
                         border-radius: 6px;
                         border-width: 1px;
@@ -244,19 +268,15 @@ export component ActionEditorDialog inherits Rectangle {
                 }
             }
 
-            // 参数模板
+            // 字段 3：参数模板
             VerticalLayout {
                 spacing: 4px;
                 Text { text: "参数模板"; color: Theme.text-secondary; font-size: 12px; }
-                TextInput {
+                StyledInput {
                     text <=> root.edit-args;
-                    height: 32px;
-                    font-size: 13px;
-                    color: Theme.text-primary;
-                    single-line: true;
+                    placeholder: "例如：\"{target_path}\"";
                 }
 
-                // 点击追加占位符（前置空格）。
                 HorizontalLayout {
                     spacing: 6px;
                     alignment: start;
@@ -268,9 +288,9 @@ export component ActionEditorDialog inherits Rectangle {
                 }
             }
 
-            // 作用对象（单选）
+            // 字段 4：作用对象（单选）
             VerticalLayout {
-                spacing: 2px;
+                spacing: 4px;
                 Text { text: "作用对象"; color: Theme.text-secondary; font-size: 12px; }
 
                 HorizontalLayout {
@@ -295,56 +315,127 @@ export component ActionEditorDialog inherits Rectangle {
                 }
             }
 
-            // 层级归属（选择已有分组）
+            // 字段 5：层级归属（向上弹出上拉菜单，选项多时限高 140px 并支持滚动）
             VerticalLayout {
                 spacing: 4px;
                 Text { text: "层级归属"; color: Theme.text-secondary; font-size: 12px; }
 
-                // 分组较多时横向滚动，避免溢出卡片。
-                Flickable {
-                    height: 26px;
-                    content-width: chips.preferred-width;
+                drop-box := Rectangle {
+                    height: 32px;
+                    border-radius: 6px;
+                    background: Theme.bg-main;
+                    border-width: 1px;
+                    border-color: root.dropdown-open ? Theme.accent : Theme.border;
 
-                    chips := HorizontalLayout {
-                        height: 26px;
-                        spacing: 6px;
-                        alignment: start;
-                        padding-right: 4px;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
 
-                        for opt in root.group-options : GroupChip {
-                            label: opt;
-                            selected: root.edit-group == (opt == "一级菜单" ? "" : opt);
-                            clicked-cb => {
-                                root.edit-group = opt == "一级菜单" ? "" : opt;
+                        Text {
+                            text: root.edit-group == "" ? "一级菜单" : root.edit-group;
+                            color: Theme.text-primary;
+                            font-size: 12.5px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            overflow: elide;
+                        }
+
+                        Text {
+                            // 上拉菜单：展开时箭头朝上 ▲，收起时朝下 ▼
+                            text: root.dropdown-open ? "▲" : "▼";
+                            color: Theme.text-secondary;
+                            font-size: 8px;
+                            font-family: Theme.symbol-font-family;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
+                        }
+                    }
+
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.dropdown-open = !root.dropdown-open;
+                        }
+                    }
+
+                    // 上拉菜单浮层：直接挂在 drop-box 内部，坐标为负值向上展开！
+                    // 彻底解决跨组件绝对坐标错位的 Bug，上方空间充足，限高 140px 自动滚动
+                    if (root.dropdown-open) : Rectangle {
+                        x: 0px;
+                        y: -self.height - 4px; // 向上弹出，紧贴 drop-box 顶端
+                        width: parent.width;
+                        height: min(140px, root.group-options.length * 30px + 8px);
+                        z: 100;
+                        background: Theme.bg-input;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        clip: true;
+
+                        Flickable {
+                            width: 100%;
+                            height: 100%;
+                            content-height: opt-layout.preferred-height;
+                            interactive: true;
+
+                            opt-layout := VerticalLayout {
+                                padding-top: 4px;
+                                padding-bottom: 4px;
+                                spacing: 0px;
+
+                                for opt in root.group-options : Rectangle {
+                                    height: 30px;
+                                    background: opt-ta.has-hover ? Theme.bg-hover : (root.edit-group == (opt == "一级菜单" ? "" : opt) ? Theme.bg-selected : transparent);
+
+                                    HorizontalLayout {
+                                        padding-left: 10px;
+                                        padding-right: 10px;
+
+                                        Text {
+                                            text: opt;
+                                            color: root.edit-group == (opt == "一级菜单" ? "" : opt) ? Theme.accent : Theme.text-primary;
+                                            font-size: 12px;
+                                            font-weight: root.edit-group == (opt == "一级菜单" ? "" : opt) ? 600 : 400;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    opt-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => {
+                                            root.edit-group = (opt == "一级菜单" ? "" : opt);
+                                            root.dropdown-open = false;
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // 扩展名
+            // 字段 6：适用扩展名
             VerticalLayout {
                 spacing: 4px;
                 Text { text: "适用扩展名（仅「仅文件」，逗号分隔，可空）"; color: Theme.text-secondary; font-size: 12px; }
-                TextInput {
+                StyledInput {
                     text <=> root.edit-extensions;
-                    height: 32px;
-                    font-size: 13px;
-                    color: Theme.text-primary;
-                    single-line: true;
+                    placeholder: "例如：txt, md, rs（留空匹配全部）";
                 }
             }
 
-            // 底部按钮
+            // 底部操作按钮
             HorizontalLayout {
-                height: 36px;
+                height: 34px;
                 spacing: 12px;
                 alignment: end;
 
                 Rectangle {
-                    width: 70px;
+                    width: 72px;
                     height: parent.height;
-                    background: cancel-ta.has-hover ? Theme.bg-hover : transparent;
+                    background: cancel-btn-ta.has-hover ? Theme.bg-hover : transparent;
                     border-radius: 6px;
                     border-width: 1px;
                     border-color: Theme.border;
@@ -352,14 +443,14 @@ export component ActionEditorDialog inherits Rectangle {
                     Text {
                         text: "取消";
                         color: Theme.text-primary;
-                        font-size: 13px;
+                        font-size: 12.5px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                         width: 100%;
                         height: 100%;
                     }
 
-                    cancel-ta := TouchArea {
+                    cancel-btn-ta := TouchArea {
                         width: 100%;
                         height: 100%;
                         clicked => {
@@ -369,22 +460,22 @@ export component ActionEditorDialog inherits Rectangle {
                 }
 
                 Rectangle {
-                    width: 70px;
+                    width: 72px;
                     height: parent.height;
-                    background: save-ta.has-hover ? Theme.accent-hover : Theme.accent;
+                    background: save-btn-ta.has-hover ? Theme.accent-hover : Theme.accent;
                     border-radius: 6px;
 
                     Text {
                         text: "保存";
                         color: white;
-                        font-size: 13px;
+                        font-size: 12.5px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                         width: 100%;
                         height: 100%;
                     }
 
-                    save-ta := TouchArea {
+                    save-btn-ta := TouchArea {
                         width: 100%;
                         height: 100%;
                         clicked => {

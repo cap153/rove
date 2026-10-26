@@ -219,11 +219,6 @@ out property <length> row-height-out: file-list.row-height-out;
     private property <length> topbar-h: 82px; // 标签栏 38 + 工具栏 44
     private property <length> statusbar-h: 28px;
 
-    // 面包屑变化后滚到最右端（显示最深路径）。
-    changed breadcrumbs => {
-        crumbs-flick.content-x = -10000px;
-    }
-
     /// 文件列表滚动到顶端（Rust 调用）。
     public function scroll-list-to-top() {
         file-list.scroll-to-top();
@@ -324,69 +319,75 @@ out property <length> row-height-out: file-list.row-height-out;
                     background: Theme.border;
                 }
 
-                // 面包屑导航。
+                // 面包屑地址栏（复刻 Pulse：常态即为 28px 圆角输入框，与右侧搜索框严格统一）
                 Rectangle {
                     horizontal-stretch: 1;
-                    height: parent.height;
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 6px;
+                    background: Theme.bg-input;
+                    border-width: 1px;
+                    border-color: root.path-editing ? Theme.accent : Theme.border;
                     clip: true;
 
-                    // 编辑态：路径输入框替换面包屑。
-                    if (root.path-editing) : Rectangle {
-                        x: 0px;
-                        y: (parent.height - 28px) / 2;
-                        width: parent.width - 4px;
-                        height: 28px;
-                        border-radius: 6px;
-                        background: Theme.bg-input;
-                        border-width: 1px;
-                        border-color: Theme.accent;
+                    // 1. 编辑态：文本输入框直接嵌入
+                    if (root.path-editing) : TextInput {
+                        x: 8px;
+                        width: parent.width - 16px;
+                        height: parent.height;
+                        text: root.path-edit-text;
+                        font-size: 12px;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                        single-line: true;
 
-                        path-input := TextInput {
-                            x: 8px;
-                            width: parent.width - 16px;
-                            height: parent.height;
-                            text: root.path-edit-text;
-                            font-size: 12px;
-                            color: Theme.text-primary;
-                            vertical-alignment: center;
-                            single-line: true;
+                        accepted => {
+                            root.path_editing = false;
+                            root.path_edit_committed(self.text);
+                        }
 
-                            accepted => {
-                                root.path_editing = false;
-                                root.path_edit_committed(self.text);
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.path-editing = false;
+                                return EventResult.accept;
                             }
+                            return EventResult.reject;
+                        }
 
-                            key-pressed(event) => {
-                                if (event.text == Key.Escape) {
-                                    root.path-editing = false;
-                                    return EventResult.accept;
-                                }
-                                return EventResult.reject;
+                        changed has-focus => {
+                            // 失焦即退出编辑（视为取消）。
+                            if (!self.has-focus && root.path-editing) {
+                                root.path-editing = false;
                             }
+                        }
 
-                            changed has-focus => {
-                                // 失焦即退出编辑（视为取消）。
-                                if (!self.has-focus && root.path-editing) {
-                                    root.path-editing = false;
-                                }
-                            }
-
-                            init => {
-                                self.focus();
-                                self.select-all();
-                            }
+                        init => {
+                            self.focus();
+                            self.select-all();
                         }
                     }
 
-                    // 非编辑态：面包屑条。点击空白处进入路径编辑。
-                    crumbs-flick := Flickable {
-                        visible: !root.path-editing;
-                        width: 100%;
+                    // 2. 非编辑态：展示面包屑胶囊流，点击空白处无缝进入编辑
+                    if (!root.path-editing) : crumbs-flick := Flickable {
+                        x: 4px;
+                        width: parent.width - 8px;
                         height: parent.height;
                         content-width: max(crumbs-layout.preferred-width, self.width);
                         interactive: true;
 
-                        // 空白区背景：整条面包屑区域的点击兜底（位于面包屑下层）。
+                        // 面包屑变化后滚到最右端（显示最深路径）。
+                        // 本元素位于 if 分支内，根级 changed 已不可访问；
+                        // changed 语法仅支持本元素属性，故用别名属性中转观测。
+                        // 编辑态切换会重建本元素，init 保证重建后同样定位到最右端。
+                        private property <[BreadcrumbSegment]> breadcrumbs-watch: root.breadcrumbs;
+                        changed breadcrumbs-watch => {
+                            self.content-x = -10000px;
+                        }
+                        init => {
+                            self.content-x = -10000px;
+                        }
+
+                        // 点击文本框内空白处进入路径编辑
                         crumb-bg-ta := TouchArea {
                             width: 100%;
                             height: 100%;
@@ -397,60 +398,60 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
 
                         crumbs-layout := HorizontalLayout {
-                                x: 0px;
-                                y: 0px;
+                            x: 0px;
+                            y: 0px;
+                            height: parent.height;
+                            spacing: 0px;
+
+                            for seg[i] in root.breadcrumbs : Rectangle {
                                 height: parent.height;
-                                spacing: 0px;
-                                padding-left: 2px;
+                                width: crumb-text.preferred-width + (i == 0 ? 12px : 24px);
 
-                                for seg[i] in root.breadcrumbs : Rectangle {
+                                // 分隔箭头 "›"
+                                if (i > 0) : Text {
+                                    x: 0px;
+                                    width: 12px;
                                     height: parent.height;
-                                    width: crumb-text.preferred-width + (i == 0 ? 14px : 26px);
+                                    text: "›";
+                                    color: Theme.text-disabled;
+                                    font-size: 12px;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
 
-                                    // 分隔箭头（第一段除外）。
-                                    if (i > 0) : Text {
-                                        x: 0px;
-                                        width: 14px;
-                                        height: parent.height;
-                                        text: "›";
-                                        color: Theme.text-disabled;
-                                        font-size: 13px;
-                                        horizontal-alignment: center;
+                                // 单个路径胶囊（悬停微底色）
+                                Rectangle {
+                                    x: i == 0 ? 0px : 12px;
+                                    width: parent.width - (i == 0 ? 0px : 12px);
+                                    height: 22px;
+                                    y: (parent.height - 22px) / 2;
+                                    border-radius: 4px;
+                                    background: crumb-ta.has-hover ? Theme.bg-hover : transparent;
+
+                                    crumb-text := Text {
+                                        text: seg.label;
+                                        color: i == root.breadcrumbs.length - 1 ? Theme.text-primary : Theme.text-secondary;
+                                        font-size: 12px;
+                                        font-weight: i == root.breadcrumbs.length - 1 ? 600 : 400;
                                         vertical-alignment: center;
+                                        horizontal-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                        overflow: elide;
                                     }
 
-                                    Rectangle {
-                                        x: i == 0 ? 0px : 14px;
-                                        width: parent.width - (i == 0 ? 0px : 14px);
-                                        height: 26px;
-                                        y: (parent.height - 26px) / 2;
-                                        border-radius: 5px;
-                                        background: crumb-ta.has-hover ? Theme.bg-hover : transparent;
-
-                                        crumb-text := Text {
-                                            text: seg.label;
-                                            color: i == root.breadcrumbs.length - 1 ? Theme.text-primary : Theme.text-secondary;
-                                            font-size: 12.5px;
-                                            font-weight: i == root.breadcrumbs.length - 1 ? 600 : 400;
-                                            vertical-alignment: center;
-                                            horizontal-alignment: center;
-                                            width: 100%;
-                                            height: 100%;
-                                            overflow: elide;
-                                        }
-
-                                        crumb-ta := TouchArea {
-                                            width: 100%;
-                                            height: 100%;
-                                            clicked => {
-                                                root.breadcrumb_clicked(seg.path);
-                                            }
+                                    crumb-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => {
+                                            root.breadcrumb_clicked(seg.path);
                                         }
                                     }
                                 }
                             }
                         }
                     }
+                }
 
                 // 刷新按钮（28px x 28px，与左侧导航按钮尺寸完全对称）
                 Rectangle {

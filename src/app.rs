@@ -3840,8 +3840,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.ui.set_settings_editor_target("any".into());
             app.ui.set_settings_editor_extensions("".into());
             app.ui.set_settings_editor_program("".into());
-            // 参数模板默认给 {target_path}，符合任务书约定。
-            app.ui.set_settings_editor_args("{target_path}".into());
+            // 参数模板默认给 "{target_path}"（带双引号），符合任务书约定。
+            app.ui.set_settings_editor_args("\"{target_path}\"".into());
         });
     }
     {
