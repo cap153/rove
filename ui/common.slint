@@ -131,11 +131,16 @@ export component HighlightName inherits Rectangle {
     in property <bool> is-dir: false;
     // true = 文本顶部对齐（图标网格两行区域的单行场景）。
     in property <bool> align-top: false;
+    // 是否在水平方向上居中（用于大图标/超大图标视图）
+    in property <bool> horizontal-center: false;
     clip: true;
     background: transparent;
 
     HorizontalLayout {
+        width: 100%; // 必须撑满外层容器，否则 alignment:center 无足够横向空间生效
         spacing: 0px;
+        // 核心修复：根据外部传入的开关，决定是居中拼装还是靠左拼装
+        alignment: root.horizontal-center ? center : start;
 
         for part in root.parts : Text {
             width: self.preferred-width;

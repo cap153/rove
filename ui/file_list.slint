@@ -709,6 +709,7 @@ export component FileList inherits Rectangle {
                         font-size: 11.5px;
                         is-dir: row.is-dir;
                         align-top: true;
+                        horizontal-center: true; // 网格图标视图：文件名水平居中于缩略图下方
                     }
                     if (row.name-parts.length == 0) : Text {
                         height: parent.height - root.cell-thumb - 4px;
@@ -717,6 +718,7 @@ export component FileList inherits Rectangle {
                         font-size: 11.5px;
                         font-weight: row.is-dir ? 500 : 400;
                         vertical-alignment: top;
+                        horizontal-alignment: center; // 非搜索态下的常态文字居中
                         wrap: word-wrap;
                         overflow: elide;
                         max-lines: 2;
