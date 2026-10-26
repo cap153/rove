@@ -11,7 +11,12 @@ export component StagingTray inherits Rectangle {
     callback copy_here_requested();
     callback move_here_requested();
 
-    height: root.expanded ? 224px : 36px;
+    // 动态高度计算：空载时大幅压缩列表区，使托盘变得小巧精致
+    property <length> header-h: 32px; // 从 36px 压实到 32px
+    property <length> list-h: root.items.length > 0 ? 116px : 60px; // 有内容时 116px，空载时压缩至 60px
+    property <length> btn-h: 42px; // 按钮区压实到 42px
+
+    height: root.expanded ? (root.header-h + root.list-h + root.btn-h) : root.header-h;
     background: Theme.bg-sidebar;
     clip: true;
     animate height { duration: 140ms; easing: ease-out; }
@@ -33,7 +38,7 @@ export component StagingTray inherits Rectangle {
 
         // ---- 标题栏 ----
         Rectangle {
-            height: 36px;
+            height: root.header-h; // 改为引用变量
 
             TouchArea {
                 width: 100%;
@@ -107,7 +112,7 @@ export component StagingTray inherits Rectangle {
 
         // ---- 条目列表（固定高度容器，避免布局绑定环） ----
         Rectangle {
-            height: root.expanded ? 136px : 0px;
+            height: root.expanded ? root.list-h : 0px; // 改为引用变量
             clip: true;
 
             if (root.expanded && root.items.length > 0) : Flickable {
@@ -220,13 +225,13 @@ export component StagingTray inherits Rectangle {
 
         // ---- 操作按钮 ----
         if (root.expanded) : HorizontalLayout {
-            height: 52px;
+            height: root.btn-h; // 改为引用变量
             spacing: 6px;
 
             // 复制到当前目录。
             Rectangle {
                 height: 28px;
-                y: 12px;
+                y: (parent.height - self.height) / 2; // 替换死板的 y: 12px
                 horizontal-stretch: 1;
                 border-radius: 6px;
                 background: root.items.length > 0 ? Theme.accent : Theme.border;
@@ -256,7 +261,7 @@ export component StagingTray inherits Rectangle {
             Rectangle {
                 width: 84px;
                 height: 28px;
-                y: 12px;
+                y: (parent.height - self.height) / 2; // 替换死板的 y: 12px
                 border-radius: 6px;
                 background: (root.items.length > 0) ? Theme.bg-badge : transparent;
                 border-width: 1px;
@@ -287,7 +292,7 @@ export component StagingTray inherits Rectangle {
             Rectangle {
                 width: 28px;
                 height: 28px;
-                y: 12px;
+                y: (parent.height - self.height) / 2; // 替换死板的 y: 12px
                 border-radius: 6px;
                 background: (root.items.length > 0 && clear-ta.has-hover) ? Theme.bg-hover : transparent;
 

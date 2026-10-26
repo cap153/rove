@@ -232,7 +232,8 @@ export component FileList inherits Rectangle {
 
         // ---- 表头（仅详细信息视图） ----
         header := Rectangle {
-            height: 30px;
+            // 核心修复：非详细信息视图时高度必须归零，否则 VerticalLayout 中会留下 30px 的透明死区空白
+            height: root.view-mode == "details" ? 30px : 0px;
             background: Theme.bg-toolbar;
             clip: true;
             visible: root.view-mode == "details";
