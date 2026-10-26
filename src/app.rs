@@ -1199,12 +1199,19 @@ impl App {
     /// 当前视图对应的缩略图边长。
     #[cfg(windows)]
     fn thumb_size_for_view(&self) -> u32 {
-        match self.config.view_mode.as_str() {
-            "icons-xl" => 132,
-            "icons-large" => 88,
-            "icons-medium" => 60,
-            _ => crate::ops::thumbs::THUMB_SIZE,
-        }
+        // 获取当前窗口的真实物理缩放比例（如 125% -> 1.25, 150% -> 1.5）
+        let scale = self.ui.window().scale_factor() as f32;
+
+        let logical_size = match self.config.view_mode.as_str() {
+            "icons-xl" => 132.0,
+            "icons-large" => 88.0,
+            "icons-medium" => 60.0,
+            _ => crate::ops::thumbs::THUMB_SIZE as f32,
+        };
+
+        // 关键修复：向 Windows Shell 索要乘上缩放系数的真实物理分辨率图像，
+        // 杜绝位图被强行放大发虚（高 DPI 屏下发虚的根因）。
+        (logical_size * scale).ceil() as u32
     }
 
     #[cfg(windows)]
