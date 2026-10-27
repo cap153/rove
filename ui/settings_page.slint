@@ -229,6 +229,10 @@ export component SettingsPage inherits Rectangle {
     in property <string> page-title: "本地右键菜单";
     in property <string> page-desc: "开关控制菜单项显隐；内置动作仅允许开关，自定义动作可编辑或删除。";
     in property <bool> show-add: true;
+    /// 是否显示隐藏文件（由 MainWindow 透传自 config）。
+    in property <bool> show-hidden: false;
+    /// 开关「显示隐藏项目」时触发（bool = 新的开关态）。
+    callback show_hidden_toggled(bool);
     // 分组列表内容高度（Rust 按模型计算）。与 Slint 侧实测值取 max，
     // 任一来源少报都不会导致内容被裁切后无法滚动到。
     in property <length> content-height: 0px;
@@ -361,17 +365,58 @@ export component SettingsPage inherits Rectangle {
                 wrap: word-wrap;
             }
 
-            Flickable {
-                visible: root.action-groups.length > 0;
+            // ---- 子页 1：通用设置面板（严格置顶对齐） ----
+            if (root.page-title == "通用") : VerticalLayout {
+                spacing: 12px;
+                alignment: start;
                 vertical-stretch: 1;
-                // self.height 作为保底下限：卡片折叠导致内容不足一屏时，
-                // 保证 content-height >= self.height，把视口偏移量锁死为 0，
-                // 卡片永远自然置顶，杜绝内容向下悬空、顶部露出空白断层。
-                // （与侧栏/文件列表同一手法：max(内容高度, 视口高度)。）
+
+                Rectangle {
+                    background: Theme.bg-input;
+                    border-radius: 8px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    height: 58px;
+
+                    HorizontalLayout {
+                        padding-left: 16px;
+                        padding-right: 16px;
+                        spacing: 12px;
+
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+
+                            Text {
+                                text: "显示隐藏的文件、文件夹和驱动器";
+                                color: Theme.text-primary;
+                                font-size: 13px;
+                                font-weight: 500;
+                            }
+                            Text {
+                                text: "关闭时自动过滤具有隐藏属性的文件；开启时以半透明效果显示";
+                                color: Theme.text-secondary;
+                                font-size: 11px;
+                            }
+                        }
+
+                        Toggle {
+                            y: (parent.height - self.height) / 2;
+                            checked: root.show-hidden;
+                            toggled => {
+                                root.show_hidden_toggled(self.checked);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- 子页 2：本地右键菜单分组列表 ----
+            if (root.page-title == "本地右键菜单" && root.action-groups.length > 0) : Flickable {
+                vertical-stretch: 1;
                 content-height: max(self.height, max(root.content-height, groups-layout.preferred-height));
 
-                // 诊断：内容高度每次变化时打印三者，便于判断是"内容真的放得下"
-                // 还是"某一路少报"。
                 changed content-height => {
                     root.scroll_debug(self.height, self.content-height, groups-layout.preferred-height);
                 }
@@ -380,28 +425,20 @@ export component SettingsPage inherits Rectangle {
                     y: 0px;
                     width: 100%;
                     spacing: 12px;
-                    alignment: start; // 显式置顶：卡片向上紧贴，多余空白自然沉在底部
+                    alignment: start;
 
                     for group in root.action-groups : GroupCard {
                         group: group;
-                        toggled(id, enabled) => {
-                            root.action_toggled(id, enabled);
-                        }
-                        group_toggled(name, expanded) => {
-                            root.group_toggled(name, expanded);
-                        }
-                        edit(id) => {
-                            root.action_edit(id);
-                        }
-                        delete(id) => {
-                            root.action_delete(id);
-                        }
+                        toggled(id, enabled) => { root.action_toggled(id, enabled); }
+                        group_toggled(name, expanded) => { root.group_toggled(name, expanded); }
+                        edit(id) => { root.action_edit(id); }
+                        delete(id) => { root.action_delete(id); }
                     }
                 }
             }
 
-            // 未实现的子页占位提示（有内容时隐藏）。
-            if (root.action-groups.length == 0) : Text {
+            // ---- 其余未实现的子页占位提示 ----
+            if (root.page-title != "通用" && root.page-title != "本地右键菜单") : Text {
                 text: "该设置页将在后续 Sprint 实现。";
                 color: Theme.text-disabled;
                 font-size: 12px;

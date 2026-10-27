@@ -57,10 +57,18 @@ pub struct FileEntry {
     pub type_text: String,
     /// 驱动器视图下的附加文本（容量等）。
     pub extra: String,
+    /// 是否隐藏（Windows 隐藏属性，或 Unix 以 '.' 开头的文件）。
+    pub is_hidden: bool,
 }
 
 impl FileEntry {
-    pub fn from_path(path: &Path, is_dir: bool, size: u64, modified: Option<SystemTime>) -> Self {
+    pub fn from_path(
+        path: &Path,
+        is_dir: bool,
+        size: u64,
+        modified: Option<SystemTime>,
+        is_hidden: bool,
+    ) -> Self {
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -92,6 +100,7 @@ impl FileEntry {
             style,
             type_text,
             extra: String::new(),
+            is_hidden,
         }
     }
 
@@ -117,6 +126,7 @@ impl FileEntry {
                 format_size_bytes(drive.free_bytes),
                 format_size_bytes(drive.total_bytes)
             ),
+            is_hidden: false,
         }
     }
 }

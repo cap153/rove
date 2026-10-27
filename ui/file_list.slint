@@ -489,7 +489,7 @@ export component FileList inherits Rectangle {
                     vertical-alignment: center;
                     overflow: elide;
                     // 剪切态文件整体淡出。
-                    opacity: row.cut ? 0.55 : 1.0;
+                    opacity: row.cut ? 0.45 : (row.is-hidden ? 0.5 : 1.0);
                 }
                 // 名称(搜索命中高亮):命中片段用强调色。
                 if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
@@ -499,7 +499,7 @@ export component FileList inherits Rectangle {
                     parts: row.name-parts;
                     font-size: 13px;
                     is-dir: row.is-dir;
-                    opacity: row.cut ? 0.55 : 1.0;
+                    opacity: row.cut ? 0.45 : (row.is-hidden ? 0.5 : 1.0);
                 }
 
                 // 修改时间
@@ -727,7 +727,7 @@ export component FileList inherits Rectangle {
                 }
 
                 // 剪切态淡出。
-                opacity: row.cut ? 0.55 : 1.0;
+                opacity: row.cut ? 0.45 : (row.is-hidden ? 0.5 : 1.0);
             }
         }
     }

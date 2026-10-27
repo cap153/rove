@@ -28,6 +28,8 @@ pub struct Config {
     pub sidebar_order: Vec<String>,
     /// 视图模式：details | list | icons-small | icons-medium | icons-large | icons-xl。
     pub view_mode: String,
+    /// 是否显示隐藏文件/文件夹/驱动器（默认 false，即过滤掉）。
+    pub show_hidden: bool,
 }
 
 /// 侧栏分区的默认顺序。
@@ -52,6 +54,7 @@ impl Default for Config {
             network_expanded: true, // 默认展开
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
+            show_hidden: false,
         }
     }
 }
@@ -132,6 +135,9 @@ impl Config {
                 config.view_mode = vm.to_string();
             }
         }
+        if let Some(sh) = json.get("show_hidden").and_then(|v| v.as_bool()) {
+            config.show_hidden = sh;
+        }
         config
     }
 
@@ -157,6 +163,7 @@ impl Config {
             "network_expanded": self.network_expanded,
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
+            "show_hidden": self.show_hidden,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);

@@ -247,7 +247,7 @@ pub fn list_recycle_entries() -> Vec<super::entry::FileEntry> {
             .unwrap_or(0);
         // 原路径已不在磁盘上，目录/文件只能按扩展名推断。
         let is_dir = item.name.to_string_lossy().ends_with('/');
-        let mut entry = super::entry::FileEntry::from_path(&original, is_dir, size, modified);
+        let mut entry = super::entry::FileEntry::from_path(&original, is_dir, size, modified, false);
         if is_dir {
             entry.name = name.trim_end_matches('/').to_string();
         }

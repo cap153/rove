@@ -338,7 +338,7 @@ fn deep_walk(
             };
             let modified = meta.and_then(|m| m.modified().ok());
             st.out.push(DeepItem {
-                entry: crate::fs::FileEntry::from_path(&path, ft.is_dir(), size, modified),
+                entry: crate::fs::FileEntry::from_path(&path, ft.is_dir(), size, modified, false),
                 fields,
             });
         }

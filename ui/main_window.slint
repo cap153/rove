@@ -92,6 +92,9 @@ export component MainWindow inherits Window {
     in-out property <string> settings-page-desc: "";
     in-out property <bool> settings-show-add: true;
     in-out property <length> settings-content-height: 0px;
+    // 是否显示隐藏文件（来自 config.show_hidden，驱动设置页「通用」开关）。
+    in-out property <bool> show-hidden: false;
+    callback show_hidden_toggled(bool);
     // 动作编辑器弹窗状态。
     in-out property <string> settings-editor-title: "";
     in-out property <bool> settings-editor-open: false;
@@ -725,6 +728,8 @@ out property <length> row-height-out: file-list.row-height-out;
                     page-desc: root.settings-page-desc;
                     show-add: root.settings-show-add;
                     content-height: root.settings-content-height;
+                    show-hidden: root.show-hidden;
+                    show_hidden_toggled(v) => { root.show_hidden_toggled(v); }
                     scroll_debug(viewport, content, preferred) => {
                         root.settings_scroll_debug(viewport, content, preferred);
                     }

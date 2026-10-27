@@ -44,7 +44,18 @@ pub fn list_directory(path: &Path) -> Vec<FileEntry> {
         let is_dir = meta.is_dir();
         let size = if is_dir { 0 } else { meta.len() };
         let modified = meta.modified().ok();
-        entries.push(FileEntry::from_path(&path, is_dir, size, modified));
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        // Windows 隐藏属性（FILE_ATTRIBUTE_HIDDEN = 2）或以 '.' 开头的 Unix 隐藏文件。
+        #[cfg(windows)]
+        let is_hidden = {
+            use std::os::windows::fs::MetadataExt;
+            (meta.file_attributes() & 2) != 0 || name.starts_with('.')
+        };
+        #[cfg(not(windows))]
+        let is_hidden = name.starts_with('.');
+
+        entries.push(FileEntry::from_path(&path, is_dir, size, modified, is_hidden));
     }
     entries
 }
@@ -148,6 +159,7 @@ pub fn test_entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
         style: super::entry::IconStyle::Generic,
         type_text: String::new(),
         extra: String::new(),
+        is_hidden: false,
     }
 }
 

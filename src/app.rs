@@ -370,7 +370,13 @@ impl App {
         if tab.generation != result.generation {
             return; // 过期结果
         }
-        tab.entries = result.entries;
+        // 按「显示隐藏文件」开关过滤：关闭时剔除具有隐藏属性的条目。
+        let show_hidden = self.config.show_hidden;
+        tab.entries = if show_hidden {
+            result.entries
+        } else {
+            result.entries.into_iter().filter(|e| !e.is_hidden).collect()
+        };
         // 拼音缓存随 entries 失效（惰性重建）。
         tab.pinyin_cache.clear();
         // 新列表到达即失效全局搜索的截断提示。
@@ -861,7 +867,7 @@ impl App {
         let entries: Vec<FileEntry> = result
             .hits
             .into_iter()
-            .map(|(e, _)| FileEntry::from_path(&e.path, e.is_dir, 0, None))
+            .map(|(e, _)| FileEntry::from_path(&e.path, e.is_dir, 0, None, false))
             .collect();
         let shown = entries.len();
         let tab = self.state.active_mut();
@@ -1347,6 +1353,7 @@ impl App {
                     name: entry.name.clone().into(),
                     path: entry.path.to_string_lossy().into_owned().into(),
                     is_dir: entry.is_dir,
+                    is_hidden: entry.is_hidden,
                     size_text: if computer_view {
                         entry.extra.clone()
                     } else {
@@ -1895,6 +1902,8 @@ impl App {
             },
         ];
         self.ui.set_settings_nav_items(ModelRc::new(VecModel::from(nav_items)));
+        // 向设置页「通用」开关灌入当前状态。
+        self.ui.set_show_hidden(self.config.show_hidden);
 
         // 子页标题 / 描述 / 新增入口（未实现子页显示占位提示）。
         let (title, desc, show_add) = match current {
@@ -3774,7 +3783,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_settings_requested(move || {
             let Some(app) = app.upgrade() else { return };
-            app.borrow_mut().open_settings_tab(crate::state::SettingsSubpage::ContextMenu);
+            // 点击设置齿轮：默认打开「通用」设置页
+            app.borrow_mut().open_settings_tab(crate::state::SettingsSubpage::General);
         });
     }
     {
@@ -3791,6 +3801,23 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             };
             app.state.active_mut().settings_subpage = subpage;
             app.sync_settings();
+            app.sync_tabs(); // 修复核心：点击后立即刷新标签栏标题，无需切标签！
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_show_hidden_toggled(move |enabled| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.show_hidden = enabled;
+            app.config.save();
+            // 实时全局生效：刷新所有已打开的文件标签页
+            let n = app.state.tabs.len();
+            for i in 0..n {
+                if app.state.tabs[i].kind == crate::state::TabKind::Explorer {
+                    app.reload_tab(i);
+                }
+            }
         });
     }
     {
@@ -4197,12 +4224,8 @@ mod drag_hittest {
 /// 文本按 CJK / ASCII 分别估宽——Rove 的标题多是中文目录名，
 /// 用单一均值会系统性低估，导致拖拽热区压到最后一个标签上。
 #[cfg(windows)]
-fn estimate_tab_width(title: &str) -> f32 {
-    let text_w: f32 = title
-        .chars()
-        .map(|c| if (c as u32) >= 0x2E80 { 12.5 } else { 7.0 })
-        .sum();
-    (56.0 + text_w).clamp(80.0, 220.0)
+fn estimate_tab_width(_title: &str) -> f32 {
+    150.0 // 标签宽度固定为 150px
 }
 
 /// 把标题栏空白拖拽区边界同步给 Win32 命中测试钩子（仅 Windows）。
