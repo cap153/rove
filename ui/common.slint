@@ -76,6 +76,8 @@ export struct SidebarItem {
     icon-text: string,
     // 容量占用 0..1；< 0 表示不显示进度条。
     usage: float,
+    /// Windows 原生 Shell 图标（若存在则直接渲染，空则回退单字色块）
+    icon: image,
 }
 
 export struct StagingItem {

@@ -989,10 +989,24 @@ impl App {
         let mut h = header("快速访问");
         h.icon_text = arrow_quick.into();
         let mut quick_items: Vec<SidebarItem> = vec![h];
+
+        // 侧边栏图标统一采用 Windows 标准 32px 规格：
+        // 彻底解决启动阶段 scale 由 1.0 变 1.5 导致请求 key(20) 与判定 key(30) 脱节的 Bug！
+        const SIDEBAR_ICON_PX: u32 = 32;
+
         if self.config.quick_expanded {
             for (label, id_suffix, dir) in quick_access_dirs() {
-                // 目录不存在时跳过该入口（值本身不使用，仅作存在性探测）。
-                let Some(_dir) = dir else { continue };
+                let Some(dir) = dir else { continue };
+                // 回收站使用系统解析名，其余系统目录直接使用物理路径
+                #[cfg(windows)]
+                let icon_img = if label == "回收站" {
+                    self.thumb_for(Path::new("shell:RecycleBinFolder"), SIDEBAR_ICON_PX)
+                } else {
+                    self.thumb_for(&dir, SIDEBAR_ICON_PX)
+                };
+                #[cfg(not(windows))]
+                let icon_img = slint::Image::default();
+
                 let (color, icon) = match label {
                     "桌面" => (Color::from_rgb_u8(0xE8, 0xB3, 0x3C), "桌"),
                     "下载" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "下"),
@@ -1019,6 +1033,7 @@ impl App {
                 icon_color: color,
                 icon_text: icon.into(),
                 usage: -1.0,
+                icon: icon_img, // <-- 注入原生 Shell 图标
             });
             }
         }
@@ -1033,10 +1048,18 @@ impl App {
 
             // 仅在展开状态下才推入子条目；收起时仅保留标题栏
             if self.config.recent_expanded {
-                for path in self.state.recent.iter().take(8) {
+                // 复制路径快照：避免在遍历 self.state.recent（不可变借用）期间
+                // 又对 self 做可变借用（thumb_for），触发借用冲突。
+                let recent_paths: Vec<PathBuf> = self.state.recent.iter().take(8).cloned().collect();
+                for path in recent_paths {
                     if !path.exists() {
                         continue;
                     }
+                    #[cfg(windows)]
+                    let icon_img = self.thumb_for(&path, SIDEBAR_ICON_PX);
+                    #[cfg(not(windows))]
+                    let icon_img = slint::Image::default();
+
                     let label = path
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
@@ -1049,6 +1072,7 @@ impl App {
                         icon_color: Color::from_rgb_u8(0xE8, 0xB3, 0x3C),
                         icon_text: String::new().into(),
                         usage: -1.0,
+                        icon: icon_img, // <-- 注入原生文件夹图标
                     });
                 }
             }
@@ -1060,14 +1084,13 @@ impl App {
         let mut computer_items: Vec<SidebarItem> = vec![h];
         if self.config.computer_expanded {
             for (idx, drive) in self.drives.iter().enumerate() {
-                // 已用 = 总量 - 剩余；Pulse 风格紧凑格式（如 "268G / 831G"）。
-                let used_bytes = drive.total_bytes.saturating_sub(drive.free_bytes);
+                // 紧凑格式改为：剩余容量 / 总容量（如 "32G / 100G"）
                 computer_items.push(SidebarItem {
                     id: format!("drive:{}", drive.letter).into(),
                     label: drive.display_label().into(),
                     detail: format!(
                         "{} / {}",
-                        format_pulse_size(used_bytes),
+                        format_pulse_size(drive.free_bytes),
                         format_pulse_size(drive.total_bytes)
                     )
                     .into(),
@@ -1075,6 +1098,7 @@ impl App {
                     icon_color: drive_pulse_color(idx, drive),
                     icon_text: drive.letter.to_string().into(),
                     usage: drive.usage() as f32,
+                    icon: slint::Image::default(),
                 });
             }
         }
@@ -1093,6 +1117,7 @@ impl App {
                     icon_color: Color::from_rgb_u8(0x8A, 0x8F, 0x98),
                     icon_text: "网".into(),
                     usage: -1.0,
+                    icon: slint::Image::default(),
                 });
             } else {
                 for remote in &network {
@@ -1104,6 +1129,7 @@ impl App {
                         icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
                         icon_text: "网".into(),
                         usage: -1.0,
+                        icon: slint::Image::default(),
                     });
                 }
             }
@@ -1273,9 +1299,16 @@ impl App {
             }
         }
         self.thumb_order.push(key.clone());
-        self.thumb_cache.insert(key, img);
+        self.thumb_cache.insert(key.clone(), img);
         self.visible_cache = None;
         self.refresh_visible_rows();
+
+        // 核心修复：当提取完成的图标属于侧栏尺寸时，立即刷新侧边栏（把方块替换为原生图标）。
+        // 侧边栏尺寸已锁定为常量 32，不再动态计算，彻底杜绝启动期 DPI 缩放竞争导致的 key 脱节。
+        if key.1 == 32 {
+            self.sidebar_fingerprint = 0; // 重置指纹
+            self.sync_sidebar();          // 实时将原生图标刷上侧边栏！
+        }
     }
 
     fn refresh_visible_rows(&mut self) {
@@ -1425,6 +1458,7 @@ fn header(label: &str) -> SidebarItem {
         icon_color: Color::default(),
         icon_text: String::new().into(),
         usage: -1.0,
+        icon: slint::Image::default(),
     }
 }
 

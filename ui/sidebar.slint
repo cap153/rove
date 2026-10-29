@@ -147,23 +147,38 @@ export component Sidebar inherits Rectangle {
                     height: parent.height;
                     spacing: 8px;
 
-                    // 图标方块：单字符标识。
+                    // 图标展示：优先渲染 Windows 原生系统图标，未加载或非 Windows 时回退单字占位色块
                     Rectangle {
                         width: 20px;
                         height: 20px;
                         y: (parent.height - 20px) / 2;
-                        border-radius: 5px;
-                        background: item.icon-color.transparentize(0.84);
+                        background: transparent;
 
-                        Text {
-                            text: item.icon-text;
-                            color: item.icon-color;
-                            font-size: 10px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                        // 1. 原生系统图标（透明底，无缝融入侧边栏）
+                        if (item.icon.width > 0) : Image {
                             width: 100%;
                             height: 100%;
+                            source: item.icon;
+                            image-fit: contain;
+                        }
+
+                        // 2. 兜底占位小方块
+                        if (item.icon.width <= 0) : Rectangle {
+                            width: 20px;
+                            height: 20px;
+                            border-radius: 5px;
+                            background: item.icon-color.transparentize(0.84);
+
+                            Text {
+                                text: item.icon-text;
+                                color: item.icon-color;
+                                font-size: 10px;
+                                font-weight: 700;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
                         }
                     }
 
