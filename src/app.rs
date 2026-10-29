@@ -201,6 +201,36 @@ struct DeepResult {
     items: Vec<crate::search::index::DeepItem>,
 }
 
+/// 文件夹体积统计请求（一批 = 当前列表中的全部子文件夹 + 各自的修改时间）。
+struct DirSizeRequest {
+    tab_id: u32,
+    generation: u64,
+    /// 待计算目录及其列举时的修改时间（用于缓存命中校验）。
+    dirs: Vec<(PathBuf, Option<SystemTime>)>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 文件夹体积统计结果（算完一个回传一个，不攒批）。
+struct DirSizeResult {
+    tab_id: u32,
+    generation: u64,
+    path: PathBuf,
+    size: u64,
+    /// 计算时记录的目录修改时间（用于写入带时效的缓存）。
+    mtime: Option<SystemTime>,
+}
+
+/// 文件夹容量内存缓存上限（参考 Pulse folder_size_store 的 4096）。
+const DIR_SIZE_CACHE_CAP: usize = 4096;
+
+/// 调试日志：经项目既有的 `log_write` 写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`），
+/// 与项目其它诊断日志同源、同一 `ROVE_LOG` 开关（存在即启用），不再走 stderr。
+fn dirsize_trace(msg: String) {
+    if log_enabled(1) {
+        log_write(&format!("[rove:dirsize] {msg}"));
+    }
+}
+
 /// 应用主体。
 pub struct App {
     ui: MainWindow,
@@ -249,6 +279,15 @@ pub struct App {
     /// 深度搜索通道（文件夹视图子树搜索，独立线程执行）。
     deep_tx: Sender<DeepRequest>,
     deep_rx: Receiver<DeepResult>,
+    /// 文件夹体积异步统计通道（独立 worker 线程逐个递归计算并回传）。
+    dir_size_tx: Sender<DirSizeRequest>,
+    dir_size_rx: Receiver<DirSizeResult>,
+    /// 当前一批统计任务的取消开关：切换目录/刷新时置位即可中断前序任务。
+    dir_size_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// 文件夹容量 + 修改时间内存缓存：Path -> (bytes, mtime)，命中即瞬时呈现。
+    dir_size_cache: HashMap<PathBuf, (u64, SystemTime)>,
+    /// 缓存插入顺序，用于 FIFO/LRU 淘汰（达到上限时移除最旧项）。
+    dir_size_cache_order: Vec<PathBuf>,
     poll_timer: Timer,
     sidebar_timer: Timer,
     /// 侧栏周期刷新（驱动器容量/回收站统计/网络位置）。
@@ -270,6 +309,8 @@ impl App {
         deep_tx: Sender<DeepRequest>,
         deep_rx: Receiver<DeepResult>,
         thumb_tx: Sender<(PathBuf, u32)>,
+        dir_size_tx: Sender<DirSizeRequest>,
+        dir_size_rx: Receiver<DirSizeResult>,
     ) -> Self {
         let state = AppState::new(None);
         Self {
@@ -287,6 +328,11 @@ impl App {
             dir_mtimes: HashMap::new(),
             drop_timer: Timer::default(),
             drag_pending: None,
+            dir_size_tx,
+            dir_size_rx,
+            dir_size_stop: None,
+            dir_size_cache: HashMap::new(),
+            dir_size_cache_order: Vec::new(),
             preview: PreviewWindow::new().expect("failed to create preview window"),
             preview_shown: false,
             actions: Vec::new(),
@@ -354,9 +400,31 @@ impl App {
         }
     }
 
-    /// 重新列举当前标签。
-    fn reload_active(&self) {
+    /// 重新列举当前标签（常规操作复用：新建/删除/拖放/还原等，不清体积缓存）。
+    fn reload_active(&mut self) {
         self.reload_tab(self.state.active_tab);
+    }
+
+    /// 用户主动刷新（F5 / 工具栏 / 右键菜单）：清理「当前目录下各子文件夹」的
+    /// 历史体积缓存，强制穿透重算（子目录 mtime 可能已变而父目录 mtime 未变）。
+    fn user_refresh_active(&mut self) {
+        if let Some(current_dir) = self.state.active().path.clone() {
+            let before = self.dir_size_cache.len();
+            self.dir_size_cache
+                .retain(|path, _| path.parent() != Some(current_dir.as_path()));
+            self.dir_size_cache_order
+                .retain(|path| path.parent() != Some(current_dir.as_path()));
+            let cleared = before - self.dir_size_cache.len();
+            if cleared > 0 {
+                dirsize_trace(format!(
+                    "F5/invalidate: cleared {} cached subdir sizes under {} ({} left)",
+                    cleared,
+                    current_dir.display(),
+                    self.dir_size_cache.len()
+                ));
+            }
+        }
+        self.reload_active();
     }
 
     /// 列举结果到达：代号匹配才应用。
@@ -401,6 +469,78 @@ impl App {
         }
         // 标签标题可能变化（"此电脑" 不变，目录名会变）。
         self.sync_tabs();
+
+        // ---- 异步统计子文件夹体积 ----
+        // 命中缓存则瞬时填入（mtime 严格一致才算），仅未命中/已变动的目录提交后台。
+        if let Some(current_path) = self.state.tabs[tab_index].path.as_ref() {
+            // ⑥ 网络路径防护：UNC 路径（\\server\share）不自动递归，避免拖垮内网 IO。
+            let is_unc = current_path.to_string_lossy().starts_with(r"\\");
+            if is_unc {
+                dirsize_trace(format!(
+                    "UNC path -> skip auto scan: {}",
+                    current_path.display()
+                ));
+            }
+
+            if !is_unc {
+                // 停掉上一批未完成的计算任务，避免旧结果回灌当前视图
+                if let Some(old_stop) = self.dir_size_stop.take() {
+                    old_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+
+                // 1. 校验缓存：仅当目录 mtime 严格一致时复用历史体积
+                let mut missing_dirs: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
+                let mut hit_count = 0usize;
+                {
+                    let tab = &mut self.state.tabs[tab_index];
+                    for entry in tab.entries.iter_mut().filter(|e| e.is_dir) {
+                        let cache_hit = match (entry.modified, self.dir_size_cache.get(&entry.path)) {
+                            (Some(cur_mtime), Some(&(cached_sz, cached_mtime)))
+                                if cur_mtime == cached_mtime =>
+                            {
+                                entry.size = cached_sz;
+                                entry.dir_size_loaded = true;
+                                true
+                            }
+                            _ => false,
+                        };
+                        if !cache_hit {
+                            missing_dirs.push((entry.path.clone(), entry.modified));
+                        } else {
+                            hit_count += 1;
+                        }
+                    }
+                }
+
+                if hit_count > 0 {
+                    dirsize_trace(format!("cache HIT x{} -> instant fill", hit_count));
+                }
+
+                // 有缓存命中且是当前标签时，先刷一遍 UI 让旧值立即显现
+                if tab_index == self.state.active_tab {
+                    self.visible_cache = None;
+                    self.refresh_visible_rows();
+                }
+
+                // 2. 仅对未命中或 mtime 已变动的目录派发后台统计
+                if !missing_dirs.is_empty() {
+                    dirsize_trace(format!(
+                        "cache MISS x{} -> dispatch background scan",
+                        missing_dirs.len()
+                    ));
+                    let new_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                    self.dir_size_stop = Some(new_stop.clone());
+
+                    let tab = &self.state.tabs[tab_index];
+                    let _ = self.dir_size_tx.send(DirSizeRequest {
+                        tab_id: tab.id,
+                        generation: tab.generation,
+                        dirs: missing_dirs,
+                        stop: new_stop,
+                    });
+                }
+            }
+        }
     }
 
     /// 统一应用搜索词（搜索框编辑 / 外部唤起预填共用）：
@@ -483,6 +623,66 @@ impl App {
             self.sync_status();
         }
     }
+
+    /// 文件夹体积统计结果到达：标签与代号都匹配才写入条目。
+    /// 命中后先写入带 mtime 的 LRU 缓存，再刷新当前视图。
+    fn apply_dir_size_result(&mut self, result: DirSizeResult) {
+        // 写入 LRU 缓存（FIFO 淘汰，达到上限移除最旧项）。
+        if let Some(mtime) = result.mtime {
+            if !self.dir_size_cache.contains_key(&result.path) {
+                if self.dir_size_cache.len() >= DIR_SIZE_CACHE_CAP {
+                    if let Some(oldest) = self.dir_size_cache_order.first().cloned() {
+                        self.dir_size_cache_order.remove(0);
+                        self.dir_size_cache.remove(&oldest);
+                        dirsize_trace(format!(
+                            "cache EVICT (cap={}): {}",
+                            DIR_SIZE_CACHE_CAP,
+                            oldest.display()
+                        ));
+                    }
+                }
+                self.dir_size_cache_order.push(result.path.clone());
+            }
+            self.dir_size_cache.insert(result.path.clone(), (result.size, mtime));
+            dirsize_trace(format!(
+                "cache STORE: {} = {} bytes (mtime ok, total {} entries)",
+                result.path.display(),
+                result.size,
+                self.dir_size_cache.len()
+            ));
+        } else {
+            dirsize_trace(format!(
+                "result without mtime, NOT cached: {}",
+                result.path.display()
+            ));
+        }
+
+        let Some(tab_index) = self.state.tab_by_id(result.tab_id) else {
+            return;
+        };
+        // 局部借用块：写入条目并顺带取出选中态，块结束即释放借用，
+        // 避免与下方 self.* 重绘调用冲突。
+        let is_selected = {
+            let tab = &mut self.state.tabs[tab_index];
+            if tab.generation != result.generation {
+                return;
+            }
+            if let Some(entry) = tab.entries.iter_mut().find(|e| e.path == result.path) {
+                entry.size = result.size;
+                entry.dir_size_loaded = true;
+            }
+            tab.selection.contains(&result.path)
+        };
+
+        if tab_index == self.state.active_tab {
+            // 让可见缓存失效，就地重新渲染当前视口中的行
+            self.visible_cache = None;
+            self.refresh_visible_rows();
+            if is_selected {
+                self.sync_status();
+            }
+        }
+    }
 }
 
 /// 设置标签栏加载态（仅影响激活标签的 spinner）。
@@ -560,6 +760,38 @@ fn spawn_deep_worker(rx: Receiver<DeepRequest>, tx: Sender<DeepResult>) {
             }
         })
         .expect("spawn rove-deepsearch worker");
+}
+
+/// 启动文件夹体积统计工作线程。
+/// 一批请求内的目录逐个递归计算，算完一个立即回传一个；
+/// `req.stop` 被置位（切换目录/刷新）后尽快放弃剩余目录。
+fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>) {
+    std::thread::Builder::new()
+        .name("rove-dirsize".into())
+        .spawn(move || {
+            while let Ok(req) = rx.recv() {
+                for (dir, mtime) in req.dirs {
+                    if req.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let sz = crate::fs::dir::calculate_dir_size(&dir, &req.stop);
+                    if req.stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let sent = tx.send(DirSizeResult {
+                        tab_id: req.tab_id,
+                        generation: req.generation,
+                        path: dir,
+                        size: sz,
+                        mtime,
+                    });
+                    if sent.is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .expect("spawn rove-dirsize worker");
 }
 
 /// 缩略图工作线程：COM 初始化一次，循环取路径生成缩略图，
@@ -2577,7 +2809,7 @@ impl App {
                 }
             }
             ACT_NEW_FOLDER => self.create_folder(),
-            ACT_REFRESH => self.reload_active(),
+            ACT_REFRESH => self.user_refresh_active(),
             ACT_SELECT_ALL => {
                 let tab = self.state.active_mut();
                 let all: Vec<PathBuf> = tab
@@ -3332,6 +3564,9 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 while let Ok(result) = app.deep_rx.try_recv() {
                     app.apply_deep_result(result);
                 }
+                while let Ok(result) = app.dir_size_rx.try_recv() {
+                    app.apply_dir_size_result(result);
+                }
             });
     }
     // 任务 3：目录变更轮询（1s），检测文件被移动/重命名等后实时刷新。
@@ -3479,7 +3714,7 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                         app.start_rename();
                     }
                     NamedKey::F5 => {
-                        app.reload_active();
+                        app.user_refresh_active();
                     }
                     NamedKey::Enter => {
                         app.open_selection();
@@ -3795,7 +4030,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_refresh_requested(move || {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
-            app.reload_active();
+            app.user_refresh_active();
             app.sync_sidebar();
         });
     }
@@ -4475,6 +4710,11 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     #[cfg(not(windows))]
     drop(thumb_rx);
 
+    // 文件夹体积统计 worker：逐个递归计算目录大小，算完一个回传一个。
+    let (dir_size_tx, dir_size_worker_rx) = mpsc::channel::<DirSizeRequest>();
+    let (dir_size_worker_tx, dir_size_rx) = mpsc::channel::<DirSizeResult>();
+    spawn_dir_size_worker(dir_size_worker_rx, dir_size_worker_tx);
+
     let app = Rc::new(RefCell::new(App::new(
         ui,
         config,
@@ -4484,6 +4724,8 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         deep_tx,
         deep_rx,
         thumb_tx,
+        dir_size_tx,
+        dir_size_rx,
     )));
     {
         let raw = crate::ops::actions::load_or_create();

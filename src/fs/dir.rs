@@ -1,8 +1,17 @@
 //! 目录枚举与排序。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::entry::FileEntry;
+
+/// 调试日志：经项目既有的 `log_write` 写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`），
+/// 与项目其它诊断日志同源、同一 `ROVE_LOG` 开关（存在即启用），不再走 stderr。
+fn dirsize_trace(msg: String) {
+    if crate::app::log_enabled(1) {
+        crate::app::log_write(&format!("[rove:dirsize] {msg}"));
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortKey {
@@ -160,7 +169,65 @@ pub fn test_entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
         type_text: String::new(),
         extra: String::new(),
         is_hidden: false,
+        dir_size_loaded: true,
     }
+}
+
+/// 递归计算文件夹总大小（跳过 symlink/Junction 重解析点，支持外部协作式中断）。
+/// 由后台 worker 线程调用；`stop` 置位后尽快返回 0（结果会被丢弃）。
+pub fn calculate_dir_size(dir: &Path, stop: &AtomicBool) -> u64 {
+    if stop.load(Ordering::Relaxed) {
+        return 0;
+    }
+
+    // 根节点防御：若目标自身即为 Junction/Reparse Point（如自环入口），直接跳过
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if let Ok(meta) = std::fs::symlink_metadata(dir) {
+            if (meta.file_attributes() & 0x400) != 0 {
+                dirsize_trace(format!("skip reparse ROOT: {}", dir.display()));
+                return 0;
+            }
+        }
+    }
+
+    let Ok(read_dir) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total: u64 = 0;
+    for entry in read_dir.flatten() {
+        if stop.load(Ordering::Relaxed) {
+            return 0;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+
+        if meta.is_dir() {
+            // 仅目录需跳过 Junction 重解析点（防 Application Data 等自环死循环）；
+            // 普通文件即使带虚拟化重解析点标记（Office C2R / WindowsApps 的
+            // exe/dll）也应正常计入体积，故文件不在跳过之列。
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                if (meta.file_attributes() & 0x400) != 0 {
+                    dirsize_trace(format!("skip reparse/junction: {}", entry.path().display()));
+                    continue;
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                if meta.file_type().is_symlink() {
+                    continue;
+                }
+            }
+            total = total.saturating_add(calculate_dir_size(&entry.path(), stop));
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
 }
 
 #[cfg(test)]

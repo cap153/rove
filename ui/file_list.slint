@@ -681,13 +681,13 @@ export component FileList inherits Rectangle {
                     }
                 }
 
-                // 中/大/超大图标：竖排（缩略图上 + 名称下）。
+                // 中/大/超大图标：竖排（缩略图上 + 名称/大小下）。
                 if (root.view-mode != "icons-small") : VerticalLayout {
                     x: 4px;
                     y: 4px;
                     width: parent.width - 8px;
                     height: parent.height - 8px;
-                    spacing: 4px;
+                    spacing: 3px;
 
                     Rectangle {
                         height: root.cell-thumb;
@@ -703,26 +703,42 @@ export component FileList inherits Rectangle {
                         }
                     }
 
-                    // 名称:搜索命中时单行高亮;否则保持两行换行原样。
-                    if (row.name-parts.length > 0) : HighlightName {
-                        height: parent.height - root.cell-thumb - 4px;
-                        parts: row.name-parts;
-                        font-size: 11.5px;
-                        is-dir: row.is-dir;
-                        align-top: true;
-                        horizontal-center: true; // 网格图标视图：文件名水平居中于缩略图下方
-                    }
-                    if (row.name-parts.length == 0) : Text {
-                        height: parent.height - root.cell-thumb - 4px;
-                        text: row.name;
-                        color: Theme.text-primary;
-                        font-size: 11.5px;
-                        font-weight: row.is-dir ? 500 : 400;
-                        vertical-alignment: top;
-                        horizontal-alignment: center; // 非搜索态下的常态文字居中
-                        wrap: word-wrap;
-                        overflow: elide;
-                        max-lines: 2;
+                    // 文字区域：包含名称与容量信息
+                    VerticalLayout {
+                        height: parent.height - root.cell-thumb - 7px;
+                        spacing: 1px;
+                        alignment: start;
+
+                        // 名称:搜索命中时单行高亮;否则根据是否有容量行自适应 1~2 行
+                        if (row.name-parts.length > 0) : HighlightName {
+                            parts: row.name-parts;
+                            font-size: 11.5px;
+                            is-dir: row.is-dir;
+                            align-top: true;
+                            horizontal-center: true;
+                        }
+                        if (row.name-parts.length == 0) : Text {
+                            text: row.name;
+                            color: Theme.text-primary;
+                            font-size: 11.5px;
+                            font-weight: row.is-dir ? 500 : 400;
+                            horizontal-alignment: center;
+                            vertical-alignment: top;
+                            wrap: word-wrap;
+                            overflow: elide;
+                            max-lines: row.size-text != "" ? 1 : 2;
+                        }
+
+                        // 容量文本：灰色居中显示（文件夹异步统计完成后出现）
+                        if (row.size-text != "") : Text {
+                            text: row.size-text;
+                            color: Theme.text-secondary;
+                            font-size: 11px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            font-family: Theme.mono-font-family;
+                        }
                     }
                 }
 

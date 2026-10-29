@@ -59,6 +59,8 @@ pub struct FileEntry {
     pub extra: String,
     /// 是否隐藏（Windows 隐藏属性，或 Unix 以 '.' 开头的文件）。
     pub is_hidden: bool,
+    /// 文件夹体积是否已完成统计（文件默认为 true，文件夹初始为 false）。
+    pub dir_size_loaded: bool,
 }
 
 impl FileEntry {
@@ -101,6 +103,7 @@ impl FileEntry {
             type_text,
             extra: String::new(),
             is_hidden,
+            dir_size_loaded: !is_dir, // 文件即时可用，文件夹需等待异步统计
         }
     }
 
@@ -122,11 +125,12 @@ impl FileEntry {
             style: IconStyle::Disk,
             type_text: drive.drive_type.label().to_string(),
             extra: format!(
-                "{} 可用，共 {}",
+                "{} / {}",
                 format_size_bytes(drive.free_bytes),
                 format_size_bytes(drive.total_bytes)
             ),
             is_hidden: false,
+            dir_size_loaded: true, // 驱动器容量即时可得
         }
     }
 }
@@ -245,12 +249,18 @@ pub fn icon_color(entry: &FileEntry) -> slint::Color {
     entry.style.color()
 }
 
-/// 体积格式化：1024 进制，一位小数（"34.5 KB"）；目录返回空串。
+/// 体积格式化：1024 进制，一位小数（"34.5 KB"）。
+/// 文件夹在异步统计完成前返回空串，完成后显示真实体积。
 pub fn format_size(entry: &FileEntry) -> String {
     if entry.is_dir {
-        return String::new();
+        if entry.dir_size_loaded {
+            format_size_bytes(entry.size)
+        } else {
+            String::new()
+        }
+    } else {
+        format_size_bytes(entry.size)
     }
-    format_size_bytes(entry.size)
 }
 
 pub fn format_size_bytes(bytes: u64) -> String {
