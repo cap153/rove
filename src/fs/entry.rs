@@ -61,6 +61,10 @@ pub struct FileEntry {
     pub is_hidden: bool,
     /// 文件夹体积是否已完成统计（文件默认为 true，文件夹初始为 false）。
     pub dir_size_loaded: bool,
+    /// 是否为部分统计/下界估值（遇到跳过的子目录或权限受限）。
+    pub dir_size_partial: bool,
+    /// 是否为跳过自动扫描的系统目录（显示 "—"）。
+    pub dir_size_deferred: bool,
 }
 
 impl FileEntry {
@@ -104,6 +108,8 @@ impl FileEntry {
             extra: String::new(),
             is_hidden,
             dir_size_loaded: !is_dir, // 文件即时可用，文件夹需等待异步统计
+            dir_size_partial: false,
+            dir_size_deferred: false,
         }
     }
 
@@ -131,6 +137,8 @@ impl FileEntry {
             ),
             is_hidden: false,
             dir_size_loaded: true, // 驱动器容量即时可得
+            dir_size_partial: false,
+            dir_size_deferred: false,
         }
     }
 }
@@ -250,13 +258,21 @@ pub fn icon_color(entry: &FileEntry) -> slint::Color {
 }
 
 /// 体积格式化：1024 进制，一位小数（"34.5 KB"）。
-/// 文件夹在异步统计完成前返回空串，完成后显示真实体积。
+/// 文件夹在异步统计完成前返回空串；推迟统计显示 "—"；
+/// 部分统计（跳过 Junction/云占位/无权限子树）显示下界 "≥ X"。
 pub fn format_size(entry: &FileEntry) -> String {
     if entry.is_dir {
-        if entry.dir_size_loaded {
-            format_size_bytes(entry.size)
+        if !entry.dir_size_loaded {
+            return String::new();
+        }
+        if entry.dir_size_deferred {
+            return "—".to_string();
+        }
+        let text = format_size_bytes(entry.size);
+        if entry.dir_size_partial {
+            format!("≥ {text}")
         } else {
-            String::new()
+            text
         }
     } else {
         format_size_bytes(entry.size)

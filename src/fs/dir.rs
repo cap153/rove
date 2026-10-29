@@ -7,8 +7,9 @@ use super::entry::FileEntry;
 
 /// 调试日志：经项目既有的 `log_write` 写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`），
 /// 与项目其它诊断日志同源、同一 `ROVE_LOG` 开关（存在即启用），不再走 stderr。
+#[cfg(windows)]
 fn dirsize_trace(msg: String) {
-    if crate::app::log_enabled(1) {
+    if crate::app::log_enabled(2) {
         crate::app::log_write(&format!("[rove:dirsize] {msg}"));
     }
 }
@@ -170,14 +171,23 @@ pub fn test_entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
         extra: String::new(),
         is_hidden: false,
         dir_size_loaded: true,
+        dir_size_partial: false,
+        dir_size_deferred: false,
     }
 }
 
 /// 递归计算文件夹总大小（跳过 symlink/Junction 重解析点，支持外部协作式中断）。
-/// 由后台 worker 线程调用；`stop` 置位后尽快返回 0（结果会被丢弃）。
-pub fn calculate_dir_size(dir: &Path, stop: &AtomicBool) -> u64 {
+/// 递归计算文件夹总大小（跳过 symlink/Junction 重解析点/云占位，支持外部中断）。
+/// 返回 (总字节数, 是否为不完全统计下界)。
+pub fn calculate_dir_size(dir: &Path, stop: &AtomicBool) -> (u64, bool) {
+    // Windows 云按需文件/占位目录属性（OneDrive / iCloud / Dropbox 等）
+    // 0x00040000: FILE_ATTRIBUTE_RECALL_ON_OPEN
+    // 0x00400000: FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_RECALL: u32 = 0x00040000 | 0x00400000;
+
     if stop.load(Ordering::Relaxed) {
-        return 0;
+        return (0, true);
     }
 
     // 根节点防御：若目标自身即为 Junction/Reparse Point（如自环入口），直接跳过
@@ -187,20 +197,25 @@ pub fn calculate_dir_size(dir: &Path, stop: &AtomicBool) -> u64 {
         if let Ok(meta) = std::fs::symlink_metadata(dir) {
             if (meta.file_attributes() & 0x400) != 0 {
                 dirsize_trace(format!("skip reparse ROOT: {}", dir.display()));
-                return 0;
+                return (0, true);
             }
         }
     }
 
     let Ok(read_dir) = std::fs::read_dir(dir) else {
-        return 0;
+        // 无法读取（如 Access Denied 无权限、设备忙等）-> 标为 partial 下界
+        return (0, true);
     };
+
     let mut total: u64 = 0;
+    let mut is_partial = false;
+
     for entry in read_dir.flatten() {
         if stop.load(Ordering::Relaxed) {
-            return 0;
+            return (total, true);
         }
         let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            is_partial = true;
             continue;
         };
 
@@ -211,23 +226,32 @@ pub fn calculate_dir_size(dir: &Path, stop: &AtomicBool) -> u64 {
             #[cfg(windows)]
             {
                 use std::os::windows::fs::MetadataExt;
-                if (meta.file_attributes() & 0x400) != 0 {
-                    dirsize_trace(format!("skip reparse/junction: {}", entry.path().display()));
+                if (meta.file_attributes() & (0x400 | FILE_ATTRIBUTE_RECALL)) != 0 {
+                    dirsize_trace(format!(
+                        "skip reparse/cloud placeholder: {}",
+                        entry.path().display()
+                    ));
+                    is_partial = true; // 存在未统计的子树，整体标记为下界
                     continue;
                 }
             }
             #[cfg(not(windows))]
             {
                 if meta.file_type().is_symlink() {
+                    is_partial = true;
                     continue;
                 }
             }
-            total = total.saturating_add(calculate_dir_size(&entry.path(), stop));
+            let (child_sz, child_partial) = calculate_dir_size(&entry.path(), stop);
+            total = total.saturating_add(child_sz);
+            if child_partial {
+                is_partial = true;
+            }
         } else {
             total = total.saturating_add(meta.len());
         }
     }
-    total
+    (total, is_partial)
 }
 
 #[cfg(test)]

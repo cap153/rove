@@ -4,6 +4,9 @@ pub mod dir;
 pub mod drives;
 pub mod entry;
 pub mod time;
+pub mod watcher;
+
+pub use watcher::DirWatcher;
 
 pub use dir::{SortKey, SortState, list_directory, sort_entries};
 pub use drives::{

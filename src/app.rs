@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 use slint::language::{PointerEvent, PointerEventButton, PointerEventKind};
@@ -216,6 +217,8 @@ struct DirSizeResult {
     generation: u64,
     path: PathBuf,
     size: u64,
+    /// 是否为部分统计/下界估值（跳过 Junction/云占位/无权限子树）。
+    partial: bool,
     /// 计算时记录的目录修改时间（用于写入带时效的缓存）。
     mtime: Option<SystemTime>,
 }
@@ -226,9 +229,129 @@ const DIR_SIZE_CACHE_CAP: usize = 4096;
 /// 调试日志：经项目既有的 `log_write` 写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`），
 /// 与项目其它诊断日志同源、同一 `ROVE_LOG` 开关（存在即启用），不再走 stderr。
 fn dirsize_trace(msg: String) {
-    if log_enabled(1) {
+    if log_enabled(2) {
         log_write(&format!("[rove:dirsize] {msg}"));
     }
+}
+
+/// 判定是否为跳过自动扫描的昂贵系统目录（显示 "—"，需显式点击才计算）。
+/// 注意：`$Recycle.Bin` 用户明确要求统计，不应列入推迟名单。
+fn is_expensive_system_dir(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    let norm = s.trim_end_matches(['\\', '/']);
+    // 系统根目录（动态读 SystemRoot，回退 C:\Windows）
+    if let Ok(sys_root) = std::env::var("SystemRoot") {
+        if norm.eq_ignore_ascii_case(sys_root.trim_end_matches(['\\', '/'])) {
+            return true;
+        }
+    } else if norm.eq_ignore_ascii_case(r"C:\Windows") {
+        return true;
+    }
+    // 卷根下的系统保留目录（无权限/不可枚举）
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name.eq_ignore_ascii_case("System Volume Information") {
+            return true;
+        }
+    }
+    false
+}
+
+/// 磁盘持久化条目格式（落盘到系统 Temp/rove_dir_sizes.json）。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistentDirSize {
+    path: PathBuf,
+    size: u64,
+    partial: bool,
+    mtime_ms: u64,
+}
+
+/// 文件夹体积容量缓存（内存 + 落盘双用）。全局单例，进程级生命周期。
+struct DirSizeStore {
+    cache: HashMap<PathBuf, (u64, bool, SystemTime)>,
+    order: Vec<PathBuf>,
+    /// 自上次落盘以来是否被修改（避免无变化时频繁写盘）。
+    dirty: bool,
+    /// 上次落盘时刻，用于节流（≥5s 才真正写一次）。
+    last_save: std::time::Instant,
+}
+
+impl DirSizeStore {
+    fn new() -> Self {
+        let mut store = Self {
+            cache: HashMap::new(),
+            order: Vec::new(),
+            dirty: false,
+            last_save: std::time::Instant::now(),
+        };
+        store.load_from_temp();
+        store
+    }
+
+    fn temp_file_path() -> PathBuf {
+        std::env::temp_dir().join("rove_dir_sizes.json")
+    }
+
+    fn load_from_temp(&mut self) {
+        let path = Self::temp_file_path();
+        let Ok(file) = std::fs::File::open(&path) else {
+            return;
+        };
+        let reader = std::io::BufReader::new(file);
+        let items: Vec<PersistentDirSize> = serde_json::from_reader(reader).unwrap_or_default();
+        let count = items.len();
+        for item in items {
+            let mtime = std::time::UNIX_EPOCH + std::time::Duration::from_millis(item.mtime_ms);
+            self.cache.insert(item.path.clone(), (item.size, item.partial, mtime));
+            self.order.push(item.path);
+        }
+        dirsize_trace(format!("cache LOAD from {}: {} entries", path.display(), count));
+    }
+
+    fn save_to_temp(&mut self) {
+        let path = Self::temp_file_path();
+        let items: Vec<PersistentDirSize> = self
+            .order
+            .iter()
+            .filter_map(|p| {
+                self.cache.get(p).map(|&(size, partial, mtime)| {
+                    let mtime_ms = mtime
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
+                    PersistentDirSize {
+                        path: p.clone(),
+                        size,
+                        partial,
+                        mtime_ms,
+                    }
+                })
+            })
+            .collect();
+        let count = items.len();
+        if let Ok(file) = std::fs::File::create(&path) {
+            let writer = std::io::BufWriter::new(file);
+            if serde_json::to_writer(writer, &items).is_ok() {
+                dirsize_trace(format!("cache SAVE to {}: {} entries", path.display(), count));
+            }
+        }
+        self.dirty = false;
+        self.last_save = std::time::Instant::now();
+    }
+
+    /// 标记已修改，并按节流间隔（≥5s）落盘，避免高频写文件。
+    fn mark_modified(&mut self) {
+        self.dirty = true;
+        if self.last_save.elapsed() >= std::time::Duration::from_secs(5) {
+            self.save_to_temp();
+        }
+    }
+}
+
+/// 全局常驻的体积缓存单例（进程级生命周期，窗口关闭不销毁）。
+static GLOBAL_DIR_SIZES: OnceLock<Mutex<DirSizeStore>> = OnceLock::new();
+
+fn global_dir_sizes() -> &'static Mutex<DirSizeStore> {
+    GLOBAL_DIR_SIZES.get_or_init(|| Mutex::new(DirSizeStore::new()))
 }
 
 /// 应用主体。
@@ -284,10 +407,17 @@ pub struct App {
     dir_size_rx: Receiver<DirSizeResult>,
     /// 当前一批统计任务的取消开关：切换目录/刷新时置位即可中断前序任务。
     dir_size_stop: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// 文件夹容量 + 修改时间内存缓存：Path -> (bytes, mtime)，命中即瞬时呈现。
-    dir_size_cache: HashMap<PathBuf, (u64, SystemTime)>,
-    /// 缓存插入顺序，用于 FIFO/LRU 淘汰（达到上限时移除最旧项）。
-    dir_size_cache_order: Vec<PathBuf>,
+    /// 当前活动目录的文件系统递归监听器（随当前目录切换重建）。
+    active_watcher: Option<crate::fs::DirWatcher>,
+    /// 文件变更事件通道：worker 线程 -> 主线程 poll_timer 消费。
+    watch_tx: Sender<PathBuf>,
+    watch_rx: Receiver<PathBuf>,
+    /// 变动防抖收集池：记录需要被重算的当前层直接子文件夹。
+    pending_invalidated_subdirs: HashSet<PathBuf>,
+    /// 最近一次变动发生时刻，用于 400ms 防抖。
+    last_watch_event: Option<std::time::Instant>,
+    /// 单目录重算冷却时间戳：避免大量文件变动时密集轰炸磁盘（最低 2.5s 间隔）。
+    last_rescan_times: HashMap<PathBuf, std::time::Instant>,
     poll_timer: Timer,
     sidebar_timer: Timer,
     /// 侧栏周期刷新（驱动器容量/回收站统计/网络位置）。
@@ -311,6 +441,8 @@ impl App {
         thumb_tx: Sender<(PathBuf, u32)>,
         dir_size_tx: Sender<DirSizeRequest>,
         dir_size_rx: Receiver<DirSizeResult>,
+        watch_tx: Sender<PathBuf>,
+        watch_rx: Receiver<PathBuf>,
     ) -> Self {
         let state = AppState::new(None);
         Self {
@@ -331,8 +463,12 @@ impl App {
             dir_size_tx,
             dir_size_rx,
             dir_size_stop: None,
-            dir_size_cache: HashMap::new(),
-            dir_size_cache_order: Vec::new(),
+            active_watcher: None,
+            watch_tx,
+            watch_rx,
+            pending_invalidated_subdirs: HashSet::new(),
+            last_watch_event: None,
+            last_rescan_times: HashMap::new(),
             preview: PreviewWindow::new().expect("failed to create preview window"),
             preview_shown: false,
             actions: Vec::new(),
@@ -409,20 +545,24 @@ impl App {
     /// 历史体积缓存，强制穿透重算（子目录 mtime 可能已变而父目录 mtime 未变）。
     fn user_refresh_active(&mut self) {
         if let Some(current_dir) = self.state.active().path.clone() {
-            let before = self.dir_size_cache.len();
-            self.dir_size_cache
+            let mut store = global_dir_sizes().lock().unwrap();
+            let before = store.cache.len();
+            store
+                .cache
                 .retain(|path, _| path.parent() != Some(current_dir.as_path()));
-            self.dir_size_cache_order
+            store
+                .order
                 .retain(|path| path.parent() != Some(current_dir.as_path()));
-            let cleared = before - self.dir_size_cache.len();
+            let cleared = before - store.cache.len();
             if cleared > 0 {
                 dirsize_trace(format!(
                     "F5/invalidate: cleared {} cached subdir sizes under {} ({} left)",
                     cleared,
                     current_dir.display(),
-                    self.dir_size_cache.len()
+                    store.cache.len()
                 ));
             }
+            store.mark_modified();
         }
         self.reload_active();
     }
@@ -492,13 +632,36 @@ impl App {
                 let mut missing_dirs: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
                 let mut hit_count = 0usize;
                 {
+                    let store = global_dir_sizes().lock().unwrap();
+                    // 毫秒级一致性比对：NTFS 的 100ns 精度在 JSON 落盘时被截断为 ms，
+                    // 若用全等于 == 比对，重启后 loaded 的 mtime 会被误判为"已修改" -> 100% MISS。
+                    let mtime_equal = |t1: SystemTime, t2: SystemTime| {
+                        let ms1 = t1
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let ms2 = t2
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        ms1 == ms2
+                    };
                     let tab = &mut self.state.tabs[tab_index];
                     for entry in tab.entries.iter_mut().filter(|e| e.is_dir) {
-                        let cache_hit = match (entry.modified, self.dir_size_cache.get(&entry.path)) {
-                            (Some(cur_mtime), Some(&(cached_sz, cached_mtime)))
-                                if cur_mtime == cached_mtime =>
+                        // 1a. 昂贵系统目录：不入队扫描，直接呈现 "—"
+                        if is_expensive_system_dir(&entry.path) {
+                            entry.dir_size_loaded = true;
+                            entry.dir_size_deferred = true;
+                            continue;
+                        }
+
+                        // 1b. 查缓存：目录 mtime 毫秒级一致即复用历史体积
+                        let cache_hit = match (entry.modified, store.cache.get(&entry.path)) {
+                            (Some(cur_mtime), Some(&(cached_sz, cached_partial, cached_mtime)))
+                                if mtime_equal(cur_mtime, cached_mtime) =>
                             {
                                 entry.size = cached_sz;
+                                entry.dir_size_partial = cached_partial;
                                 entry.dir_size_loaded = true;
                                 true
                             }
@@ -538,6 +701,28 @@ impl App {
                         dirs: missing_dirs,
                         stop: new_stop,
                     });
+                }
+
+                // ---- 文件变更监听：对当前活动目录递归监听整棵子树 ----
+                if let Some(path) = self.state.tabs[tab_index].path.clone() {
+                    let is_unc = path.to_string_lossy().starts_with(r"\\");
+                    if tab_index == self.state.active_tab && !is_unc {
+                        // 若当前已有监听器且监听的正是该路径，直接复用，不重复重建
+                        let already_watching = self
+                            .active_watcher
+                            .as_ref()
+                            .map(|w| w.path == path)
+                            .unwrap_or(false);
+
+                        if !already_watching {
+                            // 重建监听器：旧 watcher 在 drop 时自动关闭句柄，杀掉旧线程
+                            self.active_watcher =
+                                crate::fs::DirWatcher::start(&path, self.watch_tx.clone());
+                            self.pending_invalidated_subdirs.clear();
+                            self.last_watch_event = None;
+                            dirsize_trace(format!("watcher started on {}", path.display()));
+                        }
+                    }
                 }
             }
         }
@@ -629,11 +814,12 @@ impl App {
     fn apply_dir_size_result(&mut self, result: DirSizeResult) {
         // 写入 LRU 缓存（FIFO 淘汰，达到上限移除最旧项）。
         if let Some(mtime) = result.mtime {
-            if !self.dir_size_cache.contains_key(&result.path) {
-                if self.dir_size_cache.len() >= DIR_SIZE_CACHE_CAP {
-                    if let Some(oldest) = self.dir_size_cache_order.first().cloned() {
-                        self.dir_size_cache_order.remove(0);
-                        self.dir_size_cache.remove(&oldest);
+            let mut store = global_dir_sizes().lock().unwrap();
+            if !store.cache.contains_key(&result.path) {
+                if store.cache.len() >= DIR_SIZE_CACHE_CAP {
+                    if let Some(oldest) = store.order.first().cloned() {
+                        store.order.remove(0);
+                        store.cache.remove(&oldest);
                         dirsize_trace(format!(
                             "cache EVICT (cap={}): {}",
                             DIR_SIZE_CACHE_CAP,
@@ -641,15 +827,18 @@ impl App {
                         ));
                     }
                 }
-                self.dir_size_cache_order.push(result.path.clone());
+                store.order.push(result.path.clone());
             }
-            self.dir_size_cache.insert(result.path.clone(), (result.size, mtime));
+            store
+                .cache
+                .insert(result.path.clone(), (result.size, result.partial, mtime));
             dirsize_trace(format!(
                 "cache STORE: {} = {} bytes (mtime ok, total {} entries)",
                 result.path.display(),
                 result.size,
-                self.dir_size_cache.len()
+                store.cache.len()
             ));
+            store.mark_modified();
         } else {
             dirsize_trace(format!(
                 "result without mtime, NOT cached: {}",
@@ -669,6 +858,7 @@ impl App {
             }
             if let Some(entry) = tab.entries.iter_mut().find(|e| e.path == result.path) {
                 entry.size = result.size;
+                entry.dir_size_partial = result.partial;
                 entry.dir_size_loaded = true;
             }
             tab.selection.contains(&result.path)
@@ -774,7 +964,7 @@ fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>
                     if req.stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
-                    let sz = crate::fs::dir::calculate_dir_size(&dir, &req.stop);
+                    let (sz, partial) = crate::fs::dir::calculate_dir_size(&dir, &req.stop);
                     if req.stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
                     }
@@ -783,6 +973,7 @@ fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>
                         generation: req.generation,
                         path: dir,
                         size: sz,
+                        partial,
                         mtime,
                     });
                     if sent.is_err() {
@@ -915,7 +1106,7 @@ mod tests {
     #[test]
     fn drag_gesture_accumulates_until_threshold() {
         let paths = vec![PathBuf::from("C:\\a.txt")];
-        let mut dp = Some((0.0f32, 0.0f32, paths.clone()));
+        let dp = Some((0.0f32, 0.0f32, paths.clone()));
 
         // 首次微小移动（1px）：未越过 4px 阈值，不应触发，且手势保留。
         assert!(drag_gesture_paths(&dp, 1.0, 1.0).is_none());
@@ -1224,17 +1415,18 @@ impl App {
 
         // 侧边栏图标统一采用 Windows 标准 32px 规格：
         // 彻底解决启动阶段 scale 由 1.0 变 1.5 导致请求 key(20) 与判定 key(30) 脱节的 Bug！
+        #[cfg(windows)]
         const SIDEBAR_ICON_PX: u32 = 32;
 
         if self.config.quick_expanded {
             for (label, id_suffix, dir) in quick_access_dirs() {
-                let Some(dir) = dir else { continue };
+                let Some(_dir) = dir else { continue };
                 // 回收站使用系统解析名，其余系统目录直接使用物理路径
                 #[cfg(windows)]
                 let icon_img = if label == "回收站" {
                     self.thumb_for(Path::new("shell:RecycleBinFolder"), SIDEBAR_ICON_PX)
                 } else {
-                    self.thumb_for(&dir, SIDEBAR_ICON_PX)
+                    self.thumb_for(&_dir, SIDEBAR_ICON_PX)
                 };
                 #[cfg(not(windows))]
                 let icon_img = slint::Image::default();
@@ -3297,7 +3489,10 @@ impl App {
         };
 
         // 光标（屏幕物理坐标）→ 窗口逻辑坐标 → 行命中
+        #[cfg(windows)]
         let mut target = base.clone();
+        #[cfg(not(windows))]
+        let target = base.clone();
         #[cfg(windows)]
         {
             let scale = self.ui.window().scale_factor() as f32;
@@ -3566,6 +3761,109 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 }
                 while let Ok(result) = app.dir_size_rx.try_recv() {
                     app.apply_dir_size_result(result);
+                }
+
+                // ---- 消费文件变更事件：逆向反查当前视图的直接子目录并防抖重算 ----
+                let mut got_events = false;
+                if let Some(cur_dir) = app.state.active().path.clone() {
+                    while let Ok(changed_path) = app.watch_rx.try_recv() {
+                        // 1. 过滤 Rove 自身读写文件，打破贪吃蛇死循环
+                        //    （重算时 save_to_temp 会写 AppData\Local\Temp\rove_dir_sizes.json，
+                        //     该路径落在监听子树内，反查到 Users 后又触发重算 -> 无限循环）。
+                        let s = changed_path.to_string_lossy();
+                        if s.ends_with("rove_dir_sizes.json") || s.ends_with("rove.log") {
+                            continue;
+                        }
+                        // 2. 过滤系统与软件后台高频静默写入区
+                        //    （Chrome/微信/系统日志每几百毫秒写入 AppData 与 Windows，
+                        //     会不断唤醒 Users 重算导致界面卡顿）。
+                        if s.contains(r"\AppData\Local\Temp\")
+                            || s.contains(r"\AppData\Local\")
+                            || s.contains(r"\AppData\Roaming\")
+                            || s.contains(r"\Windows\")
+                        {
+                            continue;
+                        }
+                        // 关键逆向追溯：changed_path 属于 cur_dir 子树时，取其第一层子目录。
+                        // 例：cur_dir=C:\，changed=C:\Users\captain\Downloads\9G.zip
+                        //     -> rel=Users\captain\Downloads\9G.zip -> first=Users -> 锁定 C:\Users
+                        if let Ok(rel) = changed_path.strip_prefix(&cur_dir) {
+                            if let Some(first_comp) = rel.components().next() {
+                                let direct_child = cur_dir.join(first_comp);
+                                app.pending_invalidated_subdirs.insert(direct_child);
+                                got_events = true;
+                            }
+                        }
+                    }
+                }
+                if got_events {
+                    app.last_watch_event = Some(std::time::Instant::now());
+                }
+
+                // 400ms 静默防抖：连续变动停止 400ms 后，批量穿透重算失效的文件夹
+                if let Some(last_time) = app.last_watch_event {
+                    if last_time.elapsed() >= std::time::Duration::from_millis(400) {
+                        app.last_watch_event = None;
+                        let dirs_to_rescan: Vec<PathBuf> =
+                            app.pending_invalidated_subdirs.drain().collect();
+                        if !dirs_to_rescan.is_empty() {
+                            // 1. 先在全局缓存中清除这批目录，保证穿透重算
+                            {
+                                let mut store = global_dir_sizes().lock().unwrap();
+                                for d in &dirs_to_rescan {
+                                    store.cache.remove(d);
+                                    store.order.retain(|p| p != d);
+                                }
+                                store.mark_modified();
+                            }
+                            // 2. 仅对当前存在且是目录的项派发重新统计
+                            let mut rescan_reqs: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
+                            let (tab_id, tab_generation) = {
+                                let tab = app.state.active();
+                                for d in &dirs_to_rescan {
+                                    // 严禁重算推迟目录（如 C:\Windows、System Volume Information）
+                                    if is_expensive_system_dir(&d) {
+                                        continue;
+                                    }
+                                    // 单目录重算冷却：距上次不足 2.5s 则跳过，避免密集轰炸磁盘
+                                    if let Some(last) = app.last_rescan_times.get(d) {
+                                        if last.elapsed()
+                                            < std::time::Duration::from_millis(2500)
+                                        {
+                                            continue;
+                                        }
+                                    }
+                                    if let Some(entry) =
+                                        tab.entries.iter().find(|e| &e.path == d && e.is_dir)
+                                    {
+                                        rescan_reqs.push((entry.path.clone(), entry.modified));
+                                        dirsize_trace(format!(
+                                            "watcher invalidate & rescan: {}",
+                                            d.display()
+                                        ));
+                                    }
+                                }
+                                (tab.id, tab.generation)
+                            };
+                            if !rescan_reqs.is_empty() {
+                                // 记录本次派发时刻，供冷却判断
+                                let now = std::time::Instant::now();
+                                for (p, _) in &rescan_reqs {
+                                    app.last_rescan_times.insert(p.clone(), now);
+                                }
+                                let new_stop = std::sync::Arc::new(
+                                    std::sync::atomic::AtomicBool::new(false),
+                                );
+                                app.dir_size_stop = Some(new_stop.clone());
+                                let _ = app.dir_size_tx.send(DirSizeRequest {
+                                    tab_id,
+                                    generation: tab_generation,
+                                    dirs: rescan_reqs,
+                                    stop: new_stop,
+                                });
+                            }
+                        }
+                    }
                 }
             });
     }
@@ -4715,6 +5013,9 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     let (dir_size_worker_tx, dir_size_rx) = mpsc::channel::<DirSizeResult>();
     spawn_dir_size_worker(dir_size_worker_rx, dir_size_worker_tx);
 
+    // 文件变更监听通道（worker 线程 -> 主线程 poll_timer 消费）。
+    let (watch_tx, watch_rx) = mpsc::channel::<PathBuf>();
+
     let app = Rc::new(RefCell::new(App::new(
         ui,
         config,
@@ -4726,6 +5027,8 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         thumb_tx,
         dir_size_tx,
         dir_size_rx,
+        watch_tx,
+        watch_rx,
     )));
     {
         let raw = crate::ops::actions::load_or_create();
@@ -4827,6 +5130,10 @@ pub fn destroy_session() {
     let ui = app.borrow().ui.as_weak();
     if let Some(w) = ui.upgrade() {
         let _ = w.hide();
+    }
+    // 会话销毁时，将累计的目录容量缓存刷写到系统 Temp 目录（重启不丢）。
+    if let Ok(mut store) = global_dir_sizes().lock() {
+        store.save_to_temp();
     }
     drop(app);
     logln!("session destroyed; daemon resident");
