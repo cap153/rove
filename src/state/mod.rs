@@ -339,6 +339,8 @@ pub struct AppState {
     /// 剪贴板中的文件（缓存副本，用于"粘贴"可用性判断）。
     pub clipboard_paths: Vec<PathBuf>,
     pub clipboard_operation: String,
+    /// 记录当前剪贴板中的内容是否从回收站剪切出来。
+    pub clipboard_from_recycle: bool,
     pub recent: Vec<PathBuf>,
 }
 
@@ -353,6 +355,7 @@ impl AppState {
             cut_paths: HashSet::new(),
             clipboard_paths: Vec::new(),
             clipboard_operation: "copy".into(),
+            clipboard_from_recycle: false,
             recent: Vec::new(),
         }
     }

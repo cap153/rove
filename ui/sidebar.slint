@@ -12,6 +12,7 @@ export component Sidebar inherits Rectangle {
     in-out property <bool> staging-expanded: true;
 
     callback item_activated(id: string);
+    callback background_clicked();
     callback item_pointer_event(id: string, event: PointerEvent, x: length, y: length);
     // 分区标题拖拽排序：phase 0=按下 1=拖动 2=松开，y 为指针相对行内的偏移。
     callback header_drag(index: int, phase: int, y: length);
@@ -62,6 +63,15 @@ export component Sidebar inherits Rectangle {
             height: 3px;
             border-radius: 1.5px;
             background: Theme.accent;
+        }
+
+        // 侧栏空白处点击：通知外层退出聚焦
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => {
+                root.background_clicked();
+            }
         }
 
         items-layout := VerticalLayout {

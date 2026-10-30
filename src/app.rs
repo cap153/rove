@@ -3146,6 +3146,27 @@ impl App {
         if paths.is_empty() {
             return;
         }
+
+        let is_recycle =
+            self.state.active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path());
+        if is_recycle {
+            // 回收站条目的物理文件在 $Recycle.Bin 下，原始路径在磁盘上不存在，
+            // 不向系统 CF_HDROP 写入死路径（避免 Shell 报错），由 Rove 内部接管。
+            self.state.clipboard_from_recycle = true;
+            self.state.clipboard_paths = paths.clone();
+            self.state.clipboard_operation = "move".into();
+            self.state.cut_paths = paths.into_iter().collect();
+            self.visible_cache = None;
+            self.refresh_visible_rows();
+            self.set_status_job(format!(
+                "已剪切 {} 个回收站项目（粘贴即可移动到目标文件夹）",
+                self.state.clipboard_paths.len()
+            ));
+            return;
+        }
+
+        // 常规目录正常写入系统剪贴板
+        self.state.clipboard_from_recycle = false;
         match clipboard::set_files(&paths, is_move) {
             Ok(()) => {
                 self.state.clipboard_paths = paths.clone();
@@ -3167,14 +3188,81 @@ impl App {
         }
     }
 
-    /// 粘贴剪贴板内容到当前目录。
+    /// 粘贴剪贴板内容到当前目录（含回收站双向闭环）。
     fn paste_clipboard(&mut self) {
-        let files = clipboard::read_files();
-        if files.paths.is_empty() {
-            // 读不到时回落内部缓存。
-            if self.state.clipboard_paths.is_empty() {
+        let Some(dest) = self.state.active().path.clone() else {
+            self.set_status_job("请先进入目标文件夹");
+            return;
+        };
+
+        // 场景 1：在回收站视图内粘贴 -> 删除到回收站（与资源管理器语义一致）。
+        if dest == fs::drives::recycle_virtual_path() {
+            // 防护：回收站内部剪切的内容本就已在回收站中，不能再次删除。
+            if self.state.clipboard_from_recycle {
+                self.set_status_job("这些项目已在回收站中");
                 return;
             }
+            let files = clipboard::read_files();
+            let paths = if files.paths.is_empty() {
+                self.state.clipboard_paths.clone()
+            } else {
+                files.paths
+            };
+            if paths.is_empty() {
+                return;
+            }
+            let is_move = files.operation == "move" || self.state.clipboard_operation == "move";
+            self.submit_job(JobKind::Delete { paths, to_trash: true });
+            if is_move {
+                self.state.clipboard_paths.clear();
+                self.state.cut_paths.clear();
+                self.visible_cache = None;
+            }
+            return;
+        }
+
+        // 场景 2：从回收站剪切后粘贴到常规目录 -> 先还原，再移动到目标目录。
+        if self.state.clipboard_from_recycle && !self.state.clipboard_paths.is_empty() {
+            let paths = std::mem::take(&mut self.state.clipboard_paths);
+            self.state.clipboard_from_recycle = false;
+            self.state.cut_paths.clear();
+            self.visible_cache = None;
+
+            let mut restored = Vec::new();
+            for p in &paths {
+                if fs::drives::restore_recycle_entry(p) > 0 {
+                    restored.push(p.clone());
+                }
+            }
+
+            if restored.is_empty() {
+                self.set_status_job("还原失败（项目可能已被彻底删除）");
+                return;
+            }
+
+            // 还原位置与目标目录不一致的项目需要移动过去。
+            let to_move: Vec<PathBuf> = restored
+                .into_iter()
+                .filter(|p| p.parent() != Some(dest.as_path()))
+                .collect();
+
+            if !to_move.is_empty() {
+                self.submit_job(JobKind::Move {
+                    sources: to_move,
+                    dest_dir: dest,
+                });
+            } else {
+                self.set_status_job(format!("已从回收站还原 {} 个项目到当前目录", paths.len()));
+                self.reload_active();
+            }
+            self.sidebar_fingerprint = 0;
+            return;
+        }
+
+        // 场景 3：常规目录之间粘贴。
+        let files = clipboard::read_files();
+        if files.paths.is_empty() && self.state.clipboard_paths.is_empty() {
+            return;
         }
         let paths = if files.paths.is_empty() {
             self.state.clipboard_paths.clone()
@@ -3182,10 +3270,6 @@ impl App {
             files.paths
         };
         let is_move = files.operation == "move" || self.state.clipboard_operation == "move";
-        let Some(dest) = self.state.active().path.clone() else {
-            self.set_status_job("请先进入目标文件夹");
-            return;
-        };
         self.state.clipboard_paths = paths.clone();
         self.state.clipboard_operation = if is_move { "move".into() } else { "copy".into() };
         let kind = if is_move {
@@ -3241,10 +3325,14 @@ impl App {
         // 刷新路径受影响的标签（源父目录 / 目标目录及其子路径）。
         let affected = &summary.affected_dirs;
         for index in 0..self.state.tabs.len() {
-            let needs = self.state.tabs[index]
-                .path
-                .as_ref()
-                .is_some_and(|p| affected.iter().any(|a| a == p || p.starts_with(a)));
+            // 回收站视图始终刷新：删除/清空等操作都会改变回收站内容。
+            let is_recycle = self.state.tabs[index].path.as_deref()
+                == Some(fs::drives::recycle_virtual_path().as_path());
+            let needs = is_recycle
+                || self.state.tabs[index]
+                    .path
+                    .as_ref()
+                    .is_some_and(|p| affected.iter().any(|a| a == p || p.starts_with(a)));
             if needs {
                 self.reload_tab(index);
             }
@@ -3355,11 +3443,6 @@ impl App {
             _ => {}
         }
         if event.kind != PointerEventKind::Down {
-            return;
-        }
-        // 地址栏编辑中：第一次点击列表仅取消编辑（与资源管理器一致）。
-        if self.ui.get_path_editing() {
-            self.ui.set_path_editing(false);
             return;
         }
         let Some(path) = self.state.active().display_entry(index).map(|e| e.path.clone()) else {
@@ -3771,11 +3854,6 @@ impl App {
         if event.kind != PointerEventKind::Down {
             return;
         }
-        // 地址栏编辑中：点击空白处仅取消编辑。
-        if self.ui.get_path_editing() {
-            self.ui.set_path_editing(false);
-            return;
-        }
         match event.button {
             PointerEventButton::Left => {
                 let tab = self.state.active_mut();
@@ -4143,6 +4221,9 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                 }
             }
             "refresh" => app.user_refresh_active(),
+            "focus_search" => {
+                app.ui.invoke_focus_search_box();
+            }
             "clear_filter" => {
                 app.ui.set_filter_text(SharedString::default());
                 {
@@ -4922,7 +5003,14 @@ mod drag_hittest {
     ) -> windows_sys::Win32::Foundation::LRESULT {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CallWindowProcW, HTCAPTION, HTCLIENT, IsZoomed, WNDPROC, WM_NCHITTEST,
+            WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
         };
+
+        // 核心修复：点击标题栏空白拖拽区（非客户区）时，立即派发失焦通知
+        if msg == WM_NCLBUTTONDOWN || msg == WM_NCRBUTTONDOWN {
+            super::clear_global_focus();
+        }
+
         let prev: WNDPROC = std::mem::transmute(PREV_WNDPROC.load(Ordering::Relaxed));
 
         if msg == WM_NCHITTEST {
@@ -5069,6 +5157,16 @@ fn work_area_logical(_scale: f32) -> Option<(f32, f32)> {
 // `invoke_from_event_loop`（空捕获、可跨线程）在本线程执行时访问。
 thread_local! {
     static SESSION: RefCell<Option<Rc<RefCell<App>>>> = const { RefCell::new(None) };
+}
+
+/// 在事件循环线程清空全部输入聚焦（供跨模块 / 窗口消息钩子调用）。
+#[cfg(windows)]
+pub(crate) fn clear_global_focus() {
+    let _ = slint::invoke_from_event_loop(|| {
+        if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+            app.borrow().ui.invoke_clear_all_focus();
+        }
+    });
 }
 
 pub fn run() {

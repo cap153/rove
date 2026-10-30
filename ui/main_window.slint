@@ -251,6 +251,18 @@ out property <length> row-height-out: file-list.row-height-out;
         file-list.set-drag-armed(v);
     }
 
+    /// 统一失焦：同时释放搜索框光标并退出地址栏编辑态。
+    public function clear-all-focus() {
+        filter-input.clear-focus();
+        root.path-editing = false;
+    }
+
+    /// 聚焦并全选搜索框（Ctrl+F，Rust 调用）。
+    public function focus-search-box() {
+        filter-input.focus();
+        filter-input.select-all();
+    }
+
     /// 拖拽悬停高亮：把命中的目标行索引暴露给 Rust（拖入/拖出悬停时设置）。
     in-out property <int> file-drop-hover-index <=> file-list.drop-hover-index;
 
@@ -275,18 +287,23 @@ out property <length> row-height-out: file-list.row-height-out;
             active-tab: root.active-tab;
             loading: root.tab-loading;
             tab_activated(id) => {
+                root.clear-all-focus();
                 root.tab_activated(id);
             }
             tab_closed(id) => {
                 root.tab_closed(id);
             }
             new_tab_requested() => {
+                root.clear-all-focus();
                 root.new_tab_requested();
             }
             window_minimize => { root.window_minimize(); }
             window_maximize => { root.window_maximize(); }
             window_close => { root.window_close(); }
-            settings_requested => { root.settings_requested(); }
+            settings_requested => {
+                root.clear-all-focus();
+                root.settings_requested();
+            }
         }
 
         // ---- 工具栏（设置页整体收起，内容从标签栏下方直接开始）----
@@ -294,6 +311,15 @@ out property <length> row-height-out: file-list.row-height-out;
             visible: !root.settings-open;
             height: root.settings-open ? 0px : 44px;
             background: Theme.bg-main;
+
+            // 工具栏空白处点击：退出一切输入聚焦
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => {
+                    root.clear-all-focus();
+                }
+            }
 
             HorizontalLayout {
                 x: 0px;
@@ -592,6 +618,7 @@ out property <length> row-height-out: file-list.row-height-out;
                                 if (event.text == Key.Escape) {
                                     self.text = "";
                                     root.filter_edited("");
+                                    self.clear-focus();
                                     return EventResult.accept;
                                 }
                                 return EventResult.reject;
@@ -662,7 +689,11 @@ out property <length> row-height-out: file-list.row-height-out;
                     drop-visible: root.sidebar-drop-visible;
                     drop-y: root.sidebar-drop-y;
                     item_activated(id) => {
+                        root.clear-all-focus();
                         root.sidebar_item_activated(id);
+                    }
+                    background_clicked => {
+                        root.clear-all-focus();
                     }
                     header_drag(index, phase, y) => {
                         root.sidebar_header_drag(index, phase, y);
@@ -704,6 +735,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     rename-path: root.rename-path;
                     loading: root.file-loading;
                     row_pointer_event(index, event, x, y) => {
+                        if (event.kind == PointerEventKind.down) {
+                            root.clear-all-focus();
+                        }
                         root.file_row_pointer_event(index, event, x, y);
                     }
                     row_double_clicked(index) => {
@@ -716,6 +750,9 @@ out property <length> row-height-out: file-list.row-height-out;
                         root.file_scroll_changed(offset);
                     }
                     background_pointer_event(event, x, y) => {
+                        if (event.kind == PointerEventKind.down) {
+                            root.clear-all-focus();
+                        }
                         root.file_background_pointer_event(event, x, y);
                     }
                     rename_committed(path, new-name) => {

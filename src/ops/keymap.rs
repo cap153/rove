@@ -26,6 +26,7 @@ pub const DEFAULT_SHORTCUTS: &[ShortcutMeta] = &[
     // 导航与查看
     ShortcutMeta { id: "refresh", name: "刷新当前目录", group: "导航与查看", default_chord: "F5", is_readonly: false },
     ShortcutMeta { id: "clear_filter", name: "清空筛选 / 取消", group: "导航与查看", default_chord: "Escape", is_readonly: true },
+    ShortcutMeta { id: "focus_search", name: "聚焦搜索框", group: "导航与查看", default_chord: "Ctrl+F", is_readonly: false },
     // 编辑与选择
     ShortcutMeta { id: "copy", name: "复制", group: "编辑与选择", default_chord: "Ctrl+C", is_readonly: false },
     ShortcutMeta { id: "cut", name: "剪切", group: "编辑与选择", default_chord: "Ctrl+X", is_readonly: false },
