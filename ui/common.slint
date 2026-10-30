@@ -66,6 +66,23 @@ export struct SettingsActionGroup {
     items: [SettingsActionItem],
 }
 
+export struct SettingsShortcutItem {
+    id: string,
+    slot-index: int,
+    item-key: string,
+    name: string,
+    group: string,
+    chord: string,
+    default-chord: string,
+    is-customized: bool,
+    is-readonly: bool,
+}
+
+export struct SettingsShortcutGroup {
+    name: string,
+    items: [SettingsShortcutItem],
+}
+
 export struct SidebarItem {
     id: string,
     label: string,

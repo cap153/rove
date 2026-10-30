@@ -30,6 +30,8 @@ pub struct Config {
     pub view_mode: String,
     /// 是否显示隐藏文件/文件夹/驱动器（默认 false，即过滤掉）。
     pub show_hidden: bool,
+    /// 用户自定义快捷键映射: ActionId -> [Chord1, Chord2]（空字符串代表已取消绑定）。
+    pub shortcuts: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// 侧栏分区的默认顺序。
@@ -55,6 +57,7 @@ impl Default for Config {
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
             show_hidden: false,
+            shortcuts: std::collections::HashMap::new(),
         }
     }
 }
@@ -138,6 +141,20 @@ impl Config {
         if let Some(sh) = json.get("show_hidden").and_then(|v| v.as_bool()) {
             config.show_hidden = sh;
         }
+        if let Some(map) = json.get("shortcuts").and_then(|v| v.as_object()) {
+            for (k, v) in map {
+                // 兼容旧版单个字符串与新版列表两种格式
+                if let Some(arr) = v.as_array() {
+                    let chords = arr
+                        .iter()
+                        .filter_map(|c| c.as_str().map(str::to_string))
+                        .collect();
+                    config.shortcuts.insert(k.clone(), chords);
+                } else if let Some(s) = v.as_str() {
+                    config.shortcuts.insert(k.clone(), vec![s.to_string()]);
+                }
+            }
+        }
         config
     }
 
@@ -164,6 +181,7 @@ impl Config {
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
             "show_hidden": self.show_hidden,
+            "shortcuts": self.shortcuts,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);

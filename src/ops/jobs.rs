@@ -131,6 +131,7 @@ fn run_job(job: &JobKind, status: &Arc<Mutex<JobStatus>>, cancel: &Arc<AtomicBoo
     }
 }
 
+#[allow(unused_variables)]
 fn run_transfer(
     sources: &[PathBuf],
     dest_dir: &Path,
@@ -140,61 +141,98 @@ fn run_transfer(
 ) -> JobSummary {
     let total = sources.len();
     let mut affected = vec![dest_dir.to_path_buf()];
-    let mut failed = 0usize;
-    let mut last_error = None;
-
-    for (i, src) in sources.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return JobSummary {
-                message: "已取消".into(),
-                affected_dirs: affected,
-                failed,
-            };
-        }
-        let name = src
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| src.to_string_lossy().into_owned());
-        if let Ok(mut s) = status.lock() {
-            s.done = i;
-            s.current = name.clone();
-        }
-        if let Some(parent) = src.parent() {
+    for s in sources {
+        if let Some(parent) = s.parent() {
             if !affected.iter().any(|d| d == parent) {
                 affected.push(parent.to_path_buf());
             }
         }
-
-        let dest = unique_dest(dest_dir, &name, src.is_dir());
-        let result = if is_move {
-            move_path(src, &dest)
-        } else {
-            copy_recursive(src, &dest)
-        };
-        if let Err(e) = result {
-            failed += 1;
-            last_error = Some(format!("{}: {e}", name));
-        }
     }
 
-    let message = match (failed, last_error) {
-        (0, _) => {
-            if is_move {
-                format!("已移动 {total} 个项目")
+    #[cfg(windows)]
+    {
+        // 传入 0 作无模态宿主 HWND，系统自行弹出居中对话框
+        // （原生 Shell 操作自带官方传输进度条、同名覆盖确认、UAC 提权、Ctrl+Z 撤销栈）
+        let res = if is_move {
+            crate::sys::shell::shell_move(sources, dest_dir, 0)
+        } else {
+            crate::sys::shell::shell_copy(sources, dest_dir, 0)
+        };
+        return match res {
+            Ok(aborted) => JobSummary {
+                message: if aborted {
+                    "操作已取消".into()
+                } else if is_move {
+                    format!("已移动 {total} 个项目")
+                } else {
+                    format!("已复制 {total} 个项目")
+                },
+                affected_dirs: affected,
+                failed: 0,
+            },
+            Err(e) => JobSummary {
+                message: format!("操作失败：{e}"),
+                affected_dirs: affected,
+                failed: total,
+            },
+        };
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 平台：保留原有逐文件拷贝/移动回退实现
+        let mut failed = 0usize;
+        let mut last_error = None;
+
+        for (i, src) in sources.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return JobSummary {
+                    message: "已取消".into(),
+                    affected_dirs: affected,
+                    failed,
+                };
+            }
+            let name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| src.to_string_lossy().into_owned());
+            if let Ok(mut s) = status.lock() {
+                s.done = i;
+                s.current = name.clone();
+            }
+
+            let dest = unique_dest(dest_dir, &name, src.is_dir());
+            let result = if is_move {
+                move_path(src, &dest)
             } else {
-                format!("已复制 {total} 个项目")
+                copy_recursive(src, &dest)
+            };
+            if let Err(e) = result {
+                failed += 1;
+                last_error = Some(format!("{}: {e}", name));
             }
         }
-        (f, Some(err)) => format!("{f}/{total} 个项目失败（{err}）"),
-        (f, None) => format!("{f}/{total} 个项目失败"),
-    };
-    JobSummary {
-        message,
-        affected_dirs: affected,
-        failed,
+
+        let message = match (failed, last_error) {
+            (0, _) => {
+                if is_move {
+                    format!("已移动 {total} 个项目")
+                } else {
+                    format!("已复制 {total} 个项目")
+                }
+            }
+            (f, Some(err)) => format!("{f}/{total} 个项目失败（{err}）"),
+            (f, None) => format!("{f}/{total} 个项目失败"),
+        };
+        JobSummary {
+            message,
+            affected_dirs: affected,
+            failed,
+        }
     }
 }
 
+#[allow(unused_variables)]
 fn run_delete(
     paths: &[PathBuf],
     to_trash: bool,
@@ -203,59 +241,89 @@ fn run_delete(
 ) -> JobSummary {
     let total = paths.len();
     let mut affected = Vec::new();
-    let mut failed = 0usize;
-    let mut last_error = None;
-
-    for (i, path) in paths.iter().enumerate() {
-        if cancel.load(Ordering::Relaxed) {
-            return JobSummary {
-                message: "已取消".into(),
-                affected_dirs: affected,
-                failed,
-            };
-        }
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| path.to_string_lossy().into_owned());
-        if let Ok(mut s) = status.lock() {
-            s.done = i;
-            s.current = name.clone();
-        }
-        if let Some(parent) = path.parent() {
+    for p in paths {
+        if let Some(parent) = p.parent() {
             if !affected.iter().any(|d| d == parent) {
                 affected.push(parent.to_path_buf());
             }
         }
-
-        let result = if to_trash {
-            trash::delete(path).map_err(|e| e.to_string())
-        } else if path.is_dir() {
-            std::fs::remove_dir_all(path).map_err(|e| e.to_string())
-        } else {
-            std::fs::remove_file(path).map_err(|e| e.to_string())
-        };
-        if let Err(e) = result {
-            failed += 1;
-            last_error = Some(format!("{name}: {e}"));
-        }
     }
 
-    let message = match (failed, last_error) {
-        (0, _) => {
-            if to_trash {
-                format!("已删除 {total} 个项目到回收站")
+    #[cfg(windows)]
+    {
+        let res = crate::sys::shell::shell_delete(paths, to_trash, 0);
+        return match res {
+            Ok(aborted) => JobSummary {
+                message: if aborted {
+                    "删除已取消".into()
+                } else if to_trash {
+                    format!("已删除 {total} 个项目到回收站")
+                } else {
+                    format!("已彻底删除 {total} 个项目")
+                },
+                affected_dirs: affected,
+                failed: 0,
+            },
+            Err(e) => JobSummary {
+                message: format!("删除失败：{e}"),
+                affected_dirs: affected,
+                failed: total,
+            },
+        };
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 非 Windows 平台：保留原有逐文件删除回退实现
+        let mut failed = 0usize;
+        let mut last_error = None;
+
+        for (i, path) in paths.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return JobSummary {
+                    message: "已取消".into(),
+                    affected_dirs: affected,
+                    failed,
+                };
+            }
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.to_string_lossy().into_owned());
+            if let Ok(mut s) = status.lock() {
+                s.done = i;
+                s.current = name.clone();
+            }
+
+            let result = if to_trash {
+                trash::delete(path).map_err(|e| e.to_string())
+            } else if path.is_dir() {
+                std::fs::remove_dir_all(path).map_err(|e| e.to_string())
             } else {
-                format!("已彻底删除 {total} 个项目")
+                std::fs::remove_file(path).map_err(|e| e.to_string())
+            };
+            if let Err(e) = result {
+                failed += 1;
+                last_error = Some(format!("{name}: {e}"));
             }
         }
-        (f, Some(err)) => format!("{f}/{total} 个项目删除失败（{err}）"),
-        (f, None) => format!("{f}/{total} 个项目删除失败"),
-    };
-    JobSummary {
-        message,
-        affected_dirs: affected,
-        failed,
+
+        let message = match (failed, last_error) {
+            (0, _) => {
+                if to_trash {
+                    format!("已删除 {total} 个项目到回收站")
+                } else {
+                    format!("已彻底删除 {total} 个项目")
+                }
+            }
+            (f, Some(err)) => format!("{f}/{total} 个项目删除失败（{err}）"),
+            (f, None) => format!("{f}/{total} 个项目删除失败"),
+        };
+        JobSummary {
+            message,
+            affected_dirs: affected,
+            failed,
+        }
     }
 }
 
@@ -291,6 +359,8 @@ pub fn unique_dest(dest_dir: &Path, name: &str, is_dir: bool) -> PathBuf {
 }
 
 /// 递归复制（文件或目录）。
+// 仅在非 Windows 回退路径与单元测试中使用；Windows 运行时由原生 Shell 接管。
+#[allow(dead_code)]
 pub fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     let meta = std::fs::metadata(src).map_err(|e| e.to_string())?;
     if meta.is_dir() {
@@ -311,6 +381,8 @@ pub fn copy_recursive(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// 移动：优先 rename，跨卷时退回复制 + 删除。
+// 仅在非 Windows 回退路径与单元测试中使用；Windows 运行时由原生 Shell 接管。
+#[allow(dead_code)]
 pub fn move_path(src: &Path, dst: &Path) -> Result<(), String> {
     if std::fs::rename(src, dst).is_ok() {
         return Ok(());

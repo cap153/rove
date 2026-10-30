@@ -4,6 +4,7 @@
 pub mod actions;
 pub mod clipboard;
 pub mod jobs;
+pub mod keymap;
 pub mod shortcut;
 #[cfg(windows)]
 pub mod thumbs;

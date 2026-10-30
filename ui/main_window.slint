@@ -1,4 +1,4 @@
-import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, SettingsNavItem, SettingsActionGroup } from "common.slint";
+import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
@@ -87,6 +87,14 @@ export component MainWindow inherits Window {
     // 设置页数据。
     in-out property <[SettingsNavItem]> settings-nav-items: [];
     in-out property <[SettingsActionGroup]> settings-action-groups: [];
+    in-out property <[SettingsShortcutGroup]> settings-shortcut-groups: [];
+    in-out property <string> settings-recording-item: "";
+    callback settings_shortcut_record(string, int);
+    callback settings_shortcut_reset(string, int);
+    callback settings_shortcut_unbind(string, int);
+    callback settings_shortcut_add_alternate(string);
+    callback settings_shortcut_remove_alternate(string, int);
+    callback settings_shortcut_reset_all();
     // 设置页子页标题 / 描述 / 新增入口 / 内容高度。
     in-out property <string> settings-page-title: "本地右键菜单";
     in-out property <string> settings-page-desc: "";
@@ -724,6 +732,14 @@ out property <length> row-height-out: file-list.row-height-out;
                     visible: root.settings-open;
                     nav-items: root.settings-nav-items;
                     action-groups: root.settings-action-groups;
+                    shortcut-groups: root.settings-shortcut-groups;
+                    recording-item-key: root.settings-recording-item;
+                    shortcut_record_clicked(id, slot) => { root.settings_shortcut_record(id, slot); }
+                    shortcut_reset_clicked(id, slot) => { root.settings_shortcut_reset(id, slot); }
+                    shortcut_unbind_clicked(id, slot) => { root.settings_shortcut_unbind(id, slot); }
+                    shortcut_add_alternate_clicked(id) => { root.settings_shortcut_add_alternate(id); }
+                    shortcut_remove_alternate_clicked(id, slot) => { root.settings_shortcut_remove_alternate(id, slot); }
+                    shortcut_reset_all_clicked() => { root.settings_shortcut_reset_all(); }
                     page-title: root.settings-page-title;
                     page-desc: root.settings-page-desc;
                     show-add: root.settings-show-add;

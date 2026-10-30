@@ -5,3 +5,4 @@
 
 pub mod pick;
 pub mod dnd;
+pub mod shell;

@@ -11,6 +11,7 @@ pub enum SettingsSubpage {
     General,
     SearchAndIndex,
     ContextMenu,
+    Shortcuts,
     Duplicates,
     QuickLook,
 }
@@ -304,9 +305,10 @@ impl TabState {
                 SettingsSubpage::General => "通用设置".to_string(),
                 SettingsSubpage::SearchAndIndex => "搜索与索引".to_string(),
                 SettingsSubpage::ContextMenu => "本地右键菜单".to_string(),
+                SettingsSubpage::Shortcuts => "快捷键".to_string(),
                 SettingsSubpage::Duplicates => "重复文件".to_string(),
                 SettingsSubpage::QuickLook => "快速预览".to_string(),
-            };
+                };
         }
         match &self.path {
             None => "此电脑".to_string(),
@@ -383,12 +385,16 @@ impl AppState {
         id
     }
 
-    /// 打开设置页标签；若已存在同子页面则切换过去，否则新建。
-    pub fn open_settings(&mut self, subpage: SettingsSubpage) -> u32 {
-        if let Some(idx) = self.tabs.iter().position(|t| {
-            t.kind == TabKind::Settings && t.settings_subpage == subpage
-        }) {
+    /// 打开或聚焦设置页标签（确保全局唯一设置标签）。
+    /// - `force_subpage = false`（顶部齿轮点击）：已存在时仅切换聚焦，保持当前子页面不变；未打开时以 `subpage` 创建。
+    /// - `force_subpage = true`（如右键菜单显式点击管理动作）：已存在时切换聚焦并强制切换到目标 `subpage`。
+    pub fn open_settings(&mut self, subpage: SettingsSubpage, force_subpage: bool) -> u32 {
+        // 全局唯一判定：只要是设置页标签即可复用
+        if let Some(idx) = self.tabs.iter().position(|t| t.kind == TabKind::Settings) {
             self.active_tab = idx;
+            if force_subpage {
+                self.tabs[idx].settings_subpage = subpage;
+            }
             return self.tabs[idx].id;
         }
         let id = self.next_tab_id;

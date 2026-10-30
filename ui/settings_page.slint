@@ -1,7 +1,7 @@
 // 设置页面（独立标签页）。
 // 目前实现：左侧子导航 + 右侧「本地右键菜单」分组管理。
 
-import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem } from "common.slint";
+import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem, SettingsShortcutGroup, SettingsShortcutItem } from "common.slint";
 
 component Toggle inherits Rectangle {
     in-out property <bool> checked: true;
@@ -41,7 +41,16 @@ component SettingRow inherits Rectangle {
     callback delete(id: string);
 
     height: 42px;
-    background: transparent;
+    background: row-ta.has-hover ? Theme.bg-hover : transparent;
+
+    // 全行点击切换开关（编辑/删除按钮位于其上层，独立拦截不受影响）
+    row-ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        clicked => {
+            root.toggled(root.item.id, !root.item.enabled);
+        }
+    }
 
     HorizontalLayout {
         x: 16px;
@@ -225,12 +234,30 @@ component GroupCard inherits Rectangle {
 export component SettingsPage inherits Rectangle {
     in property <[SettingsNavItem]> nav-items: [];
     in property <[SettingsActionGroup]> action-groups: [];
+    in property <[SettingsShortcutGroup]> shortcut-groups: [];
+    in property <string> recording-item-key: ""; // 正在录制的 item-key，如 "preview:0"
+
+    // 快捷键右键菜单状态
+    property <bool> menu-open: false;
+    property <string> menu-target-id: "";
+    property <int> menu-target-slot: 0;
+    property <bool> menu-target-custom: false;
+    property <bool> menu-target-readonly: false;
+    property <length> menu-x: 0px;
+    property <length> menu-y: 0px;
+
+    callback shortcut_record_clicked(string, int);      // id, slot
+    callback shortcut_reset_clicked(string, int);       // id, slot
+    callback shortcut_unbind_clicked(string, int);      // id, slot
+    callback shortcut_add_alternate_clicked(string);    // id
+    callback shortcut_remove_alternate_clicked(string, int); // id, slot
+    callback shortcut_reset_all_clicked();
     // 当前子页的标题 / 描述 / 是否显示「新增动作」入口。
     in property <string> page-title: "本地右键菜单";
     in property <string> page-desc: "开关控制菜单项显隐；内置动作仅允许开关，自定义动作可编辑或删除。";
     in property <bool> show-add: true;
     /// 是否显示隐藏文件（由 MainWindow 透传自 config）。
-    in property <bool> show-hidden: false;
+    in-out property <bool> show-hidden: false;
     /// 开关「显示隐藏项目」时触发（bool = 新的开关态）。
     callback show_hidden_toggled(bool);
     // 分组列表内容高度（Rust 按模型计算）。与 Slint 侧实测值取 max，
@@ -247,6 +274,14 @@ export component SettingsPage inherits Rectangle {
     callback scroll_debug(viewport: length, content: length, preferred: length);
 
     background: Theme.bg-main;
+
+    // 点击空白关闭右键菜单
+    if (root.menu-open) : TouchArea {
+        width: 100%;
+        height: 100%;
+        z: 99;
+        clicked => { root.menu-open = false; }
+    }
 
     HorizontalLayout {
         spacing: 0px;
@@ -355,6 +390,32 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
                     }
+
+                    // 快捷键页面的「全部恢复默认」按钮
+                    if (root.page-title == "快捷键") : Rectangle {
+                        width: 104px;
+                        height: 30px;
+                        border-radius: 6px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        background: reset-all-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
+
+                        Text {
+                            text: "全部恢复默认";
+                            color: Theme.text-secondary;
+                            font-size: 12px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+
+                        reset-all-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => { root.shortcut_reset_all_clicked(); }
+                        }
+                    }
                 }
             }
 
@@ -372,11 +433,21 @@ export component SettingsPage inherits Rectangle {
                 vertical-stretch: 1;
 
                 Rectangle {
-                    background: Theme.bg-input;
+                    background: gen-row-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
                     border-radius: 8px;
                     border-width: 1px;
                     border-color: Theme.border;
                     height: 58px;
+
+                    // 全行点击切换（菲茨定律）：本地翻转 UI 并派发
+                    gen-row-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.show-hidden = !root.show-hidden;
+                            root.show_hidden_toggled(root.show-hidden);
+                        }
+                    }
 
                     HorizontalLayout {
                         padding-left: 16px;
@@ -405,6 +476,7 @@ export component SettingsPage inherits Rectangle {
                             y: (parent.height - self.height) / 2;
                             checked: root.show-hidden;
                             toggled => {
+                                root.show-hidden = self.checked;
                                 root.show_hidden_toggled(self.checked);
                             }
                         }
@@ -437,12 +509,299 @@ export component SettingsPage inherits Rectangle {
                 }
             }
 
+            // ---- 子页：快捷键 ----
+            if (root.page-title == "快捷键") : Flickable {
+                vertical-stretch: 1;
+
+                VerticalLayout {
+                    padding-top: 4px;
+                    padding-bottom: 24px;
+                    spacing: 16px;
+                    alignment: start;
+
+                    for group in root.shortcut-groups : Rectangle {
+                        background: Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 42px + group.items.length * 40px;
+
+                        VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            spacing: 0px;
+
+                            Text {
+                                height: 24px;
+                                text: group.name;
+                                color: Theme.text-secondary;
+                                font-size: 12px;
+                                font-weight: 600;
+                            }
+
+                            for item in group.items : row-rect := Rectangle {
+                                height: 42px;
+                                border-radius: 6px;
+                                background: row-k-ta.has-hover ? Theme.bg-hover : transparent;
+
+                                // 全行点击：左键进入录制，右键弹出操作菜单
+                                row-k-ta := TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down) {
+                                            if (event.button == PointerEventButton.right) {
+                                                root.menu-target-id = item.id;
+                                                root.menu-target-slot = item.slot-index;
+                                                root.menu-target-custom = item.is-customized;
+                                                root.menu-target-readonly = item.is-readonly;
+
+                                                // 核心修复：absolute-position 精准换算到 SettingsPage 根坐标
+                                                let row-top = row-rect.absolute-position.y - root.absolute-position.y;
+                                                let row-left = row-rect.absolute-position.x - root.absolute-position.x;
+                                                root.menu-x = min(root.width - 170px, max(10px, row-left + self.mouse-x));
+                                                root.menu-y = min(root.height - (item.slot-index > 0 ? 144px : 112px), row-top + self.mouse-y + 4px);
+                                                root.menu-open = true;
+                                            } else if (event.button == PointerEventButton.left) {
+                                                if (!item.is-readonly) {
+                                                    root.shortcut_record_clicked(item.id, item.slot-index);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 12px;
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+
+                                    // 名称与槽位/锁定标识
+                                    HorizontalLayout {
+                                        horizontal-stretch: 1;
+                                        spacing: 6px;
+                                        alignment: start;
+
+                                        Text {
+                                            text: item.name;
+                                            color: item.is-readonly ? Theme.text-secondary : Theme.text-primary;
+                                            font-size: 13px;
+                                            vertical-alignment: center;
+                                        }
+                                        if (item.slot-index > 0) : Text {
+                                            text: "(备用)";
+                                            color: Theme.text-disabled;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                        if (item.is-readonly) : Text {
+                                            text: "(锁定)";
+                                            color: Theme.text-disabled;
+                                            font-size: 11px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    // 按键芯片（录制提示用中文字体，绝无方块字）
+                                    Rectangle {
+                                        height: 26px;
+                                        width: max(key-txt.preferred-width + 16px, 48px);
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 5px;
+                                        border-width: 1px;
+                                        border-color: root.recording-item-key == item.item-key
+                                            ? Theme.accent
+                                            : (item.is-readonly ? Theme.border.transparentize(0.5) : Theme.border);
+                                        background: root.recording-item-key == item.item-key
+                                            ? Theme.accent.transparentize(0.85)
+                                            : (item.is-readonly ? Theme.bg-input : Theme.bg-main);
+
+                                        key-txt := Text {
+                                            text: root.recording-item-key == item.item-key
+                                                ? "请按键..."
+                                                : (item.chord == "" ? "—" : item.chord);
+                                            color: root.recording-item-key == item.item-key
+                                                ? Theme.accent
+                                                : (item.chord == "" ? Theme.text-disabled : Theme.text-primary);
+                                            font-size: 11.5px;
+                                            // 关键修复：录制中强制使用中文字体，避免西文 Mono 字体缺中文字形
+                                            font-family: root.recording-item-key == item.item-key
+                                                ? Theme.font-family
+                                                : Theme.mono-font-family;
+                                            font-weight: 500;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+                                    }
+
+                                    // 更多操作按钮 ⋮（符号字体，防 Emoji 回退）
+                                    more-btn := Rectangle {
+                                        width: 24px;
+                                        height: 26px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 4px;
+                                        background: more-ta.has-hover ? Theme.bg-hover : transparent;
+
+                                        Text {
+                                            text: "⋮";
+                                            color: Theme.text-secondary;
+                                            font-size: 13px;
+                                            font-family: Theme.symbol-font-family;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+
+                                        more-ta := TouchArea {
+                                            width: 100%;
+                                            height: 100%;
+                                            clicked => {
+                                                root.menu-target-id = item.id;
+                                                root.menu-target-slot = item.slot-index;
+                                                root.menu-target-custom = item.is-customized;
+                                                root.menu-target-readonly = item.is-readonly;
+
+                                                // 核心修复：点击 ⋮ 时精准定位在按钮左下方
+                                                let btn-top = more-btn.absolute-position.y - root.absolute-position.y;
+                                                let btn-left = more-btn.absolute-position.x - root.absolute-position.x;
+                                                root.menu-x = max(10px, btn-left - 130px);
+                                                root.menu-y = min(root.height - (item.slot-index > 0 ? 144px : 112px), btn-top + 28px);
+                                                root.menu-open = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // ---- 其余未实现的子页占位提示 ----
-            if (root.page-title != "通用" && root.page-title != "本地右键菜单") : Text {
+            if (root.page-title != "通用" && root.page-title != "本地右键菜单" && root.page-title != "快捷键") : Text {
                 text: "该设置页将在后续 Sprint 实现。";
                 color: Theme.text-disabled;
                 font-size: 12px;
                 vertical-alignment: top;
+            }
+        }
+    }
+
+    // ---- 复刻 Sigma 右键快捷菜单 ----
+    if (root.menu-open) : Rectangle {
+        x: root.menu-x;
+        y: root.menu-y;
+        z: 100;
+        width: 164px;
+        height: root.menu-target-slot > 0 ? 134px : 102px; // 备用行多一项，高度自适应
+        background: Theme.bg-popup;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 12px;
+        drop-shadow-color: #00000033;
+
+        VerticalLayout {
+            padding: 4px;
+            spacing: 2px;
+
+            // 1. 重置快捷键
+            Rectangle {
+                height: 28px;
+                border-radius: 4px;
+                background: mi-reset-ta.has-hover ? Theme.bg-hover : transparent;
+                opacity: root.menu-target-custom ? 1.0 : 0.4;
+
+                Text {
+                    x: 10px;
+                    text: "重置快捷键";
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                mi-reset-ta := TouchArea {
+                    enabled: root.menu-target-custom;
+                    clicked => {
+                        root.menu-open = false;
+                        root.shortcut_reset_clicked(root.menu-target-id, root.menu-target-slot);
+                    }
+                }
+            }
+
+            // 2. 取消绑定
+            Rectangle {
+                height: 28px;
+                border-radius: 4px;
+                background: mi-unbind-ta.has-hover ? Theme.bg-hover : transparent;
+                opacity: !root.menu-target-readonly ? 1.0 : 0.4;
+
+                Text {
+                    x: 10px;
+                    text: "取消绑定";
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                mi-unbind-ta := TouchArea {
+                    enabled: !root.menu-target-readonly;
+                    clicked => {
+                        root.menu-open = false;
+                        root.shortcut_unbind_clicked(root.menu-target-id, root.menu-target-slot);
+                    }
+                }
+            }
+
+            // 3. 添加备用快捷键绑定
+            Rectangle {
+                height: 28px;
+                border-radius: 4px;
+                background: mi-alt-ta.has-hover ? Theme.bg-hover : transparent;
+                opacity: !root.menu-target-readonly ? 1.0 : 0.4;
+
+                Text {
+                    x: 10px;
+                    text: "添加备用绑定";
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                mi-alt-ta := TouchArea {
+                    enabled: !root.menu-target-readonly;
+                    clicked => {
+                        root.menu-open = false;
+                        root.shortcut_add_alternate_clicked(root.menu-target-id);
+                    }
+                }
+            }
+
+            // 4. 移除备用快捷键绑定（仅在备用槽位显示，危险红）
+            if (root.menu-target-slot > 0) : Rectangle {
+                height: 28px;
+                border-radius: 4px;
+                background: mi-rm-ta.has-hover ? Theme.bg-hover : transparent;
+
+                Text {
+                    x: 10px;
+                    text: "移除备用快捷键绑定";
+                    color: #C0392B;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                }
+
+                mi-rm-ta := TouchArea {
+                    clicked => {
+                        root.menu-open = false;
+                        root.shortcut_remove_alternate_clicked(root.menu-target-id, root.menu-target-slot);
+                    }
+                }
             }
         }
     }

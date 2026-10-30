@@ -418,6 +418,10 @@ pub struct App {
     last_watch_event: Option<std::time::Instant>,
     /// 单目录重算冷却时间戳：避免大量文件变动时密集轰炸磁盘（最低 2.5s 间隔）。
     last_rescan_times: HashMap<PathBuf, std::time::Instant>,
+    /// 声明式快捷键映射（差量合并后）。
+    keymap: crate::ops::keymap::Keymap,
+    /// 正在录制的 (Action ID, 槽位序号)（非空时优先捕获物理键）。
+    recording_shortcut: Option<(String, usize)>,
     poll_timer: Timer,
     sidebar_timer: Timer,
     /// 侧栏周期刷新（驱动器容量/回收站统计/网络位置）。
@@ -445,10 +449,12 @@ impl App {
         watch_rx: Receiver<PathBuf>,
     ) -> Self {
         let state = AppState::new(None);
+        let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
         Self {
             ui,
             state,
             config,
+            keymap,
             jobs,
             drives: Vec::new(),
             sidebar_fingerprint: 0,
@@ -460,6 +466,7 @@ impl App {
             dir_mtimes: HashMap::new(),
             drop_timer: Timer::default(),
             drag_pending: None,
+            recording_shortcut: None,
             dir_size_tx,
             dir_size_rx,
             dir_size_stop: None,
@@ -2116,6 +2123,8 @@ impl App {
                 items.push(item(ACT_SELECT_ALL, "全选", "▣", gray, "normal"));
                 items.push(item(ACT_MANAGE_ACTIONS, "管理右键动作...", "✎", gray, "normal"));
                 items.push(item(ACT_VIEW, "视图", "▦", gray, "submenu"));
+                items.push(sep());
+                items.push(item("act:builtin.properties", "属性", "ⓘ", gray, "normal"));
             }
         }
 
@@ -2295,9 +2304,9 @@ fn sum_group_heights<M: Model<Data = SettingsActionGroup>>(model: &M) -> f32 {
 }
 
 impl App {
-    /// 打开设置页标签（本地右键菜单子页）。
-    fn open_settings_tab(&mut self, subpage: crate::state::SettingsSubpage) {
-        self.state.open_settings(subpage);
+    /// 打开或切换到设置页标签。
+    fn open_settings_tab(&mut self, subpage: crate::state::SettingsSubpage, force_subpage: bool) {
+        self.state.open_settings(subpage, force_subpage);
         self.ui.set_settings_open(true);
         self.ui.set_filter_text(SharedString::default());
         self.sync_tabs();
@@ -2347,6 +2356,12 @@ impl App {
                 selected: current == SettingsSubpage::ContextMenu,
             },
             SettingsNavItem {
+                id: "shortcuts".into(),
+                label: "快捷键".into(),
+                icon: "⌨".into(),
+                selected: current == SettingsSubpage::Shortcuts,
+            },
+            SettingsNavItem {
                 id: "duplicates".into(),
                 label: "重复文件".into(),
                 icon: "◫".into(),
@@ -2372,12 +2387,57 @@ impl App {
                 "开关控制菜单项显隐；内置动作仅允许开关，自定义动作可编辑或删除。",
                 true,
             ),
+            SettingsSubpage::Shortcuts => (
+                "快捷键",
+                "点击按键芯片即可录制新快捷键；修改会自动保存，支持单项或全部恢复默认。",
+                false,
+            ),
             SettingsSubpage::Duplicates => ("重复文件", "重复项扫描规则与清理策略。", false),
             SettingsSubpage::QuickLook => ("快速预览", "空格键快速预览的行为配置。", false),
         };
         self.ui.set_settings_page_title(title.into());
         self.ui.set_settings_page_desc(desc.into());
         self.ui.set_settings_show_add(show_add);
+
+        if current == SettingsSubpage::Shortcuts {
+            let mut groups_map: std::collections::BTreeMap<&'static str, Vec<SettingsShortcutItem>> =
+                std::collections::BTreeMap::new();
+            for meta in crate::ops::keymap::DEFAULT_SHORTCUTS {
+                let chords = self
+                    .keymap
+                    .action_to_chords
+                    .get(meta.id)
+                    .cloned()
+                    .unwrap_or_else(|| vec![meta.default_chord.to_string()]);
+                let is_custom = self.config.shortcuts.contains_key(meta.id);
+
+                for (slot, chord) in chords.into_iter().enumerate() {
+                    let item = SettingsShortcutItem {
+                        id: meta.id.into(),
+                        slot_index: slot as i32,
+                        item_key: format!("{}:{}", meta.id, slot).into(),
+                        name: meta.name.into(),
+                        group: meta.group.into(),
+                        chord: chord.into(),
+                        default_chord: meta.default_chord.into(),
+                        is_customized: is_custom,
+                        is_readonly: meta.is_readonly,
+                    };
+                    groups_map.entry(meta.group).or_default().push(item);
+                }
+            }
+            let groups: Vec<SettingsShortcutGroup> = ["文件操作", "导航与查看", "编辑与选择"]
+                .into_iter()
+                .filter_map(|g| {
+                    groups_map.remove(g).map(|items| SettingsShortcutGroup {
+                        name: g.into(),
+                        items: ModelRc::new(VecModel::from(items)),
+                    })
+                })
+                .collect();
+            self.ui.set_settings_shortcut_groups(ModelRc::new(VecModel::from(groups)));
+            return;
+        }
 
         if current != SettingsSubpage::ContextMenu {
             self.ui.set_settings_action_groups(ModelRc::new(VecModel::from(Vec::<SettingsActionGroup>::new())));
@@ -2883,7 +2943,20 @@ impl App {
                     return;
                 }
                 "builtin.properties" => {
-                    // 占位：后续可调用 Windows 属性对话框。
+                    let paths = match &target {
+                        MenuTarget::Files(p) => p.clone(),
+                        MenuTarget::Background => {
+                            // 空白处右键属性：查看当前目录属性
+                            self.state.active().path.clone().into_iter().collect()
+                        }
+                    };
+                    if !paths.is_empty() {
+                        #[cfg(windows)]
+                        {
+                            let hwnd = get_window_hwnd(&self.ui).unwrap_or(0);
+                            crate::sys::shell::show_properties(&paths, hwnd);
+                        }
+                    }
                     return;
                 }
                 _ => {
@@ -2906,7 +2979,8 @@ impl App {
             }
         }
         if id == ACT_MANAGE_ACTIONS {
-            self.open_settings_tab(crate::state::SettingsSubpage::ContextMenu);
+            // 显式管理动作：force_subpage = true，聚焦并切换到本地右键菜单页
+            self.open_settings_tab(crate::state::SettingsSubpage::ContextMenu, true);
             return;
         }
         // 回收站视图动作。
@@ -3259,6 +3333,7 @@ fn key_down(_vk: i32) -> bool {
 
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
+const VK_MENU: i32 = 0x12;
 
 impl App {
     fn row_pointer_event(&mut self, index: usize, event: &PointerEvent, x: f32, y: f32) {
@@ -4000,62 +4075,93 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
 
         let ctrl = key_down(VK_CONTROL);
         let shift = key_down(VK_SHIFT);
-        match logical_key {
-            Key::Named(named) => {
-                use slint::winit_030::winit::keyboard::NamedKey;
-                match named {
-                    NamedKey::Space => {
-                        // 任务 3.1：QuickLook 预览开关。
-                        app.toggle_preview();
-                    }
-                    NamedKey::F2 => {
-                        app.start_rename();
-                    }
-                    NamedKey::F5 => {
-                        app.user_refresh_active();
-                    }
-                    NamedKey::Enter => {
-                        app.open_selection();
-                    }
-                    NamedKey::Delete => {
-                        if shift {
-                            app.delete_selection(false);
-                        } else {
-                            app.delete_selection(true);
-                        }
-                    }
-                    NamedKey::Escape => {
-                        app.ui.set_filter_text(SharedString::default());
-                        {
-                            let tab = app.state.active_mut();
-                            tab.filter.clear();
-                        }
-                        app.start_deep_search();
-                        app.state.active_mut().rebuild_display();
-                        app.sync_file_list();
-                        app.sync_status();
-                    }
-                    _ => return EventResult::Propagate,
-                }
-                let _ = ctrl;
+        let alt = key_down(VK_MENU);
+
+        // ===== 声明式快捷键：录制态优先拦截物理键 =====
+        if app.recording_shortcut.is_some() {
+            // Esc 取消录制：无论取消还是提交，都必须立即清除 UI 高亮态
+            if matches!(logical_key, Key::Named(slint::winit_030::winit::keyboard::NamedKey::Escape)) {
+                app.recording_shortcut = None;
+                app.ui.set_settings_recording_item(slint::SharedString::default());
+                return EventResult::PreventDefault;
             }
-            Key::Character(ch) => {
-                let ch = ch.to_lowercase();
-                if ctrl {
-                    match ch.as_str() {
-                        "c" => app.copy_selection(false),
-                        "x" => app.copy_selection(true),
-                        "v" => app.paste_clipboard(),
-                        "a" => app.select_all(),
-                        _ => return EventResult::Propagate,
-                    }
+            if let Some(chord) = crate::ops::keymap::format_chord(logical_key, ctrl, shift, alt) {
+                let (id, slot) = app.recording_shortcut.take().unwrap();
+                app.ui.set_settings_recording_item(slint::SharedString::default());
+
+                // 差量维护槽位：优先落入已有槽位，越界则追加
+                let defaults = app
+                    .keymap
+                    .action_to_chords
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_default();
+                let slots = app.config.shortcuts.entry(id.clone()).or_insert(defaults);
+                if slot < slots.len() {
+                    slots[slot] = chord;
                 } else {
-                    return EventResult::Propagate;
+                    slots.push(chord);
+                }
+                app.config.save();
+                app.keymap = crate::ops::keymap::Keymap::new(&app.config.shortcuts);
+                app.sync_settings();
+                return EventResult::PreventDefault;
+            }
+            // 纯修饰键等无效输入：保持录制态，忽略
+            return EventResult::PreventDefault;
+        }
+
+        // ===== 常规按键：规范化为 Chord 并在 Keymap 中解析 =====
+        let Some(chord) = crate::ops::keymap::format_chord(logical_key, ctrl, shift, alt) else {
+            return EventResult::Propagate;
+        };
+        let Some(action) = app.keymap.resolve(&chord).map(|s| s.to_string()) else {
+            return EventResult::Propagate;
+        };
+
+        match action.as_str() {
+            "preview" => app.toggle_preview(),
+            "open" => app.open_selection(),
+            "rename" => app.start_rename(),
+            "delete" => app.delete_selection(true),
+            "delete_perm" => app.delete_selection(false),
+            "properties" => {
+                let paths = app.state.active().selected_paths();
+                let target: Vec<std::path::PathBuf> = if paths.is_empty() {
+                    app.state.active().path.clone().into_iter().collect()
+                } else {
+                    paths
+                };
+                #[cfg(windows)]
+                {
+                    let hwnd = get_window_hwnd(&app.ui).unwrap_or(0);
+                    crate::sys::shell::show_properties(&target, hwnd);
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = target;
                 }
             }
+            "refresh" => app.user_refresh_active(),
+            "clear_filter" => {
+                app.ui.set_filter_text(SharedString::default());
+                {
+                    let tab = app.state.active_mut();
+                    tab.filter.clear();
+                }
+                app.start_deep_search();
+                app.state.active_mut().rebuild_display();
+                app.sync_file_list();
+                app.sync_status();
+            }
+            "copy" => app.copy_selection(false),
+            "cut" => app.copy_selection(true),
+            "paste" => app.paste_clipboard(),
+            "select_all" => app.select_all(),
             _ => return EventResult::Propagate,
         }
-        EventResult::Propagate
+
+        EventResult::PreventDefault
     });
 }
 
@@ -4350,8 +4456,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_settings_requested(move || {
             let Some(app) = app.upgrade() else { return };
-            // 点击设置齿轮：默认打开「通用」设置页
-            app.borrow_mut().open_settings_tab(crate::state::SettingsSubpage::General);
+            // force_subpage = false：已打开过则仅聚焦，不改变用户正在看的子页面
+            app.borrow_mut()
+                .open_settings_tab(crate::state::SettingsSubpage::General, false);
         });
     }
     {
@@ -4362,6 +4469,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let subpage = match id.as_str() {
                 "search" => crate::state::SettingsSubpage::SearchAndIndex,
                 "context" => crate::state::SettingsSubpage::ContextMenu,
+                "shortcuts" => crate::state::SettingsSubpage::Shortcuts,
                 "duplicates" => crate::state::SettingsSubpage::Duplicates,
                 "quicklook" => crate::state::SettingsSubpage::QuickLook,
                 _ => crate::state::SettingsSubpage::General,
@@ -4373,11 +4481,107 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        upgrade().on_settings_shortcut_record(move |id, slot| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let key = format!("{}:{}", id, slot);
+            app.recording_shortcut = Some((id.to_string(), slot as usize));
+            app.ui.set_settings_recording_item(key.into());
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_shortcut_reset(move |id, _slot| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.shortcuts.remove(id.as_str());
+            app.config.save();
+            app.keymap = crate::ops::keymap::Keymap::new(&app.config.shortcuts);
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_shortcut_unbind(move |id, slot| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let id_str = id.to_string();
+            let defaults = app
+                .keymap
+                .action_to_chords
+                .get(&id_str)
+                .cloned()
+                .unwrap_or_default();
+            let slots = app.config.shortcuts.entry(id_str).or_insert(defaults);
+            if (slot as usize) < slots.len() {
+                slots[slot as usize] = String::new(); // 清空，界面显示为 "—"
+            }
+            app.config.save();
+            app.keymap = crate::ops::keymap::Keymap::new(&app.config.shortcuts);
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_shortcut_add_alternate(move |id| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let id_str = id.to_string();
+            let defaults = app
+                .keymap
+                .action_to_chords
+                .get(&id_str)
+                .cloned()
+                .unwrap_or_default();
+            let slots = app.config.shortcuts.entry(id_str).or_insert(defaults);
+            slots.push(String::new()); // 追加空白备用槽位
+            app.config.save();
+            app.keymap = crate::ops::keymap::Keymap::new(&app.config.shortcuts);
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_shortcut_remove_alternate(move |id, slot| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let id_str = id.to_string();
+            let defaults = app
+                .keymap
+                .action_to_chords
+                .get(&id_str)
+                .cloned()
+                .unwrap_or_default();
+            let slots = app.config.shortcuts.entry(id_str).or_insert(defaults);
+            let s = slot as usize;
+            // 仅允许移除备用槽位（slot > 0），首项为主槽位不可移除
+            if s > 0 && s < slots.len() {
+                slots.remove(s);
+            }
+            app.config.save();
+            app.keymap = crate::ops::keymap::Keymap::new(&app.config.shortcuts);
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_shortcut_reset_all(move || {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.shortcuts.clear();
+            app.config.save();
+            app.keymap = crate::ops::keymap::Keymap::new(&app.config.shortcuts);
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
         upgrade().on_show_hidden_toggled(move |enabled| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
             app.config.show_hidden = enabled;
             app.config.save();
+            app.ui.set_show_hidden(enabled); // 核心修复：实时回填 UI 状态，开关才会翻转
             // 实时全局生效：刷新所有已打开的文件标签页
             let n = app.state.tabs.len();
             for i in 0..n {
