@@ -9,9 +9,18 @@
 //! 严禁在此模块操作 Slint UI；仅做 Win32 交互并返回结果。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// 拖出判定阈值：按下后位移超过该值（逻辑像素）才触发拖放。
 pub const DRAG_THRESHOLD: f32 = 4.0;
+
+/// 正在执行 `DoDragDrop` 的全局标志。
+///
+/// OLE 拖放期间系统仍会向窗口派发 `WM_NCHITTEST`；若窗口边缘此时返回
+/// `HTLEFT/HTTOP...`，系统会用缩放光标覆盖 OLE 的拖放光标（表现为拖到
+/// Rove 边缘时变成调整大小的箭头）。`WM_NCHITTEST` 钩子据此强制 `HTCLIENT`。
+#[allow(dead_code)]
+pub static IS_DRAGGING: AtomicBool = AtomicBool::new(false);
 
 /// 拖出结果。
 #[allow(dead_code)]
@@ -38,7 +47,10 @@ pub fn begin_drag_out<F: Fn() + 'static>(paths: &[PathBuf], on_feedback: F) -> D
     if paths.is_empty() {
         return DragOutOutcome::Cancelled;
     }
-    drag_out_impl(paths, Box::new(on_feedback))
+    IS_DRAGGING.store(true, Ordering::SeqCst);
+    let res = drag_out_impl(paths, Box::new(on_feedback));
+    IS_DRAGGING.store(false, Ordering::SeqCst);
+    res
 }
 
 #[cfg(not(windows))]

@@ -171,6 +171,8 @@ enum MenuTarget {
 /// 目录列举请求。
 struct ListRequest {
     tab_id: u32,
+    /// 目标分屏面板下标（0 / 1）：分屏时两栏各自请求、各自回填。
+    pane: usize,
     generation: u64,
     /// None = "此电脑"视图（列举驱动器）。
     path: Option<PathBuf>,
@@ -180,6 +182,7 @@ struct ListRequest {
 /// 目录列举结果。
 struct ListResult {
     tab_id: u32,
+    pane: usize,
     generation: u64,
     entries: Vec<FileEntry>,
 }
@@ -187,6 +190,7 @@ struct ListResult {
 /// 深度搜索请求：在目录子树中递归查找匹配项（文件夹视图搜索）。
 struct DeepRequest {
     tab_id: u32,
+    pane: usize,
     generation: u64,
     deep_generation: u64,
     root: PathBuf,
@@ -196,6 +200,7 @@ struct DeepRequest {
 /// 深度搜索结果。
 struct DeepResult {
     tab_id: u32,
+    pane: usize,
     generation: u64,
     deep_generation: u64,
     query: String,
@@ -511,23 +516,38 @@ impl App {
     }
 
     /// 请求列举目录（工作线程执行）。
-    fn request_listing(&self, tab_id: u32, generation: u64, path: Option<PathBuf>, sort: SortState) {
-        logln!("request_listing tab={tab_id} gen={generation} path={path:?}");
+    fn request_listing(
+        &self,
+        tab_id: u32,
+        pane: usize,
+        generation: u64,
+        path: Option<PathBuf>,
+        sort: SortState,
+    ) {
+        logln!("request_listing tab={tab_id} pane={pane} gen={generation} path={path:?}");
         let _ = self.list_tx.send(ListRequest {
             tab_id,
+            pane,
             generation,
             path,
             sort,
         });
     }
 
-    /// 重新列举指定标签的当前目录。
+    /// 重新列举指定标签的当前聚焦面板。
     fn reload_tab(&self, tab_index: usize) {
         let Some(tab) = self.state.tabs.get(tab_index) else {
             return;
         };
         tab_loading_flag(&self.ui, tab_index == self.state.active_tab, true);
-        self.request_listing(tab.id, tab.generation, tab.path.clone(), tab.sort);
+        let pane = tab.active_pane;
+        self.request_listing(
+            tab.id,
+            pane,
+            tab.panes[pane].generation,
+            tab.panes[pane].path.clone(),
+            tab.panes[pane].sort,
+        );
     }
 
     /// 任务 3：轮询各打开目录的 mtime，检测外部/内部变更后实时刷新对应标签。
@@ -538,7 +558,7 @@ impl App {
         let n = self.state.tabs.len();
         let mut to_reload: Vec<usize> = Vec::new();
         for i in 0..n {
-            let path = match self.state.tabs[i].path.clone() {
+            let path = match self.state.tabs[i].active().path.clone() {
                 Some(p) => p,
                 None => continue,
             };
@@ -567,7 +587,7 @@ impl App {
     /// 用户主动刷新（F5 / 工具栏 / 右键菜单）：清理「当前目录下各子文件夹」的
     /// 历史体积缓存，强制穿透重算（子目录 mtime 可能已变而父目录 mtime 未变）。
     fn user_refresh_active(&mut self) {
-        if let Some(current_dir) = self.state.active().path.clone() {
+        if let Some(current_dir) = self.state.active().active().path.clone() {
             let mut store = global_dir_sizes().lock().unwrap();
             let before = store.cache.len();
             store
@@ -598,44 +618,53 @@ impl App {
             return;
         };
         let tab = &mut self.state.tabs[tab_index];
-        if tab.generation != result.generation {
+        if tab.panes[result.pane].generation != result.generation {
             return; // 过期结果
         }
         // 按「显示隐藏文件」开关过滤：关闭时剔除具有隐藏属性的条目。
         let show_hidden = self.config.show_hidden;
-        tab.entries = if show_hidden {
-            result.entries
-        } else {
-            result.entries.into_iter().filter(|e| !e.is_hidden).collect()
-        };
-        // 拼音缓存随 entries 失效（惰性重建）。
-        tab.pinyin_cache.clear();
-        // 新列表到达即失效全局搜索的截断提示。
-        tab.search_total = None;
-        // 「此电脑」重载 = 回到驱动器列表，残留的全局搜索词会误过滤空表。
-        if tab.path.is_none() {
-            tab.filter.clear();
+        let listed_is_active = result.pane == tab.active_pane;
+        {
+            let pane = &mut tab.panes[result.pane];
+            pane.entries = if show_hidden {
+                result.entries
+            } else {
+                result.entries.into_iter().filter(|e| !e.is_hidden).collect()
+            };
+            // 拼音缓存随 entries 失效（惰性重建）。
+            pane.pinyin_cache.clear();
+            // 新列表到达即失效全局搜索的截断提示。
+            pane.search_total = None;
+            // 「此电脑」重载 = 回到驱动器列表，残留的全局搜索词会误过滤空表。
+            if pane.path.is_none() {
+                pane.filter.clear();
+            }
+            pane.loading = false;
+            pane.rebuild_display();
         }
-        tab.loading = false;
-        tab.rebuild_display();
-        // 记录最近目录。
-        if let Some(path) = tab.path.clone() {
-            self.state.push_recent(&path);
-            self.config.recent = self.state.recent.clone();
-            self.config.save();
+        let listed_path = tab.panes[result.pane].path.clone();
+        // 记录最近目录（仅当前聚焦面板才写入）。
+        if listed_is_active {
+            if let Some(path) = listed_path {
+                self.state.push_recent(&path);
+                self.config.recent = self.state.recent.clone();
+                self.config.save();
+            }
         }
         if tab_index == self.state.active_tab {
             self.visible_cache = None;
             self.sync_file_list();
-            self.sync_status();
-            self.sync_nav();
+            if listed_is_active {
+                self.sync_status();
+                self.sync_nav();
+            }
         }
         // 标签标题可能变化（"此电脑" 不变，目录名会变）。
         self.sync_tabs();
 
         // ---- 异步统计子文件夹体积 ----
         // 命中缓存则瞬时填入（mtime 严格一致才算），仅未命中/已变动的目录提交后台。
-        if let Some(current_path) = self.state.tabs[tab_index].path.as_ref() {
+        if let Some(current_path) = self.state.tabs[tab_index].panes[result.pane].path.as_ref() {
             // ⑥ 网络路径防护：UNC 路径（\\server\share）不自动递归，避免拖垮内网 IO。
             let is_unc = current_path.to_string_lossy().starts_with(r"\\");
             if is_unc {
@@ -670,7 +699,7 @@ impl App {
                         ms1 == ms2
                     };
                     let tab = &mut self.state.tabs[tab_index];
-                    for entry in tab.entries.iter_mut().filter(|e| e.is_dir) {
+                    for entry in tab.active_mut().entries.iter_mut().filter(|e| e.is_dir) {
                         // 1a. 昂贵系统目录：不入队扫描，直接呈现 "—"
                         if is_expensive_system_dir(&entry.path) {
                             entry.dir_size_loaded = true;
@@ -720,14 +749,14 @@ impl App {
                     let tab = &self.state.tabs[tab_index];
                     let _ = self.dir_size_tx.send(DirSizeRequest {
                         tab_id: tab.id,
-                        generation: tab.generation,
+                        generation: tab.active().generation,
                         dirs: missing_dirs,
                         stop: new_stop,
                     });
                 }
 
                 // ---- 文件变更监听：对当前活动目录递归监听整棵子树 ----
-                if let Some(path) = self.state.tabs[tab_index].path.clone() {
+                if let Some(path) = self.state.tabs[tab_index].active().path.clone() {
                     let is_unc = path.to_string_lossy().starts_with(r"\\");
                     if tab_index == self.state.active_tab && !is_unc {
                         // 若当前已有监听器且监听的正是该路径，直接复用，不重复重建
@@ -755,7 +784,7 @@ impl App {
     /// 「此电脑」= 全局索引秒搜；目录视图 = 本地过滤 + 异步深度搜索。
     fn apply_search_query(&mut self, text: &str) {
         logln!("search query: {text:?}");
-        let is_root = self.state.active().path.is_none();
+        let is_root = self.state.active().active().path.is_none();
         // 「此电脑」视图：搜索框 = 全局拼音秒搜（Phase 5 索引）。
         if is_root {
             let query = text.trim().to_string();
@@ -763,11 +792,11 @@ impl App {
         } else {
             {
                 let tab = self.state.active_mut();
-                tab.filter = text.to_string();
+                tab.active_mut().filter = text.to_string();
             }
             // 深度搜索（子树递归）：异步执行，结果经 poll timer 合并。
             self.start_deep_search();
-            self.state.active_mut().rebuild_display();
+            self.state.active_mut().active_mut().rebuild_display();
         }
         self.visible_cache = None;
         self.sync_file_list();
@@ -779,13 +808,14 @@ impl App {
     /// 空查询仅清空残留结果；有效查询在代号递增后发往工作线程。
     fn start_deep_search(&mut self) {
         let tab = self.state.active_mut();
-        tab.clear_deep();
-        let (tab_id, generation, deep_generation, root, query) = (
+        tab.active_mut().clear_deep();
+        let (tab_id, pane, generation, deep_generation, root, query) = (
             tab.id,
-            tab.generation,
-            tab.deep_generation,
-            tab.path.clone(),
-            tab.filter.trim().to_string(),
+            tab.active_pane,
+            tab.active_mut().generation,
+            tab.active_mut().deep_generation,
+            tab.active_mut().path.clone(),
+            tab.active_mut().filter.trim().to_string(),
         );
         // 「此电脑」/ 回收站虚拟目录没有子树搜索。
         let Some(root) = root else { return };
@@ -794,12 +824,13 @@ impl App {
         }
         let _ = self.deep_tx.send(DeepRequest {
             tab_id,
+            pane,
             generation,
             deep_generation,
             root,
             query,
         });
-        self.state.active_mut().deep_searching = true;
+        self.state.active_mut().active_mut().deep_searching = true;
     }
 
     /// 深度搜索结果到达：标签存在、代号与查询都匹配才应用。
@@ -815,20 +846,24 @@ impl App {
             return;
         };
         let tab = &mut self.state.tabs[tab_index];
-        if tab.generation != result.generation || tab.deep_generation != result.deep_generation {
+        let deep_is_active = result.pane == tab.active_pane;
+        let pane = &mut tab.panes[result.pane];
+        if pane.generation != result.generation || pane.deep_generation != result.deep_generation {
             return; // 过期结果
         }
-        if tab.filter.trim().to_lowercase() != result.query.trim().to_lowercase() {
+        if pane.filter.trim().to_lowercase() != result.query.trim().to_lowercase() {
             return;
         }
-        tab.deep_entries = result.items.iter().map(|i| i.entry.clone()).collect();
-        tab.deep_pinyin = result.items.into_iter().map(|i| i.fields).collect();
-        tab.deep_searching = false;
-        tab.rebuild_display();
+        pane.deep_entries = result.items.iter().map(|i| i.entry.clone()).collect();
+        pane.deep_pinyin = result.items.into_iter().map(|i| i.fields).collect();
+        pane.deep_searching = false;
+        pane.rebuild_display();
         if tab_index == self.state.active_tab {
             self.visible_cache = None;
             self.sync_file_list();
-            self.sync_status();
+            if deep_is_active {
+                self.sync_status();
+            }
         }
     }
 
@@ -876,15 +911,15 @@ impl App {
         // 避免与下方 self.* 重绘调用冲突。
         let is_selected = {
             let tab = &mut self.state.tabs[tab_index];
-            if tab.generation != result.generation {
+            if tab.active_mut().generation != result.generation {
                 return;
             }
-            if let Some(entry) = tab.entries.iter_mut().find(|e| e.path == result.path) {
+            if let Some(entry) = tab.active_mut().entries.iter_mut().find(|e| e.path == result.path) {
                 entry.size = result.size;
                 entry.dir_size_partial = result.partial;
                 entry.dir_size_loaded = true;
             }
-            tab.selection.contains(&result.path)
+            tab.active_mut().selection.contains(&result.path)
         };
 
         if tab_index == self.state.active_tab {
@@ -933,6 +968,7 @@ fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
                 };
                 let sent = tx.send(ListResult {
                     tab_id: req.tab_id,
+                    pane: req.pane,
                     generation: req.generation,
                     entries,
                 });
@@ -962,6 +998,7 @@ fn spawn_deep_worker(rx: Receiver<DeepRequest>, tx: Sender<DeepResult>) {
                 };
                 let sent = tx.send(DeepResult {
                     tab_id: req.tab_id,
+                    pane: req.pane,
                     generation: req.generation,
                     deep_generation: req.deep_generation,
                     query: req.query,
@@ -1180,7 +1217,7 @@ impl App {
                 let icon_text = if t.kind == crate::state::TabKind::Settings {
                     "⚙".to_string()
                 } else {
-                    match &t.path {
+                    match &t.active().path {
                         None => "此".to_string(),
                         Some(p) if *p == fs::drives::recycle_virtual_path() => "回".to_string(),
                         Some(p) => p
@@ -1207,15 +1244,15 @@ impl App {
         #[cfg(windows)]
         sync_drag_bounds(self);
         self.ui.set_active_tab(self.state.active_tab as i32);
-        self.ui.set_tab_loading(self.state.active().loading);
+        self.ui.set_tab_loading(self.state.active().active().loading);
         self.ui.set_settings_open(self.state.active().kind == crate::state::TabKind::Settings);
     }
 
     fn sync_nav(&self) {
         let tab = self.state.active();
-        self.ui.set_can_go_back(tab.can_go_back());
-        self.ui.set_can_go_forward(tab.can_go_forward());
-        self.ui.set_can_go_up(tab.parent_path().is_some());
+        self.ui.set_can_go_back(tab.active().can_go_back());
+        self.ui.set_can_go_forward(tab.active().can_go_forward());
+        self.ui.set_can_go_up(tab.active().parent_path().is_some());
     }
 
     fn sync_breadcrumbs(&self) {
@@ -1225,7 +1262,7 @@ impl App {
             label: "此电脑".into(),
             path: SharedString::default(),
         });
-        if let Some(path) = &tab.path {
+        if let Some(path) = &tab.active().path {
             if *path == fs::drives::recycle_virtual_path() {
                 // 回收站视图：单个虚拟段。
                 segments.push(BreadcrumbSegment {
@@ -1279,7 +1316,7 @@ impl App {
         self.config.save();
         self.ui.set_view_mode(mode.into());
         self.visible_cache = None;
-        self.state.active_mut().scroll_y = 0.0;
+        self.state.active_mut().active_mut().scroll_y = 0.0;
         self.ui.invoke_scroll_list_to_top();
         self.sync_file_list();
         self.refresh_visible_rows();
@@ -1297,11 +1334,11 @@ impl App {
                 drives.iter().map(FileEntry::drive).collect();
             let n = entries.len();
             let tab = self.state.active_mut();
-            tab.entries = entries;
-            tab.pinyin_cache.clear();
-            tab.filter.clear();
-            tab.search_total = None;
-            tab.display = (0..n).collect();
+            tab.active_mut().entries = entries;
+            tab.active_mut().pinyin_cache.clear();
+            tab.active_mut().filter.clear();
+            tab.active_mut().search_total = None;
+            tab.active_mut().display = (0..n).collect();
             return;
         }
         let index = shared();
@@ -1317,12 +1354,12 @@ impl App {
             .collect();
         let shown = entries.len();
         let tab = self.state.active_mut();
-        tab.entries = entries;
-        tab.pinyin_cache.clear();
-        tab.filter = query.to_string();
+        tab.active_mut().entries = entries;
+        tab.active_mut().pinyin_cache.clear();
+        tab.active_mut().filter = query.to_string();
         // 命中数超过展示上限时记录总数，供状态栏提示截断。
-        tab.search_total = (shown < total).then_some(total);
-        tab.rebuild_display();
+        tab.active_mut().search_total = (shown < total).then_some(total);
+        tab.active_mut().rebuild_display();
     }
 
     /// 全盘索引刚刚就绪：若当前正处于「此电脑」全局搜索且搜索框非空，
@@ -1333,7 +1370,7 @@ impl App {
     fn refresh_after_index_ready(&mut self) {
         let (is_root, query) = {
             let tab = self.state.active();
-            (tab.path.is_none(), tab.filter.trim().to_string())
+            (tab.active().path.is_none(), tab.active().filter.trim().to_string())
         };
         // 仅全局搜索需要补全：目录视图走的是本地过滤 + 深度搜索，与索引无关。
         if !is_root || query.is_empty() {
@@ -1364,24 +1401,24 @@ impl App {
         let has_clipboard = !self.state.clipboard_paths.is_empty() || !clipboard::read_files().paths.is_empty();
         self.ui.set_can_paste(has_clipboard);
         let tab = self.state.active();
-        let (dirs, files, selected_size) = tab.stats();
-        let total = tab.display.len();
+        let (dirs, files, selected_size) = tab.active().stats();
+        let total = tab.active().display.len();
         let mut left = format!("{total} 个项目（{dirs} 个文件夹，{files} 个文件）");
         // 全盘索引构建中：此电脑视图的全局搜索结果可能只是已扫完那部分磁盘的
         // 未完成结果（会随构建推进而增多），必须显式告知，否则用户会以为搜漏了。
         // 判定绑定真实构建状态：仅「已启动但未就绪」才提示，索引未启动不误报。
-        if tab.path.is_none() && matches!(Self::index_build_state(), Some(false)) {
+        if tab.active().path.is_none() && matches!(Self::index_build_state(), Some(false)) {
             left.push_str(" · 全盘索引构建中...");
         }
         // 全局索引搜索命中数超过展示上限：明确告知结果被截断。
-        if let Some(found) = tab.search_total.filter(|&n| total < n) {
+        if let Some(found) = tab.active().search_total.filter(|&n| total < n) {
             left.push_str(&format!(" · 已展示前 {total} 项（共找到 {found} 项）"));
         }
-        if tab.deep_searching {
+        if tab.active().deep_searching {
             left.push_str(" · 正在搜索子文件夹…");
         }
         self.ui.set_status_left(left.into());
-        let selected = tab.selection_count();
+        let selected = tab.active().selection_count();
         let right = if selected == 0 {
             String::new()
         } else if selected_size > 0 {
@@ -1595,7 +1632,7 @@ impl App {
         }
 
         // 当前激活的侧边栏项。
-        let active_id = match self.state.active().path.as_ref() {
+        let active_id = match self.state.active().active().path.as_ref() {
             None => String::new(),
             Some(path) if *path == fs::drives::recycle_virtual_path() => "quick:recycle".to_string(),
             Some(path) => {
@@ -1650,25 +1687,36 @@ impl App {
 
     /// 全量同步文件列表（标题、排序态、总行数、可见窗口）。
     fn sync_file_list(&mut self) {
-        self.ui
-            .set_sort_key(match self.state.active().sort.key {
-                SortKey::Name => "name",
-                SortKey::Size => "size",
-                SortKey::Modified => "modified",
-                SortKey::Type => "type",
-                SortKey::Path => "path",
-            }
-            .into());
-        self.ui
-            .set_sort_ascending(self.state.active().sort.ascending);
-        self.ui.set_file_loading(self.state.active().loading);
-        self.ui
-            .set_file_total(self.state.active().display.len() as i32);
-        // 「路径」列仅回收站显示：站内条目来源各异，路径列是唯一来源线索；
-        // 普通目录的路径与地址栏一致，隐藏以让出宽度给名称列。
-        let is_recycle = self.state.active().path.as_deref()
-            == Some(&fs::drives::recycle_virtual_path());
+        let (sort_key, sort_asc, loading0, total0, is_recycle, is_split, loading1, total1) = {
+            let tab = self.state.active();
+            let panes = &tab.panes;
+            (
+                match tab.active().sort.key {
+                    SortKey::Name => "name",
+                    SortKey::Size => "size",
+                    SortKey::Modified => "modified",
+                    SortKey::Type => "type",
+                    SortKey::Path => "path",
+                },
+                tab.active().sort.ascending,
+                panes[0].loading,
+                panes[0].display.len() as i32,
+                // 「路径」列仅回收站显示：站内条目来源各异，路径列是唯一来源线索；
+                // 普通目录的路径与地址栏一致，隐藏以让出宽度给名称列。
+                panes[0].path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()),
+                tab.is_split,
+                panes.get(1).map(|p| p.loading).unwrap_or(false),
+                panes.get(1).map(|p| p.display.len()).unwrap_or(0) as i32,
+            )
+        };
+        self.ui.set_sort_key(sort_key.into());
+        self.ui.set_sort_ascending(sort_asc);
+        self.ui.set_file_loading(loading0);
+        self.ui.set_file_total(total0);
         self.ui.set_show_path_column(is_recycle);
+        self.ui.set_is_split(is_split);
+        self.ui.set_file_loading_right(loading1);
+        self.ui.set_file_total_right(total1);
         self.refresh_visible_rows();
     }
 
@@ -1760,71 +1808,95 @@ impl App {
 
     fn refresh_visible_rows(&mut self) {
         let list_height = self.ui.get_list_height();
-        // 视图几何：details/list 每行 1 条；icons 网格按 cells-per-row 折算。
         let cells_per_row = (self.ui.get_cells_per_row().max(1)) as usize;
-        let row_h_px = (self.ui.get_row_height_out() / 1.0f32.max(1.0)).max(ROW_HEIGHT);
         let row_h = if self.ui.get_row_height_out() > 0.0 {
             self.ui.get_row_height_out()
         } else {
             ROW_HEIGHT
         };
-        let _ = row_h_px;
         let rows_visible = (list_height / row_h).ceil() as usize + OVERSCAN * 2;
-        let total = self.state.active().display.len();
-        let total_rows = total.div_ceil(cells_per_row);
-        let scroll = self.state.active().scroll_y.max(0.0);
-        let mut first_row = (scroll / row_h).floor() as isize - OVERSCAN as isize;
-        first_row = first_row.clamp(0, total_rows.saturating_sub(1) as isize);
-        let first_row = first_row.max(0) as usize;
-        let count_rows = rows_visible.min(total_rows.saturating_sub(first_row)).max(1);
 
-        // 行区间 → 条目区间。
-        let first = first_row * cells_per_row;
-        let count = (count_rows * cells_per_row).min(total.saturating_sub(first)).max(1);
+        let (is_split, total0, scroll0) = {
+            let tab = self.state.active();
+            (
+                tab.is_split,
+                tab.panes[0].display.len(),
+                tab.panes[0].scroll_y.max(0.0),
+            )
+        };
 
-        // 高频噪音日志：仅在 ROVE_LOG=2 时输出（排查虚拟窗口/布局问题时用）。
-        logv!("visible_rows h={list_height} total={total} cpr={cells_per_row} first={first} count={count}");
-        if self.visible_cache == Some((first, count)) && !self.state.active().loading {
-            return;
+        let (first0, count0) = pane_view_range(total0, cells_per_row, row_h, rows_visible, scroll0);
+
+        // 左栏始终绑定 pane 0
+        let rows0 = self.build_rows_for_pane(self.state.active_tab, 0, first0, count0);
+        self.ui.set_file_rows(ModelRc::new(VecModel::from(rows0)));
+
+        // 右栏（如果开启分屏）绑定 pane 1
+        if is_split {
+            let (total1, scroll1) = {
+                let tab = self.state.active();
+                if let Some(pane) = tab.panes.get(1) {
+                    (pane.display.len(), pane.scroll_y.max(0.0))
+                } else {
+                    (0, 0.0)
+                }
+            };
+            let (first1, count1) = pane_view_range(total1, cells_per_row, row_h, rows_visible, scroll1);
+            let rows1 = self.build_rows_for_pane(self.state.active_tab, 1, first1, count1);
+            self.ui.set_file_rows_right(ModelRc::new(VecModel::from(rows1)));
+        } else {
+            self.ui.set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
         }
-        self.visible_cache = Some((first, count));
+    }
 
-        let tab = self.state.active();
-        let computer_view = tab.path.is_none();
-        let cut = &self.state.cut_paths;
-        // 高亮查询（空 = 不高亮）：取自当前标签过滤词（文件夹视图与
-        // 全局搜索都写入 filter），命中区间经拼音反向索引映射回原名。
-        let hl_query = tab.filter.trim().to_lowercase();
-        let mut hl_matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
-        let mut hl_bufs = (Vec::new(), Vec::new(), Vec::new());
-        // 第一遍（借用 tab）：收集除缩略图外的全部行数据；
-        // 第二遍（借用 self）：填缩略图 / 发起后台加载请求。
-        let collected: Vec<(i32, FileEntry, bool, bool, Vec<(String, bool)>)> =
-            (first..first + count)
-                .filter_map(|di| {
-                    let entry = tab.display_entry(di)?.clone();
-                    let selected = tab.selection.contains(&entry.path);
-                    let cut = cut.contains(&entry.path);
-                    let name_parts = if hl_query.is_empty() {
-                        Vec::new()
-                    } else {
-                        tab.display_parts(di)
-                            .map(|(e, fields)| {
-                                crate::search::highlight_parts(
-                                    &e.name,
-                                    fields,
-                                    &hl_query,
-                                    &mut hl_matcher,
-                                    &mut hl_bufs,
-                                )
-                            })
-                            .unwrap_or_default()
-                    };
-                    Some((di as i32, entry, selected, cut, name_parts))
-                })
-                .collect();
-        // tab 借用随 collected 完成而结束。
-        let rows: Vec<FileRow> = collected
+    /// 为指定面板构建可视窗口的行模型（左栏 pane 0 / 右栏 pane 1）。
+    ///
+    /// 两遍构建：第一遍在 `self.state` 的不可变借用下收集条目/选择/高亮，
+    /// 第二遍释放借用后再调 `self.thumb_for` 填缩略图（可能需要 &mut self）。
+    fn build_rows_for_pane(
+        &mut self,
+        tab_index: usize,
+        pane_index: usize,
+        first: usize,
+        count: usize,
+    ) -> Vec<FileRow> {
+        let (collected, computer_view) = {
+            let tab = &self.state.tabs[tab_index];
+            let Some(pane) = tab.panes.get(pane_index) else {
+                return Vec::new();
+            };
+            let computer_view = pane.path.is_none();
+            let hl_query = pane.filter.trim().to_lowercase();
+            let cut = &self.state.cut_paths;
+            let mut hl_matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+            let mut hl_bufs = (Vec::new(), Vec::new(), Vec::new());
+            let collected: Vec<(i32, FileEntry, bool, bool, Vec<(String, bool)>)> =
+                (first..first + count)
+                    .filter_map(|di| {
+                        let entry = pane.display_entry(di)?.clone();
+                        let selected = pane.selection.contains(&entry.path);
+                        let cut = cut.contains(&entry.path);
+                        let name_parts = if hl_query.is_empty() {
+                            Vec::new()
+                        } else {
+                            pane.display_parts(di)
+                                .map(|(e, fields)| {
+                                    crate::search::highlight_parts(
+                                        &e.name,
+                                        fields,
+                                        &hl_query,
+                                        &mut hl_matcher,
+                                        &mut hl_bufs,
+                                    )
+                                })
+                                .unwrap_or_default()
+                        };
+                        Some((di as i32, entry, selected, cut, name_parts))
+                    })
+                    .collect();
+            (collected, computer_view)
+        };
+        collected
             .into_iter()
             .map(|(index, entry, selected, cut, name_parts)| {
                 let thumb = self.thumb_for(&entry.path, self.thumb_size_for_view());
@@ -1855,9 +1927,7 @@ impl App {
                     )),
                 }
             })
-            .collect();
-        self.ui
-            .set_file_rows(ModelRc::new(VecModel::from(rows)));
+            .collect()
     }
 
     /// 切换标签后的完整同步。
@@ -1868,14 +1938,114 @@ impl App {
         self.sync_nav();
         self.sync_breadcrumbs();
         self.sync_status();
+        self.sync_split_state();
+        let ratio = self.state.active().split_ratio;
+        self.ui.set_split_ratio(ratio);
         self.visible_cache = None;
         self.sync_file_list();
         self.sync_sidebar_active();
     }
 
+    /// 切换当前标签的分屏状态。
+    ///
+    /// - 开启：以当前聚焦面板为蓝本克隆第二个面板（同路径 / 历史 / 排序），
+    ///   聚焦切到新面板并立刻发起列举；
+    /// - 关闭：丢弃第二个面板，聚焦回到面板 0。
+    fn toggle_split(&mut self) {
+        let mut request = None;
+        {
+            let tab = self.state.active_mut();
+            if tab.kind != crate::state::TabKind::Explorer {
+                return; // 设置页不分屏
+            }
+            if !tab.is_split {
+                let src = tab.active();
+                let mut pane = crate::state::PaneState::new(src.path.clone());
+                pane.history = src.history.clone();
+                pane.history_index = src.history_index;
+                pane.sort = src.sort;
+                pane.loading = true;
+                tab.panes.push(pane);
+                tab.is_split = true;
+                tab.active_pane = 1;
+                let p = tab.active_pane;
+                request = Some((
+                    tab.id,
+                    p,
+                    tab.panes[p].generation,
+                    tab.panes[p].path.clone(),
+                    tab.panes[p].sort,
+                ));
+            } else {
+                tab.panes.truncate(1);
+                tab.is_split = false;
+                tab.active_pane = 0;
+            }
+        }
+        if let Some((id, pane, generation, path, sort)) = request {
+            self.request_listing(id, pane, generation, path, sort);
+        }
+        let ratio = self.state.active().split_ratio;
+        self.visible_cache = None;
+        self.sync_split_state();
+        self.ui.set_split_ratio(ratio);
+        self.sync_nav();
+        self.sync_breadcrumbs();
+        self.sync_status();
+        self.sync_file_list();
+        self.sync_tabs();
+    }
+
+    /// 聚焦某一分屏面板（0 / 1），顶部地址栏与工具栏随之切换数据源。
+    fn focus_pane(&mut self, index: usize) {
+        let active_tab = self.state.active_tab;
+        let mut request = None;
+        {
+            let Some(tab) = self.state.tabs.get_mut(active_tab) else {
+                return;
+            };
+            if index >= tab.panes.len() || tab.active_pane == index {
+                return;
+            }
+            tab.active_pane = index;
+            // 该面板尚未列举过（例如刚克隆出来）则补一次请求。
+            let need_reload = tab.panes[index].entries.is_empty()
+                && tab.panes[index].path.is_some()
+                && !tab.panes[index].loading;
+            if need_reload {
+                tab.panes[index].loading = true;
+                request = Some((
+                    tab.id,
+                    index,
+                    tab.panes[index].generation,
+                    tab.panes[index].path.clone(),
+                    tab.panes[index].sort,
+                ));
+            }
+        }
+        if let Some((id, pane, generation, path, sort)) = request {
+            self.request_listing(id, pane, generation, path, sort);
+        }
+        self.visible_cache = None;
+        self.sync_split_state();
+        self.sync_nav();
+        self.sync_breadcrumbs();
+        self.sync_status();
+        self.sync_file_list();
+        // 同步标签栏标题、图标和 loading：标签作用于当前聚焦面板。
+        self.sync_tabs();
+    }
+
+    /// 把分屏状态同步到 UI（开关 / 当前聚焦面板）。
+    fn sync_split_state(&self) {
+        let tab = self.state.active();
+        self.ui.set_is_split(tab.is_split);
+        self.ui.set_active_pane(tab.active_pane as i32);
+    }
+
     fn sync_sidebar_active(&mut self) {
         // 仅更新激活项（避免整表重建）。
-        let active_id = match self.state.active().path.as_ref() {
+        let active_id = match self.state.active().active().path.as_ref() {
             None => SharedString::default(),
             Some(path) => {
                 let s = path.to_string_lossy().into_owned();
@@ -1894,6 +2064,26 @@ impl App {
         };
         self.ui.set_sidebar_active_id(active_id);
     }
+}
+
+/// 计算某面板的虚拟窗口条目区间（行区间 × cells-per-row）。
+fn pane_view_range(
+    total: usize,
+    cells_per_row: usize,
+    row_h: f32,
+    rows_visible: usize,
+    scroll: f32,
+) -> (usize, usize) {
+    let total_rows = total.div_ceil(cells_per_row);
+    let mut first_row = (scroll / row_h).floor() as isize - OVERSCAN as isize;
+    first_row = first_row.clamp(0, total_rows.saturating_sub(1) as isize);
+    let first_row = first_row.max(0) as usize;
+    let count_rows = rows_visible.min(total_rows.saturating_sub(first_row)).max(1);
+    let first = first_row * cells_per_row;
+    let count = (count_rows * cells_per_row)
+        .min(total.saturating_sub(first))
+        .max(1);
+    (first, count)
 }
 
 fn header(label: &str) -> SidebarItem {
@@ -2050,7 +2240,7 @@ impl App {
         let danger = Color::from_rgb_u8(0xC4, 0x2B, 0x1C);
 
         // 回收站视图：专用菜单（还原 / 彻底删除 / 清空）。
-        if self.state.active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()) {
+        if self.state.active().active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()) {
             let mut items: Vec<MenuItem> = Vec::new();
             match target {
                 MenuTarget::Files(_) => {
@@ -2748,15 +2938,15 @@ impl App {
             _ => return,
         };
         let tab = self.state.active_mut();
-        if tab.sort.key == new_key {
-            tab.sort.ascending = !tab.sort.ascending;
+        if tab.active_mut().sort.key == new_key {
+            tab.active_mut().sort.ascending = !tab.active_mut().sort.ascending;
         } else {
-            tab.sort.key = new_key;
-            tab.sort.ascending = true;
+            tab.active_mut().sort.key = new_key;
+            tab.active_mut().sort.ascending = true;
         }
-        let sort = tab.sort;
-        sort_entries(&mut tab.entries, sort);
-        tab.rebuild_display();
+        let sort = tab.active_mut().sort;
+        sort_entries(&mut tab.active_mut().entries, sort);
+        tab.active_mut().rebuild_display();
         self.visible_cache = None;
         self.sync_file_list();
         self.sync_status();
@@ -2788,8 +2978,8 @@ impl App {
             Ok(()) => {
                 // 更新选择/暂存/剪切集合中的旧路径。
                 let tab = self.state.active_mut();
-                if tab.selection.remove(path) {
-                    tab.selection.insert(new_path.clone());
+                if tab.active_mut().selection.remove(path) {
+                    tab.active_mut().selection.insert(new_path.clone());
                 }
                 self.state.cut_paths.remove(path);
                 self.reload_active();
@@ -2806,7 +2996,7 @@ impl App {
             self.sync_staging();
             return;
         }
-        let Some(dest) = self.state.active().path.clone() else {
+        let Some(dest) = self.state.active().active().path.clone() else {
             self.set_status_job("请先进入目标文件夹");
             return;
         };
@@ -2831,7 +3021,7 @@ impl App {
 
     /// 开始重命名选中项（仅单项）。
     fn start_rename(&self) {
-        let paths = self.state.active().selected_paths();
+        let paths = self.state.active().active().selected_paths();
         if paths.len() == 1 {
             self.ui
                 .set_rename_path(paths[0].to_string_lossy().into_owned().into());
@@ -2840,7 +3030,7 @@ impl App {
 
     /// 打开选中项。
     fn open_selection(&mut self) {
-        let paths = self.state.active().selected_paths();
+        let paths = self.state.active().active().selected_paths();
         if let Some(path) = paths.first() {
             let path = path.clone();
             self.open_path(&path);
@@ -2849,7 +3039,7 @@ impl App {
 
     /// 删除选中项。
     fn delete_selection(&mut self, to_trash: bool) {
-        let paths = self.state.active().selected_paths();
+        let paths = self.state.active().active().selected_paths();
         if !paths.is_empty() {
             self.submit_job(JobKind::Delete { paths, to_trash });
         }
@@ -2859,12 +3049,12 @@ impl App {
     fn select_all(&mut self) {
         let selected: HashSet<PathBuf> = {
             let tab = self.state.active();
-            tab.display
+            tab.active().display
                 .iter()
-                .filter_map(|&i| tab.entries.get(i).map(|e| e.path.clone()))
+                .filter_map(|&i| tab.active().entries.get(i).map(|e| e.path.clone()))
                 .collect()
         };
-        self.state.active_mut().selection = selected;
+        self.state.active_mut().active_mut().selection = selected;
         self.visible_cache = None;
         self.refresh_visible_rows();
         self.sync_status();
@@ -2949,7 +3139,7 @@ impl App {
                         MenuTarget::Files(paths) => paths
                             .first()
                             .and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }),
-                        MenuTarget::Background => self.state.active().path.clone(),
+                        MenuTarget::Background => self.state.active().active().path.clone(),
                     };
                     if let Some(dir) = dir {
                         if let Err(e) = ops::open_terminal(&dir) {
@@ -2963,7 +3153,7 @@ impl App {
                         MenuTarget::Files(p) => p.clone(),
                         MenuTarget::Background => {
                             // 空白处右键属性：查看当前目录属性
-                            self.state.active().path.clone().into_iter().collect()
+                            self.state.active().active().path.clone().into_iter().collect()
                         }
                     };
                     if !paths.is_empty() {
@@ -3082,7 +3272,7 @@ impl App {
                     MenuTarget::Files(paths) => paths
                         .first()
                         .and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }),
-                    MenuTarget::Background => self.state.active().path.clone(),
+                    MenuTarget::Background => self.state.active().active().path.clone(),
                 };
                 if let Some(dir) = dir {
                     if let Err(e) = ops::open_terminal(&dir) {
@@ -3093,9 +3283,8 @@ impl App {
             ACT_NEW_FOLDER => self.create_folder(),
             ACT_REFRESH => self.user_refresh_active(),
             ACT_SELECT_ALL => {
-                let tab = self.state.active_mut();
-                let all: Vec<PathBuf> = tab
-                    .display
+                let tab = self.state.active_mut().active_mut();
+                let all: Vec<PathBuf> = tab.display
                     .iter()
                     .filter_map(|&i| tab.entries.get(i).map(|e| e.path.clone()))
                     .collect();
@@ -3139,10 +3328,10 @@ impl App {
     /// 激活行（双击 / Enter）：普通路径按类型打开；
     /// 回收站视图下还原到原位置。
     fn activate_row(&mut self, index: usize) {
-        let Some(entry) = self.state.active().display_entry(index).cloned() else {
+        let Some(entry) = self.state.active().active().display_entry(index).cloned() else {
             return;
         };
-        if self.state.active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()) {
+        if self.state.active().active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()) {
             let n = fs::drives::restore_recycle_entry(&entry.path);
             if n > 0 {
                 self.set_status_job(format!("已还原 {} 项到原位置", n));
@@ -3158,13 +3347,13 @@ impl App {
 
     /// 复制/剪切当前选择到系统剪贴板。
     fn copy_selection(&mut self, is_move: bool) {
-        let paths = self.state.active().selected_paths();
+        let paths = self.state.active().active().selected_paths();
         if paths.is_empty() {
             return;
         }
 
         let is_recycle =
-            self.state.active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path());
+            self.state.active().active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path());
         if is_recycle {
             // 回收站条目的物理文件在 $Recycle.Bin 下，原始路径在磁盘上不存在，
             // 不向系统 CF_HDROP 写入死路径（避免 Shell 报错），由 Rove 内部接管。
@@ -3206,7 +3395,7 @@ impl App {
 
     /// 粘贴剪贴板内容到当前目录（含回收站双向闭环）。
     fn paste_clipboard(&mut self) {
-        let Some(dest) = self.state.active().path.clone() else {
+        let Some(dest) = self.state.active().active().path.clone() else {
             self.set_status_job("请先进入目标文件夹");
             return;
         };
@@ -3304,7 +3493,7 @@ impl App {
 
     /// 在当前目录新建文件夹并进入重命名。
     fn create_folder(&mut self) {
-        let Some(dir) = self.state.active().path.clone() else {
+        let Some(dir) = self.state.active().active().path.clone() else {
             self.set_status_job("请先进入一个文件夹");
             return;
         };
@@ -3338,21 +3527,34 @@ impl App {
     /// 任务完成后的处理：刷新受影响目录。
     fn on_job_finished(&mut self, summary: JobSummary) {
         self.set_status_job(summary.message.clone());
-        // 刷新路径受影响的标签（源父目录 / 目标目录及其子路径）。
         let affected = &summary.affected_dirs;
+        let mut requests = Vec::new();
+
+        // 遍历所有标签页的所有面板，精准找出受影响的 pane。
         for index in 0..self.state.tabs.len() {
-            // 回收站视图始终刷新：删除/清空等操作都会改变回收站内容。
-            let is_recycle = self.state.tabs[index].path.as_deref()
-                == Some(fs::drives::recycle_virtual_path().as_path());
-            let needs = is_recycle
-                || self.state.tabs[index]
-                    .path
-                    .as_ref()
-                    .is_some_and(|p| affected.iter().any(|a| a == p || p.starts_with(a)));
-            if needs {
-                self.reload_tab(index);
+            let tab = &mut self.state.tabs[index];
+            for (pane_idx, pane) in tab.panes.iter_mut().enumerate() {
+                let is_recycle = pane.path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path());
+                let needs = is_recycle
+                    || pane.path.as_ref().is_some_and(|p| affected.iter().any(|a| a == p || p.starts_with(a)));
+                if needs {
+                    pane.loading = true;
+                    requests.push((tab.id, pane_idx, pane.generation, pane.path.clone(), pane.sort));
+                }
             }
         }
+
+        // 统一发起重新列举请求。
+        for (id, pane, gen, path, sort) in requests {
+            self.request_listing(id, pane, gen, path, sort);
+        }
+
+        // 如果当前有标签页因刷新而处于 loading 状态，同步更新 UI。
+        if self.state.tabs.iter().any(|t| t.active().loading) {
+            self.sync_file_list();
+            self.sync_status();
+        }
+
         // 移动操作会消耗剪贴板。
         if summary.message.starts_with("已移动") {
             self.state.clipboard_paths.clear();
@@ -3370,7 +3572,7 @@ impl App {
 impl App {
     /// 当前标签导航到路径（压入历史）。
     fn navigate_active(&mut self, path: Option<PathBuf>) {
-        self.state.active_mut().navigate(path);
+        self.state.active_mut().active_mut().navigate(path);
         self.sync_after_navigate();
     }
 
@@ -3392,26 +3594,26 @@ impl App {
 
     fn nav_back(&mut self) {
         let tab = self.state.active();
-        if !tab.can_go_back() {
+        if !tab.active().can_go_back() {
             return;
         }
-        let index = tab.history_index - 1;
-        self.state.active_mut().jump_to(index);
+        let index = tab.active().history_index - 1;
+        self.state.active_mut().active_mut().jump_to(index);
         self.sync_after_navigate();
     }
 
     fn nav_forward(&mut self) {
         let tab = self.state.active();
-        if !tab.can_go_forward() {
+        if !tab.active().can_go_forward() {
             return;
         }
-        let index = tab.history_index + 1;
-        self.state.active_mut().jump_to(index);
+        let index = tab.active().history_index + 1;
+        self.state.active_mut().active_mut().jump_to(index);
         self.sync_after_navigate();
     }
 
     fn nav_up(&mut self) {
-        let Some(parent) = self.state.active().parent_path() else {
+        let Some(parent) = self.state.active().active().parent_path() else {
             return;
         };
         self.navigate_active(parent);
@@ -3461,19 +3663,19 @@ impl App {
         if event.kind != PointerEventKind::Down {
             return;
         }
-        let Some(path) = self.state.active().display_entry(index).map(|e| e.path.clone()) else {
+        let Some(path) = self.state.active().active().display_entry(index).map(|e| e.path.clone()) else {
             return;
         };
         match event.button {
             PointerEventButton::Right => {
                 // 未选中则先选中它，再弹菜单。
-                if !self.state.active().selection.contains(&path) {
-                    let tab = self.state.active_mut();
+                if !self.state.active().active().selection.contains(&path) {
+                    let tab = self.state.active_mut().active_mut();
                     tab.selection.clear();
                     tab.selection.insert(path.clone());
                     tab.anchor = Some(path.clone());
                 }
-                let target = MenuTarget::Files(self.state.active().selected_paths());
+                let target = MenuTarget::Files(self.state.active().active().selected_paths());
                 self.menu_target = Some(target.clone());
                 self.visible_cache = None;
                 self.refresh_visible_rows();
@@ -3496,7 +3698,7 @@ impl App {
                 self.last_click = Some((path.clone(), now));
                 let ctrl = key_down(VK_CONTROL);
                 let shift = key_down(VK_SHIFT);
-                let tab = self.state.active_mut();
+                let tab = self.state.active_mut().active_mut();
                 if ctrl {
                     if tab.selection.contains(&path) {
                         tab.selection.remove(&path);
@@ -3506,8 +3708,7 @@ impl App {
                     tab.anchor = Some(path);
                 } else if shift {
                     if let Some(anchor) = tab.anchor.clone() {
-                        let anchor_pos = tab
-                            .display
+                        let anchor_pos = tab.display
                             .iter()
                             .position(|&i| tab.entries.get(i).is_some_and(|e| e.path == anchor));
                         if let Some(anchor_pos) = anchor_pos {
@@ -3537,13 +3738,13 @@ impl App {
                 self.refresh_visible_rows();
                 self.sync_status();
                 // 登记拖出待定手势：拖动的是选中集（行在选中集中时）或该行。
-                if self.state.active().path.is_some() && !self.ui.get_rename_path().is_empty() {
+                if self.state.active().active().path.is_some() && !self.ui.get_rename_path().is_empty() {
                     // 重命名输入态不触发拖出。
-                } else if let Some(row_path) = self.state.active().display_entry(index).map(|e| e.path.clone()) {
+                } else if let Some(row_path) = self.state.active().active().display_entry(index).map(|e| e.path.clone()) {
                     let tab = self.state.active();
-                    let paths = if tab.selection.contains(&row_path) && tab.selection.len() > 1 {
-                        tab.selected_paths()
-                    } else if tab.selection.contains(&row_path) {
+                    let paths = if tab.active().selection.contains(&row_path) && tab.active().selection.len() > 1 {
+                        tab.active().selected_paths()
+                    } else if tab.active().selection.contains(&row_path) {
                         vec![row_path]
                     } else {
                         vec![row_path]
@@ -3588,11 +3789,15 @@ impl App {
         let last_highlight_rect: std::rc::Rc<std::cell::RefCell<Option<windows_sys::Win32::Foundation::RECT>>> =
             std::rc::Rc::new(std::cell::RefCell::new(None));
         #[cfg(windows)]
+        let last_pane: std::rc::Rc<std::cell::Cell<i32>> = std::rc::Rc::new(std::cell::Cell::new(-1));
+        #[cfg(windows)]
         let last_idx: std::rc::Rc<std::cell::Cell<i32>> = std::rc::Rc::new(std::cell::Cell::new(-1));
 
         let outcome = crate::sys::dnd::begin_drag_out(&paths, {
             #[cfg(windows)]
             let last_highlight_rect = last_highlight_rect.clone();
+            #[cfg(windows)]
+            let last_pane = last_pane.clone();
             #[cfg(windows)]
             let last_idx = last_idx.clone();
             move || {
@@ -3600,9 +3805,12 @@ impl App {
                 if let Some(ui) = ui_weak.upgrade() {
                     #[cfg(windows)]
                     if let Some((lx, ly)) = cursor_window_logical(&ui, scale) {
-                        let idx = ui.invoke_row_hit_test(lx, ly);
+                        let res = ui.invoke_get_drop_target(lx, ly);
+                        let pane = if res.row_count() == 2 { res.row_data(0).unwrap_or(0) as i32 } else { 0 };
+                        let idx = if res.row_count() == 2 { res.row_data(1).unwrap_or(-1) as i32 } else { -1 };
 
-                        if idx != last_idx.get() {
+                        if pane != last_pane.get() || idx != last_idx.get() {
+                            last_pane.set(pane);
                             last_idx.set(idx);
 
                             // 1. 擦除上一个高亮框
@@ -3614,7 +3822,7 @@ impl App {
 
                             // 2. 在当前悬停项绘制原生高亮焦点框
                             if idx >= 0 && hwnd != 0 {
-                                let rect_arr = ui.invoke_get_item_rect(idx);
+                                let rect_arr = ui.invoke_get_item_rect_target(pane, idx);
                                 if rect_arr.row_count() == 4 {
                                     let rx = rect_arr.row_data(0).unwrap_or(0.0) * scale;
                                     let ry = rect_arr.row_data(1).unwrap_or(0.0) * scale;
@@ -3652,47 +3860,75 @@ impl App {
         }
     }
 
-    /// 任务 2.2：处理外部或内部拖入。
+    /// 任务 2.2：处理外部或内部拖入（支持左右分屏跨栏）。
     fn process_external_drop(&mut self) {
         let paths = std::mem::take(&mut self.drop_buffer);
         if paths.is_empty() || self.ui.get_settings_open() {
             return;
         }
-        let Some(base) = self.state.active().path.clone() else {
-            return;
-        };
 
-        // 光标（屏幕物理坐标）→ 窗口逻辑坐标 → 行命中
+        // 1. 根据鼠标光标位置判断目标是哪个 pane 和哪一行
         #[cfg(windows)]
-        let mut target = base.clone();
-        #[cfg(not(windows))]
-        let target = base.clone();
-        #[cfg(windows)]
-        {
+        let (target_pane, target_row) = {
             let scale = self.ui.window().scale_factor() as f32;
             if let Some((lx, ly)) = cursor_window_logical(&self.ui, scale) {
-                let idx = self.ui.invoke_row_hit_test(lx, ly);
-                if idx >= 0 {
-                    if let Some(e) = self.state.active().display_entry(idx as usize) {
-                        if e.is_dir {
-                            target = e.path.clone();
-                        }
-                    }
+                let res = self.ui.invoke_get_drop_target(lx, ly);
+                if res.row_count() == 2 {
+                    (
+                        res.row_data(0).unwrap_or(0) as usize,
+                        res.row_data(1).unwrap_or(-1) as i32,
+                    )
+                } else {
+                    (self.state.active().active_pane, -1)
                 }
+            } else {
+                (self.state.active().active_pane, -1)
+            }
+        };
+        #[cfg(not(windows))]
+        let (target_pane, target_row) = (self.state.active().active_pane, -1);
+
+        // 2. 确定目标目录（先取出 owned 值，避免持有 self.state 借用时再调 &mut self）
+        let target_dir_opt = self
+            .state
+            .active()
+            .panes
+            .get(target_pane)
+            .map(|pane| pane.path.clone());
+        let mut target_dir = match target_dir_opt {
+            Some(Some(p)) => p,
+            Some(None) => {
+                self.set_status_job("无法将文件拖放到此电脑");
+                return;
+            }
+            None => return,
+        };
+
+        // 3. 如果命中了文件夹，目标改为该文件夹
+        if target_row >= 0 {
+            let hit_dir = self
+                .state
+                .active()
+                .panes
+                .get(target_pane)
+                .and_then(|pane| pane.display_entry(target_row as usize))
+                .filter(|e| e.is_dir)
+                .map(|e| e.path.clone());
+            if let Some(dir) = hit_dir {
+                target_dir = dir;
             }
         }
 
-        // 1. 如果源文件本来就在目标目录下，说明是同级空白处误放，直接忽略（防止自我移动）
-        if paths.iter().all(|p| p.parent() == Some(&target)) {
-            return;
+        // 4. 防止原地拖放或拖入自身子目录
+        if paths.iter().all(|p| p.parent() == Some(target_dir.as_path())) {
+            return; // 同一目录下移动/复制，直接忽略
         }
-
-        // 2. 严禁将文件夹移动到自身或自身的子文件夹中
-        if paths.iter().any(|p| p == &target || target.starts_with(p)) {
+        if paths.iter().any(|p| p == &target_dir || target_dir.starts_with(p)) {
             self.set_status_job("无法将文件夹移动到自身或其子文件夹中");
             return;
         }
 
+        // 5. 判定是复制还是移动（修饰键优先，否则同盘移动、跨盘复制）
         let ctrl = key_down(VK_CONTROL);
         let shift = key_down(VK_SHIFT);
         let is_move = if ctrl {
@@ -3700,12 +3936,12 @@ impl App {
         } else if shift {
             true
         } else {
-            same_volume(&paths[0], &target)
+            same_volume(&paths[0], &target_dir)
         };
         let kind = if is_move {
-            JobKind::Move { sources: paths, dest_dir: target }
+            JobKind::Move { sources: paths, dest_dir: target_dir }
         } else {
-            JobKind::Copy { sources: paths, dest_dir: target }
+            JobKind::Copy { sources: paths, dest_dir: target_dir }
         };
         self.submit_job(kind);
     }
@@ -3716,7 +3952,7 @@ impl App {
             self.close_preview();
             return;
         }
-        let Some(path) = self.state.active().selected_paths().into_iter().next() else {
+        let Some(path) = self.state.active().active().selected_paths().into_iter().next() else {
             self.set_status_job("请先选中一项以预览");
             return;
         };
@@ -3873,8 +4109,8 @@ impl App {
         match event.button {
             PointerEventButton::Left => {
                 let tab = self.state.active_mut();
-                tab.selection.clear();
-                tab.anchor = None;
+                tab.active_mut().selection.clear();
+                tab.active_mut().anchor = None;
                 self.visible_cache = None;
                 self.refresh_visible_rows();
                 self.sync_status();
@@ -3934,7 +4170,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
 
                 // ---- 消费文件变更事件：逆向反查当前视图的直接子目录并防抖重算 ----
                 let mut got_events = false;
-                if let Some(cur_dir) = app.state.active().path.clone() {
+                if let Some(cur_dir) = app.state.active().active().path.clone() {
                     while let Ok(changed_path) = app.watch_rx.try_recv() {
                         // 1. 过滤 Rove 自身读写文件，打破贪吃蛇死循环
                         //    （重算时 save_to_temp 会写 AppData\Local\Temp\rove_dir_sizes.json，
@@ -4003,7 +4239,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                                         }
                                     }
                                     if let Some(entry) =
-                                        tab.entries.iter().find(|e| &e.path == d && e.is_dir)
+                                        tab.active().entries.iter().find(|e| &e.path == d && e.is_dir)
                                     {
                                         rescan_reqs.push((entry.path.clone(), entry.modified));
                                         dirsize_trace(format!(
@@ -4012,7 +4248,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                                         ));
                                     }
                                 }
-                                (tab.id, tab.generation)
+                                (tab.id, tab.active().generation)
                             };
                             if !rescan_reqs.is_empty() {
                                 // 记录本次派发时刻，供冷却判断
@@ -4223,9 +4459,9 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             "delete" => app.delete_selection(true),
             "delete_perm" => app.delete_selection(false),
             "properties" => {
-                let paths = app.state.active().selected_paths();
+                let paths = app.state.active().active().selected_paths();
                 let target: Vec<std::path::PathBuf> = if paths.is_empty() {
-                    app.state.active().path.clone().into_iter().collect()
+                    app.state.active().active().path.clone().into_iter().collect()
                 } else {
                     paths
                 };
@@ -4247,10 +4483,10 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                 app.ui.set_filter_text(SharedString::default());
                 {
                     let tab = app.state.active_mut();
-                    tab.filter.clear();
+                    tab.active_mut().filter.clear();
                 }
                 app.start_deep_search();
-                app.state.active_mut().rebuild_display();
+                app.state.active_mut().active_mut().rebuild_display();
                 app.sync_file_list();
                 app.sync_status();
             }
@@ -4277,7 +4513,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_new_tab_requested(move || {
             let Some(app) = app.upgrade() else { return };
-            let current = app.borrow().state.active().path.clone();
+            let current = app.borrow().state.active().active().path.clone();
             app.borrow_mut().state.new_tab(current);
             let mut app = app.borrow_mut();
             app.sync_active_tab();
@@ -4293,7 +4529,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 app.state.active_tab = index;
                 app.sync_active_tab();
                 // 标签内容已在状态中，直接展示；若正在加载则保持 loading。
-                if app.state.active().loading {
+                if app.state.active().active().loading {
                     app.reload_active();
                 }
             }
@@ -4402,8 +4638,49 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_file_scroll_changed(move |offset| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
-            app.state.active_mut().scroll_y = offset;
+            // 左栏固定映射 pane 0（活动栏可能已切到右侧）。
+            let active_tab = app.state.active_tab;
+            if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(0) {
+                pane.scroll_y = offset;
+            }
             app.refresh_visible_rows();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_scroll_changed_right(move |offset| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let active_tab = app.state.active_tab;
+            if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(1) {
+                pane.scroll_y = offset;
+            }
+            app.refresh_visible_rows();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_toggle_split(move || {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().toggle_split();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_pane_focused(move |index| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().focus_pane(index.max(0) as usize);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_split_ratio_changed(move |ratio| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let active_tab = app.state.active_tab;
+            if let Some(tab) = app.state.tabs.get_mut(active_tab) {
+                tab.split_ratio = ratio.clamp(0.2, 0.8);
+            }
         });
     }
     {
@@ -5139,6 +5416,11 @@ mod drag_hittest {
         let prev: WNDPROC = std::mem::transmute(PREV_WNDPROC.load(Ordering::Relaxed));
 
         if msg == WM_NCHITTEST {
+            // Rove 自身发起的拖拽期间，拦截所有非客户区，防止系统用缩放光标
+            // 覆盖 OLE 拖放自带的拖放光标（表现为拖到 Rove 边缘变成调整大小箭头）。
+            if crate::sys::dnd::IS_DRAGGING.load(Ordering::SeqCst) {
+                return HTCLIENT as isize;
+            }
             // 先让原过程处理，拿它的判定（边缘缩放手柄、原生标题栏等）。
             let hit = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
             let is_maximized = IsZoomed(hwnd as _) != 0;

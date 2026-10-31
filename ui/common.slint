@@ -327,3 +327,30 @@ export component IconTab inherits Rectangle {
         background: root.icon-color;
     }
 }
+
+// 分屏图标：圆角外框 + 中间竖线，表示左右分栏。
+export component IconSplit inherits Rectangle {
+    in property <length> size: 13px;
+    in property <color> icon-color: Theme.text-secondary;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    Rectangle {
+        x: 0.5px;
+        y: 0.5px;
+        width: parent.width - 1px;
+        height: parent.height - 1px;
+        border-radius: 3px;
+        border-width: 1.6px;
+        border-color: root.icon-color;
+        background: transparent;
+    }
+    Rectangle {
+        width: 1.6px;
+        height: parent.height - 1px;
+        x: (parent.width - self.width) / 2;
+        y: 0.5px;
+        background: root.icon-color;
+    }
+}

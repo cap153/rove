@@ -35,9 +35,8 @@ impl Default for TabKind {
     }
 }
 
-/// 一个标签页的完整状态。
-pub struct TabState {
-    pub id: u32,
+/// 单个分屏面板的完整状态：path / history / entries 等都挂在面板上。
+pub struct PaneState {
     /// None 表示"此电脑"根视图。
     pub path: Option<PathBuf>,
     /// 导航历史（含当前位置）。
@@ -73,16 +72,11 @@ pub struct TabState {
     /// 全局索引搜索的未截断命中总数；`Some(n)` 且 `display.len() < n` 时，
     /// 状态栏提示「结果已截断」。
     pub search_total: Option<usize>,
-    /// 标签页类型：普通文件管理器 / 设置页。
-    pub kind: TabKind,
-    /// 设置页当前子页面（仅 kind = Settings 时有效）。
-    pub settings_subpage: SettingsSubpage,
 }
 
-impl TabState {
-    pub fn new(id: u32, path: Option<PathBuf>) -> Self {
+impl PaneState {
+    pub fn new(path: Option<PathBuf>) -> Self {
         Self {
-            id,
             path: path.clone(),
             history: vec![path],
             history_index: 0,
@@ -101,17 +95,7 @@ impl TabState {
             deep_generation: 0,
             deep_searching: false,
             search_total: None,
-            kind: TabKind::Explorer,
-            settings_subpage: SettingsSubpage::default(),
         }
-    }
-
-    /// 新建一个设置页标签。
-    pub fn new_settings(id: u32, subpage: SettingsSubpage) -> Self {
-        let mut tab = Self::new(id, None);
-        tab.kind = TabKind::Settings;
-        tab.settings_subpage = subpage;
-        tab
     }
 
     pub fn can_go_back(&self) -> bool {
@@ -297,8 +281,57 @@ impl TabState {
             .sum();
         (dirs, files, selected_size)
     }
+}
+
+/// 一个标签页的完整状态：包含若干分屏面板（PaneState）、整体类型与分屏配置。
+pub struct TabState {
+    pub id: u32,
+    pub panes: Vec<PaneState>,
+    /// 当前聚焦的面板下标（0 或 1）。
+    pub active_pane: usize,
+    /// 是否处于分屏状态（仅 Explorer 标签；设置页不分屏）。
+    pub is_split: bool,
+    /// 左右分屏比例，0~1 之间（左栏占比）。
+    pub split_ratio: f32,
+    /// 标签页类型：普通文件管理器 / 设置页。
+    pub kind: TabKind,
+    /// 设置页当前子页面（仅 kind = Settings 时有效）。
+    pub settings_subpage: SettingsSubpage,
+}
+
+impl TabState {
+    pub fn new(id: u32, path: Option<PathBuf>) -> Self {
+        Self {
+            id,
+            panes: vec![PaneState::new(path.clone())],
+            active_pane: 0,
+            is_split: false,
+            split_ratio: 0.5,
+            kind: TabKind::Explorer,
+            settings_subpage: SettingsSubpage::default(),
+        }
+    }
+
+    /// 新建一个设置页标签。
+    pub fn new_settings(id: u32, subpage: SettingsSubpage) -> Self {
+        let mut tab = Self::new(id, None);
+        tab.kind = TabKind::Settings;
+        tab.settings_subpage = subpage;
+        tab
+    }
+
+    /// 当前聚焦面板。
+    pub fn active(&self) -> &PaneState {
+        &self.panes[self.active_pane]
+    }
+
+    /// 当前聚焦面板（可变）。
+    pub fn active_mut(&mut self) -> &mut PaneState {
+        &mut self.panes[self.active_pane]
+    }
 
     /// 标签标题：当前目录名 / "此电脑" / 设置页。
+    /// Explorer 标签取当前聚焦面板的目录名；设置页取子页面名。
     pub fn title(&self) -> String {
         if self.kind == TabKind::Settings {
             return match self.settings_subpage {
@@ -308,9 +341,9 @@ impl TabState {
                 SettingsSubpage::Shortcuts => "快捷键".to_string(),
                 SettingsSubpage::Duplicates => "重复文件".to_string(),
                 SettingsSubpage::QuickLook => "快速预览".to_string(),
-                };
+            };
         }
-        match &self.path {
+        match &self.panes[self.active_pane].path {
             None => "此电脑".to_string(),
             Some(p) if *p == crate::fs::drives::recycle_virtual_path() => "回收站".to_string(),
             Some(p) => p
@@ -376,11 +409,12 @@ impl AppState {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let mut tab = TabState::new(id, path);
-        // 新标签默认继承当前目录（Explorer/Pulse 习惯）。
-        if tab.path.is_none() {
-            if let Some(current) = self.active().path.clone() {
-                tab.path = Some(current.clone());
-                tab.history = vec![Some(current)];
+        // 新标签默认继承当前目录（Explorer/Pulse 习惯）：写入当前聚焦面板。
+        if tab.active().path.is_none() {
+            if let Some(current) = self.active().active().path.clone() {
+                let pane = tab.active_mut();
+                pane.path = Some(current.clone());
+                pane.history = vec![Some(current)];
             }
         }
         self.tabs.push(tab);

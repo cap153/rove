@@ -1,4 +1,4 @@
-import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup } from "common.slint";
+import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
@@ -121,6 +121,10 @@ export component MainWindow inherits Window {
     in-out property <[FileRow]> file-rows: [];
     in-out property <int> file-total: 0;
     in-out property <bool> file-loading: false;
+    // 分屏右栏数据源（分屏关闭时不使用）。
+    in-out property <[FileRow]> file-rows-right: [];
+    in-out property <int> file-total-right: 0;
+    in-out property <bool> file-loading-right: false;
     in-out property <string> sort-key: "name";
     in-out property <bool> sort-ascending: true;
     in-out property <string> rename-path: "";
@@ -154,6 +158,11 @@ out property <length> row-height-out: file-list.row-height-out;
     filter-has-focus: filter-input.has-focus;
     /// 文件列表可视高度（Rust 只读，用于虚拟窗口计算）。
     list-height: file-list.view-height;
+
+    // ---- 分屏（步骤 1：UI 搭建，核心逻辑待后续） ----
+    in-out property <bool> is-split: false;
+    in-out property <int> active-pane: 0;
+    in-out property <float> split-ratio: 0.5; // 左右分屏比例，0~1 之间
 
     // ---- 右键菜单状态 ----
     in-out property <[MenuItem]> menu-items: [];
@@ -190,6 +199,9 @@ out property <length> row-height-out: file-list.row-height-out;
     callback file_row_double_clicked(index: int);
     callback file_header_clicked(key: string);
     callback file_scroll_changed(offset: length);
+    // 分屏右栏滚动 / 分隔条比例落盘
+    callback file_scroll_changed_right(offset: length);
+    callback split_ratio_changed(ratio: float);
     callback file_background_pointer_event(event: PointerEvent, x: length, y: length);
     callback file_rename_committed(path: string, new_name: string);
     callback file_rename_cancelled();
@@ -205,6 +217,9 @@ out property <length> row-height-out: file-list.row-height-out;
     callback paste_requested();
     callback view_picker_requested();
     callback settings_requested();
+    // 分屏：切换分屏开关 / 某栏获得焦点（active-pane 高亮与地址栏归属）
+    callback toggle_split();
+    callback pane_focused(int);
     callback settings_nav_changed(id: string);
     // 诊断：设置页滚动几何（视口 / 内容 / 实测首选高度）。
     callback settings_scroll_debug(viewport: length, content: length, preferred: length);
@@ -247,9 +262,32 @@ out property <length> row-height-out: file-list.row-height-out;
         return [r[0] + file-list.absolute-position.x, r[1] + file-list.absolute-position.y, r[2], r[3]];
     }
 
+    /// 获取指定窗口坐标下的目标 pane 和行索引，返回 [pane_index, row_index]。
+    /// 分屏时以右栏左边界为分界判定命中哪一栏。
+    public function get-drop-target(wx: length, wy: length) -> [int] {
+        if (root.is-split) {
+            if (wx >= file-list-right.absolute-position.x) {
+                return [1, file-list-right.row-hit-test(wx - file-list-right.absolute-position.x, wy - file-list-right.absolute-position.y)];
+            }
+        }
+        return [0, file-list.row-hit-test(wx - file-list.absolute-position.x, wy - file-list.absolute-position.y)];
+    }
+
+    /// 获取指定 pane 和行索引相对窗口的坐标几何 [x, y, width, height]。
+    public function get-item-rect-target(pane: int, idx: int) -> [length] {
+        if (pane == 0) {
+            let r = file-list.get-item-rect(idx);
+            return [r[0] + file-list.absolute-position.x, r[1] + file-list.absolute-position.y, r[2], r[3]];
+        }
+        let r = file-list-right.get-item-rect(idx);
+        return [r[0] + file-list-right.absolute-position.x, r[1] + file-list-right.absolute-position.y, r[2], r[3]];
+    }
+
     /// 拖出上膛：行按下时禁用 flick 交互滚动，让拖动只发起 OLE 拖放。
+    /// 分屏时两栏都上膛（隐藏的右栏无副作用），保证从任意一栏都能发起拖出。
     public function set-drag-armed(v: bool) {
         file-list.set-drag-armed(v);
+        file-list-right.set-drag-armed(v);
     }
 
     /// 统一失焦：同时释放搜索框光标并退出地址栏编辑态。
@@ -568,6 +606,30 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                 }
 
+                // 分屏切换按钮（放在视图按钮与搜索框之间）。28x28，激活时高亮。
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 5px;
+                    background: root.is-split ? Theme.accent : (split-ta.has-hover ? Theme.bg-hover : transparent);
+
+                    IconSplit {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        size: 13px;
+                        icon-color: root.is-split ? Theme.accent-text : (split-ta.has-hover ? Theme.text-primary : Theme.text-secondary);
+                    }
+
+                    split-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.toggle_split();
+                        }
+                    }
+                }
+
                 // 当前目录过滤搜索（全局 MFT 搜索为后续阶段）。
                 Rectangle {
                     width: 200px;
@@ -725,11 +787,23 @@ out property <length> row-height-out: file-list.row-height-out;
             Rectangle {
                 horizontal-stretch: 1;
 
-                file-list := FileList {
+                file-split := HorizontalLayout {
                     width: 100%;
                     height: 100%;
                     visible: !root.settings-open;
-                    rows: root.file-rows;
+
+                    // 左栏（固定 pane 0）。分屏时宽度按 split-ratio 分配。
+                    // 用外层 Rectangle 包一层，便于给聚焦面板加高亮描边；file-list 命名不变。
+                    left-pane := Rectangle {
+                    horizontal-stretch: root.is-split ? root.split-ratio : 1.0;
+                    height: 100%;
+                    background: Theme.bg-list;
+
+                    file-list := FileList {
+                        width: 100%;
+                        height: 100%;
+                        visible: true;
+                        rows: root.file-rows;
                     total-count: root.file-total;
                     sort-key: root.sort-key;
                     sort-ascending: root.sort-ascending;
@@ -738,6 +812,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     row_pointer_event(index, event, x, y) => {
                         if (event.kind == PointerEventKind.down) {
                             root.clear-all-focus();
+                            root.pane_focused(0);
                         }
                         root.file_row_pointer_event(index, event, x, y);
                     }
@@ -745,6 +820,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         root.file_row_double_clicked(index);
                     }
                     header_clicked(key) => {
+                        root.pane_focused(0);
                         root.file_header_clicked(key);
                     }
                     scroll_changed(offset) => {
@@ -753,6 +829,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     background_pointer_event(event, x, y) => {
                         if (event.kind == PointerEventKind.down) {
                             root.clear-all-focus();
+                            root.pane_focused(0);
                         }
                         root.file_background_pointer_event(event, x, y);
                     }
@@ -761,6 +838,109 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                     rename_cancelled() => {
                         root.file_rename_cancelled();
+                    }
+                    }
+
+                    // 聚焦高亮：顶部 2px 强调条（画在列表之上，避免被背景盖住）。
+                    Rectangle {
+                        y: 0;
+                        width: 100%;
+                        height: 2px;
+                        background: root.is-split && root.active-pane == 0 ? Theme.accent : transparent;
+                    }
+                    }
+
+                    // 可拖分隔条：按布局宽度换算左右比例（限制 20%~80%），松手落盘。
+                    if (root.is-split) : Rectangle {
+                        width: 5px;
+                        background: splitter-ta.has-hover || splitter-ta.pressed ? Theme.accent : Theme.divider;
+
+                        splitter-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            moved => {
+                                if (self.pressed) {
+                                    if (file-split.width > 1px) {
+                                        let mx = splitter-ta.absolute-position.x + self.mouse-x - file-split.absolute-position.x;
+                                        let ratio = mx / file-split.width;
+                                        root.split-ratio = max(0.2, min(0.8, ratio));
+                                    }
+                                }
+                            }
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.up) {
+                                    root.split_ratio_changed(root.split-ratio);
+                                }
+                            }
+                        }
+                    }
+
+                    // 右栏（固定 pane 1）。常驻声明以便公共函数访问其几何，
+                    // 非分屏时通过 visible 隐藏（不可见元素不参与布局）。
+                    right-pane := Rectangle {
+                    visible: root.is-split;
+                    horizontal-stretch: root.is-split ? (1.0 - root.split-ratio) : 0.0;
+                    height: 100%;
+                    background: Theme.bg-list;
+
+                    file-list-right := FileList {
+                        width: 100%;
+                        height: 100%;
+                        rows: root.file-rows-right;
+                        total-count: root.file-total-right;
+                        sort-key: root.sort-key;
+                        sort-ascending: root.sort-ascending;
+                        view-mode: root.view-mode;
+                        show-path-column: root.show-path-column;
+                        rename-path: "";
+                        loading: root.file-loading-right;
+                        row_pointer_event(index, event, x, y) => {
+                            if (event.kind == PointerEventKind.down) {
+                                root.clear-all-focus();
+                                root.pane_focused(1);
+                            }
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                                root.file_row_pointer_event(index, event, x + left-pane.width + 5px, y);
+                            } else {
+                                root.file_row_pointer_event(index, event, x, y);
+                            }
+                        }
+                        row_double_clicked(index) => {
+                            root.file_row_double_clicked(index);
+                        }
+                        header_clicked(key) => {
+                            root.pane_focused(1);
+                            root.file_header_clicked(key);
+                        }
+                        scroll_changed(offset) => {
+                            root.file_scroll_changed_right(offset);
+                        }
+                        background_pointer_event(event, x, y) => {
+                            if (event.kind == PointerEventKind.down) {
+                                root.clear-all-focus();
+                                root.pane_focused(1);
+                            }
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                                root.file_background_pointer_event(event, x + left-pane.width + 5px, y);
+                            } else {
+                                root.file_background_pointer_event(event, x, y);
+                            }
+                        }
+                        rename_committed(path, new-name) => {
+                            root.file_rename_committed(path, new-name);
+                        }
+                        rename_cancelled() => {
+                            root.file_rename_cancelled();
+                        }
+                    }
+
+                    // 聚焦高亮：顶部 2px 强调条。
+                    Rectangle {
+                        y: 0;
+                        width: 100%;
+                        height: 2px;
+                        background: root.active-pane == 1 ? Theme.accent : transparent;
+                    }
                     }
                 }
 

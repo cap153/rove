@@ -140,7 +140,7 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
     }
 }
 
-/// 按文件名过滤（大小写不敏感的子串匹配）。当前由 TabState::rebuild_display
+/// 按文件名过滤（大小写不敏感的子串匹配）。当前由 PaneState::rebuild_display
 /// 内联实现，保留作单元测试与复用入口。
 #[allow(dead_code)]
 pub fn filter_entries(entries: &[FileEntry], filter: &str) -> Vec<usize> {
