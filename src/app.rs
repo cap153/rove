@@ -4154,8 +4154,11 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             return EventResult::Propagate;
         };
         let mut app = key_app.borrow_mut();
-        // 焦点在过滤框 / 重命名输入框时，按键归输入框所有。
-        if app.ui.get_filter_has_focus() || !app.ui.get_rename_path().is_empty() {
+        // 焦点在过滤框 / 重命名输入框 / 地址栏编辑框时，按键归输入框所有。
+        if app.ui.get_filter_has_focus()
+            || !app.ui.get_rename_path().is_empty()
+            || app.ui.get_path_editing()
+        {
             return EventResult::Propagate;
         }
         // 菜单打开时只处理 Escape。
