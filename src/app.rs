@@ -4682,11 +4682,15 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             if query.is_empty() {
                 app.jump_window
                     .set_results(ModelRc::new(VecModel::from(Vec::<JumpResult>::new())));
-                // bottom 吸附时窗口底边固定，结果清空后高度塌缩，需重新锚定底边缘，
-                // 否则底边会向上弹走约 296px 不再贴着对话框底部。
+                // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
+                // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行
                 #[cfg(windows)]
                 if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
-                    position_jump_window(&app, gx, gy, gw, gplacement);
+                    if gplacement == "bottom" {
+                        reposition_bottom_next_tick(gx, gy, gw, gplacement.clone());
+                    } else {
+                        position_jump_window(&app, gx, gy, gw, gplacement);
+                    }
                 }
                 return;
             }
@@ -4717,10 +4721,15 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
 
             app.jump_window.set_results(ModelRc::new(VecModel::from(results)));
 
-            // bottom 吸附时窗口高度随结果数变化，需重新锚定底边（top 吸附顶边固定，重算亦无害）
+            // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
+            // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行
             #[cfg(windows)]
             if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
-                position_jump_window(&app, gx, gy, gw, gplacement);
+                if gplacement == "bottom" {
+                    reposition_bottom_next_tick(gx, gy, gw, gplacement.clone());
+                } else {
+                    position_jump_window(&app, gx, gy, gw, gplacement);
+                }
             }
         });
     }
@@ -4731,9 +4740,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         app.borrow().jump_window.on_focus_changed(move || {
             let Some(app) = weak.upgrade() else { return };
             let app = app.borrow();
-            // 失焦收缩 / 聚焦展开都会改变窗口高度，bottom 吸附需重新锚定底边
+            // 失焦收缩 / 聚焦展开都会改变窗口高度，bottom 吸附需重新锚定底边：
+            // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行
             if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
-                position_jump_window(&app, gx, gy, gw, gplacement);
+                if gplacement == "bottom" {
+                    reposition_bottom_next_tick(gx, gy, gw, gplacement.clone());
+                } else {
+                    position_jump_window(&app, gx, gy, gw, gplacement);
+                }
             }
         });
     }
@@ -5282,21 +5296,79 @@ pub(crate) fn clear_global_focus() {
 /// - `top`：窗口顶边固定在对话框顶边上方 40px，搜索框不动，结果向下生长进对话框；
 /// - `bottom`：窗口底边固定在对话框底边下方 40px，搜索框不动，结果向上生长进对话框，
 ///   因此顶边需按 Slint 实时高度（`content-height`）上移。
+///
+/// bottom 的坑：Slint 窗口只能设左上角，resize 默认顶边锚定 → 高度一变底边就弹走一帧。
+/// 故 bottom 不走 `set_position`，而是直接调 Win32 `SetWindowPos`，在**同一次 API 调用**
+/// 里同时设定位置与大小，把底边锚定做成原子的，不留中间帧。
 #[cfg(windows)]
 fn position_jump_window(app: &App, x: i32, y: i32, w: i32, placement: &str) {
     let window = app.jump_window.window();
     let scale = window.scale_factor();
     let bar: i32 = (40.0 * scale) as i32;
 
-    let actual_y = if placement == "top" {
-        y - bar
-    } else {
-        let h = (app.jump_window.get_content_height() * scale) as i32;
-        y + bar - h
-    };
-    window.set_position(slint::PhysicalPosition::new(x, actual_y));
+    // 1. 先同步逻辑宽度和吸附方向给 Slint，确保 Slint 视口按正确宽度渲染，
+    //    避免 SetWindowPos 设完物理尺寸后又被逻辑宽度回写打桩
     app.jump_window.set_window_width((w as f32 / scale) as f32);
     app.jump_window.set_placement(placement.into());
+
+    if placement == "top" {
+        // 顶边固定：搜索框不动，结果向下生长，resize 不会让搜索框移动
+        window.set_position(slint::PhysicalPosition::new(x, y - bar));
+    } else {
+        // bottom：底边必须固定 → 用 SetWindowPos 原子设定位置 + 大小
+        let h = (app.jump_window.get_content_height() * scale) as i32;
+        let top = y + bar - h;
+        if let Some(hwnd) = jump_window_hwnd(window) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                SetWindowPos, SWP_NOCOPYBITS, SWP_NOACTIVATE, SWP_NOZORDER,
+            };
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    // SWP_NOZORDER 下插入位置无意义，传空指针避免干扰 Z 序
+                    std::ptr::null_mut(),
+                    x,
+                    top,
+                    // w 已经是对话框实测的物理像素宽度，切勿再除以 scale，
+                    // 否则 HWND 实际宽度小于 Slint 视口宽度，右侧被系统裁剪（渲染不完整）
+                    w,
+                    h,
+                    SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOCOPYBITS,
+                );
+            }
+        } else {
+            // 句柄暂不可得（极端时序）时的保底，仍可能有一帧底边弹动
+            window.set_position(slint::PhysicalPosition::new(x, top));
+        }
+    }
+}
+
+/// 取 Slint 吸附窗的 Win32 HWND（复用 show_dialog_jump 里 window_handle 的取法）。
+#[cfg(windows)]
+fn jump_window_hwnd(window: &slint::Window) -> Option<windows_sys::Win32::Foundation::HWND> {
+    use raw_window_handle::RawWindowHandle;
+    if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(&window.window_handle()) {
+        if let RawWindowHandle::Win32(win) = h.as_raw() {
+            return Some(win.hwnd.get() as windows_sys::Win32::Foundation::HWND);
+        }
+    }
+    None
+}
+
+/// 在下一轮事件循环里对 bottom 吸附窗做原子重定位。
+///
+/// 必须延后一轮：设置 `results` 后 `content-height` 尚未重新计算，立即读到的还是旧高度，
+/// 会导致底边锚定算错。延后到下一轮 Slint 已完成 height 重算，再调 `SetWindowPos` 原子锚定。
+/// 闭包只捕获 `i32/String`（均可 Send），运行时从事件循环线程经 `SESSION` 取 App，
+/// 避免携带 `Weak<RefCell<App>>`（非 Send）跨线程。
+#[cfg(windows)]
+fn reposition_bottom_next_tick(x: i32, y: i32, w: i32, placement: String) {
+    let _ = slint::invoke_from_event_loop(move || {
+        if let Some(app_rc) = SESSION.with(|slot| slot.borrow().clone()) {
+            let app = app_rc.borrow();
+            position_jump_window(&app, x, y, w, &placement);
+        }
+    });
 }
 
 /// 呼出文件对话框跳转吸附窗，并贴合到对话框边缘。
@@ -5314,10 +5386,14 @@ pub(crate) fn show_dialog_jump(
         app.jump_target = Some((hwnd, current_dir));
         app.jump_geom = Some((x, y, w, placement.clone()));
 
-        position_jump_window(&app, x, y, w, &placement);
-
+        // 1. 先 show() 让底层 HWND 创建完毕，否则首次呼出时
+        //    jump_window_hwnd 拿不到句柄，SetWindowPos 定位会静默失效
         let window = app.jump_window.window();
         let _ = app.jump_window.show();
+
+        // 2. 再定位（此时必然能取到有效 HWND，底边锚定一次到位）
+        position_jump_window(&app, x, y, w, &placement);
+
         // 默认不抢焦点：由用户主动点击吸附条再聚焦，避免在原生对话框里打字被劫持。
         // 仅登记吸附窗自身 HWND，供事件钩子豁免「用户点击吸附条」引发的 FOREGROUND 事件。
         use raw_window_handle::HasWindowHandle;
