@@ -1,0 +1,191 @@
+import { Theme, HighlightName, NamePart, IconSearch } from "common.slint";
+
+export struct JumpResult {
+    name: string,
+    path: string,
+    name-parts: [NamePart],
+}
+
+export component DialogJumpWindow inherits Window {
+    no-frame: true;
+    always-on-top: true;
+    background: Theme.bg-main;
+    // 独立窗口必须显式设默认字体族：否则落到 Slint 内置默认字体，
+    // CJK 字形覆盖不全，文件夹名里的生僻字会渲染成方块。
+    default-font-family: Theme.font-family;
+
+    in-out property <length> window-width: 600px;
+    width: root.window-width;
+    // 仅当搜索框拥有焦点且有结果时才撑开高度，否则只显示 40px 输入框（失焦自动收缩）
+    property <bool> show-results: input.has-focus && root.results.length > 0;
+    // 暴露实时高度给 Rust：bottom 吸附时窗口底边固定，顶边需按此值随高度上移
+    out property <length> content-height: 40px + (show-results ? min(root.results.length, 8) * 36px + 8px : 0px);
+    height: root.content-height;
+
+    in-out property <string> query: "";
+    // 声明为 in-out：跳转后需要由组件内部（clear-query）自行清空残留结果
+    in-out property <[JumpResult]> results: [];
+    in-out property <int> selected-index: 0;
+    // 吸附位置："bottom"（向下展开）或 "top"（向上展开）
+    in property <string> placement: "bottom";
+
+    callback text_changed(string);
+    callback item_activated(string);
+    // 焦点切换会改变窗口高度（失焦收缩 / 聚焦展开），Rust 需据此重新锚定 bottom 吸附位置
+    callback focus-changed();
+
+    public function init-focus() {
+        input.focus();
+        input.select-all();
+    }
+
+    public function clear-query() {
+        input.text = "";
+        root.query = "";
+        // 关键：同时清空结果模型与选中项，否则列表会带着上一次的残留结果继续展开
+        root.results = [];
+        root.selected-index = 0;
+    }
+
+    Rectangle {
+        width: parent.width;
+        height: parent.height;
+        border-width: 1px;
+        border-color: Theme.accent;
+        border-radius: 6px;
+        clip: true;
+
+        VerticalLayout {
+            // bottom 吸附：结果列表位于搜索框上方，向上生长进对话框（参考 Pulse 行为）
+            if (root.placement == "bottom" && root.show-results) : Rectangle {
+                vertical-stretch: 1;
+                background: Theme.bg-main;
+
+                Flickable {
+                    content-y: min(0px, max(self.height - self.content-height, -(root.selected-index * 36px + 18px) + self.height / 2));
+                    VerticalLayout {
+                        padding-top: 4px;
+                        padding-bottom: 4px;
+                        for item[i] in root.results : Rectangle {
+                            height: 36px;
+                            background: root.selected-index == i ? Theme.bg-selected : (item-ta-top.has-hover ? Theme.bg-hover : transparent);
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                Text { text: "📁"; color: Theme.accent; font-size: 14px; font-family: Theme.symbol-font-family; vertical-alignment: center; }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    HighlightName { height: 18px; parts: item.name-parts; font-size: 13px; is-dir: true; }
+                                    Text { height: 14px; text: item.path; color: Theme.text-secondary; font-size: 10.5px; overflow: elide; }
+                                }
+                            }
+                            item-ta-top := TouchArea { clicked => { root.item_activated(item.path); } }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 40px;
+                background: Theme.bg-input;
+
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    spacing: 8px;
+
+                    IconSearch {
+                        y: (parent.height - self.height) / 2;
+                        size: 14px;
+                        icon-color: Theme.accent;
+                    }
+
+                    input := TextInput {
+                        horizontal-stretch: 1;
+                        height: parent.height;
+                        text <=> root.query;
+                        font-size: 13px;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                        single-line: true;
+
+                        // 用 changed text 而非 edited：edited 只在「用户编辑」时触发，
+                        // IME 预编辑 / 程序化改写等路径可能不触发，表现为「能输入但不出结果」。
+                        changed text => {
+                            root.selected-index = 0;
+                            root.text_changed(self.text);
+                        }
+
+                        changed has-focus => {
+                            root.focus-changed();
+                        }
+
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                // Esc 仅取消聚焦：结果随即收缩回单行，吸附条保持挂载不隐藏
+                                input.clear-focus();
+                                return EventResult.accept;
+                            }
+                            if (event.text == Key.UpArrow) {
+                                root.selected-index = max(0, root.selected-index - 1);
+                                return EventResult.accept;
+                            }
+                            if (event.text == Key.DownArrow) {
+                                root.selected-index = min(root.results.length - 1, root.selected-index + 1);
+                                return EventResult.accept;
+                            }
+                            if (event.text == Key.Return) {
+                                if (root.show-results && root.selected-index >= 0 && root.selected-index < root.results.length) {
+                                    root.item_activated(root.results[root.selected-index].path);
+                                }
+                                return EventResult.accept;
+                            }
+                            return EventResult.reject;
+                        }
+                    }
+                }
+
+                // 分隔线：top 吸附（结果在下方）时在搜索框下缘，bottom 吸附（结果在上方）时在上缘
+                Rectangle {
+                    y: root.placement == "top" ? parent.height - 1px : 0px;
+                    width: parent.width;
+                    height: 1px;
+                    background: Theme.border;
+                }
+            }
+
+            // top 吸附：结果列表位于搜索框下方，向下生长进对话框（参考 Pulse 行为）
+            if (root.placement == "top" && root.show-results) : Rectangle {
+                vertical-stretch: 1;
+                background: Theme.bg-main;
+
+                Flickable {
+                    content-y: min(0px, max(self.height - self.content-height, -(root.selected-index * 36px + 18px) + self.height / 2));
+                    VerticalLayout {
+                        padding-top: 4px;
+                        padding-bottom: 4px;
+                        for item[i] in root.results : Rectangle {
+                            height: 36px;
+                            background: root.selected-index == i ? Theme.bg-selected : (item-ta-bottom.has-hover ? Theme.bg-hover : transparent);
+                            HorizontalLayout {
+                                padding-left: 12px;
+                                padding-right: 12px;
+                                spacing: 10px;
+                                Text { text: "📁"; color: Theme.accent; font-size: 14px; font-family: Theme.symbol-font-family; vertical-alignment: center; }
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    HighlightName { height: 18px; parts: item.name-parts; font-size: 13px; is-dir: true; }
+                                    Text { height: 14px; text: item.path; color: Theme.text-secondary; font-size: 10.5px; overflow: elide; }
+                                }
+                            }
+                            item-ta-bottom := TouchArea { clicked => { root.item_activated(item.path); } }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

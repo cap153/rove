@@ -9,6 +9,9 @@ import { Theme } from "common.slint";
 import { ScrollView, TextEdit } from "std-widgets.slint";
 
 export component PreviewWindow inherits Window {
+    // 独立窗口需显式设默认字体族，否则 CJK 生僻字会渲染成方块
+    default-font-family: Theme.font-family;
+
     in-out property <image> preview-image;
     in-out property <int> preview-kind: 2; // 0 图片/视频, 1 文本, 2 元数据
     in-out property <string> text-content: "";

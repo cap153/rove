@@ -13,6 +13,7 @@ export { PreviewWindow } from "preview_window.slint";
 // Slint 规定：全局单例只有从根文件（或 slint! 宏）导出，Rust 侧才能通过
 // ui.global::<Theme>() 访问，否则其值会被编译期内联。
 export { Theme } from "common.slint";
+export { DialogJumpWindow, JumpResult } from "dialog_jump.slint";
 
 // 工具栏导航按钮（内部自居中，高度适应工具栏，杜绝偏上问题）
 component nav-btn inherits Rectangle {

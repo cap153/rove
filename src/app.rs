@@ -427,7 +427,17 @@ pub struct App {
     /// 侧栏周期刷新（驱动器容量/回收站统计/网络位置）。
     /// 必须挂在 App 字段上：局部 Timer 会在函数返回时停止。
     refresh_timer: Timer,
-}
+    /// 文件对话框跳转吸附窗（Ctrl+G 呼出）。
+    jump_window: DialogJumpWindow,
+    /// 当前跳转目标：(对话框 HWND, 当前目录)。
+    jump_target: Option<(usize, Option<PathBuf>)>,
+    /// 最近一次吸附几何 (x, y, w, placement)，供结果数 / 焦点变化时重新锚定。
+    #[cfg(windows)]
+    jump_geom: Option<(i32, i32, i32, String)>,
+    /// 文件对话框吸附轮询定时器（仅 Windows 生效，见 wire_callbacks）。
+    /// 必须挂在 App 字段上：局部 Timer 会在函数返回时停止。
+    jump_poll_timer: Timer,
+    }
 
 // ---------------------------------------------------------------------------
 // 构造与运行
@@ -450,6 +460,7 @@ impl App {
     ) -> Self {
         let state = AppState::new(None);
         let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
+        let jump_window = DialogJumpWindow::new().unwrap();
         Self {
             ui,
             state,
@@ -491,6 +502,11 @@ impl App {
             poll_timer: Timer::default(),
             sidebar_timer: Timer::default(),
             refresh_timer: Timer::default(),
+            jump_window,
+            jump_target: None,
+            #[cfg(windows)]
+            jump_geom: None,
+            jump_poll_timer: Timer::default(),
         }
     }
 
@@ -4656,6 +4672,98 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
     {
+        let app = app.clone();
+        let weak = Rc::downgrade(&app);
+        app.borrow().jump_window.on_text_changed(move |query| {
+            let Some(app) = weak.upgrade() else { return };
+            let app = app.borrow_mut();
+
+            // 空查询（含 clear-query 的程序化清空）直接收空结果，避免白跑一次跨进程探测
+            if query.is_empty() {
+                app.jump_window
+                    .set_results(ModelRc::new(VecModel::from(Vec::<JumpResult>::new())));
+                // bottom 吸附时窗口底边固定，结果清空后高度塌缩，需重新锚定底边缘，
+                // 否则底边会向上弹走约 296px 不再贴着对话框底部。
+                #[cfg(windows)]
+                if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
+                    position_jump_window(&app, gx, gy, gw, gplacement);
+                }
+                return;
+            }
+
+            // 🎯 核心补丁：每次输入实时从对话框提取最新路径，避免跳转后目录滞后
+            #[cfg(windows)]
+            let current_latest_dir = app
+                .jump_target
+                .as_ref()
+                .and_then(|(hwnd, _)| crate::sys::dialog_jump::extract_current_folder(*hwnd as _));
+            #[cfg(not(windows))]
+            let current_latest_dir: Option<std::path::PathBuf> = None;
+
+            let hits = crate::search::jump::search(&query, current_latest_dir.as_deref());
+            let results: Vec<JumpResult> = hits
+                .into_iter()
+                .map(|hit| JumpResult {
+                    name: hit.name.into(),
+                    path: hit.path.to_string_lossy().into_owned().into(),
+                    name_parts: ModelRc::new(VecModel::from(
+                        hit.name_parts
+                            .into_iter()
+                            .map(|(t, hl)| NamePart { text: t.into(), hl })
+                            .collect::<Vec<_>>(),
+                    )),
+                })
+                .collect();
+
+            app.jump_window.set_results(ModelRc::new(VecModel::from(results)));
+
+            // bottom 吸附时窗口高度随结果数变化，需重新锚定底边（top 吸附顶边固定，重算亦无害）
+            #[cfg(windows)]
+            if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
+                position_jump_window(&app, gx, gy, gw, gplacement);
+            }
+        });
+    }
+    #[cfg(windows)]
+    {
+        let app = app.clone();
+        let weak = Rc::downgrade(&app);
+        app.borrow().jump_window.on_focus_changed(move || {
+            let Some(app) = weak.upgrade() else { return };
+            let app = app.borrow();
+            // 失焦收缩 / 聚焦展开都会改变窗口高度，bottom 吸附需重新锚定底边
+            if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
+                position_jump_window(&app, gx, gy, gw, gplacement);
+            }
+        });
+    }
+    {
+        let app = app.clone();
+        let weak = Rc::downgrade(&app);
+        app.borrow().jump_window.on_item_activated(move |_path| {
+            let Some(app) = weak.upgrade() else { return };
+            let app = app.borrow();
+            if let Some((_hwnd, _)) = app.jump_target {
+                #[cfg(windows)]
+                let _ = crate::sys::dialog_jump::navigate_dialog(_hwnd as _, Path::new(_path.as_str()));
+            }
+            // 跳转完成后自动清空搜索文本并收起结果，但保持窗口挂载以备后用
+            app.jump_window.invoke_clear_query();
+        });
+    }
+    {
+        // 文件对话框吸附轮询：跑在主线程事件循环上。
+        // 不能挂在钩子线程——那里会被 WINEVENT 的事件洪水饿死 WM_TIMER。
+        app.borrow().jump_poll_timer.start(
+            TimerMode::Repeated,
+            Duration::from_millis(500),
+            || {
+                #[cfg(windows)]
+                crate::sys::dialog_jump::poll_foreground();
+            },
+        );
+    }
+    {
         let app = Rc::downgrade(app);
         upgrade().on_show_hidden_toggled(move |enabled| {
             let Some(app) = app.upgrade() else { return };
@@ -5169,8 +5277,88 @@ pub(crate) fn clear_global_focus() {
     });
 }
 
+/// 按吸附方向重定位吸附窗（参考 Pulse 行为：搜索框钉在对话框边缘不动，结果向对话框内侧生长）。
+///
+/// - `top`：窗口顶边固定在对话框顶边上方 40px，搜索框不动，结果向下生长进对话框；
+/// - `bottom`：窗口底边固定在对话框底边下方 40px，搜索框不动，结果向上生长进对话框，
+///   因此顶边需按 Slint 实时高度（`content-height`）上移。
+#[cfg(windows)]
+fn position_jump_window(app: &App, x: i32, y: i32, w: i32, placement: &str) {
+    let window = app.jump_window.window();
+    let scale = window.scale_factor();
+    let bar: i32 = (40.0 * scale) as i32;
+
+    let actual_y = if placement == "top" {
+        y - bar
+    } else {
+        let h = (app.jump_window.get_content_height() * scale) as i32;
+        y + bar - h
+    };
+    window.set_position(slint::PhysicalPosition::new(x, actual_y));
+    app.jump_window.set_window_width((w as f32 / scale) as f32);
+    app.jump_window.set_placement(placement.into());
+}
+
+/// 呼出文件对话框跳转吸附窗，并贴合到对话框边缘。
+#[cfg(windows)]
+pub(crate) fn show_dialog_jump(
+    hwnd: usize,
+    current_dir: Option<PathBuf>,
+    x: i32,
+    y: i32,
+    w: i32,
+    placement: String,
+) {
+    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+        let mut app = app.borrow_mut();
+        app.jump_target = Some((hwnd, current_dir));
+        app.jump_geom = Some((x, y, w, placement.clone()));
+
+        position_jump_window(&app, x, y, w, &placement);
+
+        let window = app.jump_window.window();
+        let _ = app.jump_window.show();
+        // 默认不抢焦点：由用户主动点击吸附条再聚焦，避免在原生对话框里打字被劫持。
+        // 仅登记吸附窗自身 HWND，供事件钩子豁免「用户点击吸附条」引发的 FOREGROUND 事件。
+        use raw_window_handle::HasWindowHandle;
+        let handle = window.window_handle();
+        if let Ok(rh) = handle.window_handle() {
+            if let raw_window_handle::RawWindowHandle::Win32(win) = rh.as_raw() {
+                let slint_hwnd = win.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+                crate::sys::dialog_jump::register_jump_window(slint_hwnd as isize);
+            }
+        }
+    }
+}
+
+/// 对话框移动时实时跟随更新吸附窗位置与吸附方向。
+#[cfg(windows)]
+pub(crate) fn update_dialog_jump_position(x: i32, y: i32, w: i32, placement: String) {
+    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+        let mut app = app.borrow_mut();
+        app.jump_geom = Some((x, y, w, placement.clone()));
+        position_jump_window(&app, x, y, w, &placement);
+    }
+}
+
+/// 对话框失焦 / 销毁时自动隐藏吸附窗。
+#[cfg(windows)]
+pub(crate) fn hide_dialog_jump() {
+    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+        let mut app = app.borrow_mut();
+        app.jump_target = None;
+        app.jump_geom = None;
+        let _ = app.jump_window.window().hide();
+        app.jump_window.invoke_clear_query();
+    }
+    crate::sys::dialog_jump::register_jump_window(0);
+}
+
 pub fn run() {
     logln!("starting, args: {:?}", std::env::args().collect::<Vec<_>>());
+
+    // 守护模式启动：拉起 Windows 文件对话框监听器（非 Windows 平台为空实现）。
+    crate::sys::dialog_jump::start_daemon();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
