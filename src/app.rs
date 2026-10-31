@@ -5404,7 +5404,8 @@ mod drag_hittest {
         lparam: windows_sys::Win32::Foundation::LPARAM,
     ) -> windows_sys::Win32::Foundation::LRESULT {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CallWindowProcW, HTCAPTION, HTCLIENT, IsZoomed, WNDPROC, WM_NCHITTEST,
+            CallWindowProcW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
+            HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, WNDPROC, WM_NCHITTEST,
             WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
         };
 
@@ -5421,27 +5422,63 @@ mod drag_hittest {
             if crate::sys::dnd::IS_DRAGGING.load(Ordering::SeqCst) {
                 return HTCLIENT as isize;
             }
-            // 先让原过程处理，拿它的判定（边缘缩放手柄、原生标题栏等）。
-            let hit = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+
             let is_maximized = IsZoomed(hwnd as _) != 0;
 
-            // 未最大化：透传原判定，保留 6px 边缘缩放手柄（HTLEFT/HTTOP/…）。
-            // 已最大化：一律不再透传非客户区结果——最大化时窗口紧贴屏幕边缘，
-            // 那 6px 手柄会把最右/上边缘变成缩放光标，导致鼠标甩到右上角
-            // 点不中关闭按钮。此时强制把边缘收归客户区，只保留拖拽热区。
-            if !is_maximized && hit != HTCLIENT as isize {
-                return hit;
+            if !is_maximized {
+                let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
+                let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
+                let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
+                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd as _, &mut pt);
+                let scale = bits(&DRAG_SCALE);
+                let lx = pt.x as f32 / scale;
+                let ly = pt.y as f32 / scale;
+
+                let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
+                let win_w = (rect.right - rect.left) as f32 / scale;
+                let win_h = (rect.bottom - rect.top) as f32 / scale;
+                let border = 6.0;
+
+                // 1. 顶部边缘（宽 8px 防漏网）
+                if ly <= 8.0 {
+                    // 右上角按钮区（170px）禁止缩放，拦截 Winit 内部光标
+                    if lx >= win_w - 170.0 {
+                        return HTCLIENT as isize;
+                    }
+                    if lx <= border { return HTTOPLEFT as isize; }
+                    if lx >= win_w - border { return HTTOPRIGHT as isize; }
+                    return HTTOP as isize;
+                }
+
+                // 2. 底部边缘
+                if ly >= win_h - border {
+                    if lx <= border { return HTBOTTOMLEFT as isize; }
+                    if lx >= win_w - border { return HTBOTTOMRIGHT as isize; }
+                    return HTBOTTOM as isize;
+                }
+
+                // 3. 左侧边缘
+                if lx <= border {
+                    return HTLEFT as isize;
+                }
+
+                // 4. 右侧边缘
+                if lx >= win_w - border {
+                    return HTRIGHT as isize;
+                }
             }
+
+            // 非缩放边缘：判断是否在标题栏空白拖拽区。
             let (x, w, scale) = (bits(&DRAG_X), bits(&DRAG_W), bits(&DRAG_SCALE));
             if w > 0.0 && scale > 0.0 {
-                // lparam：低 16 位为屏幕 x、高 16 位为屏幕 y（均按有符号解析）。
                 let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
                 let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
                 let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
                 windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd as _, &mut pt);
                 let lx = pt.x as f32 / scale;
                 let ly = pt.y as f32 / scale;
-                // 纵向在标签栏内、横向处于空白拖拽区 → 向系统回报标题栏。
+                
                 if (0.0..=TAB_BAR_H).contains(&ly) && lx >= x && lx <= x + w {
                     return HTCAPTION as isize;
                 }
@@ -5477,7 +5514,7 @@ mod drag_hittest {
             PREV_WNDPROC.store(current as i64, Ordering::Relaxed);
             let _ = SetWindowLongPtrW(hwnd as _, GWLP_WNDPROC, wndproc as *const () as isize);
             INSTALLED_HWND.store(hwnd as i64, Ordering::Relaxed);
-            logln!("drag hittest: hooked hwnd={hwnd:#x} prev={current:#x}");
+            logv!("drag hittest: hooked hwnd={hwnd:#x} prev={current:#x}");
         }
     }
 }
@@ -5941,7 +5978,7 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         match hwnd {
             Some(h) if !drag_hittest::is_installed(h) => drag_hittest::install(h),
             Some(_) => {}
-            None => logln!("drag hittest: hwnd not ready after show(); will retry in poll_timer"),
+            None => logv!("drag hittest: hwnd not ready after show(); will retry in poll_timer"),
         }
         sync_drag_bounds(&app.borrow());
     }

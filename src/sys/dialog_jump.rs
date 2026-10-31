@@ -27,7 +27,7 @@ mod imp {
         WINEVENT_OUTOFCONTEXT,
     };
 
-    use crate::logln;
+    use crate::logv;
 
     static CURRENT_DIALOG: AtomicIsize = AtomicIsize::new(0);
 
@@ -395,7 +395,7 @@ mod imp {
                 return;
             }
         }
-        logln!("[rove:dialog_jump] filename restore failed: no writable edit");
+        logv!("[rove:dialog_jump] filename restore failed: no writable edit");
     }
 
     /// 驱动对话框跳转（Win32 消息流）。
@@ -429,7 +429,7 @@ mod imp {
             let candidates: Vec<usize> =
                 edit_candidates(dialog).into_iter().map(|h| h as usize).take(3).collect();
             if candidates.is_empty() {
-                logln!("[rove:dialog_jump] navigation failed: no filename edit found");
+                logv!("[rove:dialog_jump] navigation failed: no filename edit found");
                 return;
             }
             let ok_btn = find_ok_button(dialog);
@@ -451,7 +451,7 @@ mod imp {
 
                 // 1. 记下原本文件名（必须在注入动作之前）
                 let original_name = get_window_text(edit);
-                logln!(
+                logv!(
                     "[rove:dialog_jump] navigating dialog={:#x}, edit_ctrl={:#x}, ok_btn={:#x}, filename={:?}",
                     dialog as usize,
                     edit as usize,
@@ -461,7 +461,7 @@ mod imp {
 
                 // 2. 注入带尾斜杠的目标目录路径 + 触发跳转
                 if !set_window_text(edit, &target_str) {
-                    logln!("[rove:dialog_jump] candidate #{} rejected: write failed", idx);
+                    logv!("[rove:dialog_jump] candidate #{} rejected: write failed", idx);
                     continue;
                 }
                 trigger_accept(dialog, ok_btn);
@@ -473,7 +473,7 @@ mod imp {
                 if get_window_text(edit).trim_end_matches('\\')
                     == target_str.trim_end_matches('\\')
                 {
-                    logln!("[rove:dialog_jump] candidate #{} did not navigate", idx);
+                    logv!("[rove:dialog_jump] candidate #{} did not navigate", idx);
                     set_window_text(edit, "");
                     continue;
                 }
@@ -490,7 +490,7 @@ mod imp {
             unsafe {
                 SetForegroundWindow(dialog);
             }
-            logln!(
+            logv!(
                 "[rove:dialog_jump] navigation completed, filename restored: {}",
                 restore.as_ref().map(|(_, n)| n.as_str()).unwrap_or("")
             );
@@ -557,7 +557,7 @@ mod imp {
             if prev != hwnd as isize {
                 let folder = extract_current_folder(hwnd);
                 let (x, y, w, placement) = get_dialog_placement(hwnd);
-                logln!(
+                logv!(
                     "[rove:dialog_jump] poll: attaching to dialog {:#x}, placement={}",
                     hwnd as usize,
                     placement
@@ -571,7 +571,7 @@ mod imp {
         } else {
             let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
             if prev != 0 {
-                logln!("[rove:dialog_jump] poll: dialog blurred, hiding search bar");
+                logv!("[rove:dialog_jump] poll: dialog blurred, hiding search bar");
                 let _ = slint::invoke_from_event_loop(|| {
                     crate::app::hide_dialog_jump();
                 });
@@ -583,7 +583,7 @@ mod imp {
         std::thread::Builder::new()
             .name("rove-dialog-hook".into())
             .spawn(|| unsafe {
-                logln!("[rove:dialog_jump] hook thread started");
+                logv!("[rove:dialog_jump] hook thread started");
 
                 let hook = SetWinEventHook(
                     EVENT_SYSTEM_FOREGROUND,
@@ -640,7 +640,7 @@ mod imp {
                     if prev != hwnd as isize {
                         let folder = extract_current_folder(hwnd);
                         let (x, y, w, placement) = get_dialog_placement(hwnd);
-                        logln!(
+                        logv!(
                             "[rove:dialog_jump] auto-attaching to dialog {:#x}, placement={}",
                             hwnd as usize,
                             placement
@@ -661,7 +661,7 @@ mod imp {
                 } else {
                     let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
                     if prev != 0 {
-                        logln!("[rove:dialog_jump] dialog blurred, hiding search bar");
+                        logv!("[rove:dialog_jump] dialog blurred, hiding search bar");
                         let _ = slint::invoke_from_event_loop(|| {
                             crate::app::hide_dialog_jump();
                         });
@@ -672,7 +672,7 @@ mod imp {
                 let cur = CURRENT_DIALOG.load(Ordering::SeqCst);
                 if cur == hwnd as isize {
                     CURRENT_DIALOG.store(0, Ordering::SeqCst);
-                    logln!("[rove:dialog_jump] dialog closed, hiding search bar");
+                    logv!("[rove:dialog_jump] dialog closed, hiding search bar");
                     let _ = slint::invoke_from_event_loop(|| {
                         crate::app::hide_dialog_jump();
                     });

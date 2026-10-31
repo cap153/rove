@@ -69,9 +69,9 @@ component nav-btn inherits Rectangle {
 export component MainWindow inherits Window {
     title: "Rove";
     no-frame: true; // 移除 Windows 原生黑色标题栏与边框，改由 TabBar 右侧自绘控制按钮
-    // 最大化时边框厚度动态归 0，彻底关停 Slint 内部的缩放光标与点击拦截；还原时恢复 6px 正常缩放。
-    // （仅靠 WM_NCHITTEST 拦截不够：Slint 自己也会按该厚度返回 HTLEFT 等。）
-    resize-border-width: root.win-maximized ? 0px : 6px;
+    // 废弃 Winit 内置缩放：全部交由 app.rs 的 WM_NCHITTEST 钩子接管，
+    // 否则 Winit 会在客户区内部私自接管光标并触发缩放（导致右上角按钮区域出现调整大小箭头）。
+    resize-border-width: 0px;
     min-width: 880px;
     min-height: 560px;
     preferred-width: 1200px;
