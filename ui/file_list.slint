@@ -187,7 +187,7 @@ export component FileList inherits Rectangle {
     /// 滚动条轨道宽（含内边距）。
     private property <length> sb-width: 12px;
     /// 滚动条按下时记录的滑块 y，用于计算拖拽增量。
-    private property <length> sb-drag-start-thumb-y: 0px;
+    private property <length> sb-drag-grab-y: 0px;
     /// 横向滚动条按下时记录的滑块 x。
     private property <length> hsb-drag-start-thumb-x: 0px;
 
@@ -748,106 +748,97 @@ export component FileList inherits Rectangle {
         }
     }
 
-    // ---- 自绘横向滚动条（窗口窄于列宽总和时出现） ----
+    // ---- 自绘横向滚动条（现代浮动呼吸胶囊） ----
     hscrollbar := Rectangle {
-        x: 0px;
-        y: parent.height - 8px;
-        width: parent.width - (scrollbar.visible ? root.sb-width : 0px);
+        x: 2px;
+        y: parent.height - self.height - 2px;
+        width: parent.width - (scrollbar.visible ? 10px : 0px) - 4px;
         height: 8px;
         visible: flick.content-width > flick.width + 1px;
 
         property <length> track-w: self.width;
-        property <length> thumb-w: max(28px, min(self.track-w, self.track-w * flick.width / max(flick.content-width, 1px)));
-        property <length> thumb-x: self.track-w * (-flick.content-x / max(flick.content-width - flick.width, 1px));
-
-        htrack := Rectangle {
-            x: 5px;
-            y: 2px;
-            width: hscrollbar.track-w - 10px;
-            height: 3px;
-            background: Theme.border;
-            border-radius: 2px;
-        }
+        property <length> thumb-w: max(32px, min(self.track-w, self.track-w * flick.width / max(flick.content-width, 1px)));
+        // 核心修复：行程为 track-w - thumb-w，避免溢出
+        property <length> thumb-x: (self.track-w - self.thumb-w) * (-flick.content-x / max(flick.content-width - flick.width, 1px));
 
         hthumb := Rectangle {
-            x: 5px + hscrollbar.thumb-x * (hscrollbar.track-w - 10px - hscrollbar.thumb-w) / max(hscrollbar.track-w - hscrollbar.thumb-w, 1px);
-            y: 2px;
+            x: min(hscrollbar.track-w - hscrollbar.thumb-w, max(0px, hscrollbar.thumb-x));
+            y: parent.height - self.height;
             width: hscrollbar.thumb-w;
-            height: 3px;
-            border-radius: 2px;
-            background: hscrollbar-ta.has-hover ? Theme.text-disabled : Theme.border;
+            height: (hscrollbar-ta.has-hover || hscrollbar-ta.pressed) ? 6px : 4px;
+            border-radius: self.height / 2;
+            background: hscrollbar-ta.pressed
+                ? Theme.text-primary.transparentize(0.35)
+                : (hscrollbar-ta.has-hover ? Theme.text-primary.transparentize(0.5) : Theme.text-primary.transparentize(0.72));
+
+            animate height, background { duration: 150ms; easing: ease-out; }
         }
 
         hscrollbar-ta := TouchArea {
-            x: 0px;
-            y: 0px;
             width: 100%;
             height: 100%;
 
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                    hsb-drag-start-thumb-x = hthumb.x - self.mouse-x;
+                    hsb-drag-start-thumb-x = min(hscrollbar.track-w - hscrollbar.thumb-w, max(0px, hscrollbar.thumb-x));
                 }
             }
 
             moved => {
                 if (self.pressed) {
                     let target = self.mouse-x + hsb-drag-start-thumb-x;
-                    let ratio = (target - 5px) / max(hscrollbar.track-w - 10px - hscrollbar.thumb-w, 1px);
+                    let ratio = target / max(hscrollbar.track-w - hscrollbar.thumb-w, 1px);
                     flick.content-x = max(root.min-content-x, min(root.max-content-x, -ratio * (flick.content-width - flick.width)));
                 }
             }
         }
     }
 
-    // ---- 自绘垂直滚动条（避开样式 ScrollBar 的差异） ----
+    // ---- 自绘垂直滚动条（现代浮动呼吸胶囊，绝不消失） ----
     scrollbar := Rectangle {
-        x: parent.width - root.sb-width + 2px;
-        y: 0px;
-        width: root.sb-width;
-        height: parent.height;
+        x: parent.width - self.width - 2px;
+        y: 2px;
+        width: 8px;
+        height: parent.height - 4px;
         visible: flick.content-height > flick.height + 1px;
 
-        // 滑块几何：高度按视口占比，位置按滚动偏移。
-        // 注意：元素自身属性的绑定里 `root` 指代本元素，故用 self。
         property <length> track-h: self.height;
-        property <length> thumb-h: max(28px, min(self.track-h, self.track-h * flick.height / max(flick.content-height, 1px)));
-        property <length> thumb-y: self.track-h * (-flick.content-y / max(flick.content-height - flick.height, 1px));
-
-        track := Rectangle {
-            x: 5px;
-            y: 0px;
-            width: 3px;
-            height: scrollbar.track-h;
-            background: Theme.border;
-            border-radius: 2px;
-        }
+        property <length> thumb-h: max(32px, min(self.track-h, self.track-h * flick.height / max(flick.content-height, 1px)));
+        // 核心修复：行程为 track-h - thumb-h，滑块滚到底部时严丝合缝贴底，绝不再消失！
+        property <length> thumb-y: (self.track-h - self.thumb-h) * (-flick.content-y / max(flick.content-height - flick.height, 1px));
 
         thumb := Rectangle {
-            x: 3px;
-            y: scrollbar.thumb-y;
-            width: 7px;
+            x: parent.width - self.width;
+            y: min(scrollbar.track-h - scrollbar.thumb-h, max(0px, scrollbar.thumb-y));
+            width: (scrollbar-ta.has-hover || scrollbar-ta.pressed) ? 6px : 4px;
             height: scrollbar.thumb-h;
-            border-radius: 4px;
-            background: scrollbar-ta.has-hover ? Theme.text-disabled : Theme.border;
+            border-radius: self.width / 2;
+            background: scrollbar-ta.pressed
+                ? Theme.text-primary.transparentize(0.35)
+                : (scrollbar-ta.has-hover ? Theme.text-primary.transparentize(0.5) : Theme.text-primary.transparentize(0.72));
+
+            animate width, background { duration: 150ms; easing: ease-out; }
         }
 
         scrollbar-ta := TouchArea {
             width: 100%;
             height: 100%;
 
-            moved => {
-                if (self.pressed) {
-                    let ratio = (self.mouse-y - sb-drag-start-thumb-y) / max(scrollbar.track-h - scrollbar.thumb-h, 1px);
-                    let offset = max(root.min-content-y, min(root.max-content-y, -ratio * (flick.content-height - flick.height)));
-                    flick.content-y = offset;
-                    root.scroll-changed(-offset);
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    // 精准记录按下时鼠标相对于滑块顶部的距离
+                    root.sb-drag-grab-y = self.mouse-y - min(scrollbar.track-h - scrollbar.thumb-h, max(0px, scrollbar.thumb-y));
                 }
             }
 
-            pointer-event(event) => {
-                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                    sb-drag-start-thumb-y = scrollbar.thumb-y;
+            moved => {
+                if (self.pressed) {
+                    let max-travel = max(scrollbar.track-h - scrollbar.thumb-h, 1px);
+                    let target-y = self.mouse-y - root.sb-drag-grab-y;
+                    let ratio = max(0.0, min(1.0, target-y / max-travel));
+                    let offset = -ratio * (flick.content-height - flick.height);
+                    flick.content-y = max(root.min-content-y, min(root.max-content-y, offset));
+                    root.scroll-changed(-flick.content-y);
                 }
             }
 

@@ -35,16 +35,7 @@ export component Sidebar inherits Rectangle {
     // 允许纵向被压缩（内容在 Flickable 内滚动），把底部空间让给暂存托盘。
     min-height: 0px;
 
-    // 右侧 1px 分隔线。
-    Rectangle {
-        x: parent.width - 1px;
-        y: 0px;
-        width: 1px;
-        height: parent.height;
-        background: Theme.divider;
-    }
-
-    Flickable {
+    flick := Flickable {
         x: 0px;
         y: 0px;
         width: parent.width;
@@ -54,6 +45,8 @@ export component Sidebar inherits Rectangle {
         min-height: 0px;
         content-height: max(items-layout.preferred-height, self.height);
         interactive: true;
+        // 核心修复 1：彻底关闭鼠标拖动把侧栏当手机屏幕平移的行为
+        mouse-drag-pan-enabled: false;
 
         // 拖拽排序落点指示线（内容坐标系，绘制在条目之上）。
         if (root.drop-visible) : Rectangle {
@@ -287,8 +280,65 @@ export component Sidebar inherits Rectangle {
             }
         }
 
-        // ---- 底部固定：临时暂存托盘（在 Flickable 之外，始终贴住左下角，
-        // 不随侧栏内容滚动） ----
+    }
+
+    // 核心修复 2：滚动条必须放在 Flickable 外部，作为 Sidebar 的独立浮动层
+    sb := Rectangle {
+        x: parent.width - self.width - 2px;
+        y: 2px;
+        width: 8px;
+        height: parent.height - root.tray-h - 4px;
+        visible: flick.content-height > flick.height + 1px;
+        z: 20; // 确保置顶于内容之上
+
+        property <length> track-h: self.height;
+        property <length> thumb-h: max(28px, min(self.track-h, self.track-h * flick.height / max(flick.content-height, 1px)));
+        property <length> thumb-y: (self.track-h - self.thumb-h) * (-flick.content-y / max(flick.content-height - flick.height, 1px));
+        // 记录鼠标按下时在滑块内部的局部偏移
+        property <length> drag-grab-y: 0px;
+
+        thumb := Rectangle {
+            x: parent.width - self.width;
+            y: min(sb.track-h - sb.thumb-h, max(0px, sb.thumb-y));
+            width: (sb-ta.has-hover || sb-ta.pressed) ? 5px : 3px;
+            height: sb.thumb-h;
+            border-radius: self.width / 2;
+            background: sb-ta.pressed
+                ? Theme.text-primary.transparentize(0.35)
+                : (sb-ta.has-hover ? Theme.text-primary.transparentize(0.5) : Theme.text-primary.transparentize(0.72));
+
+            animate width, background { duration: 150ms; easing: ease-out; }
+        }
+
+        sb-ta := TouchArea {
+            width: 100%;
+            height: 100%;
+
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    // 按下时精准记录鼠标相对于滑块顶部的距离
+                    sb.drag-grab-y = self.mouse-y - min(sb.track-h - sb.thumb-h, max(0px, sb.thumb-y));
+                }
+            }
+
+            moved => {
+                if (self.pressed) {
+                    let max-travel = max(sb.track-h - sb.thumb-h, 1px);
+                    let target-y = self.mouse-y - sb.drag-grab-y;
+                    let ratio = max(0.0, min(1.0, target-y / max-travel));
+                    flick.content-y = -ratio * (flick.content-height - flick.height);
+                }
+            }
+
+            scroll-event(event) => {
+                if (event.delta-y != 0px) {
+                    let min-y = min(0px, flick.height - flick.content-height);
+                    flick.content-y = min(0px, max(min-y, flick.content-y + event.delta-y));
+                    return EventResult.accept;
+                }
+                return EventResult.reject;
+            }
+        }
     }
 
     tray := StagingTray {
