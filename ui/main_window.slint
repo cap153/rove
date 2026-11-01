@@ -164,6 +164,21 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <int> active-pane: 0;
     in-out property <float> split-ratio: 0.5; // 左右分屏比例，0~1 之间
 
+    // 核心修复 3：开启分屏或窗口收窄时，若空间不足以支撑双栏，自动智能收缩侧栏
+    changed is-split => {
+        if (root.is-split) {
+            let min_pane_w = 216px;
+            let double_pane_min = min_pane_w * 2 + 8px;
+            let max_allowed_sidebar = max(70px, root.width - double_pane_min);
+            if (root.sidebar-w > max_allowed_sidebar) {
+                root.sidebar-w = max_allowed_sidebar;
+                root.sidebar_width_changed(root.sidebar-w / 1px);
+            }
+            // 比例归中重置，确保两侧均衡
+            root.split-ratio = 0.5;
+        }
+    }
+
     // ---- 右键菜单状态 ----
     in-out property <[MenuItem]> menu-items: [];
     in-out property <length> menu-items-height: 0px;
@@ -786,11 +801,13 @@ out property <length> row-height-out: file-list.row-height-out;
             Rectangle {
                 horizontal-stretch: 1;
                 height: 100%;
+                min-width: 0px; // 允许按需收缩，绝不向外溢出窗口
                 background: Theme.bg-list;
 
                 file-split := HorizontalLayout {
                     width: 100%;
                     height: 100%;
+                    min-width: 0px;
                     visible: !root.settings-open;
 
                     // 左栏（固定 pane 0）。分屏时宽度按 split-ratio 分配。
@@ -798,6 +815,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     left-pane := Rectangle {
                     horizontal-stretch: root.is-split ? root.split-ratio : 1.0;
                     height: 100%;
+                    min-width: 0px;
                     background: Theme.bg-list;
 
                     file-list := FileList {
@@ -894,6 +912,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     visible: root.is-split;
                     horizontal-stretch: root.is-split ? (1.0 - root.split-ratio) : 0.0;
                     height: 100%;
+                    min-width: 0px;
                     background: Theme.bg-list;
 
                     file-list-right := FileList {
@@ -1028,13 +1047,14 @@ out property <length> row-height-out: file-list.row-height-out;
                     moved => {
                         if (self.pressed) {
                             let new_w = self.absolute-position.x + self.mouse-x;
-                            let min_pane_w = 240px;
+                            // 核心设定：单栏最小 216px（容纳 1 列超大图标 196px + 边距）；双栏最小 216*2 + 8 = 440px
+                            let min_pane_w = 216px;
                             let right_min = root.is-split ? (min_pane_w * 2 + 8px) : min_pane_w;
                             let max_w = max(70px, root.width - right_min);
                             let clamped_w = max(70px, min(max_w, new_w));
                             root.sidebar-w = clamped_w;
                             if (root.is-split) {
-                                let remaining_w = root.width - root.sidebar-w - 8px;
+                                let remaining_w = max(1px, root.width - root.sidebar-w - 8px);
                                 let min_ratio = min_pane_w / remaining_w;
                                 let clamped_ratio = max(min_ratio, min(1.0 - min_ratio, root.split-ratio));
                                 if (clamped_ratio != root.split-ratio) { root.split-ratio = clamped_ratio; }

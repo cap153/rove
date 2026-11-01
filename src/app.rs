@@ -1843,8 +1843,10 @@ impl App {
             };
             let (first1, count1) = pane_view_range(total1, cells_per_row, row_h, rows_visible, scroll1);
             let rows1 = self.build_rows_for_pane(self.state.active_tab, 1, first1, count1);
+            self.ui.set_file_total_right(total1 as i32);
             self.ui.set_file_rows_right(ModelRc::new(VecModel::from(rows1)));
         } else {
+            self.ui.set_file_total_right(0);
             self.ui.set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
         }
     }
@@ -5346,6 +5348,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let mut app = app.borrow_mut();
             app.config.sidebar_width = w;
             app.config.save();
+            // 核心修复：侧栏宽度改变后必须让可见行缓存失效，重新计算列数排版！
+            app.visible_cache = None;
+            app.refresh_visible_rows();
         });
     }
 }
