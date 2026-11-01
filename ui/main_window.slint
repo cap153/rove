@@ -195,6 +195,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback path_edit_committed(path: string);
     callback sidebar_header_drag(index: int, phase: int, y: length);
     callback sidebar_item_activated(id: string);
+    callback sidebar_width_changed(float);
     callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length);
     callback file_row_double_clicked(index: int);
     callback file_header_clicked(key: string);
@@ -242,7 +243,7 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <bool> can-paste: false;
 
     // ---- 布局常量 ----
-    private property <length> sidebar-w: 236px;
+    in-out property <length> sidebar-w: 236px;
     private property <length> topbar-h: 82px; // 标签栏 38 + 工具栏 44
     private property <length> statusbar-h: 28px;
 
@@ -734,16 +735,15 @@ out property <length> row-height-out: file-list.row-height-out;
             horizontal-stretch: 1;
             vertical-stretch: 1;
 
-            // 侧栏列：纵向布局（侧栏滚动区 + 底部固定暂存托盘）。
-            // 设置页为全屏布局，不渲染文件侧栏（宽度收为 0 以彻底让出布局空间）。
-            VerticalLayout {
-                visible: !root.settings-open;
-                width: root.settings-open ? 0px : root.sidebar-w;
+            // 侧栏列：侧边栏 + 右边缘拖拽条
+            if (!root.settings-open) : HorizontalLayout {
+                width: root.sidebar-w + 4px;
                 horizontal-stretch: 0;
                 spacing: 0px;
 
                 Sidebar {
-                    vertical-stretch: 1;
+                    width: root.sidebar-w;
+                    height: 100%;
                     items: root.sidebar-items;
                     active-id: root.sidebar-active-id;
                     loading: root.file-loading;
@@ -772,6 +772,51 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                     staging_move_here_requested() => {
                         root.staging_move_here_requested();
+                    }
+                }
+
+                // 拖拽条
+                Rectangle {
+                    width: 4px;
+                    height: 100%;
+                    background: sidebar-resizer-ta.has-hover || sidebar-resizer-ta.pressed ? Theme.accent : transparent;
+
+                    sidebar-resizer-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        mouse-cursor: col-resize;
+                        moved => {
+                            if (self.pressed) {
+                                let new_w = self.absolute-position.x + self.mouse-x;
+                                
+                                // 1 列超大图标通常需要 200px。为了左右都不至于挤压变形，各自最小分配 240px。
+                                let min_pane_w = 240px;
+                                let right_min = root.is-split 
+                                    ? (min_pane_w * 2 + 5px) // 左右两栏各 240 + 5px 分隔条
+                                    : min_pane_w;
+                                
+                                let max_w = max(70px, root.width - right_min);
+                                let clamped_w = max(70px, min(max_w, new_w));
+                                root.sidebar-w = clamped_w;
+                                
+                                // 2. 如果开启分屏且左右分配比例极其极端（比如 0.9 : 0.1），
+                                // 哪怕侧边栏缩到底，单侧分屏也可能不足 240px。
+                                // 因此我们限制 split-ratio 的边界，保证用户拖动侧栏时视野不被破坏。
+                                if (root.is-split) {
+                                    let remaining_w = root.width - root.sidebar-w - 5px;
+                                    let min_ratio = min_pane_w / remaining_w;
+                                    let clamped_ratio = max(min_ratio, min(1.0 - min_ratio, root.split-ratio));
+                                    if (clamped_ratio != root.split-ratio) {
+                                        root.split-ratio = clamped_ratio;
+                                    }
+                                }
+                            }
+                        }
+                        pointer-event(e) => {
+                            if (e.kind == PointerEventKind.up) {
+                                root.sidebar_width_changed(root.sidebar-w / 1px);
+                            }
+                        }
                     }
                 }
             }
@@ -862,8 +907,13 @@ out property <length> row-height-out: file-list.row-height-out;
                                 if (self.pressed) {
                                     if (file-split.width > 1px) {
                                         let mx = splitter-ta.absolute-position.x + self.mouse-x - file-split.absolute-position.x;
-                                        let ratio = mx / file-split.width;
-                                        root.split-ratio = max(0.2, min(0.8, ratio));
+                                        
+                                        // 核心修复：限制左右分屏的最小绝对像素为 240px，防止分屏被拉得极窄
+                                        let min_pane_w = 240px;
+                                        let max_left_w = file-split.width - min_pane_w - 5px;
+                                        let clamped_left_w = max(min_pane_w, min(max_left_w, mx));
+                                        
+                                        root.split-ratio = clamped_left_w / file-split.width;
                                     }
                                 }
                             }

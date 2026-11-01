@@ -15,6 +15,8 @@ pub struct Config {
     pub recent: Vec<PathBuf>,
     pub window_width: u32,
     pub window_height: u32,
+    /// 侧边栏当前宽度
+    pub sidebar_width: f32,
     pub staging_expanded: bool,
     /// 「最近使用」是否展开（默认 false 收起）。
     pub recent_expanded: bool,
@@ -49,6 +51,7 @@ impl Default for Config {
             recent: Vec::new(),
             window_width: 1150,
             window_height: 690,
+            sidebar_width: 236.0,
             staging_expanded: true,
             recent_expanded: false, // 默认收起
             quick_expanded: true,   // 默认展开
@@ -99,6 +102,11 @@ impl Config {
         if let Some(h) = json.get("window_height").and_then(|v| v.as_u64()) {
             if (360..=10000).contains(&h) {
                 config.window_height = h as u32;
+            }
+        }
+        if let Some(sw) = json.get("sidebar_width").and_then(|v| v.as_f64()) {
+            if (70.0..=1200.0).contains(&sw) {
+                config.sidebar_width = sw as f32;
             }
         }
         if let Some(expanded) = json.get("staging_expanded").and_then(|v| v.as_bool()) {
@@ -173,6 +181,7 @@ impl Config {
             "recent": self.recent.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
             "window_width": self.window_width,
             "window_height": self.window_height,
+            "sidebar_width": self.sidebar_width,
             "staging_expanded": self.staging_expanded,
             "recent_expanded": self.recent_expanded,
             "quick_expanded": self.quick_expanded,

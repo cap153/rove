@@ -5337,6 +5337,17 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             slint::CloseRequestResponse::HideWindow
         });
     }
+
+    // 侧边栏宽度拖拽落盘。
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_sidebar_width_changed(move |w| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.sidebar_width = w;
+            app.config.save();
+        });
+    }
 }
 
 /// 延迟销毁会话：投递到事件循环下一拍执行（避免在回调栈内 drop 窗口）。
@@ -5920,6 +5931,7 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         ui.window().set_size(WindowSize::Logical(LogicalSize::new(w, h)));
     }
     ui.set_staging_expanded(config.staging_expanded);
+    ui.set_sidebar_w(config.sidebar_width as f32);
     ui.set_view_mode(config.view_mode.clone().into());
 
     // 目录列举通道 + 工作线程（会话私有，销毁时工作线程随之退出）。

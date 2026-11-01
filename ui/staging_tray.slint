@@ -11,10 +11,15 @@ export component StagingTray inherits Rectangle {
     callback copy_here_requested();
     callback move_here_requested();
 
-    // 动态高度计算：空载时大幅压缩列表区，使托盘变得小巧精致
-    property <length> header-h: 32px; // 从 36px 压实到 32px
-    property <length> list-h: root.items.length > 0 ? 116px : 60px; // 有内容时 116px，空载时压缩至 60px
-    property <length> btn-h: 42px; // 按钮区压实到 42px
+    // 窄屏判定：当宽度不足以并排显示文字和按钮时触发
+    private property <bool> is-narrow: root.width < 180px;
+
+    // 动态高度计算：
+    // 1. 窄屏且无文件时，大幅压缩空态区域；窄屏有文件时，保持滚动区。
+    // 2. 窄屏按钮区改为垂直排列，高度扩展为 96px（3个按钮+间距）。
+    property <length> header-h: 32px;
+    property <length> list-h: root.items.length > 0 ? 116px : (root.is-narrow ? 10px : 60px);
+    property <length> btn-h: root.is-narrow ? 96px : 42px;
 
     height: root.expanded ? (root.header-h + root.list-h + root.btn-h) : root.header-h;
     background: Theme.bg-sidebar;
@@ -38,7 +43,7 @@ export component StagingTray inherits Rectangle {
 
         // ---- 标题栏 ----
         Rectangle {
-            height: root.header-h; // 改为引用变量
+            height: root.header-h;
 
             TouchArea {
                 width: 100%;
@@ -72,13 +77,15 @@ export component StagingTray inherits Rectangle {
                     }
                 }
 
+                // 宽屏时显示全名，窄屏时显示“暂存”
                 Text {
-                    text: "临时暂存托盘";
+                    text: root.is-narrow ? "暂存" : "临时暂存托盘";
                     color: Theme.text-primary;
                     font-size: 12px;
                     font-weight: 600;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
+                    overflow: elide;
                 }
 
                 if (root.items.length > 0) : Rectangle {
@@ -110,9 +117,9 @@ export component StagingTray inherits Rectangle {
             }
         }
 
-        // ---- 条目列表（固定高度容器，避免布局绑定环） ----
+        // ---- 条目列表 ----
         Rectangle {
-            height: root.expanded ? root.list-h : 0px; // 改为引用变量
+            height: root.expanded ? root.list-h : 0px;
             clip: true;
 
             if (root.expanded && root.items.length > 0) : Flickable {
@@ -199,8 +206,8 @@ export component StagingTray inherits Rectangle {
                 }
             }
 
-            // ---- 空态提示 ----
-            if (root.expanded && root.items.length == 0) : VerticalLayout {
+            // ---- 空态提示（仅宽屏显示，窄屏直接隐藏） ----
+            if (root.expanded && root.items.length == 0 && !root.is-narrow) : VerticalLayout {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
@@ -215,7 +222,7 @@ export component StagingTray inherits Rectangle {
                     horizontal-alignment: center;
                 }
                 Text {
-                    text: "在文件上右键「添加到暂存盘」，集中复制移动";
+                    text: "在文件上右键「添加到暂存盘」";
                     color: Theme.text-disabled;
                     font-size: 10px;
                     horizontal-alignment: center;
@@ -224,94 +231,167 @@ export component StagingTray inherits Rectangle {
         }
 
         // ---- 操作按钮 ----
-        if (root.expanded) : HorizontalLayout {
-            height: root.btn-h; // 改为引用变量
-            spacing: 6px;
+        if (root.expanded) : Rectangle {
+            height: root.btn-h;
+            width: 100%;
 
-            // 复制到当前目录。
-            Rectangle {
-                height: 28px;
-                y: (parent.height - self.height) / 2; // 替换死板的 y: 12px
-                horizontal-stretch: 1;
-                border-radius: 6px;
-                background: root.items.length > 0 ? Theme.accent : Theme.border;
+            // 1. 宽屏：横向排列
+            if (!root.is-narrow) : HorizontalLayout {
+                height: 42px;
+                width: 100%; // 强制占满宽度
+                spacing: 6px;
 
-                Text {
-                    text: "复制到此处";
-                    color: root.items.length > 0 ? Theme.accent-text : Theme.text-disabled;
-                    font-size: 11.5px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
-                    width: 100%;
-                    height: 100%;
+                // 复制到此处
+                Rectangle {
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    horizontal-stretch: 1;
+                    border-radius: 6px;
+                    background: root.items.length > 0 ? Theme.accent : Theme.border;
+                    Text {
+                        text: "复制到此处";
+                        color: root.items.length > 0 ? Theme.accent-text : Theme.text-disabled;
+                        font-size: 11.5px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            if (root.items.length > 0) { root.copy_here_requested(); }
+                        }
+                    }
                 }
 
-                TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    clicked => {
-                        if (root.items.length > 0) {
-                            root.copy_here_requested();
+                // 移动
+                Rectangle {
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    horizontal-stretch: 1;
+                    border-radius: 6px;
+                    background: (root.items.length > 0) ? Theme.bg-badge : transparent;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    Text {
+                        text: "移动";
+                        color: root.items.length > 0 ? Theme.text-primary : Theme.text-disabled;
+                        font-size: 11.5px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            if (root.items.length > 0) { root.move_here_requested(); }
+                        }
+                    }
+                }
+
+                // 清空（固定宽度 28px，不参与拉伸）
+                Rectangle {
+                    width: 28px;
+                    height: 28px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 6px;
+                    background: (root.items.length > 0 && clear-ta.has-hover) ? Theme.bg-hover : transparent;
+                    Text {
+                        text: "🗑";
+                        color: root.items.length > 0 ? Theme.text-secondary : Theme.text-disabled;
+                        font-size: 12px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                    clear-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            if (root.items.length > 0) { root.clear_requested(); }
                         }
                     }
                 }
             }
 
-            // 移动到当前目录。
-            Rectangle {
-                width: 84px;
-                height: 28px;
-                y: (parent.height - self.height) / 2; // 替换死板的 y: 12px
-                border-radius: 6px;
-                background: (root.items.length > 0) ? Theme.bg-badge : transparent;
-                border-width: 1px;
-                border-color: Theme.border;
+            // 2. 窄屏：纵向排列
+            if (root.is-narrow) : VerticalLayout {
+                height: 96px;
+                spacing: 6px;
+                alignment: center;
 
-                Text {
-                    text: "移动";
-                    color: root.items.length > 0 ? Theme.text-primary : Theme.text-disabled;
-                    font-size: 11.5px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                Rectangle {
+                    height: 28px;
                     width: 100%;
-                    height: 100%;
-                }
-
-                TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    clicked => {
-                        if (root.items.length > 0) {
-                            root.move_here_requested();
+                    border-radius: 6px;
+                    background: root.items.length > 0 ? Theme.accent : Theme.border;
+                    Text {
+                        text: "复制";
+                        color: root.items.length > 0 ? Theme.accent-text : Theme.text-disabled;
+                        font-size: 11.5px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            if (root.items.length > 0) { root.copy_here_requested(); }
                         }
                     }
                 }
-            }
 
-            // 清空。
-            Rectangle {
-                width: 28px;
-                height: 28px;
-                y: (parent.height - self.height) / 2; // 替换死板的 y: 12px
-                border-radius: 6px;
-                background: (root.items.length > 0 && clear-ta.has-hover) ? Theme.bg-hover : transparent;
-
-                Text {
-                    text: "🗑";
-                    color: root.items.length > 0 ? Theme.text-secondary : Theme.text-disabled;
-                    font-size: 12px;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+                Rectangle {
+                    height: 28px;
                     width: 100%;
-                    height: 100%;
+                    border-radius: 6px;
+                    background: (root.items.length > 0) ? Theme.bg-badge : transparent;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    Text {
+                        text: "移动";
+                        color: root.items.length > 0 ? Theme.text-primary : Theme.text-disabled;
+                        font-size: 11.5px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            if (root.items.length > 0) { root.move_here_requested(); }
+                        }
+                    }
                 }
 
-                clear-ta := TouchArea {
+                Rectangle {
+                    height: 28px;
                     width: 100%;
-                    height: 100%;
-                    clicked => {
-                        if (root.items.length > 0) {
-                            root.clear_requested();
+                    border-radius: 6px;
+                    background: (root.items.length > 0 && clear-ta-narrow.has-hover) ? Theme.bg-hover : transparent;
+                    Text {
+                        text: "清空";
+                        color: root.items.length > 0 ? Theme.text-secondary : Theme.text-disabled;
+                        font-size: 11.5px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+                    clear-ta-narrow := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            if (root.items.length > 0) { root.clear_requested(); }
                         }
                     }
                 }
