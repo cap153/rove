@@ -154,6 +154,7 @@ in-out property <bool> show-path-column <=> file-list.show-path-column;
 out property <int> cells-per-row: file-list.cells-per-row;
     out property <length> view-width: file-list.view-width;
 out property <length> row-height-out: file-list.row-height-out;
+    out property <bool> is-icons-view-out: file-list.is-icons-view;
     /// 过滤输入框是否持有焦点（焦点在内时不响应应用级快捷键）。
     in-out property <bool> filter-has-focus;
     filter-has-focus: filter-input.has-focus;
@@ -229,6 +230,8 @@ out property <length> row-height-out: file-list.row-height-out;
     callback file_scroll_changed_right(offset: length);
     callback split_ratio_changed(ratio: float);
     callback file_background_pointer_event(event: PointerEvent, x: length, y: length);
+    callback file_rubber_band_selected(x1: length, y1: length, x2: length, y2: length);
+    callback file_rubber_band_move(x1: length, y1: length, x2: length, y2: length);
     callback file_rename_committed(path: string, new_name: string);
     callback file_rename_cancelled();
     callback staging_item_removed(index: int);
@@ -862,6 +865,12 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                         root.file_background_pointer_event(event, x, y);
                     }
+                    rubber_band_selected(x1, y1, x2, y2) => {
+                        root.file_rubber_band_selected(x1, y1, x2, y2);
+                    }
+                    rubber_band_move(x1, y1, x2, y2) => {
+                        root.file_rubber_band_move(x1, y1, x2, y2);
+                    }
                     rename_committed(path, new-name) => {
                         root.file_rename_committed(path, new-name);
                     }
@@ -973,6 +982,12 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                         rename_cancelled() => {
                             root.file_rename_cancelled();
+                        }
+                        rubber_band_selected(x1, y1, x2, y2) => {
+                            root.file_rubber_band_selected(x1, y1, x2, y2);
+                        }
+                        rubber_band_move(x1, y1, x2, y2) => {
+                            root.file_rubber_band_move(x1, y1, x2, y2);
                         }
                     }
 

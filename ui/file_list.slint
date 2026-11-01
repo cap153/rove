@@ -52,6 +52,19 @@ export component FileList inherits Rectangle {
     // 关键：横向滚动时表头/行会向左偏移，必须整体裁剪，
     // 否则会绘制到侧边栏区域之上。
     clip: true;
+    // 核心新增：框选相关属性
+    in-out property <bool> is-selecting: false;
+    private property <length> sel-x1: 0px;
+    private property <length> sel-y1: 0px;
+    private property <length> sel-x2: 0px;
+    private property <length> sel-y2: 0px;
+
+    // 供 Rust 调用的回调
+    callback rubber-band-selected(x1: length, y1: length, x2: length, y2: length);
+    callback rubber-band-move(x1: length, y1: length, x2: length, y2: length);
+
+    // 暴露给 Rust，区分网格/列表的碰撞算法
+    out property <bool> is-icons-view-out: root.is-icons-view;
     // 核心修复 1：允许列表容器自由向内压缩，绝不向外死锁 560px 宽度
     min-width: 0px;
 
@@ -341,7 +354,7 @@ export component FileList inherits Rectangle {
             // 横向：图标网格视图宽度严格等于视口自身（自动向下换行），只有详细/列表视图才使用 min-list-width
             content-width: root.is-icons-view ? self.width : max(root.min-list-width, self.width);
 
-            // 空白处点击 / 右键。
+            // 空白处点击 / 右键 / 框选。
             TouchArea {
                 x: 0px;
                 y: 0px;
@@ -363,9 +376,39 @@ export component FileList inherits Rectangle {
 
                 pointer-event(event) => {
                     if (event.kind == PointerEventKind.down) {
-                        root.background-pointer-event(event, self.mouse-x, self.mouse-y);
+                        // 左键：触发框选；右键：走原有逻辑
+                        if (event.button == PointerEventButton.left) {
+                            root.sel-x1 = self.mouse-x;
+                            root.sel-y1 = self.mouse-y;
+                            root.sel-x2 = self.mouse-x;
+                            root.sel-y2 = self.mouse-y;
+                            root.is-selecting = true;
+                            // 让 Rust 清空旧选择
+                            root.background-pointer-event(event, self.mouse-x, self.mouse-y);
+                            return EventResult.accept;
+                        } else if (event.button == PointerEventButton.right) {
+                            root.background-pointer-event(event, self.mouse-x, self.mouse-y);
+                            return EventResult.accept;
+                        }
+                    }
+
+                    if (event.kind == PointerEventKind.move && root.is-selecting) {
+                        root.sel-x2 = self.mouse-x;
+                        root.sel-y2 = self.mouse-y;
+                        // 核心：在背景 TouchArea 中直接触发移动回调
+                        root.rubber-band-move(root.sel-x1, root.sel-y1, root.sel-x2, root.sel-y2);
                         return EventResult.accept;
                     }
+
+                    if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.is-selecting) {
+                        root.is-selecting = false;
+                        // 仅在拖动了一定距离后才触发框选回调，避免误触
+                        if (abs(root.sel-x1 - root.sel-x2) > 4px || abs(root.sel-y1 - root.sel-y2) > 4px) {
+                            root.rubber-band-selected(root.sel-x1, root.sel-y1, root.sel-x2, root.sel-y2);
+                        }
+                        return EventResult.accept;
+                    }
+
                     return EventResult.reject;
                 }
             }
@@ -752,6 +795,18 @@ export component FileList inherits Rectangle {
 
                 // 剪切态淡出。
                 opacity: row.cut ? 0.45 : (row.is-hidden ? 0.5 : 1.0);
+            }
+
+            // ---- 框选视觉层（不需要 TouchArea 拦截） ----
+            if (root.is-selecting) : Rectangle {
+                x: min(root.sel-x1, root.sel-x2);
+                y: min(root.sel-y1, root.sel-y2);
+                width: abs(root.sel-x1 - root.sel-x2);
+                height: abs(root.sel-y1 - root.sel-y2);
+                // 像原生一样淡雅（透明度 0.88 的强调色）
+                background: Theme.accent.transparentize(0.88);
+                border-width: 1px;
+                border-color: Theme.accent;
             }
         }
     }

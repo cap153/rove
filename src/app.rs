@@ -4125,6 +4125,135 @@ impl App {
             _ => {}
         }
     }
+
+    /// 处理文件列表的框选。
+    fn handle_rubber_band_select(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
+        let left = x1.min(x2);
+        let right = x1.max(x2);
+
+        // 核心修复：加上当前视口的滚动偏移，转换为虚拟列表的绝对坐标
+        let scroll_y = self.state.active().active().scroll_y;
+        let top = y1.min(y2) + scroll_y;
+        let bottom = y1.max(y2) + scroll_y;
+
+        let is_icons = self.ui.get_is_icons_view_out();
+        let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
+        let row_h = self.ui.get_row_height_out();
+
+        let tab = self.state.active_mut().active_mut();
+        let mut newly_selected = HashSet::new();
+
+        // 遍历当前的 display 列表（即视图中所有条目）
+        for di in 0..tab.display.len() {
+            let entry = match tab.display_entry(di) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // 计算单元格的绝对坐标 (y 包含滚动偏移，因为选框是在 flick 内部生成的)
+            let (ix, iy, iw, ih) = if is_icons {
+                let col = di % cells_per_row;
+                let row = di / cells_per_row;
+                let x = col as f32 * 196.0 + 4.0; // 默认最大图标 196px
+                let y = row as f32 * 212.0 + 4.0; // 默认最大图标 212px
+                (x, y, 196.0 - 8.0, 212.0 - 8.0)
+            } else {
+                let y = di as f32 * row_h;
+                (0.0, y, 5000.0, row_h) // 列表视图横向全宽
+            };
+
+            // AABB 碰撞检测 (AxisAlignment Bounding Box)
+            if ix < right && ix + iw > left && iy < bottom && iy + ih > top {
+                newly_selected.insert(entry.path.clone());
+            }
+        }
+
+        tab.selection.extend(newly_selected);
+        tab.anchor = None; // 框选后取消按住锚点
+        self.visible_cache = None;
+        self.refresh_visible_rows();
+        self.sync_status();
+    }
+
+    /// 处理文件列表的实时框选（拖动过程中）。
+    fn handle_rubber_band_move(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
+        // 降级为 logv，避免高频刷屏
+        logv!("[rubber-band] move x1={:.1}, y1={:.1}, x2={:.1}, y2={:.1}", x1, y1, x2, y2);
+
+        let left = x1.min(x2);
+        let right = x1.max(x2);
+
+        // 核心修复：加上当前视口的滚动偏移，转换为虚拟列表的绝对坐标
+        let scroll_y = self.state.active().active().scroll_y;
+        let top = y1.min(y2) + scroll_y;
+        let bottom = y1.max(y2) + scroll_y;
+
+        let is_icons = self.ui.get_is_icons_view_out();
+        let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
+        let row_h = self.ui.get_row_height_out();
+        let ctrl = key_down(VK_CONTROL);
+        let shift = key_down(VK_SHIFT);
+
+        let tab = self.state.active_mut().active_mut();
+        let mut newly_selected = HashSet::new();
+
+        for di in 0..tab.display.len() {
+            let entry = match tab.display_entry(di) {
+                Some(e) => e,
+                None => continue,
+            };
+
+            // 根据当前视图模式计算单元格的物理边界
+            let (ix, iy, iw, ih) = if is_icons {
+                let col = di % cells_per_row;
+                let row = di / cells_per_row;
+                let cell_w = match self.config.view_mode.as_str() {
+                    "icons-xl" => 196.0,
+                    "icons-large" => 132.0,
+                    "icons-medium" => 96.0,
+                    "icons-small" => 190.0,
+                    _ => 96.0,
+                };
+                let cell_h = match self.config.view_mode.as_str() {
+                    "icons-xl" => 212.0,
+                    "icons-large" => 148.0,
+                    "icons-medium" => 108.0,
+                    "icons-small" => 52.0,
+                    _ => 108.0,
+                };
+                let x = col as f32 * cell_w + 4.0;
+                let y = row as f32 * cell_h + 4.0;
+                (x, y, cell_w - 8.0, cell_h - 8.0)
+            } else {
+                let y = di as f32 * row_h;
+                (0.0, y, 5000.0, row_h)
+            };
+
+            // AABB 碰撞检测
+            if ix < right && ix + iw > left && iy < bottom && iy + ih > top {
+                newly_selected.insert(entry.path.clone());
+            }
+        }
+
+        // 计算最终的选择集
+        let new_selection = if ctrl || shift {
+            let mut s = tab.selection.clone();
+            s.extend(newly_selected);
+            s
+        } else {
+            newly_selected
+        };
+
+        // 核心修复：仅当选择集发生变化时，才更新 UI。避免高频无效重绘导致卡顿
+        if tab.selection != new_selection {
+            // 降级为 logv，避免高频刷屏
+            logv!("[rubber-band] selection updated, count={}", new_selection.len());
+            tab.selection = new_selection;
+            self.visible_cache = None;
+            self.refresh_visible_rows();
+            self.sync_status();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4691,6 +4820,22 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut()
                 .background_pointer_event(&event, x, y);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_rubber_band_selected(move |x1, y1, x2, y2| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.handle_rubber_band_select(x1, y1, x2, y2);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_rubber_band_move(move |x1, y1, x2, y2| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.handle_rubber_band_move(x1, y1, x2, y2);
         });
     }
     {
