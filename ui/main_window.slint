@@ -72,8 +72,9 @@ export component MainWindow inherits Window {
     // 废弃 Winit 内置缩放：全部交由 app.rs 的 WM_NCHITTEST 钩子接管，
     // 否则 Winit 会在客户区内部私自接管光标并触发缩放（导致右上角按钮区域出现调整大小箭头）。
     resize-border-width: 0px;
-    min-width: 880px;
-    min-height: 560px;
+    // 核心修改 1：下调至 560px，解除 Windows 左右半屏贴靠（768px/640px）的尺寸封锁
+    min-width: 560px;
+    min-height: 500px;
     preferred-width: 1200px;
     preferred-height: 760px;
     background: Theme.bg-main;
@@ -164,17 +165,26 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <int> active-pane: 0;
     in-out property <float> split-ratio: 0.5; // 左右分屏比例，0~1 之间
 
-    // 核心修复 3：开启分屏或窗口收窄时，若空间不足以支撑双栏，自动智能收缩侧栏
+    // 辅助函数：根据当前窗口总宽，重新核算并安全钳制侧边栏宽度
+    function clamp-sidebar-on-resize() {
+        let min_pane_w = 216px;
+        let right_min = root.is-split ? (min_pane_w * 2 + 8px) : min_pane_w;
+        let max_allowed_sidebar = max(70px, root.width - right_min);
+        if (root.sidebar-w > max_allowed_sidebar) {
+            root.sidebar-w = max_allowed_sidebar;
+            root.sidebar_width_changed(root.sidebar-w / 1px);
+        }
+    }
+
+    // 核心修改 2：窗口尺寸变化（如从全屏贴靠到半屏）时，侧边栏自动退让，绝不挤压内容区
+    changed width => {
+        root.clamp-sidebar-on-resize();
+    }
+
+    // 切换分屏状态时执行约束重置
     changed is-split => {
         if (root.is-split) {
-            let min_pane_w = 216px;
-            let double_pane_min = min_pane_w * 2 + 8px;
-            let max_allowed_sidebar = max(70px, root.width - double_pane_min);
-            if (root.sidebar-w > max_allowed_sidebar) {
-                root.sidebar-w = max_allowed_sidebar;
-                root.sidebar_width_changed(root.sidebar-w / 1px);
-            }
-            // 比例归中重置，确保两侧均衡
+            root.clamp-sidebar-on-resize();
             root.split-ratio = 0.5;
         }
     }
