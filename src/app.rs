@@ -4958,10 +4958,26 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let Some(app) = weak.upgrade() else { return };
             let app = app.borrow_mut();
 
-            // 空查询（含 clear-query 的程序化清空）直接收空结果，避免白跑一次跨进程探测
+            // 空查询：列出最新的 5 个历史目录（含 clear-query 的程序化清空）
             if query.is_empty() {
-                app.jump_window
-                    .set_results(ModelRc::new(VecModel::from(Vec::<JumpResult>::new())));
+                let hits = crate::search::jump::search("", None);
+                let results: Vec<JumpResult> = hits
+                    .into_iter()
+                    .map(|hit| JumpResult {
+                        name: hit.name.into(),
+                        path: hit.path.to_string_lossy().into_owned().into(),
+                        name_parts: ModelRc::new(VecModel::from(
+                            hit.name_parts
+                                .into_iter()
+                                .map(|(t, hl)| NamePart { text: t.into(), hl })
+                                .collect::<Vec<_>>(),
+                        )),
+                        is_history: hit.is_history,
+                    })
+                    .collect();
+
+                app.jump_window.set_results(ModelRc::new(VecModel::from(results)));
+
                 // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
                 // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行
                 #[cfg(windows)]
@@ -4996,6 +5012,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                             .map(|(t, hl)| NamePart { text: t.into(), hl })
                             .collect::<Vec<_>>(),
                     )),
+                    is_history: hit.is_history,
                 })
                 .collect();
 
@@ -5020,8 +5037,28 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         app.borrow().jump_window.on_focus_changed(move || {
             let Some(app) = weak.upgrade() else { return };
             let app = app.borrow();
+
+            // 核心修复：吸附窗获得焦点且输入框为空时，主动拉取一次历史记录
+            if app.jump_window.get_query().is_empty() {
+                let hits = crate::search::jump::search("", None);
+                let results: Vec<JumpResult> = hits
+                    .into_iter()
+                    .map(|hit| JumpResult {
+                        name: hit.name.into(),
+                        path: hit.path.to_string_lossy().into_owned().into(),
+                        name_parts: ModelRc::new(VecModel::from(
+                            hit.name_parts
+                                .into_iter()
+                                .map(|(t, hl)| NamePart { text: t.into(), hl })
+                                .collect::<Vec<_>>(),
+                        )),
+                        is_history: hit.is_history,
+                    })
+                    .collect();
+                app.jump_window.set_results(ModelRc::new(VecModel::from(results)));
+            }
+
             // 失焦收缩 / 聚焦展开都会改变窗口高度，bottom 吸附需重新锚定底边：
-            // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行
             if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
                 if gplacement == "bottom" {
                     reposition_bottom_next_tick(gx, gy, gw, gplacement.clone());
@@ -5036,13 +5073,18 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let weak = Rc::downgrade(&app);
         app.borrow().jump_window.on_item_activated(move |_path| {
             let Some(app) = weak.upgrade() else { return };
-            let app = app.borrow();
-            if let Some((_hwnd, _)) = app.jump_target {
+            let jump_target = app.borrow().jump_target.clone();
+            if let Some((_hwnd, _)) = jump_target {
                 #[cfg(windows)]
                 let _ = crate::sys::dialog_jump::navigate_dialog(_hwnd as _, Path::new(_path.as_str()));
             }
-            // 跳转完成后自动清空搜索文本并收起结果，但保持窗口挂载以备后用
-            app.jump_window.invoke_clear_query();
+            // 修复：将写历史记录丢到后台线程，避免同步磁盘 IO 导致主线程 IME 上下文丢失
+            let path_str = _path.to_string();
+            std::thread::spawn(move || {
+                crate::search::jump::record_history(Path::new(&path_str));
+            });
+
+            app.borrow().jump_window.invoke_clear_query();
         });
     }
     {
@@ -5747,7 +5789,8 @@ pub(crate) fn hide_dialog_jump() {
         app.jump_target = None;
         app.jump_geom = None;
         let _ = app.jump_window.window().hide();
-        app.jump_window.invoke_clear_query();
+        // 不再 clear_query：防止切换输入法/失焦时清空用户输入。
+        // 只有用户真正跳转或主动关闭时才清空。
     }
     crate::sys::dialog_jump::register_jump_window(0);
 }

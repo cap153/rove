@@ -4,6 +4,7 @@ export struct JumpResult {
     name: string,
     path: string,
     name-parts: [NamePart],
+    is-history: bool,
 }
 
 export component DialogJumpWindow inherits Window {
@@ -73,7 +74,7 @@ export component DialogJumpWindow inherits Window {
                                 padding-left: 12px;
                                 padding-right: 12px;
                                 spacing: 10px;
-                                Text { text: "📁"; color: Theme.accent; font-size: 14px; font-family: Theme.symbol-font-family; vertical-alignment: center; }
+                                Text { text: item.is-history ? "🕒" : "📁"; color: item.is-history ? Theme.accent : Theme.text-secondary; font-size: 14px; font-family: Theme.symbol-font-family; vertical-alignment: center; }
                                 VerticalLayout {
                                     alignment: center;
                                     horizontal-stretch: 1;
@@ -173,7 +174,7 @@ export component DialogJumpWindow inherits Window {
                                 padding-left: 12px;
                                 padding-right: 12px;
                                 spacing: 10px;
-                                Text { text: "📁"; color: Theme.accent; font-size: 14px; font-family: Theme.symbol-font-family; vertical-alignment: center; }
+                                Text { text: item.is-history ? "🕒" : "📁"; color: item.is-history ? Theme.accent : Theme.text-secondary; font-size: 14px; font-family: Theme.symbol-font-family; vertical-alignment: center; }
                                 VerticalLayout {
                                     alignment: center;
                                     horizontal-stretch: 1;

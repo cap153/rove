@@ -18,12 +18,13 @@ mod imp {
     use windows_sys::Win32::UI::Controls::EM_SETSEL;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        BM_CLICK, DispatchMessageW, EnumChildWindows, FindWindowExW, GetClassNameW, GetDlgCtrlID, GetDlgItem,
-        GetForegroundWindow, GetMessageW, GetParent, GetSystemMetrics, GetWindowRect,
+        BM_CLICK, DispatchMessageW, EnumChildWindows, FindWindowExW, GetAncestor, GetClassNameW, GetDlgCtrlID,
+        GetDlgItem, GetForegroundWindow, GetMessageW, GetParent, GetSystemMetrics, GetWindowLongW, GetWindowRect,
         GetWindowThreadProcessId, IsWindowVisible,
         PostMessageW, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SMTO_ABORTIFHUNG, SMTO_BLOCK,
         SM_CYSCREEN, TranslateMessage, BN_CLICKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
-        EVENT_SYSTEM_FOREGROUND, IDOK, WM_COMMAND, WM_GETTEXT, WM_GETTEXTLENGTH, WM_SETTEXT,
+        EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWL_EXSTYLE, IDOK, WM_COMMAND, WM_GETTEXT, WM_GETTEXTLENGTH,
+        WM_SETTEXT, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
         WINEVENT_OUTOFCONTEXT,
     };
 
@@ -58,6 +59,43 @@ mod imp {
         } else {
             String::new()
         }
+    }
+
+    /// 判定是否是系统 UI 浮层（如语言栏、输入法候选框），避免切换输入法时误判失焦隐藏吸附窗。
+    fn is_system_ui_window(hwnd: HWND) -> bool {
+        let class = get_class_name(hwnd);
+        if class == "Shell_TrayWnd"
+            || class == "NotifyIconOverflowWindow"
+            || class == "MSCTFIME UI"
+            || class == "IME"
+            || class == "IMECompositionUI"
+            || class == "CicMarshalWnd"
+            || class == "Windows.UI.Core.CoreWindow"
+            || class == "XamlExplorerHostIslandWindow" // Win11 输入法/系统弹窗
+            || class == "tipband"
+            || class == "TextInputHost" // Win11 候选框/输入法浮层
+            || class == "Windows.UI.Composition.DesktopWindowContentBridge"
+            || class == "Microsoft.UI.Content.DesktopChildSiteBridge"
+            || class == "ImeUiWnd" // 常见输入法 UI 容器
+            || class == "Shell_InputSwitchTopLevelWindow" // 核心修复：输入法切换提示浮层
+        {
+            return true;
+        }
+
+        let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
+        if !root.is_null() {
+            let root_class = get_class_name(root);
+            if root_class == "Shell_TrayWnd" || root_class == "NotifyIconOverflowWindow" {
+                return true;
+            }
+        }
+
+        // 备用判断：无激活属性的工具窗口
+        let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        if (ex_style & WS_EX_TOOLWINDOW) != 0 && (ex_style & WS_EX_NOACTIVATE) != 0 {
+            return true;
+        }
+        false
     }
 
     /// 跨进程同步发消息，目标进程卡死时最多等 `timeout` 毫秒（失败返回 None）。
@@ -552,6 +590,11 @@ mod imp {
             return;
         }
 
+        // 核心修复：忽略系统 UI 窗口（如输入法切换框），防止切换输入法时误判失焦
+        if is_system_ui_window(hwnd) {
+            return;
+        }
+
         if probe_file_dialog(hwnd) {
             let prev = CURRENT_DIALOG.swap(hwnd as isize, Ordering::SeqCst);
             if prev != hwnd as isize {
@@ -571,6 +614,7 @@ mod imp {
         } else {
             let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
             if prev != 0 {
+                logv!("[rove:dialog_jump] POLL hide trigger, new hwnd class={:?}", get_class_name(hwnd));
                 logv!("[rove:dialog_jump] poll: dialog blurred, hiding search bar");
                 let _ = slint::invoke_from_event_loop(|| {
                     crate::app::hide_dialog_jump();
@@ -659,8 +703,13 @@ mod imp {
                         });
                     }
                 } else {
+                    // 核心修复：忽略系统 UI 窗口
+                    if is_system_ui_window(hwnd) {
+                        return;
+                    }
                     let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
                     if prev != 0 {
+                        logv!("[rove:dialog_jump] EVENT hide trigger, new hwnd class={:?}", get_class_name(hwnd));
                         logv!("[rove:dialog_jump] dialog blurred, hiding search bar");
                         let _ = slint::invoke_from_event_loop(|| {
                             crate::app::hide_dialog_jump();
