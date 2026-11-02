@@ -18,7 +18,7 @@ mod imp {
     use windows_sys::Win32::UI::Controls::EM_SETSEL;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        BM_CLICK, DispatchMessageW, EnumChildWindows, FindWindowExW, GetAncestor, GetClassNameW, GetDlgCtrlID,
+        DispatchMessageW, EnumChildWindows, FindWindowExW, GetAncestor, GetClassNameW, GetDlgCtrlID,
         GetDlgItem, GetForegroundWindow, GetMessageW, GetParent, GetSystemMetrics, GetWindowLongW, GetWindowRect,
         GetWindowThreadProcessId, IsWindowVisible,
         PostMessageW, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SMTO_ABORTIFHUNG, SMTO_BLOCK,
@@ -28,7 +28,7 @@ mod imp {
         WINEVENT_OUTOFCONTEXT,
     };
 
-    use crate::logv;
+    use crate::{logln, logv};
 
     static CURRENT_DIALOG: AtomicIsize = AtomicIsize::new(0);
 
@@ -161,6 +161,11 @@ mod imp {
 
     /// 跳转并发守卫：同一时刻只允许一个跳转线程改写文件名框，避免连点 / 回车+点击互相覆盖。
     static NAVIGATING: AtomicBool = AtomicBool::new(false);
+
+    /// 暴露给外部，用于判断是否正在执行跳转。
+    pub fn is_navigating() -> bool {
+        NAVIGATING.load(Ordering::SeqCst)
+    }
 
     /// RAII 守卫：无论跳转线程正常结束还是 panic，都复位守卫位。
     struct NavGuard;
@@ -388,23 +393,15 @@ mod imp {
     }
 
     /// 触发对话框接受。
-    ///
-    /// 只用一次真实点击：`BM_CLICK` 本身就会向父对话框送达 `WM_COMMAND(BN_CLICKED, IDOK)`；
-    /// 再手动补发一条 `WM_COMMAND(IDOK)` 等于重复触发，加载中的对话框偶尔会消费到第二条，
-    /// 此时文件名框已清空，可能误触「保存」。
-    fn trigger_accept(dialog: HWND, ok_btn: HWND) {
+    fn trigger_accept(dialog: HWND, _ok_btn: HWND) {
         unsafe {
-            if !ok_btn.is_null() {
-                PostMessageW(ok_btn, BM_CLICK, 0, 0);
-            } else {
-                // 找不到确认按钮时的兜底
-                PostMessageW(
-                    dialog,
-                    WM_COMMAND,
-                    (BN_CLICKED << 16 | IDOK as u32) as usize,
-                    0,
-                );
-            }
+            // 直接向对话框发送 IDOK 命令，不再依赖按钮句柄（跨线程句柄极易失效）
+            PostMessageW(
+                dialog,
+                WM_COMMAND,
+                (BN_CLICKED << 16 | IDOK as u32) as usize,
+                0,
+            );
         }
     }
 
@@ -449,6 +446,7 @@ mod imp {
         // 并发守卫：连点 / 回车 + 点击会让多个线程同时改写文件名框、各自触发确认并还原，
         // 目录与文件名都不可预测。已在进行中则直接放弃本次。
         if NAVIGATING.swap(true, Ordering::SeqCst) {
+            logv!("[rove:dialog_jump] navigate_dialog rejected: already navigating");
             return Err("已有跳转进行中".into());
         }
 
@@ -464,13 +462,19 @@ mod imp {
         std::thread::spawn(move || {
             let _guard = NavGuard;
             let dialog = dialog_as as HWND;
+            logln!("[rove:dialog_jump] thread started for target: {}", target_str);
             let candidates: Vec<usize> =
                 edit_candidates(dialog).into_iter().map(|h| h as usize).take(3).collect();
             if candidates.is_empty() {
-                logv!("[rove:dialog_jump] navigation failed: no filename edit found");
+                logln!("[rove:dialog_jump] navigation failed: no filename edit found");
                 return;
             }
-            let ok_btn = find_ok_button(dialog);
+            // 强制抢回前台焦点，防止后台消息被文件对话框忽略
+            unsafe {
+                SetForegroundWindow(dialog);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
             // (实际跳转成功的控件句柄, 原始文件名)
             let mut restore: Option<(HWND, String)> = None;
             // 首个候选的原始名：全部候选失败时回退用，避免吃掉用户已输入的文件名
@@ -490,19 +494,23 @@ mod imp {
                 // 1. 记下原本文件名（必须在注入动作之前）
                 let original_name = get_window_text(edit);
                 logv!(
-                    "[rove:dialog_jump] navigating dialog={:#x}, edit_ctrl={:#x}, ok_btn={:#x}, filename={:?}",
+                    "[rove:dialog_jump] navigating dialog={:#x}, edit_ctrl={:#x}, filename={:?}",
                     dialog as usize,
                     edit as usize,
-                    ok_btn as usize,
                     original_name
                 );
 
+                // 每次尝试前，重新找一次确认按钮（防止上一轮跳转导致按钮重建失效）
+                let current_ok_btn = find_ok_button(dialog);
+
                 // 2. 注入带尾斜杠的目标目录路径 + 触发跳转
+                set_window_text(edit, ""); // 先清空，打破旧的 UI 状态
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 if !set_window_text(edit, &target_str) {
                     logv!("[rove:dialog_jump] candidate #{} rejected: write failed", idx);
                     continue;
                 }
-                trigger_accept(dialog, ok_btn);
+                trigger_accept(dialog, current_ok_btn);
 
                 // 3. 等待系统加载目标目录
                 std::thread::sleep(std::time::Duration::from_millis(400));
@@ -532,6 +540,7 @@ mod imp {
                 "[rove:dialog_jump] navigation completed, filename restored: {}",
                 restore.as_ref().map(|(_, n)| n.as_str()).unwrap_or("")
             );
+            logv!("[rove:dialog_jump] thread completed, NavGuard released");
         });
 
         Ok(())
@@ -587,6 +596,12 @@ mod imp {
         // 已吸附到该对话框且前台未变化：跳过重量级的控件树递归探测。
         // 移动跟随由 LOCATIONCHANGE 事件负责，失焦由 FOREGROUND 事件负责，二者均已正常工作。
         if hwnd as isize == CURRENT_DIALOG.load(Ordering::SeqCst) {
+            return;
+        }
+
+        // 核心修复：跳转过程中，对话框会因为 UI 重建导致暂时探测失败，
+        // 此时忽略失焦判断，避免吸附窗被误隐藏导致 jump_target 丢失。
+        if is_navigating() {
             return;
         }
 
@@ -707,6 +722,12 @@ mod imp {
                     if is_system_ui_window(hwnd) {
                         return;
                     }
+
+                    // 核心修复：跳转过程中不隐藏，防止 jump_target 丢失
+                    if is_navigating() {
+                        return;
+                    }
+
                     let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
                     if prev != 0 {
                         logv!("[rove:dialog_jump] EVENT hide trigger, new hwnd class={:?}", get_class_name(hwnd));

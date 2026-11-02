@@ -432,7 +432,7 @@ pub struct App {
     /// 侧栏周期刷新（驱动器容量/回收站统计/网络位置）。
     /// 必须挂在 App 字段上：局部 Timer 会在函数返回时停止。
     refresh_timer: Timer,
-    /// 文件对话框跳转吸附窗（Ctrl+G 呼出）。
+    /// 文件对话框跳转吸附窗。
     jump_window: DialogJumpWindow,
     /// 当前跳转目标：(对话框 HWND, 当前目录)。
     jump_target: Option<(usize, Option<PathBuf>)>,
@@ -5107,7 +5107,35 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
 
             // 空查询：列出最新的 5 个历史目录（含 clear-query 的程序化清空）
             if query.is_empty() {
-                let hits = crate::search::jump::search("", None);
+                let mut hits = crate::search::jump::search("", None);
+                
+                // 核心新增：将 Rove 当前聚焦的目录插入到最前面
+                let current_path = app.state.active().active().path.clone();
+                if let Some(p) = current_path {
+                    if p != crate::fs::drives::recycle_virtual_path() {
+                        let name = p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                        
+                        let ch = crate::search::jump::JumpHit {
+                            name: name.clone(),
+                            path: p.clone(),
+                            score: 0,
+                            name_parts: vec![
+                                (name.clone(), false), 
+                                (" (当前)".to_string(), true)
+                            ],
+                            is_local: true,
+                            is_history: false,
+                            last_time: 0,
+                        };
+                        
+                        hits.retain(|h| h.path != ch.path);
+                        hits.insert(0, ch);
+                        hits.truncate(6); // 允许比平时多展示一个
+                    }
+                }
+
                 let results: Vec<JumpResult> = hits
                     .into_iter()
                     .map(|hit| JumpResult {
@@ -5187,7 +5215,35 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
 
             // 核心修复：吸附窗获得焦点且输入框为空时，主动拉取一次历史记录
             if app.jump_window.get_query().is_empty() {
-                let hits = crate::search::jump::search("", None);
+                let mut hits = crate::search::jump::search("", None);
+                
+                // 核心新增：将 Rove 当前聚焦的目录插入到最前面
+                let current_path = app.state.active().active().path.clone();
+                if let Some(p) = current_path {
+                    if p != crate::fs::drives::recycle_virtual_path() {
+                        let name = p.file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| p.to_string_lossy().into_owned());
+                        
+                        let ch = crate::search::jump::JumpHit {
+                            name: name.clone(),
+                            path: p.clone(),
+                            score: 0,
+                            name_parts: vec![
+                                (name.clone(), false), 
+                                (" (当前)".to_string(), true)
+                            ],
+                            is_local: true,
+                            is_history: false,
+                            last_time: 0,
+                        };
+                        
+                        hits.retain(|h| h.path != ch.path);
+                        hits.insert(0, ch);
+                        hits.truncate(6); // 允许比平时多展示一个
+                    }
+                }
+
                 let results: Vec<JumpResult> = hits
                     .into_iter()
                     .map(|hit| JumpResult {
@@ -5945,6 +6001,7 @@ pub(crate) fn update_dialog_jump_position(x: i32, y: i32, w: i32, placement: Str
 /// 对话框失焦 / 销毁时自动隐藏吸附窗。
 #[cfg(windows)]
 pub(crate) fn hide_dialog_jump() {
+    logv!("[rove:dialog_jump] hide_dialog_jump called!");
     if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
         let mut app = app.borrow_mut();
         app.jump_target = None;
