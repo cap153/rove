@@ -346,6 +346,7 @@ const NOISE_DIR_NAMES: &[&str] = &[
     "appdata",
     "node_modules",
     ".git",
+    "target", // 新增：屏蔽 Rust/Node 等常见的编译输出目录
 ];
 
 /// 是否系统噪声目录（大小写不敏感）。

@@ -35,31 +35,6 @@ component Toggle inherits Rectangle {
 }
 
 // 驱动器图标：纯矢量绘制（盘体 + 指示灯），不依赖字体字形。
-component DriveGlyph inherits Rectangle {
-    width: 16px;
-    height: 16px;
-    background: transparent;
-
-    Rectangle {
-        x: 0px;
-        y: 3px;
-        width: parent.width;
-        height: parent.height - 6px;
-        border-radius: 3px;
-        border-width: 1.2px;
-        border-color: Theme.text-disabled;
-        background: transparent;
-    }
-    Rectangle {
-        x: parent.width - 5px;
-        y: parent.height - 7px;
-        width: 2px;
-        height: 2px;
-        border-radius: 1px;
-        background: Theme.accent;
-    }
-}
-
 component SettingRow inherits Rectangle {
     in property <SettingsActionItem> item;
     callback toggled(id: string, enabled: bool);
@@ -809,8 +784,12 @@ export component SettingsPage inherits Rectangle {
                                     padding-right: 8px;
                                     spacing: 12px;
 
-                                    DriveGlyph {
-                                        y: (parent.height - self.height) / 2;
+                                    Text {
+                                        text: drive.is-ssd ? "⚡" : "🖴";
+                                        color: drive.is-ssd ? Theme.accent : Theme.text-secondary;
+                                        font-size: 14px;
+                                        font-family: Theme.symbol-font-family;
+                                        vertical-alignment: center;
                                     }
 
                                     VerticalLayout {

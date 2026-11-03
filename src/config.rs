@@ -42,6 +42,8 @@ pub struct Config {
     pub search_idle_rescan_minutes: u32,
     /// 搜索最大展示结果数。
     pub search_max_results: usize,
+    /// 是否首次启动（用于触发 SSD 检测与初始自动化配置）。
+    pub is_first_run: bool,
 }
 
 /// 侧栏分区的默认顺序。
@@ -73,6 +75,7 @@ impl Default for Config {
             search_excluded_paths: Vec::new(),
             search_idle_rescan_minutes: 60,
             search_max_results: 1000,
+            is_first_run: true,
         }
     }
 }
@@ -193,6 +196,9 @@ impl Config {
         if let Some(r) = json.get("search_max_results").and_then(|v| v.as_u64()) {
             config.search_max_results = (r as usize).clamp(50, 10000);
         }
+        if let Some(b) = json.get("is_first_run").and_then(|v| v.as_bool()) {
+            config.is_first_run = b;
+        }
         config
     }
 
@@ -225,6 +231,7 @@ impl Config {
             "search_excluded_paths": self.search_excluded_paths,
             "search_idle_rescan_minutes": self.search_idle_rescan_minutes,
             "search_max_results": self.search_max_results,
+            "is_first_run": self.is_first_run,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);

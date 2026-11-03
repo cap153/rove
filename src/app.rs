@@ -2620,6 +2620,7 @@ impl App {
         {
             let letter = d.letter.to_string();
             let is_indexed = !self.config.search_excluded_drives.contains(&letter);
+            let is_ssd = is_ssd_drive(d.letter);
             if is_indexed {
                 enabled_count += 1;
             }
@@ -2628,6 +2629,7 @@ impl App {
                 label: d.label.into(),
                 total_space: format!("总容量 {}", fs::format_size_bytes(d.total_bytes)).into(),
                 indexed: is_indexed,
+                is_ssd,
             });
         }
         self.ui.set_search_drives_count(enabled_count);
@@ -2642,6 +2644,7 @@ impl App {
             "System Volume Information".into(),
             "node_modules".into(),
             ".git".into(),
+            "target".into(), // 新增展示
         ];
         self.ui
             .set_search_builtin_exclusions(ModelRc::new(VecModel::from(builtin)));
@@ -6357,10 +6360,127 @@ fn setup_preview_keys(app: &Rc<RefCell<App>>) {
         });
 }
 
+/// 原生探测磁盘介质类型：通过查询寻道惩罚（Seek Penalty）精准判定。
+/// SSD 无寻道惩罚，机械硬盘有寻道惩罚。
+/// 核心改进：先将卷映射为物理驱动器，穿透卷管理器；遇到底层驱动拒绝回答时，强制兜底为 HDD 保护。
+#[cfg(windows)]
+fn is_ssd_drive(drive_letter: char) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING};
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let path = format!("\\\\.\\{}:", drive_letter);
+    let wide_path: Vec<u16> = std::ffi::OsStr::new(&path).encode_wide().chain(std::iter::once(0)).collect();
+
+    unsafe {
+        // 1. 打开卷设备（传 0 权限，无需管理员即可查询元数据）
+        let vol_handle = CreateFileW(
+            wide_path.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            0 as _,
+        );
+
+        if vol_handle == INVALID_HANDLE_VALUE {
+            // 核心防御：打不开也默认当机械盘保护，防误杀电机
+            return false;
+        }
+
+        // 2. 将卷映射为物理驱动器号
+        #[repr(C)]
+        struct DISK_EXTENT { disk_number: u32, starting_offset: i64, extent_length: i64 }
+        #[repr(C)]
+        struct VOLUME_DISK_EXTENTS { number_of_disk_extents: u32, extents: [DISK_EXTENT; 1] }
+
+        let mut extents: VOLUME_DISK_EXTENTS = std::mem::zeroed();
+        let mut bytes_returned = 0;
+        let ioctl_volume_get_extents = 5636096;
+
+        let res_extents = DeviceIoControl(
+            vol_handle, ioctl_volume_get_extents, std::ptr::null_mut(), 0,
+            &mut extents as *mut _ as *mut std::ffi::c_void, std::mem::size_of::<VOLUME_DISK_EXTENTS>() as u32,
+            &mut bytes_returned, std::ptr::null_mut()
+        );
+
+        let mut query_handle = vol_handle;
+        let mut phys_handle = INVALID_HANDLE_VALUE;
+
+        if res_extents != 0 && extents.number_of_disk_extents > 0 {
+            let phys_path = format!("\\\\.\\PhysicalDrive{}", extents.extents[0].disk_number);
+            let phys_wide: Vec<u16> = std::ffi::OsStr::new(&phys_path).encode_wide().chain(std::iter::once(0)).collect();
+            phys_handle = CreateFileW(
+                phys_wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                0 as _,
+            );
+            if phys_handle != INVALID_HANDLE_VALUE {
+                query_handle = phys_handle;
+            }
+        }
+
+        // 3. 查询寻道惩罚 (IOCTL_STORAGE_QUERY_PROPERTY)
+        #[repr(C)]
+        struct STORAGE_PROPERTY_QUERY { property_id: u32, query_type: u32, additional_parameters: [u8; 1] }
+        #[repr(C)]
+        struct DEVICE_SEEK_PENALTY_DESCRIPTOR { version: u32, size: u32, incurs_seek_penalty: u8 }
+
+        let mut query = STORAGE_PROPERTY_QUERY { property_id: 7, query_type: 0, additional_parameters: [0] };
+        let mut descriptor = DEVICE_SEEK_PENALTY_DESCRIPTOR { version: 0, size: 0, incurs_seek_penalty: 0 };
+        bytes_returned = 0;
+        let ioctl_storage_query_property = 2954240;
+
+        let res_query = DeviceIoControl(
+            query_handle, ioctl_storage_query_property,
+            &mut query as *mut _ as *mut std::ffi::c_void, std::mem::size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+            &mut descriptor as *mut _ as *mut std::ffi::c_void, std::mem::size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>() as u32,
+            &mut bytes_returned, std::ptr::null_mut()
+        );
+
+        if phys_handle != INVALID_HANDLE_VALUE { CloseHandle(phys_handle); }
+        CloseHandle(vol_handle);
+
+        if res_query != 0 {
+            // 返回 true 的唯一合法条件：底层驱动明确答复“本盘没有机械寻道延迟”
+            return descriptor.incurs_seek_penalty == 0;
+        }
+
+        // 核心修复：查询失败（如 E 盘老硬盘返回 31 错误码），
+        // 出于最高级别的保护原则，只要不能 100% 证明是 SSD，一律按 HDD 处理！
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn is_ssd_drive(_drive_letter: char) -> bool {
+    true
+}
+
 /// 创建一个 UI 会话（窗口 + 状态 + 回调 + 定时器）。
 /// 回调/定时器均以 Weak 持有 App，销毁时整图释放。
 fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
-    let config = Config::load();
+    let mut config = Config::load();
+
+    // 首次启动保护：自动将所有非系统盘的 HDD 机械硬盘加入排除名单，避免唤醒电机
+    if config.is_first_run {
+        config.is_first_run = false;
+        for d in crate::fs::list_drives()
+            .into_iter()
+            .filter(|d| matches!(d.drive_type, crate::fs::drives::DriveType::Fixed))
+        {
+            if !is_ssd_drive(d.letter) && !d.letter.to_string().eq_ignore_ascii_case("C") {
+                config.search_excluded_drives.push(d.letter.to_string().to_ascii_uppercase());
+            }
+        }
+        config.save();
+    }
 
     let ui = match MainWindow::new() {
         Ok(ui) => ui,
