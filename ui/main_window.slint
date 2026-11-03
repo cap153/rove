@@ -1,4 +1,4 @@
-import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup } from "common.slint";
+import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup, SettingsDriveItem } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
@@ -8,6 +8,8 @@ import { SettingsPage } from "settings_page.slint";
 import { ActionEditorDialog } from "action_editor.slint";
 import { PreviewWindow } from "preview_window.slint";
 export { PreviewWindow } from "preview_window.slint";
+// SettingsDriveItem 需从入口文件再导出，否则 Rust 侧拿到的是废弃的内部别名。
+export { SettingsDriveItem } from "common.slint";
 
 // 将 common.slint 中的 Theme 全局从根文件再导出——
 // Slint 规定：全局单例只有从根文件（或 slint! 宏）导出，Rust 侧才能通过
@@ -105,6 +107,27 @@ export component MainWindow inherits Window {
     // 是否显示隐藏文件（来自 config.show_hidden，驱动设置页「通用」开关）。
     in-out property <bool> show-hidden: false;
     callback show_hidden_toggled(bool);
+
+    // ---- 搜索与索引看板（Rust 驱动） ----
+    in-out property <bool> search-ready: true;
+    in-out property <string> search-status-text: "索引未构建";
+    in-out property <string> search-items-count: "0";
+    in-out property <string> search-size-text: "0 MB";
+    in-out property <int> search-drives-count: 0;
+    in-out property <string> search-last-scan-time: "未记录";
+    in-out property <[SettingsDriveItem]> search-drives: [];
+    in-out property <[string]> search-builtin-exclusions: [];
+    in-out property <[string]> search-custom-exclusions: [];
+    in-out property <bool> search-idle-enabled: true;
+    in-out property <int> search-idle-minutes: 60;
+    in-out property <int> search-max-results: 1000;
+    callback search_rescan_clicked();
+    callback search_drive_toggled(string, bool); // letter, enabled
+    callback search_add_exclusion_clicked();
+    callback search_remove_exclusion_clicked(string); // path
+    callback search_idle_toggled(bool);
+    callback search_idle_minutes_changed(int);
+    callback search_max_results_changed(int);
     // 动作编辑器弹窗状态。
     in-out property <string> settings-editor-title: "";
     in-out property <bool> settings-editor-open: false;
@@ -278,6 +301,10 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 文件列表滚动到顶端（Rust 调用）。
     public function scroll-list-to-top() {
         file-list.scroll-to-top();
+    }
+
+    public function scroll_tabs_to_end() {
+        tab-bar.scroll-to-end();
     }
 
     /// 文件列表行命中测试（外部拖入定位目标文件夹，Rust 调用）。
@@ -1021,6 +1048,25 @@ out property <length> row-height-out: file-list.row-height-out;
                     content-height: root.settings-content-height;
                     show-hidden: root.show-hidden;
                     show_hidden_toggled(v) => { root.show_hidden_toggled(v); }
+                    search-ready: root.search-ready;
+                    search-status-text: root.search-status-text;
+                    search-items-count: root.search-items-count;
+                    search-size-text: root.search-size-text;
+                    search-drives-count: root.search-drives-count;
+                    search-last-scan-time: root.search-last-scan-time;
+                    search-drives: root.search-drives;
+                    search-builtin-exclusions: root.search-builtin-exclusions;
+                    search-custom-exclusions: root.search-custom-exclusions;
+                    search-idle-enabled: root.search-idle-enabled;
+                    search-idle-minutes: root.search-idle-minutes;
+                    search-max-results: root.search-max-results;
+                    search_rescan_clicked() => { root.search_rescan_clicked(); }
+                    search_drive_toggled(letter, indexed) => { root.search_drive_toggled(letter, indexed); }
+                    search_add_exclusion_clicked() => { root.search_add_exclusion_clicked(); }
+                    search_remove_exclusion_clicked(path) => { root.search_remove_exclusion_clicked(path); }
+                    search_idle_toggled(enabled) => { root.search_idle_toggled(enabled); }
+                    search_idle_minutes_changed(mins) => { root.search_idle_minutes_changed(mins); }
+                    search_max_results_changed(res) => { root.search_max_results_changed(res); }
                     scroll_debug(viewport, content, preferred) => {
                         root.settings_scroll_debug(viewport, content, preferred);
                     }

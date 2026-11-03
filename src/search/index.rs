@@ -7,8 +7,8 @@
 //! - 总量上限 [`MAX_ENTRIES`]（达上限即停止，防止极端磁盘拖垮内存）。
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::pinyin_fields;
 
@@ -30,6 +30,8 @@ pub struct GlobalIndex {
     pub entries: Vec<IndexEntry>,
     /// 索引是否已构建完成（false = 构建中）。
     pub ready: bool,
+    /// 最近一次构建完成的时刻（用于设置页展示「上次同步」）。
+    pub built_at: Option<std::time::SystemTime>,
 }
 
 /// 一次全局索引查询的结果。
@@ -70,6 +72,10 @@ pub type SharedIndex = Arc<RwLock<GlobalIndex>>;
 
 /// 全局索引单例（首次调用初始化，后台线程异步填充）。
 static INDEX: std::sync::OnceLock<SharedIndex> = std::sync::OnceLock::new();
+/// 构建轮次：新轮次启动会令旧轮次在下次检查时自行退出并丢弃结果。
+static BUILD_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// 当前构建线程的停止开关（重新扫描时先置位旧线程）。
+static CURRENT_STOP: Mutex<Option<Arc<AtomicBool>>> = Mutex::new(None);
 
 /// 获取（必要时懒初始化）全局索引。首次调用会拉起后台构建线程。
 pub fn shared() -> SharedIndex {
@@ -90,18 +96,49 @@ pub fn try_shared() -> Option<SharedIndex> {
     INDEX.get().cloned()
 }
 
+/// 手动重建全局索引（设置页「重新扫描驱动器」）。
+///
+/// 先停掉当前构建线程并清空内存索引，再拉起新一轮后台构建；旧轮次即使在
+/// 途也会因轮次过期而丢弃结果，不会把半成品写回 `ready`。
+pub fn rebuild() -> SharedIndex {
+    let idx = shared();
+    // 置位旧线程并等待其释放写锁：随后的 clear 不会被旧轮次覆盖。
+    if let Ok(mut cur) = CURRENT_STOP.lock() {
+        if let Some(old) = cur.take() {
+            old.store(true, Ordering::Relaxed);
+        }
+    }
+    if let Ok(mut w) = idx.write() {
+        w.entries.clear();
+        w.ready = false;
+        w.built_at = None;
+    }
+    spawn_builder(idx.clone());
+    idx
+}
+
 fn spawn_builder(idx: SharedIndex) {
+    let epoch = BUILD_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let stop = Arc::new(AtomicBool::new(false));
+    // 登记新开关并停掉上一轮（若重建时未显式停止）。
+    if let Ok(mut cur) = CURRENT_STOP.lock() {
+        if let Some(old) = cur.replace(stop.clone()) {
+            old.store(true, Ordering::Relaxed);
+        }
+    }
+    let stop_thread = stop.clone();
     std::thread::Builder::new()
         .name("rove-indexer".into())
         .spawn(move || {
             let mut count = 0usize;
             let roots = list_roots();
+            let config = crate::config::Config::load();
+            let exclusions = normalize_exclusions(&config.search_excluded_paths);
             // 任务 3.2：优先用 NTFS $MFT 加速全盘索引；无管理员权限或全盘
             // 失败时回退到原有 std::fs 递归 walker。
             // 两种路径都记录条目数与耗时，便于实机对比直读收益。
             let t0 = std::time::Instant::now();
-            match crate::search::mft::build_via_mft(&idx, &stop) {
+            match crate::search::mft::build_via_mft(&idx, &stop_thread, &exclusions) {
                 Some(_) => {
                     // MFT 路径：重新统计条目数（build_via_mft 已写入）。
                     if let Ok(w) = idx.read() {
@@ -119,10 +156,10 @@ fn spawn_builder(idx: SharedIndex) {
                         t0.elapsed().as_secs_f64() * 1000.0
                     );
                     for root in roots {
-                        if count >= MAX_ENTRIES {
+                        if count >= MAX_ENTRIES || stop_thread.load(Ordering::Relaxed) {
                             break;
                         }
-                        count += walk(&root, &idx, count, &stop);
+                        count += walk(&root, &idx, count, &stop_thread, &exclusions);
                     }
                     logln!(
                         "index: std::fs walk -> {} entries in {:.1} ms",
@@ -131,8 +168,14 @@ fn spawn_builder(idx: SharedIndex) {
                     );
                 }
             }
+            // 本轮已被更新的重建请求取代：绝不覆盖 ready / 发就绪通知。
+            if BUILD_EPOCH.load(Ordering::SeqCst) != epoch {
+                logln!("index: build epoch {epoch} superseded, discard result");
+                return;
+            }
             if let Ok(mut w) = idx.write() {
                 w.ready = true;
+                w.built_at = Some(std::time::SystemTime::now());
             }
             logln!("global index built: {} entries", count);
             // 通知 UI 索引就绪。用 Slint 原生跨线程投递，而非定时器轮询：
@@ -161,9 +204,15 @@ fn is_system_drive(root: &Path) -> bool {
 /// 顺序：**非系统盘优先，系统盘（C:）排最后**。索引有总量上限，若先扫 C 盘，
 /// 海量系统文件会在触及上限前挤占掉全部名额，导致数据盘根本无法入库。
 pub(crate) fn list_roots() -> Vec<PathBuf> {
+    let excluded = crate::config::Config::load().search_excluded_drives;
     let drives: Vec<PathBuf> = crate::fs::list_drives()
         .into_iter()
         .filter(|d| matches!(d.drive_type, crate::fs::drives::DriveType::Fixed))
+        .filter(|d| {
+            !excluded
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&d.letter.to_string()))
+        })
         .map(|d| PathBuf::from(format!("{}:\\", d.letter)))
         .collect();
     // 稳定分区：数据盘保持原相对顺序沉在前面，系统盘移到末尾。
@@ -198,8 +247,40 @@ pub(crate) fn is_skipped(name: &str) -> bool {
     NOISE_DIR_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
 
+/// 归一化用户排除路径：去尾部斜杠、统一小写，便于大小写不敏感前缀比对。
+///
+/// 在构建开始时算一次，后续 `walk` / MFT 每条目只做纯字符串比较，
+/// 避免百万级条目反复 `to_lowercase()` 用户配置。
+pub(crate) fn normalize_exclusions(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|p| p.trim().trim_end_matches(['\\', '/']).to_lowercase())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// 已小写的路径是否落在任一排除子树内（按路径分隔符对齐，避免 `C:\\Foo` 误伤 `C:\\Foobar`）。
+pub(crate) fn under_exclusion_lower(p: &str, normalized: &[String]) -> bool {
+    normalized.iter().any(|e| {
+        p == e
+            || p.strip_prefix(e)
+                .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
+    })
+}
+
+/// `path` 是否在用户排除的文件夹子树内（大小写不敏感）。
+pub(crate) fn path_is_excluded_ci(path: &Path, normalized: &[String]) -> bool {
+    !normalized.is_empty() && under_exclusion_lower(&path.to_string_lossy().to_lowercase(), normalized)
+}
+
 /// 递归扫描；返回新增条目数。
-fn walk(dir: &Path, idx: &SharedIndex, count: usize, stop: &Arc<AtomicBool>) -> usize {
+fn walk(
+    dir: &Path,
+    idx: &SharedIndex,
+    count: usize,
+    stop: &Arc<AtomicBool>,
+    exclusions: &[String],
+) -> usize {
     if count >= MAX_ENTRIES || stop.load(Ordering::Relaxed) {
         return 0;
     }
@@ -217,12 +298,16 @@ fn walk(dir: &Path, idx: &SharedIndex, count: usize, stop: &Arc<AtomicBool>) -> 
             continue;
         }
         if ft.is_dir() {
-            if is_skipped(&name) {
+            let sub_path = entry.path();
+            if is_skipped(&name) || path_is_excluded_ci(&sub_path, exclusions) {
                 continue;
             }
-            subdirs.push(entry.path());
+            subdirs.push(sub_path);
         }
         if count + added >= MAX_ENTRIES {
+            break;
+        }
+        if stop.load(Ordering::Relaxed) {
             break;
         }
         let fields = pinyin_fields(&name);
@@ -240,10 +325,10 @@ fn walk(dir: &Path, idx: &SharedIndex, count: usize, stop: &Arc<AtomicBool>) -> 
         }
     }
     for sub in subdirs {
-        if count + added >= MAX_ENTRIES {
+        if count + added >= MAX_ENTRIES || stop.load(Ordering::Relaxed) {
             break;
         }
-        added += walk(&sub, idx, count + added, stop);
+        added += walk(&sub, idx, count + added, stop, exclusions);
     }
     added
 }
@@ -397,6 +482,28 @@ mod tests {
         ] {
             assert!(!is_skipped(n), "{n} 不应被判为噪音目录");
         }
+    }
+
+    #[test]
+    fn user_exclusions_align_on_separators() {
+        let ex = normalize_exclusions(&[
+            "D:\\Cache\\".to_string(),
+            "  ".to_string(),
+            "E:/Temp Files".to_string(),
+        ]);
+        assert_eq!(
+            ex,
+            vec!["d:\\cache".to_string(), "e:/temp files".to_string()]
+        );
+        // 子树 + 自身都算命中，大小写与分隔符不敏感。
+        assert!(under_exclusion_lower(r"d:\cache\a\b", &ex));
+        assert!(under_exclusion_lower(r"d:\cache", &ex));
+        assert!(under_exclusion_lower(r"e:/temp files/x.txt", &ex));
+        // 同前缀但不在同一层级的目录不能被误伤。
+        assert!(!under_exclusion_lower(r"d:\cache-old\a", &ex));
+        assert!(!under_exclusion_lower(r"d:\other", &ex));
+        assert!(!path_is_excluded_ci(Path::new(r"D:\other"), &ex));
+        assert!(!path_is_excluded_ci(Path::new(r"D:\Cache\x"), &[]));
     }
 
     #[test]

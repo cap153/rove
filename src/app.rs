@@ -81,6 +81,27 @@ pub(crate) fn log_stamp() -> String {
     }
 }
 
+/// 相对时间文案：索引构建完成时刻 -> "刚刚 / N 分钟前 / N 小时前 / N 天前"。
+fn format_ago(t: SystemTime) -> String {
+    let secs = SystemTime::now()
+        .duration_since(t)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match secs {
+        0..=59 => "刚刚".to_string(),
+        60..=3599 => format!("{} 分钟前", secs / 60),
+        3600..=86399 => format!("{} 小时前", secs / 3600),
+        _ => format!("{} 天前", secs / 86400),
+    }
+}
+
+/// 配置变更后，若索引已启用则后台重建（未启用则维持懒加载，不无端扫盘）。
+fn reindex_if_active() {
+    if crate::search::index::try_shared().is_some() {
+        crate::search::index::rebuild();
+    }
+}
+
 /// Unix 天数 → 公历 `(年, 月, 日)`（Howard Hinnant `civil_from_days` 算法）。
 #[cfg(not(windows))]
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
@@ -140,9 +161,8 @@ macro_rules! logv {
 const ROW_HEIGHT: f32 = 30.0;
 /// 视口上下过扫描行数。
 const OVERSCAN: usize = 4;
-/// 全局索引搜索单次展示上限。命中更多时在状态栏提示「共找到 N 项」，
-/// 避免无限结果把列表刷爆；1000 项在 Slint 虚拟列表下仍可流畅滚动。
-const GLOBAL_SEARCH_LIMIT: usize = 1000;
+/// 单条索引记录的粗估内存占用（路径 + 名称 + 拼音字段）。
+const INDEX_ENTRY_BYTES: usize = 80;
 
 // ---- 右键菜单动作 ID ----
 const ACT_OPEN: &str = "open";
@@ -432,6 +452,10 @@ pub struct App {
     /// 侧栏周期刷新（驱动器容量/回收站统计/网络位置）。
     /// 必须挂在 App 字段上：局部 Timer 会在函数返回时停止。
     refresh_timer: Timer,
+    /// 侧栏与空闲重扫的周期定时器（15s）。
+    /// 不能与 `refresh_timer`（1s 目录轮询）共用：Slint Timer 重复 start
+    /// 会以后一次为准，共用会把 1s 轮询错降为 15s。
+    sidebar_periodic_timer: Timer,
     /// 文件对话框跳转吸附窗。
     jump_window: DialogJumpWindow,
     /// 当前跳转目标：(对话框 HWND, 当前目录)。
@@ -507,6 +531,7 @@ impl App {
             poll_timer: Timer::default(),
             sidebar_timer: Timer::default(),
             refresh_timer: Timer::default(),
+            sidebar_periodic_timer: Timer::default(),
             jump_window,
             jump_target: None,
             #[cfg(windows)]
@@ -1203,6 +1228,15 @@ pub(crate) fn on_index_ready() {
     app.refresh_after_index_ready();
     // 无论是否重查都同步一次状态栏：把「全盘索引构建中...」摘掉。
     app.sync_status();
+    // 设置页「搜索与索引」正在前台：立即刷新看板，无需等下一次轮询。
+    let on_search_settings = {
+        let tab = app.state.active();
+        tab.kind == crate::state::TabKind::Settings
+            && tab.settings_subpage == crate::state::SettingsSubpage::SearchAndIndex
+    };
+    if on_search_settings {
+        app.sync_search_stats(false);
+    }
 }
 
 impl App {
@@ -1345,7 +1379,8 @@ impl App {
         let Ok(guard) = index.read() else {
             return;
         };
-        let result = guard.search(query, GLOBAL_SEARCH_LIMIT);
+        let limit = self.config.search_max_results.clamp(50, 10000);
+        let result = guard.search(query, limit);
         let total = result.total;
         let entries: Vec<FileEntry> = result
             .hits
@@ -2534,6 +2569,127 @@ impl App {
         let raw = crate::ops::actions::load_or_create();
         self.actions = crate::ops::actions::heal_full(&raw);
     }
+    /// 搜索索引看板指标：优先 `try_read`，绝不在 UI 线程阻塞等待构建写锁。
+    ///
+    /// `with_drives` 为 false 时只刷新高频指标（条目数 / 大小 / 状态），
+    /// 避免周期刷新重建驱动器模型打断悬停高亮与开关动画。
+    fn sync_search_stats(&self, with_drives: bool) {
+        let snapshot = crate::search::index::try_shared().and_then(|i| {
+            i.try_read()
+                .ok()
+                .map(|g| (g.ready, g.entries.len(), g.built_at))
+        });
+        let (is_ready, entry_count, built_at) = snapshot.unwrap_or((false, 0, None));
+
+        self.ui.set_search_ready(is_ready);
+        let status_text = if is_ready {
+            "索引已就绪"
+        } else if snapshot.is_some() {
+            "正在构建索引..."
+        } else {
+            "索引未构建"
+        };
+        self.ui.set_search_status_text(status_text.into());
+        self.ui.set_search_items_count(format!("{entry_count}").into());
+        let est_bytes = (entry_count * INDEX_ENTRY_BYTES) as u64;
+        self.ui.set_search_size_text(fs::format_size_bytes(est_bytes).into());
+        let last_scan = if is_ready {
+            built_at
+                .map(format_ago)
+                .unwrap_or_else(|| "刚刚".to_string())
+        } else if snapshot.is_some() {
+            "正在扫描...".to_string()
+        } else {
+            "未记录".to_string()
+        };
+        self.ui.set_search_last_scan_time(last_scan.into());
+
+        if !with_drives {
+            return;
+        }
+
+        // 纳管驱动器列表（仅固定驱动器）。
+        let mut drive_items = Vec::new();
+        let mut enabled_count = 0;
+        for d in fs::list_drives()
+            .into_iter()
+            .filter(|d| matches!(d.drive_type, fs::drives::DriveType::Fixed))
+        {
+            let letter = d.letter.to_string();
+            let is_indexed = !self.config.search_excluded_drives.contains(&letter);
+            if is_indexed {
+                enabled_count += 1;
+            }
+            drive_items.push(SettingsDriveItem {
+                letter: letter.into(),
+                label: d.label.into(),
+                total_space: format!("总容量 {}", fs::format_size_bytes(d.total_bytes)).into(),
+                indexed: is_indexed,
+            });
+        }
+        self.ui.set_search_drives_count(enabled_count);
+        self.ui.set_search_drives(ModelRc::new(VecModel::from(drive_items)));
+
+        // 内置系统忽略目录（与索引器的 NOISE_DIR_NAMES 保持一致）。
+        let builtin: Vec<SharedString> = vec![
+            "Windows".into(),
+            "Program Files".into(),
+            "AppData".into(),
+            "$Recycle.Bin".into(),
+            "System Volume Information".into(),
+            "node_modules".into(),
+            ".git".into(),
+        ];
+        self.ui
+            .set_search_builtin_exclusions(ModelRc::new(VecModel::from(builtin)));
+
+        // 用户自定义忽略目录。
+        let custom: Vec<SharedString> = self
+            .config
+            .search_excluded_paths
+            .iter()
+            .map(|p| p.clone().into())
+            .collect();
+        self.ui
+            .set_search_custom_exclusions(ModelRc::new(VecModel::from(custom)));
+
+        // 自动化策略。
+        self.ui
+            .set_search_idle_enabled(self.config.search_idle_rescan_minutes > 0);
+        self.ui.set_search_idle_minutes(if self.config.search_idle_rescan_minutes > 0 {
+            self.config.search_idle_rescan_minutes as i32
+        } else {
+            60
+        });
+        self.ui
+            .set_search_max_results(self.config.search_max_results as i32);
+    }
+
+    /// 空闲自动同步：索引已就绪、无文件操作任务、且距上次构建超过配置间隔时
+    /// 在后台静默重建。由 15s 周期定时器驱动，开销仅是一次 `try_read`。
+    fn maybe_idle_rescan(&mut self) {
+        let minutes = self.config.search_idle_rescan_minutes;
+        if minutes == 0 || self.jobs.is_running() {
+            return;
+        }
+        let Some(idx) = crate::search::index::try_shared() else {
+            return; // 索引未被使用过：不因一个配置项就无端扫盘。
+        };
+        let Ok(guard) = idx.try_read() else {
+            return; // 正在构建：本轮到点跳过。
+        };
+        let due = guard.ready
+            && guard
+                .built_at
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .is_some_and(|elapsed| elapsed >= Duration::from_secs(minutes as u64 * 60));
+        drop(guard);
+        if due {
+            logln!("idle rescan: rebuild index after {minutes} min");
+            crate::search::index::rebuild();
+        }
+    }
+
     /// 同步设置页数据到 UI。
     fn sync_settings(&self) {
         use crate::state::{SettingsSubpage, TabKind};
@@ -2606,6 +2762,11 @@ impl App {
         self.ui.set_settings_page_title(title.into());
         self.ui.set_settings_page_desc(desc.into());
         self.ui.set_settings_show_add(show_add);
+
+        if current == SettingsSubpage::SearchAndIndex {
+            self.sync_search_stats(true);
+            return;
+        }
 
         if current == SettingsSubpage::Shortcuts {
             let mut groups_map: std::collections::BTreeMap<&'static str, Vec<SettingsShortcutItem>> =
@@ -4412,6 +4573,16 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 let Some(app) = timer_app.upgrade() else { return };
                 let mut app = app.borrow_mut();
                 app.poll_dir_changes();
+                // 搜索设置页可见时刷新看板指标：索引构建中条目数会持续增长，
+                // 只刷高频字段，不重建驱动器模型（避免打断悬停 / 开关动画）。
+                let on_search_settings = {
+                    let tab = app.state.active();
+                    tab.kind == crate::state::TabKind::Settings
+                        && tab.settings_subpage == crate::state::SettingsSubpage::SearchAndIndex
+                };
+                if on_search_settings {
+                    app.sync_search_stats(false);
+                }
             });
     }
     // 任务进度 + 完成处理（120ms）。
@@ -4440,13 +4611,16 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
             });
     }
     // 侧边栏周期刷新（15s）：驱动器容量、回收站统计、网络位置。
+    // 同时承载「空闲时自动同步索引」策略。
     {
         let timer_app = Rc::downgrade(app);
         app.borrow()
-            .refresh_timer
+            .sidebar_periodic_timer
             .start(TimerMode::Repeated, Duration::from_secs(15), move || {
                 if let Some(app) = timer_app.upgrade() {
-                    app.borrow_mut().sync_sidebar();
+                    let mut app = app.borrow_mut();
+                    app.sync_sidebar();
+                    app.maybe_idle_rescan();
                 }
             });
     }
@@ -4649,6 +4823,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let mut app = app.borrow_mut();
             app.sync_active_tab();
             app.reload_active();
+            app.ui.invoke_scroll_tabs_to_end();
         });
     }
     {
@@ -5001,6 +5176,90 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.state.active_mut().settings_subpage = subpage;
             app.sync_settings();
             app.sync_tabs(); // 修复核心：点击后立即刷新标签栏标题，无需切标签！
+        });
+    }
+
+    // ---- 搜索与索引设置页交互 ----
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_rescan_clicked(move || {
+            let Some(app) = app.upgrade() else { return };
+            crate::search::index::rebuild();
+            let app = app.borrow();
+            app.sync_settings();
+            app.set_status_job("正在重新扫描驱动器并构建索引...");
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_drive_toggled(move |letter, indexed| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let letter = letter.to_string().to_ascii_uppercase();
+            if indexed {
+                app.config.search_excluded_drives.retain(|d| d != &letter);
+            } else if !app.config.search_excluded_drives.contains(&letter) {
+                app.config.search_excluded_drives.push(letter);
+            }
+            app.config.save();
+            reindex_if_active();
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_add_exclusion_clicked(move || {
+            let Some(app) = app.upgrade() else { return };
+            // 原生目录选择框（不是文件框：排除单位是文件夹子树）。
+            if let Some(folder) = crate::sys::pick::pick_folder_path() {
+                let mut app = app.borrow_mut();
+                if !app.config.search_excluded_paths.contains(&folder) {
+                    app.config.search_excluded_paths.push(folder);
+                    app.config.save();
+                    reindex_if_active();
+                    app.sync_settings();
+                }
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_remove_exclusion_clicked(move |path| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let p_str = path.to_string();
+            app.config.search_excluded_paths.retain(|p| p != &p_str);
+            app.config.save();
+            reindex_if_active();
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_idle_toggled(move |enabled| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.search_idle_rescan_minutes = if enabled { 60 } else { 0 };
+            app.config.save();
+            app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_idle_minutes_changed(move |mins| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.search_idle_rescan_minutes = mins.clamp(10, 360) as u32;
+            app.config.save();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_max_results_changed(move |res| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.search_max_results = res.clamp(100, 10000) as usize;
+            app.config.save();
         });
     }
     {
@@ -5682,29 +5941,34 @@ mod drag_hittest {
                 return HTCLIENT as isize;
             }
 
+            let scale = bits(&DRAG_SCALE);
+            let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
+            let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
+            let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
+            windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd as _, &mut pt);
+            let lx = pt.x as f32 / scale;
+            let ly = pt.y as f32 / scale;
+
+            let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
+            let win_w = (rect.right - rect.left) as f32 / scale;
+            let win_h = (rect.bottom - rect.top) as f32 / scale;
+
+            // 核心修复：右上角 172px（设置 36 + 最小化 44 + 最大化 44 + 关闭 46
+            // = 170px + 2px 余量）为窗口控制按钮的绝对独占区。任何缩放或窗口
+            // 尺寸下，只要落入此处 100% 回报 HTCLIENT，绝不允许被后面的标题栏
+            // 拖拽判定吞成 HTCAPTION（窄窗口下按钮失灵的根因）。
+            if (0.0..=TAB_BAR_H).contains(&ly) && lx >= win_w - 172.0 {
+                return HTCLIENT as isize;
+            }
+
             let is_maximized = IsZoomed(hwnd as _) != 0;
 
             if !is_maximized {
-                let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
-                let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
-                let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
-                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd as _, &mut pt);
-                let scale = bits(&DRAG_SCALE);
-                let lx = pt.x as f32 / scale;
-                let ly = pt.y as f32 / scale;
-
-                let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
-                let win_w = (rect.right - rect.left) as f32 / scale;
-                let win_h = (rect.bottom - rect.top) as f32 / scale;
                 let border = 6.0;
 
                 // 1. 顶部边缘（宽 8px 防漏网）
                 if ly <= 8.0 {
-                    // 右上角按钮区（170px）禁止缩放，拦截 Winit 内部光标
-                    if lx >= win_w - 170.0 {
-                        return HTCLIENT as isize;
-                    }
                     if lx <= border { return HTTOPLEFT as isize; }
                     if lx >= win_w - border { return HTTOPRIGHT as isize; }
                     return HTTOP as isize;
@@ -5728,16 +5992,9 @@ mod drag_hittest {
                 }
             }
 
-            // 非缩放边缘：判断是否在标题栏空白拖拽区。
-            let (x, w, scale) = (bits(&DRAG_X), bits(&DRAG_W), bits(&DRAG_SCALE));
-            if w > 0.0 && scale > 0.0 {
-                let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
-                let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
-                let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
-                windows_sys::Win32::Graphics::Gdi::ScreenToClient(hwnd as _, &mut pt);
-                let lx = pt.x as f32 / scale;
-                let ly = pt.y as f32 / scale;
-                
+            // 非缩放边缘：判断是否在标题栏空白拖拽区（坐标已在上面转换好）。
+            let (x, w) = (bits(&DRAG_X), bits(&DRAG_W));
+            if w > 0.0 {
                 if (0.0..=TAB_BAR_H).contains(&ly) && lx >= x && lx <= x + w {
                     return HTCAPTION as isize;
                 }
@@ -5780,16 +6037,6 @@ mod drag_hittest {
 
 /// 估算单个标签的宽度（逻辑像素）。仅 Windows 的拖拽热区计算使用。
 ///
-/// 依据 `tab_bar.slint` 的真实布局：内层 `HorizontalLayout` 的
-/// `padding-left 10 + 图标 16 + spacing 6 + 关闭钮 18 + padding-right 6`
-/// = 56px 固定开销，其余为标题文本；标签整体钳制在 [80, 220]。
-/// 文本按 CJK / ASCII 分别估宽——Rove 的标题多是中文目录名，
-/// 用单一均值会系统性低估，导致拖拽热区压到最后一个标签上。
-#[cfg(windows)]
-fn estimate_tab_width(_title: &str) -> f32 {
-    150.0 // 标签宽度固定为 150px
-}
-
 /// 把标题栏空白拖拽区边界同步给 Win32 命中测试钩子（仅 Windows）。
 ///
 /// 纯 Rust 计算，**不依赖 Slint 布局属性**：`drag-spacer` 的 `x`/`width`
@@ -5803,18 +6050,16 @@ fn sync_drag_bounds(app: &App) {
     // size() 是物理像素；窗口未 realize 时为 0，给个下限保证算式有意义。
     let window_w = (app.ui.window().size().width as f32 / scale).max(400.0);
 
-    // 左侧：8px 内边距 + 各标签（含 3px 间距）+ 「+」按钮 30px。
-    let mut x = 8.0f32;
-    for t in &app.state.tabs {
-        x += estimate_tab_width(&t.title()) + 3.0;
+    // 标签可视区宽度上限（与 tab_bar.slint 预留的 270px 严格对齐）
+    let max_tabs_w = (window_w - 270.0).max(0.0);
+    let mut tabs_w = 0.0f32;
+    for _ in &app.state.tabs {
+        tabs_w += 153.0; // 单标签 150px + 3px 间距
     }
-    x += 30.0;
-    // 安全边距：实测估算比真实布局起点小约 3.5px（文本宽度按 12.5px/字
-    // 仍略低估），给到 8px，确保热区绝不压到最后一个标签——否则点标签
-    // 会变成拖窗口。
-    x += 8.0;
+    let actual_tabs_w = tabs_w.min(max_tabs_w);
 
-    // 右侧：设置齿轮(36) + 三个窗口按钮(44+44+46=134) = 170px，再留 6px 余量。
+    // 拖拽起点 x = 8px 左边距 + 实际标签区宽度 + 3px 间隙 + 28px 新建按钮 + 4px 留白
+    let x = 8.0 + actual_tabs_w + 3.0 + 28.0 + 4.0;
     let controls_start = window_w - 176.0;
     let w = (controls_start - x).max(0.0);
 

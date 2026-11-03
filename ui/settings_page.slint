@@ -1,7 +1,7 @@
 // 设置页面（独立标签页）。
 // 目前实现：左侧子导航 + 右侧「本地右键菜单」分组管理。
 
-import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem, SettingsShortcutGroup, SettingsShortcutItem } from "common.slint";
+import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem, SettingsShortcutGroup, SettingsShortcutItem, SettingsDriveItem, IconRefresh, IconClose } from "common.slint";
 
 component Toggle inherits Rectangle {
     in-out property <bool> checked: true;
@@ -31,6 +31,32 @@ component Toggle inherits Rectangle {
             root.checked = !root.checked;
             root.toggled();
         }
+    }
+}
+
+// 驱动器图标：纯矢量绘制（盘体 + 指示灯），不依赖字体字形。
+component DriveGlyph inherits Rectangle {
+    width: 16px;
+    height: 16px;
+    background: transparent;
+
+    Rectangle {
+        x: 0px;
+        y: 3px;
+        width: parent.width;
+        height: parent.height - 6px;
+        border-radius: 3px;
+        border-width: 1.2px;
+        border-color: Theme.text-disabled;
+        background: transparent;
+    }
+    Rectangle {
+        x: parent.width - 5px;
+        y: parent.height - 7px;
+        width: 2px;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.accent;
     }
 }
 
@@ -231,6 +257,87 @@ component GroupCard inherits Rectangle {
     }
 }
 
+// 统一桌面级滚动容器（完全复刻 file_list.slint 的呼吸胶囊滚动条规范与定位）
+component SettingsScrollContainer inherits Rectangle {
+    in property <length> content-height;
+    in-out property <length> content-y: 0px;
+
+    vertical-stretch: 1;
+    clip: true;
+
+    // 记录按下时鼠标相对于滑块顶部的抓取偏移，消除拖拽跳动
+    private property <length> sb-drag-grab-y: 0px;
+
+    flick := Flickable {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        interactive: false; // 严禁触屏手势
+        content-width: self.width;
+        content-height: max(self.height, root.content-height);
+        content-y <=> root.content-y;
+
+        @children
+    }
+
+    // ---- 自绘垂直滚动条（完全移植自 file_list.slint，位置/尺寸/动画/色彩 100% 对齐） ----
+    scrollbar := Rectangle {
+        x: parent.width - self.width - 2px;
+        y: 2px;
+        width: 8px;
+        height: parent.height - 4px;
+        visible: flick.content-height > flick.height + 1px;
+
+        property <length> track-h: self.height;
+        property <length> thumb-h: max(32px, min(self.track-h, self.track-h * flick.height / max(flick.content-height, 1px)));
+        property <length> thumb-y: (self.track-h - self.thumb-h) * (-flick.content-y / max(flick.content-height - flick.height, 1px));
+
+        thumb := Rectangle {
+            x: parent.width - self.width;
+            y: min(scrollbar.track-h - scrollbar.thumb-h, max(0px, scrollbar.thumb-y));
+            width: (scrollbar-ta.has-hover || scrollbar-ta.pressed) ? 6px : 4px;
+            height: scrollbar.thumb-h;
+            border-radius: self.width / 2;
+            background: scrollbar-ta.pressed
+                ? Theme.text-primary.transparentize(0.35)
+                : (scrollbar-ta.has-hover ? Theme.text-primary.transparentize(0.5) : Theme.text-primary.transparentize(0.72));
+
+            animate width, background { duration: 150ms; easing: ease-out; }
+        }
+
+        scrollbar-ta := TouchArea {
+            width: 100%;
+            height: 100%;
+
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    root.sb-drag-grab-y = self.mouse-y - min(scrollbar.track-h - scrollbar.thumb-h, max(0px, scrollbar.thumb-y));
+                }
+            }
+
+            moved => {
+                if (self.pressed) {
+                    let max-travel = max(scrollbar.track-h - scrollbar.thumb-h, 1px);
+                    let target-y = self.mouse-y - root.sb-drag-grab-y;
+                    let ratio = max(0.0, min(1.0, target-y / max-travel));
+                    let offset = -ratio * (flick.content-height - flick.height);
+                    flick.content-y = max(min(0px, flick.height - flick.content-height), min(0px, offset));
+                }
+            }
+
+            scroll-event(event) => {
+                if (event.delta-y != 0px) {
+                    let min-y = min(0px, flick.height - flick.content-height);
+                    flick.content-y = min(0px, max(min-y, flick.content-y + event.delta-y));
+                    return EventResult.accept;
+                }
+                return EventResult.reject;
+            }
+        }
+    }
+}
+
 export component SettingsPage inherits Rectangle {
     in property <[SettingsNavItem]> nav-items: [];
     in property <[SettingsActionGroup]> action-groups: [];
@@ -260,6 +367,28 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> show-hidden: false;
     /// 开关「显示隐藏项目」时触发（bool = 新的开关态）。
     callback show_hidden_toggled(bool);
+
+    // ---- 搜索与索引数据与回调 ----
+    in property <bool> search-ready: true;
+    in property <string> search-status-text: "索引未构建";
+    in property <string> search-items-count: "0";
+    in property <string> search-size-text: "0 MB";
+    in property <int> search-drives-count: 0;
+    in property <string> search-last-scan-time: "未记录";
+    in property <[SettingsDriveItem]> search-drives: [];
+    in property <[string]> search-builtin-exclusions: [];
+    in property <[string]> search-custom-exclusions: [];
+    in-out property <bool> search-idle-enabled: true;
+    in-out property <int> search-idle-minutes: 60;
+    in-out property <int> search-max-results: 1000;
+
+    callback search_rescan_clicked();
+    callback search_drive_toggled(string, bool); // letter, enabled
+    callback search_add_exclusion_clicked();
+    callback search_remove_exclusion_clicked(string); // path
+    callback search_idle_toggled(bool);
+    callback search_idle_minutes_changed(int);
+    callback search_max_results_changed(int);
     // 分组列表内容高度（Rust 按模型计算）。与 Slint 侧实测值取 max，
     // 任一来源少报都不会导致内容被裁切后无法滚动到。
     in property <length> content-height: 0px;
@@ -337,14 +466,14 @@ export component SettingsPage inherits Rectangle {
             }
         }
 
-        // 右侧内容
+        // 右侧内容区（占满右半区，右边框直达窗口最边缘，与 file_list 滚动条
+        // 处于同一垂直线）。外层取消右边距，把呼吸感下放到标题/描述/子页——
+        // 如此自绘滚动条紧贴窗口右缘，不再悬浮于页面半空。
         // 注意：不要给这个布局写 height:100%。它是 HorizontalLayout 的子布局，
-        // 交叉轴（纵向）本就会被布局器撑满；显式写高度反而会覆盖该行为、
-        // 把高度链搅成内容驱动（表现为视口随内容收缩、空白顶到页面顶部）。
+        // 交叉轴（纵向）本就会被布局器撑满；显式写高度反而会覆盖该行为。
         VerticalLayout {
             horizontal-stretch: 1;
             padding-left: 24px;
-            padding-right: 24px;
             padding-top: 20px;
             padding-bottom: 20px;
             spacing: 16px;
@@ -354,7 +483,8 @@ export component SettingsPage inherits Rectangle {
                 height: 38px;
 
                 HorizontalLayout {
-                    width: 100%;
+                    padding-left: 0px;
+                    padding-right: 24px;
                     height: parent.height;
 
                     Text {
@@ -419,87 +549,689 @@ export component SettingsPage inherits Rectangle {
                 }
             }
 
-            Text {
-                text: root.page-desc;
-                color: Theme.text-secondary;
-                font-size: 12px;
-                wrap: word-wrap;
+            HorizontalLayout {
+                padding-right: 24px;
+                Text {
+                    text: root.page-desc;
+                    color: Theme.text-secondary;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
             }
 
-            // ---- 子页 1：通用设置面板（严格置顶对齐） ----
-            if (root.page-title == "通用") : VerticalLayout {
-                spacing: 12px;
-                alignment: start;
-                vertical-stretch: 1;
+            // ---- 子页 1：通用设置面板 ----
+            if (root.page-title == "通用") : SettingsScrollContainer {
+                content-height: gen-layout.preferred-height + 28px;
 
-                Rectangle {
-                    background: gen-row-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
-                    border-radius: 8px;
-                    border-width: 1px;
-                    border-color: Theme.border;
-                    height: 58px;
+                gen-layout := VerticalLayout {
+                    width: 100%;
+                    padding-right: 24px;
+                    spacing: 12px;
+                    alignment: start;
 
-                    // 全行点击切换（菲茨定律）：本地翻转 UI 并派发
-                    gen-row-ta := TouchArea {
+                    Rectangle {
                         width: 100%;
-                        height: 100%;
-                        clicked => {
-                            root.show-hidden = !root.show-hidden;
-                            root.show_hidden_toggled(root.show-hidden);
+                        background: gen-row-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 58px;
+
+                        gen-row-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.show-hidden = !root.show-hidden;
+                                root.show_hidden_toggled(root.show-hidden);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: "显示隐藏的文件、文件夹和驱动器";
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: "关闭时自动过滤具有隐藏属性的文件；开启时以半透明效果显示";
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.show-hidden;
+                                toggled => {
+                                    root.show-hidden = self.checked;
+                                    root.show_hidden_toggled(self.checked);
+                                }
+                            }
                         }
                     }
+                }
+            }
 
-                    HorizontalLayout {
-                        padding-left: 16px;
-                        padding-right: 16px;
-                        spacing: 12px;
+            // ---- 子页：搜索与索引 ----
+            if (root.page-title == "搜索与索引") : SettingsScrollContainer {
+                content-height: search-layout.preferred-height + 28px;
+
+                search-layout := VerticalLayout {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    padding-top: 4px;
+                    padding-right: 24px;
+                    padding-bottom: 24px;
+                    spacing: 16px;
+                    alignment: start;
+
+                    // 1. 顶部指标看板卡片
+                    Rectangle {
+                        width: 100%;
+                        background: Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 126px;
 
                         VerticalLayout {
-                            alignment: center;
-                            spacing: 2px;
-                            horizontal-stretch: 1;
+                            padding: 14px;
+                            spacing: 12px;
 
-                            Text {
-                                text: "显示隐藏的文件、文件夹和驱动器";
-                                color: Theme.text-primary;
-                                font-size: 13px;
-                                font-weight: 500;
+                            // 卡片头部：状态与重新扫描按钮
+                            HorizontalLayout {
+                                height: 28px;
+                                spacing: 8px;
+
+                                Rectangle {
+                                    width: 8px;
+                                    height: 8px;
+                                    border-radius: 4px;
+                                    y: (parent.height - self.height) / 2;
+                                    background: root.search-ready ? Theme.accent : #E67E22;
+                                }
+
+                                Text {
+                                    text: root.search-status-text;
+                                    color: root.search-ready ? Theme.accent : #E67E22;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    horizontal-stretch: 1;
+                                }
+
+                                // 重新扫描驱动器按钮
+                                Rectangle {
+                                    width: 132px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: rescan-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+
+                                    HorizontalLayout {
+                                        alignment: center;
+                                        spacing: 6px;
+
+                                        IconRefresh { size: 12px; icon-color: Theme.text-secondary; y: (parent.height - self.height) / 2; }
+
+                                        Text {
+                                            text: "重新扫描驱动器";
+                                            color: Theme.text-primary;
+                                            font-size: 11.5px;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    rescan-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => { root.search_rescan_clicked(); }
+                                    }
+                                }
                             }
-                            Text {
-                                text: "关闭时自动过滤具有隐藏属性的文件；开启时以半透明效果显示";
-                                color: Theme.text-secondary;
-                                font-size: 11px;
+
+                            // 4 栏指标网格
+                            HorizontalLayout {
+                                height: 58px;
+                                spacing: 10px;
+
+                                // 指标 1：已索引项目
+                                Rectangle {
+                                    height: 58px;
+                                    horizontal-stretch: 1;
+                                    background: Theme.bg-main;
+                                    border-radius: 6px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text { text: root.search-items-count; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
+                                        Text { text: "已索引项目"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                    }
+                                }
+
+                                // 指标 2：索引大小
+                                Rectangle {
+                                    height: 58px;
+                                    horizontal-stretch: 1;
+                                    background: Theme.bg-main;
+                                    border-radius: 6px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text { text: root.search-size-text; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
+                                        Text { text: "内存/缓存大小"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                    }
+                                }
+
+                                // 指标 3：驱动器
+                                Rectangle {
+                                    height: 58px;
+                                    horizontal-stretch: 1;
+                                    background: Theme.bg-main;
+                                    border-radius: 6px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text { text: root.search-drives-count; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
+                                        Text { text: "已纳管驱动器"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                    }
+                                }
+
+                                // 指标 4：上次同步
+                                Rectangle {
+                                    height: 58px;
+                                    horizontal-stretch: 1;
+                                    background: Theme.bg-main;
+                                    border-radius: 6px;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text { text: root.search-last-scan-time; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
+                                        Text { text: "上次同步"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                    }
+                                }
                             }
                         }
+                    }
 
-                        Toggle {
-                            y: (parent.height - self.height) / 2;
-                            checked: root.show-hidden;
-                            toggled => {
-                                root.show-hidden = self.checked;
-                                root.show_hidden_toggled(self.checked);
+                    // 2. 驱动器管理卡片
+                    Rectangle {
+                        width: 100%;
+                        background: Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 44px + root.search-drives.length * 44px;
+
+                        VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            spacing: 0px;
+
+                            Text {
+                                height: 24px;
+                                text: "驱动器检索范围";
+                                color: Theme.text-secondary;
+                                font-size: 12px;
+                                font-weight: 600;
+                            }
+
+                            for drive in root.search-drives : Rectangle {
+                                height: 44px;
+                                background: d-ta.has-hover ? Theme.bg-hover : transparent;
+                                border-radius: 6px;
+
+                                d-ta := TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+                                    clicked => { root.search_drive_toggled(drive.letter, !drive.indexed); }
+                                }
+
+                                HorizontalLayout {
+                                    padding-left: 8px;
+                                    padding-right: 8px;
+                                    spacing: 12px;
+
+                                    DriveGlyph {
+                                        y: (parent.height - self.height) / 2;
+                                    }
+
+                                    VerticalLayout {
+                                        alignment: center;
+                                        horizontal-stretch: 1;
+                                        spacing: 1px;
+                                        Text {
+                                            text: drive.label + " (" + drive.letter + ":)";
+                                            color: Theme.text-primary;
+                                            font-size: 13px;
+                                            font-weight: 500;
+                                            overflow: elide;
+                                        }
+                                        Text {
+                                            text: drive.total-space;
+                                            color: Theme.text-secondary;
+                                            font-size: 11px;
+                                        }
+                                    }
+
+                                    // 状态角标
+                                    Rectangle {
+                                        width: 50px;
+                                        height: 20px;
+                                        y: (parent.height - self.height) / 2;
+                                        border-radius: 4px;
+                                        background: drive.indexed ? Theme.accent.transparentize(0.85) : Theme.bg-badge;
+                                        Text {
+                                            text: drive.indexed ? "已索引" : "未索引";
+                                            color: drive.indexed ? Theme.accent : Theme.text-disabled;
+                                            font-size: 10.5px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+                                    }
+
+                                    Toggle {
+                                        y: (parent.height - self.height) / 2;
+                                        checked: drive.indexed;
+                                        toggled => { root.search_drive_toggled(drive.letter, self.checked); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. 忽略与排除路径
+                    Rectangle {
+                        width: 100%;
+                        background: Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 106px;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 8px;
+
+                            HorizontalLayout {
+                                height: 28px;
+                                spacing: 8px;
+
+                                VerticalLayout {
+                                    spacing: 1px;
+                                    horizontal-stretch: 1;
+                                    alignment: center;
+                                    Text { text: "忽略与剪枝路径"; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
+                                    Text { text: "自动跳过匹配的文件夹子树，大幅减少冗余文件干扰"; font-size: 10.5px; color: Theme.text-disabled; overflow: elide; }
+                                }
+
+                                HorizontalLayout {
+                                    spacing: 6px;
+                                    y: (parent.height - self.height) / 2;
+
+                                    Rectangle {
+                                        width: 80px;
+                                        height: 26px;
+                                        border-radius: 5px;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+                                        background: add-ex-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+
+                                        Text {
+                                            text: "+ 添加路径";
+                                            color: Theme.text-primary;
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+
+                                        add-ex-ta := TouchArea {
+                                            width: 100%;
+                                            height: 100%;
+                                            clicked => { root.search_add_exclusion_clicked(); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 横向流式标签栏
+                            tags-flick := Flickable {
+                                height: 30px;
+                                content-width: max(tags-layout.preferred-width, self.width);
+                                interactive: false;
+
+                                tags-layout := HorizontalLayout {
+                                    x: 0px;
+                                    y: 2px;
+                                    height: 26px;
+                                    spacing: 8px;
+
+                                    // 内置系统排除项（灰显，不可删除）
+                                    for item in root.search-builtin-exclusions : Rectangle {
+                                        height: 26px;
+                                        width: bi-txt.preferred-width + 16px;
+                                        border-radius: 5px;
+                                        background: Theme.bg-badge;
+                                        border-width: 1px;
+                                        border-color: Theme.border.transparentize(0.5);
+
+                                        bi-txt := Text {
+                                            text: item;
+                                            color: Theme.text-disabled;
+                                            font-size: 11px;
+                                            font-family: Theme.mono-font-family;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                        }
+                                    }
+
+                                    // 自定义排除项（支持点击右侧 × 删除）
+                                    for item in root.search-custom-exclusions : Rectangle {
+                                        height: 26px;
+                                        width: c-txt.preferred-width + 30px;
+                                        border-radius: 5px;
+                                        background: Theme.bg-main;
+                                        border-width: 1px;
+                                        border-color: Theme.border;
+
+                                        HorizontalLayout {
+                                            padding-left: 8px;
+                                            padding-right: 6px;
+                                            spacing: 4px;
+
+                                            c-txt := Text {
+                                                text: item;
+                                                color: Theme.text-primary;
+                                                font-size: 11px;
+                                                font-family: Theme.mono-font-family;
+                                                vertical-alignment: center;
+                                                horizontal-stretch: 1;
+                                                overflow: elide;
+                                            }
+
+                                            IconClose {
+                                                size: 8px;
+                                                icon-color: Theme.danger;
+                                                y: (parent.height - self.height) / 2;
+                                            }
+                                        }
+
+                                        TouchArea {
+                                            width: 100%;
+                                            height: 100%;
+                                            clicked => { root.search_remove_exclusion_clicked(item); }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 横向滚动条（悬停加粗高亮 + 点击跳转 + 拖动滑块）
+                            if (tags-flick.content-width > tags-flick.width) : Rectangle {
+                                height: 6px;
+                                width: 100%;
+                                background: transparent;
+
+                                property <length> max-scroll: max(1px, tags-flick.content-width - tags-flick.width);
+                                property <length> thumb-w: max(32px, self.width * (tags-flick.width / max(tags-flick.content-width, 1px)));
+                                property <length> max-travel: max(0px, self.width - self.thumb-w);
+                                property <bool> active: h-track-ta.has-hover || h-track-ta.pressed;
+
+                                // 视觉轨道：3px → 5px，命中区固定 6px
+                                Rectangle {
+                                    y: (parent.height - self.height) / 2;
+                                    width: 100%;
+                                    height: parent.active ? 5px : 3px;
+                                    border-radius: self.height / 2;
+                                    background: parent.active ? Theme.bg-hover : Theme.bg-main;
+
+                                    animate height { duration: 120ms; }
+                                    animate background { duration: 120ms; }
+                                }
+
+                                h-track-ta := TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+
+                                    property <length> drag-start-x: 0px;
+                                    property <length> drag-start-scroll: 0px;
+
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down) {
+                                            // 按在滑块上直接拖拽；按在轨道空白处先跳转到该位置。
+                                            let thumb-left = parent.max-travel * (-tags-flick.content-x / parent.max-scroll);
+                                            if (self.mouse-x < thumb-left || self.mouse-x > thumb-left + parent.thumb-w) {
+                                                let click-ratio = (self.mouse-x - parent.thumb-w / 2) / max(1px, parent.max-travel);
+                                                tags-flick.content-x = -max(0.0, min(1.0, click-ratio)) * parent.max-scroll;
+                                            }
+                                            self.drag-start-scroll = tags-flick.content-x;
+                                            self.drag-start-x = self.mouse-x;
+                                        }
+                                    }
+
+                                    moved => {
+                                        if (self.pressed && parent.max-travel > 0px) {
+                                            let delta-x = self.mouse-x - self.drag-start-x;
+                                            let delta-scroll = (delta-x / parent.max-travel) * parent.max-scroll;
+                                            tags-flick.content-x = max(-parent.max-scroll, min(0px, self.drag-start-scroll - delta-scroll));
+                                        }
+                                    }
+                                }
+
+                                // 滑块本体（悬停/拖动时加粗加亮）
+                                Rectangle {
+                                    x: parent.max-travel * (-tags-flick.content-x / parent.max-scroll);
+                                    y: (parent.height - self.height) / 2;
+                                    width: parent.thumb-w;
+                                    height: parent.active ? 5px : 3px;
+                                    border-radius: self.height / 2;
+                                    background: h-track-ta.pressed ? Theme.accent : (h-track-ta.has-hover ? Theme.text-secondary : Theme.border);
+                                    opacity: parent.active ? 0.9 : 0.6;
+
+                                    animate height { duration: 120ms; }
+                                    animate background { duration: 120ms; }
+                                    animate opacity { duration: 120ms; }
+                                }
+                            }
+                        }
+                    }
+
+                    // 4. 自动化与结果策略卡片
+                    Rectangle {
+                        width: 100%;
+                        background: Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 108px;
+
+                        VerticalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            padding-top: 10px;
+                            padding-bottom: 10px;
+                            spacing: 4px;
+
+                            // 行 1：空闲重扫
+                            HorizontalLayout {
+                                height: 42px;
+                                spacing: 12px;
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    spacing: 1px;
+                                    Text { text: "空闲时自动同步索引"; font-size: 13px; font-weight: 500; color: Theme.text-primary; }
+                                    Text { text: "应用进入空闲且距离上次构建超过指定时间后，在后台静默增量同步"; font-size: 11px; color: Theme.text-secondary; overflow: elide; }
+                                }
+
+                                Toggle {
+                                    y: (parent.height - self.height) / 2;
+                                    checked: root.search-idle-enabled;
+                                    toggled => {
+                                        root.search-idle-enabled = self.checked;
+                                        root.search_idle_toggled(self.checked);
+                                    }
+                                }
+
+                                // 步进器
+                                Rectangle {
+                                    width: 108px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: Theme.bg-main;
+                                    opacity: root.search-idle-enabled ? 1.0 : 0.4;
+
+                                    HorizontalLayout {
+                                        Rectangle {
+                                            width: 26px;
+                                            background: idle-minus-ta.has-hover ? Theme.bg-hover : transparent;
+                                            Text { text: "—"; color: Theme.text-secondary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            idle-minus-ta := TouchArea {
+                                                width: 100%;
+                                                height: 100%;
+                                                enabled: root.search-idle-enabled && root.search-idle-minutes > 10;
+                                                clicked => {
+                                                    root.search-idle-minutes = max(10, root.search-idle-minutes - 10);
+                                                    root.search_idle_minutes_changed(root.search-idle-minutes);
+                                                }
+                                            }
+                                        }
+                                        Text {
+                                            text: root.search-idle-minutes + " 分钟";
+                                            font-size: 11px;
+                                            color: Theme.text-primary;
+                                            font-weight: 500;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Rectangle {
+                                            width: 26px;
+                                            background: idle-plus-ta.has-hover ? Theme.bg-hover : transparent;
+                                            Text { text: "+"; color: Theme.text-secondary; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            idle-plus-ta := TouchArea {
+                                                width: 100%;
+                                                height: 100%;
+                                                enabled: root.search-idle-enabled && root.search-idle-minutes < 360;
+                                                clicked => {
+                                                    root.search-idle-minutes = min(360, root.search-idle-minutes + 10);
+                                                    root.search_idle_minutes_changed(root.search-idle-minutes);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 行 2：结果上限限制
+                            HorizontalLayout {
+                                height: 42px;
+                                spacing: 12px;
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    horizontal-stretch: 1;
+                                    spacing: 1px;
+                                    Text { text: "全局搜索结果展示上限"; font-size: 13px; font-weight: 500; color: Theme.text-primary; }
+                                    Text { text: "限制此电脑全盘秒搜返回的最佳匹配条目上限，保证虚拟列表丝滑滚动"; font-size: 11px; color: Theme.text-secondary; overflow: elide; }
+                                }
+
+                                // 步进器
+                                Rectangle {
+                                    width: 108px;
+                                    height: 28px;
+                                    y: (parent.height - self.height) / 2;
+                                    border-radius: 6px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: Theme.bg-main;
+
+                                    HorizontalLayout {
+                                        Rectangle {
+                                            width: 26px;
+                                            background: max-minus-ta.has-hover ? Theme.bg-hover : transparent;
+                                            Text { text: "—"; color: Theme.text-secondary; font-size: 11px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            max-minus-ta := TouchArea {
+                                                width: 100%;
+                                                height: 100%;
+                                                enabled: root.search-max-results > 200;
+                                                clicked => {
+                                                    root.search-max-results = max(200, root.search-max-results - 200);
+                                                    root.search_max_results_changed(root.search-max-results);
+                                                }
+                                            }
+                                        }
+                                        Text {
+                                            text: root.search-max-results + " 项";
+                                            font-size: 11px;
+                                            color: Theme.text-primary;
+                                            font-weight: 500;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            horizontal-stretch: 1;
+                                        }
+                                        Rectangle {
+                                            width: 26px;
+                                            background: max-plus-ta.has-hover ? Theme.bg-hover : transparent;
+                                            Text { text: "+"; color: Theme.text-secondary; font-size: 13px; horizontal-alignment: center; vertical-alignment: center; width: 100%; height: 100%; }
+                                            max-plus-ta := TouchArea {
+                                                width: 100%;
+                                                height: 100%;
+                                                enabled: root.search-max-results < 5000;
+                                                clicked => {
+                                                    root.search-max-results = min(5000, root.search-max-results + 200);
+                                                    root.search_max_results_changed(root.search-max-results);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
 
-            // ---- 子页 2：本地右键菜单分组列表 ----
-            if (root.page-title == "本地右键菜单" && root.action-groups.length > 0) : Flickable {
-                vertical-stretch: 1;
-                content-height: max(self.height, max(root.content-height, groups-layout.preferred-height));
 
-                changed content-height => {
-                    root.scroll_debug(self.height, self.content-height, groups-layout.preferred-height);
-                }
+
+            // ---- 子页 2：本地右键菜单分组列表 ----
+            if (root.page-title == "本地右键菜单" && root.action-groups.length > 0) : SettingsScrollContainer {
+                content-height: max(root.content-height, groups-layout.preferred-height) + 28px;
 
                 groups-layout := VerticalLayout {
-                    y: 0px;
                     width: 100%;
+                    padding-right: 24px;
                     spacing: 12px;
                     alignment: start;
 
                     for group in root.action-groups : GroupCard {
+                        width: 100%;
                         group: group;
                         toggled(id, enabled) => { root.action_toggled(id, enabled); }
                         group_toggled(name, expanded) => { root.group_toggled(name, expanded); }
@@ -510,11 +1242,13 @@ export component SettingsPage inherits Rectangle {
             }
 
             // ---- 子页：快捷键 ----
-            if (root.page-title == "快捷键") : Flickable {
-                vertical-stretch: 1;
+            if (root.page-title == "快捷键") : SettingsScrollContainer {
+                content-height: keys-layout.preferred-height + 28px;
 
-                VerticalLayout {
+                keys-layout := VerticalLayout {
+                    width: 100%;
                     padding-top: 4px;
+                    padding-right: 24px;
                     padding-bottom: 24px;
                     spacing: 16px;
                     alignment: start;
@@ -683,11 +1417,14 @@ export component SettingsPage inherits Rectangle {
             }
 
             // ---- 其余未实现的子页占位提示 ----
-            if (root.page-title != "通用" && root.page-title != "本地右键菜单" && root.page-title != "快捷键") : Text {
-                text: "该设置页将在后续 Sprint 实现。";
-                color: Theme.text-disabled;
-                font-size: 12px;
-                vertical-alignment: top;
+            if (root.page-title != "通用" && root.page-title != "搜索与索引" && root.page-title != "本地右键菜单" && root.page-title != "快捷键") : HorizontalLayout {
+                padding-right: 24px;
+                Text {
+                    text: "该设置页将在后续 Sprint 实现。";
+                    color: Theme.text-disabled;
+                    font-size: 12px;
+                    vertical-alignment: top;
+                }
             }
         }
     }

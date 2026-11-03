@@ -50,6 +50,54 @@ unsafe fn run_dialog() -> Option<String> {
     Some(s)
 }
 
+/// 弹出原生目录选择对话框，返回选中文件夹的绝对路径；用户取消或失败时为 None。
+///
+/// 与 [`pick_program_path`] 一样会开启嵌套消息循环，仅适合用户点击时调用。
+#[cfg(windows)]
+pub fn pick_folder_path() -> Option<String> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+
+    unsafe {
+        let uninit = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let out = run_folder_dialog();
+        if uninit {
+            CoUninitialize();
+        }
+        out
+    }
+}
+
+#[cfg(windows)]
+unsafe fn run_folder_dialog() -> Option<String> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+    use windows::Win32::UI::Shell::{
+        FileOpenDialog, IFileDialog, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST, FOS_PICKFOLDERS,
+        SIGDN_FILESYSPATH,
+    };
+
+    let dialog: IFileDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).ok()?;
+
+    let title: Vec<u16> = "选择要排除索引的文件夹\0".encode_utf16().collect();
+    let _ = dialog.SetTitle(PCWSTR(title.as_ptr()));
+    let _ = dialog.SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+
+    // 父窗口省略（HWND 0）：对话框独立于主窗口，避免嵌套模态与 Slint 事件循环冲突。
+    if dialog.Show(None).is_err() {
+        return None;
+    }
+
+    let item = dialog.GetResult().ok()?;
+    let path = item.GetDisplayName(SIGDN_FILESYSPATH).ok()?;
+    path.to_string().ok()
+}
+
+/// 非 Windows 平台（交叉编译期）的空实现。
+#[cfg(not(windows))]
+pub fn pick_folder_path() -> Option<String> {
+    None
+}
+
 /// 非 Windows 平台（交叉编译期）的空实现。
 #[cfg(not(windows))]
 pub fn pick_program_path() -> Option<String> {

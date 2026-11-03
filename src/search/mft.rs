@@ -30,15 +30,22 @@ use crate::logln;
 
 /// 尝试用 USN/MFT 构建全盘索引；成功索引到条目返回 `Some(条目数)`，
 /// 失败（无权限 / 非 NTFS）返回 `None`（回退 walker）。
+///
+/// `exclusions` 为用户自定义排除路径（已小写、无尾部分隔符），解析出
+/// 绝对路径后整棵子树剪枝。
 #[cfg(windows)]
-pub fn build_via_mft(idx: &SharedIndex, stop: &AtomicBool) -> Option<usize> {
+pub fn build_via_mft(
+    idx: &SharedIndex,
+    stop: &AtomicBool,
+    exclusions: &[String],
+) -> Option<usize> {
     let mut total = 0usize;
     let mut any_drive = false;
     for drive in super::index::list_roots() {
         if stop.load(Ordering::Relaxed) || total >= MAX_ENTRIES {
             break;
         }
-        if let Some(n) = scan_drive_mft(&drive, idx, stop, total) {
+        if let Some(n) = scan_drive_mft(&drive, idx, stop, total, exclusions) {
             any_drive = true;
             total += n;
         }
@@ -52,7 +59,11 @@ pub fn build_via_mft(idx: &SharedIndex, stop: &AtomicBool) -> Option<usize> {
 
 /// 非 Windows 平台无 MFT，直接回退 walker。
 #[cfg(not(windows))]
-pub fn build_via_mft(_idx: &SharedIndex, _stop: &AtomicBool) -> Option<usize> {
+pub fn build_via_mft(
+    _idx: &SharedIndex,
+    _stop: &AtomicBool,
+    _exclusions: &[String],
+) -> Option<usize> {
     None
 }
 
@@ -63,7 +74,7 @@ pub fn build_via_mft(_idx: &SharedIndex, _stop: &AtomicBool) -> Option<usize> {
 /// （`WinSxS`、`AppData\Local\Temp`、`Servicing` 等会占满索引名额）。
 /// 这里对解析出的绝对路径做大小写不敏感的子串判定，与 walker 的剪枝范围对齐。
 #[cfg(windows)]
-fn path_is_noise(path: &Path) -> bool {
+fn path_is_noise(path: &Path, exclusions: &[String]) -> bool {
     let p = path.to_string_lossy().to_lowercase();
     // `\program files\` 已覆盖 `\program files (x86)\`；`\appdata\` 已覆盖
     // `\appdata\local\temp\`（保留显式项以示意图）。
@@ -73,6 +84,7 @@ fn path_is_noise(path: &Path) -> bool {
         || p.contains(r"\appdata\local\temp\")
         || p.contains(r"\appdata\")
         || p.contains(r"\program files\")
+        || super::index::under_exclusion_lower(&p, exclusions)
 }
 
 /// 解析单个盘的 MFT/USN 并写入索引；该盘不可用时返回 `None`。
@@ -82,6 +94,7 @@ fn scan_drive_mft(
     idx: &SharedIndex,
     stop: &AtomicBool,
     start_total: usize,
+    exclusions: &[String],
 ) -> Option<usize> {
     let letter = drive
         .to_string_lossy()
@@ -163,7 +176,7 @@ fn scan_drive_mft(
 
         // 兜底：目录名看不出、但解析出的路径落在噪音子树内（理论上已被
         // （一）（二）覆盖，此处防枚举顺序异常）。目录同样登记 fid 惠及子孙。
-        if path_is_noise(&path) {
+        if path_is_noise(&path, exclusions) {
             if is_dir {
                 noise_fids.insert(entry.fid);
             }
@@ -205,19 +218,28 @@ mod tests {
     #[test]
     fn noise_paths_are_filtered() {
         // Windows 核心系统目录（任意盘符、任意大小写）。
-        assert!(path_is_noise(Path::new(r"C:\Windows\System32\drivers\etc\hosts")));
-        assert!(path_is_noise(Path::new(r"c:\windows\winsxs\amd64_x.dll")));
-        assert!(path_is_noise(Path::new(r"D:\$Recycle.Bin\S-1-5-21\desktop.ini")));
-        assert!(path_is_noise(Path::new(
-            r"C:\System Volume Information\tracking.log"
-        )));
-        assert!(path_is_noise(Path::new(
-            r"C:\Users\me\AppData\Local\Temp\scratch.tmp"
-        )));
-        assert!(path_is_noise(Path::new(r"C:\Program Files\Git\cmd\git.exe")));
+        assert!(path_is_noise(Path::new(r"C:\Windows\System32\drivers\etc\hosts"), &[]));
+        assert!(path_is_noise(Path::new(r"c:\windows\winsxs\amd64_x.dll"), &[]));
+        assert!(path_is_noise(Path::new(r"D:\$Recycle.Bin\S-1-5-21\desktop.ini"), &[]));
+        assert!(path_is_noise(
+            Path::new(r"C:\System Volume Information\tracking.log"),
+            &[]
+        ));
+        assert!(path_is_noise(
+            Path::new(r"C:\Users\me\AppData\Local\Temp\scratch.tmp"),
+            &[]
+        ));
+        assert!(path_is_noise(Path::new(r"C:\Program Files\Git\cmd\git.exe"), &[]));
         // 用户数据不应被误伤。
-        assert!(!path_is_noise(Path::new(r"D:\Projects\rove\src\main.rs")));
-        assert!(!path_is_noise(Path::new(r"D:\文档\报告.docx")));
-        assert!(!path_is_noise(Path::new(r"D:\MyWindows\backup.iso")));
+        assert!(!path_is_noise(Path::new(r"D:\Projects\rove\src\main.rs"), &[]));
+        assert!(!path_is_noise(Path::new(r"D:\文档\报告.docx"), &[]));
+        assert!(!path_is_noise(Path::new(r"D:\MyWindows\backup.iso"), &[]));
+        // 用户自定义排除路径：整棵子树剪枝，且按分隔符对齐（
+        // C:\cache 不应误伤 C:\cache-old）。
+        let ex = vec![r"d:\cache".to_string(), r"d:\temp files".to_string()];
+        assert!(path_is_noise(Path::new(r"D:\Cache\sub\a.bin"), &ex));
+        assert!(path_is_noise(Path::new(r"D:\Temp Files\a.bin"), &ex));
+        assert!(!path_is_noise(Path::new(r"D:\cache-old\a.bin"), &ex));
+        assert!(!path_is_noise(Path::new(r"D:\Projects\cache\a.bin"), &ex));
     }
 }

@@ -66,6 +66,14 @@ export struct SettingsActionGroup {
     items: [SettingsActionItem],
 }
 
+// 设置页：驱动器索引配置项
+export struct SettingsDriveItem {
+    letter: string,
+    label: string,
+    total-space: string,
+    indexed: bool,
+}
+
 export struct SettingsShortcutItem {
     id: string,
     slot-index: int,

@@ -34,6 +34,14 @@ pub struct Config {
     pub show_hidden: bool,
     /// 用户自定义快捷键映射: ActionId -> [Chord1, Chord2]（空字符串代表已取消绑定）。
     pub shortcuts: std::collections::HashMap<String, Vec<String>>,
+    /// 排除建立索引的驱动器盘符（大写，如 ["D", "E"]，为空表示全部索引）。
+    pub search_excluded_drives: Vec<String>,
+    /// 用户自定义排除的文件夹路径列表。
+    pub search_excluded_paths: Vec<String>,
+    /// 空闲重新索引间隔（分钟，0 表示关闭）。
+    pub search_idle_rescan_minutes: u32,
+    /// 搜索最大展示结果数。
+    pub search_max_results: usize,
 }
 
 /// 侧栏分区的默认顺序。
@@ -61,6 +69,10 @@ impl Default for Config {
             view_mode: "details".to_string(),
             show_hidden: false,
             shortcuts: std::collections::HashMap::new(),
+            search_excluded_drives: Vec::new(),
+            search_excluded_paths: Vec::new(),
+            search_idle_rescan_minutes: 60,
+            search_max_results: 1000,
         }
     }
 }
@@ -163,6 +175,24 @@ impl Config {
                 }
             }
         }
+        if let Some(arr) = json.get("search_excluded_drives").and_then(|v| v.as_array()) {
+            config.search_excluded_drives = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_ascii_uppercase()))
+                .collect();
+        }
+        if let Some(arr) = json.get("search_excluded_paths").and_then(|v| v.as_array()) {
+            config.search_excluded_paths = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        }
+        if let Some(m) = json.get("search_idle_rescan_minutes").and_then(|v| v.as_u64()) {
+            config.search_idle_rescan_minutes = m as u32;
+        }
+        if let Some(r) = json.get("search_max_results").and_then(|v| v.as_u64()) {
+            config.search_max_results = (r as usize).clamp(50, 10000);
+        }
         config
     }
 
@@ -191,6 +221,10 @@ impl Config {
             "view_mode": self.view_mode,
             "show_hidden": self.show_hidden,
             "shortcuts": self.shortcuts,
+            "search_excluded_drives": self.search_excluded_drives,
+            "search_excluded_paths": self.search_excluded_paths,
+            "search_idle_rescan_minutes": self.search_idle_rescan_minutes,
+            "search_max_results": self.search_max_results,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);

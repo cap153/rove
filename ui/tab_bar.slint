@@ -1,4 +1,4 @@
-import { Theme, TabInfo, IconClose, IconTab } from "common.slint";
+import { Theme, TabInfo, IconClose, IconTab, IconPlus } from "common.slint";
 
 // 顶部标签栏：复刻 Pulse 的扁平标签样式（激活标签白底 + 主题色下边线），
 // 支持点击切换、悬停/激活显示关闭按钮、中键关闭、双击空白新建。
@@ -19,6 +19,12 @@ export component TabBar inherits Rectangle {
     callback window_close();
     callback settings_requested(); // 标题栏设置齿轮入口
 
+    // 新增：向右滚动到底部，保证新标签立即可见
+    public function scroll-to-end() {
+        let total-w = root.tabs.length * 153px;
+        tabs-flick.content-x = -max(0px, total-w - tabs-flick.width);
+    }
+
     // 导出空白拖拽区的起止位置（供后端 WM_NCHITTEST 判定，见 app.rs drag_hittest）
     out property <length> drag-x: drag-spacer.x;
     out property <length> drag-w: drag-spacer.width;
@@ -35,132 +41,155 @@ export component TabBar inherits Rectangle {
         padding-left: 8px;
         padding-right: 0px; // 关闭按钮贴死右边界：最大化时甩到最右上角可盲点关闭
 
-        for tab[i] in root.tabs : Rectangle {
-            width: 150px; // 固定统一宽度，整齐划一，超出部分文字自动带省略号
-            horizontal-stretch: 0;
-            height: 34px;
-            border-top-left-radius: 6px;
-            border-top-right-radius: 6px;
-            background: tab.active ? Theme.bg-active-tab : (ta.has-hover ? Theme.bg-hover : transparent);
+        // 1. 标签滚动视口：自适应宽度但严格受右侧控制区约束，超量时绝对不挤占窗口按钮
+        tabs-area := Rectangle {
+            // 右侧预留：控制按钮组 170px + 新建按钮 28px + 舒适拖拽空白区 68px + 间距 = 270px
+            width: min(tabs-layout.preferred-width, max(0px, parent.width - 270px));
+            height: parent.height;
+            clip: true;
 
-            // 激活标签的主题色下边线。
-            Rectangle {
-                y: parent.height - 2px;
-                x: 0px;
-                width: parent.width;
-                height: 2px;
-                background: tab.active ? Theme.accent : transparent;
-            }
-
-            HorizontalLayout {
-                spacing: 6px;
-                padding-left: 10px;
-                padding-right: 6px;
-                height: parent.height;
-
-                // 标签图标（加载时脉冲，否则为文件夹标识）。
-                if (tab.active && root.loading) : Rectangle {
-                    width: 14px;
-                    height: 14px;
-                    y: (parent.height - 14px) / 2;
-                    border-radius: 7px;
-                    background: Math.mod(animation-tick(), 800ms) < 400ms
-                        ? Theme.accent.transparentize(0.55)
-                        : Theme.accent;
-                }
-                if (!(tab.active && root.loading)) : Rectangle {
-                    width: 16px;
-                    height: 16px;
-                    y: (parent.height - 16px) / 2;
-                    border-radius: 4px;
-                    background: Theme.accent.transparentize(0.82);
-
-                    Text {
-                        // 动态盘符/标识（C、D、此、⚙）。显式指定符号字体，
-                        // 避免 ⚙/📁 这类非 CJK 符号在微软雅黑里缺字成方块。
-                        text: tab.icon-text;
-                        color: Theme.accent;
-                        font-size: 10px;
-                        font-weight: 700;
-                        font-family: Theme.symbol-font-family;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                    }
-                }
-
-                Text {
-                    text: tab.title;
-                    color: tab.active ? Theme.text-primary : Theme.text-secondary;
-                    font-size: 12.5px;
-                    vertical-alignment: center;
-                    overflow: elide;
-                    horizontal-stretch: 1;
-                }
-
-                // 关闭按钮：悬停或激活时可见。
-                close-btn := Rectangle {
-                    width: 18px;
-                    height: 18px;
-                    y: (parent.height - 18px) / 2;
-                    border-radius: 4px;
-                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
-                    opacity: (tab.active || ta.has-hover) ? 1.0 : 0.35;
-
-                    IconClose {
-                        x: (parent.width - self.width) / 2;
-                        y: (parent.height - self.height) / 2;
-                        size: 8px;
-                        stroke-width: 1.1px; // 标签内采用稍微纤细的 1.1px，精致不突兀
-                    }
-                }
-            }
-
-            ta := TouchArea {
+            tabs-flick := Flickable {
                 width: 100%;
                 height: 100%;
+                interactive: false;
+                content-width: tabs-layout.preferred-width;
 
-                clicked => {
-                    root.tab_activated(tab.id);
-                }
+                tabs-layout := HorizontalLayout {
+                    x: 0px;
+                    y: 0px;
+                    height: 100%;
+                    spacing: 3px;
 
-                pointer-event(event) => {
-                    // 中键关闭标签。
-                    if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
-                        root.tab_closed(tab.id);
-                        return EventResult.accept;
+                    for tab[i] in root.tabs : Rectangle {
+                        width: 150px;
+                        horizontal-stretch: 0;
+                        height: 34px;
+                        border-top-left-radius: 6px;
+                        border-top-right-radius: 6px;
+                        background: tab.active ? Theme.bg-active-tab : (ta.has-hover ? Theme.bg-hover : transparent);
+
+                        Rectangle {
+                            y: parent.height - 2px;
+                            x: 0px;
+                            width: parent.width;
+                            height: 2px;
+                            background: tab.active ? Theme.accent : transparent;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 6px;
+                            padding-left: 10px;
+                            padding-right: 6px;
+                            height: parent.height;
+
+                            if (tab.active && root.loading) : Rectangle {
+                                width: 14px;
+                                height: 14px;
+                                y: (parent.height - 14px) / 2;
+                                border-radius: 7px;
+                                background: Math.mod(animation-tick(), 800ms) < 400ms
+                                    ? Theme.accent.transparentize(0.55)
+                                    : Theme.accent;
+                            }
+                            if (!(tab.active && root.loading)) : Rectangle {
+                                width: 16px;
+                                height: 16px;
+                                y: (parent.height - 16px) / 2;
+                                border-radius: 4px;
+                                background: Theme.accent.transparentize(0.82);
+
+                                Text {
+                                    text: tab.icon-text;
+                                    color: Theme.accent;
+                                    font-size: 10px;
+                                    font-weight: 700;
+                                    font-family: Theme.symbol-font-family;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+
+                            Text {
+                                text: tab.title;
+                                color: tab.active ? Theme.text-primary : Theme.text-secondary;
+                                font-size: 12.5px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+
+                            close-btn := Rectangle {
+                                width: 18px;
+                                height: 18px;
+                                y: (parent.height - 18px) / 2;
+                                border-radius: 4px;
+                                background: close-ta.has-hover ? Theme.bg-hover : transparent;
+                                opacity: (tab.active || ta.has-hover) ? 1.0 : 0.35;
+
+                                IconClose {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    size: 8px;
+                                    stroke-width: 1.1px;
+                                }
+                            }
+                        }
+
+                        ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+
+                            clicked => {
+                                root.tab_activated(tab.id);
+                            }
+
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
+                                    root.tab_closed(tab.id);
+                                    return EventResult.accept;
+                                }
+                                return EventResult.reject;
+                            }
+
+                            // 滚轮在标签上可直接左右平滑滚动
+                            scroll-event(event) => {
+                                if (event.delta-y != 0px && tabs-flick.content-width > tabs-flick.width) {
+                                    let max-scroll = tabs-flick.content-width - tabs-flick.width;
+                                    tabs-flick.content-x = max(-max-scroll, min(0px, tabs-flick.content-x + event.delta-y));
+                                    return EventResult.accept;
+                                }
+                                return EventResult.reject;
+                            }
+                        }
+
+                        close-ta := TouchArea {
+                            x: parent.width - 34px;
+                            y: 8px;
+                            width: 26px;
+                            height: 18px;
+
+                            clicked => {
+                                root.tab_closed(tab.id);
+                            }
+                        }
                     }
-                    return EventResult.reject;
-                }
-            }
-
-            close-ta := TouchArea {
-                x: parent.width - 34px;
-                y: 8px;
-                width: 26px;
-                height: 18px;
-
-                clicked => {
-                    root.tab_closed(tab.id);
                 }
             }
         }
 
-        // 新建标签按钮。
+        // 新建标签按钮（矢量十字，严格垂直居中，与右侧窗口控制按钮同排）
         Rectangle {
-            width: 30px;
-            height: 30px;
-            y: 2px;
+            width: 28px;
+            height: 28px;
+            y: (parent.height - self.height) / 2;
             border-radius: 6px;
             background: new-ta.has-hover ? Theme.bg-hover : transparent;
 
-            Text {
-                text: "＋";
-                color: Theme.text-secondary;
-                font-size: 15px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: 100%;
-                height: 100%;
+            IconPlus {
+                size: 11px;
+                icon-color: new-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
             }
 
             new-ta := TouchArea {
@@ -172,6 +201,7 @@ export component TabBar inherits Rectangle {
             }
         }
 
+
         // 剩余空白区域：Slint 原生移动区域。
         // 内部严禁放 TouchArea：触控指针会被其捕获，而手指在非客户区
         // （HTCAPTION）不会产生对应释放事件，导致指针永久卡在捕获态——
@@ -179,11 +209,15 @@ export component TabBar inherits Rectangle {
         // 双击最大化由 Windows 原生标题栏语义接管，无需在此处理。
         drag-spacer := WindowMoveArea {
             horizontal-stretch: 1;
+            min-width: 60px; // 强制至少保留 60px 舒适拖拽宽度
             height: parent.height;
         }
 
         // 窗口控制按钮组 (设置 / 最小化 / 最大化 / 关闭)
         HorizontalLayout {
+            min-width: 170px;        // 锁定 170px：布局收缩时也不允许压到按钮
+            max-width: 170px;
+            horizontal-stretch: 0;   // 严禁在窗口缩窄时被压缩
             spacing: 0px;
             height: parent.height;
 
