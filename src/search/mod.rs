@@ -10,7 +10,7 @@ use nucleo_matcher::{Matcher, Utf32Str};
 use pinyin::ToPinyinMulti;
 
 /// 一个条目的预计算拼音字段。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // indices 反向映射供后续命中高亮使用
 pub struct PinyinFields {
     pub full: Box<str>,
@@ -18,7 +18,7 @@ pub struct PinyinFields {
     indices: Vec<FieldIndicesEntry>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
 struct FieldIndicesEntry {
     name_idx: u16,
@@ -402,6 +402,31 @@ mod tests {
         let hl: String = p.iter().filter(|(_, h)| *h).map(|(t, _)| t.as_str()).collect();
         assert_eq!(hl, "Fx");
     }
+
+    #[test]
+    fn parse_drive_prefix_works() {
+        assert_eq!(parse_drive_prefix("c: videos"), (Some('C'), "videos"));
+        assert_eq!(parse_drive_prefix("C:\\videos"), (Some('C'), "videos"));
+        assert_eq!(parse_drive_prefix("d:videos"), (Some('D'), "videos"));
+        assert_eq!(parse_drive_prefix("c:"), (Some('C'), ""));
+        assert_eq!(parse_drive_prefix("c:\\"), (Some('C'), ""));
+        assert_eq!(parse_drive_prefix("videos"), (None, "videos"));
+    }
+}
+
+/// 解析查询词中的盘符限定前缀，支持 "c: videos"、"c:videos"、"c:\\videos"、"c:"。
+/// 返回 (盘符大写, 剥离盘符后的纯净关键词)。
+pub fn parse_drive_prefix(query: &str) -> (Option<char>, &str) {
+    let trimmed = query.trim_start();
+    let mut chars = trimmed.chars();
+    if let Some(drive) = chars.next() {
+        if drive.is_ascii_alphabetic() && chars.next() == Some(':') {
+            let rest = &trimmed[drive.len_utf8() + 1..];
+            let clean = rest.trim_start_matches(|c| c == '\\' || c == '/').trim_start();
+            return (Some(drive.to_ascii_uppercase()), clean);
+        }
+    }
+    (None, trimmed)
 }
 
 pub mod index;

@@ -17,6 +17,7 @@ use super::pinyin_fields;
 pub const MAX_ENTRIES: usize = 1_000_000;
 
 /// 一条全局索引记录。
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct IndexEntry {
     pub path: PathBuf,
     pub name: String,
@@ -45,19 +46,38 @@ pub struct SearchHits<'a> {
 
 impl GlobalIndex {
     /// 拼音/模糊查询，按得分排序取前 `limit` 条，并回报未截断的命中总数。
+    /// 支持盘符限定前缀（如 `c: videos`）：非目标盘一票否决；仅输入盘符（如 `c:`）时返回该盘全部条目。
     pub fn search(&self, query: &str, limit: usize) -> SearchHits<'_> {
-        let query_lower = query.to_lowercase();
-        if query_lower.is_empty() {
+        let (drive_filter, clean_query) = crate::search::parse_drive_prefix(query);
+        let query_lower = clean_query.to_lowercase();
+
+        if drive_filter.is_none() && query_lower.is_empty() {
             return SearchHits { hits: Vec::new(), total: 0 };
         }
+
         let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
         let mut bufs = (Vec::new(), Vec::new(), Vec::new());
         let mut scored: Vec<(&IndexEntry, u16)> = self
             .entries
             .iter()
             .filter_map(|e| {
-                crate::search::score(&e.name, &e.fields, &query_lower, &mut matcher, &mut bufs)
-                    .map(|s| (e, s))
+                // 1. 若指定了盘符，非目标盘一票否决
+                if let Some(target_drive) = drive_filter {
+                    let path_str = e.path.to_string_lossy();
+                    let matches_drive = path_str.chars().next().is_some_and(|c| c.eq_ignore_ascii_case(&target_drive))
+                        && path_str.chars().nth(1) == Some(':');
+                    if !matches_drive {
+                        return None;
+                    }
+                }
+
+                // 2. 若仅输入了盘符（如 "c:"），直接返回该盘条目
+                if query_lower.is_empty() {
+                    Some((e, 100u16))
+                } else {
+                    crate::search::score(&e.name, &e.fields, &query_lower, &mut matcher, &mut bufs)
+                        .map(|s| (e, s))
+                }
             })
             .collect();
         scored.sort_by(|a, b| b.1.cmp(&a.1));
@@ -82,10 +102,84 @@ pub fn shared() -> SharedIndex {
     INDEX
         .get_or_init(|| {
             let idx: SharedIndex = Arc::new(RwLock::new(GlobalIndex::default()));
-            spawn_builder(idx.clone());
+            let cached = load_cache(&idx);
+            if cached {
+                // 缓存命中：立即向 UI 发送就绪通知，第一帧即亮绿灯！
+                let _ = slint::invoke_from_event_loop(|| {
+                    crate::app::on_index_ready();
+                });
+                // 校验时效：未超过空闲重扫周期则直接复用，不无端扫盘
+                let config = crate::config::Config::load();
+                let is_fresh = if config.search_idle_rescan_minutes > 0 {
+                    idx.read()
+                        .ok()
+                        .and_then(|g| g.built_at)
+                        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+                        .is_some_and(|elapsed| {
+                            elapsed < std::time::Duration::from_secs(config.search_idle_rescan_minutes as u64 * 60)
+                        })
+                } else {
+                    true
+                };
+                if !is_fresh {
+                    spawn_builder(idx.clone());
+                }
+            } else {
+                spawn_builder(idx.clone());
+            }
             idx
         })
         .clone()
+}
+
+/// 持久化缓存文件路径：%LOCALAPPDATA%\Rove\index.bin
+pub fn cache_path() -> PathBuf {
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        PathBuf::from(local).join("Rove").join("index.bin")
+    } else {
+        std::env::temp_dir().join("Rove").join("index.bin")
+    }
+}
+
+/// 获取磁盘上持久化索引文件的物理字节大小。
+pub fn cache_file_size() -> Option<u64> {
+    std::fs::metadata(cache_path()).ok().map(|m| m.len())
+}
+
+/// 将条目序列化写入暂存文件 index.bin.tmp，并原子重命名为 index.bin。
+fn save_cache(entries: &[IndexEntry]) -> std::io::Result<()> {
+    let path = cache_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = path.with_extension("bin.tmp");
+    let file = std::fs::File::create(&tmp_path)?;
+    let writer = std::io::BufWriter::new(file);
+    bincode::serialize_into(writer, entries)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    std::fs::rename(&tmp_path, &path)?;
+    Ok(())
+}
+
+/// 启动时瞬时读取磁盘缓存，15ms 喂饱内存索引。
+pub fn load_cache(idx: &SharedIndex) -> bool {
+    let path = cache_path();
+    let Ok(file) = std::fs::File::open(&path) else {
+        return false;
+    };
+    let mtime = file.metadata().ok().and_then(|m| m.modified().ok());
+    let reader = std::io::BufReader::new(file);
+    let Ok(entries): Result<Vec<IndexEntry>, _> = bincode::deserialize_from(reader) else {
+        return false;
+    };
+    let count = entries.len();
+    if let Ok(mut w) = idx.write() {
+        w.entries = entries;
+        w.ready = true;
+        w.built_at = mtime.or_else(|| Some(std::time::SystemTime::now()));
+    }
+    logln!("index: loaded {} cached entries from disk in instant start", count);
+    true
 }
 
 /// 已初始化的索引句柄；尚未初始化时返回 `None`（**不会**触发构建）。
@@ -134,14 +228,18 @@ fn spawn_builder(idx: SharedIndex) {
             let roots = list_roots();
             let config = crate::config::Config::load();
             let exclusions = normalize_exclusions(&config.search_excluded_paths);
+
+            // 核心隔离：创建临时 staging 索引容器，构建过程完全不抢 live 读写锁
+            let staging_idx: SharedIndex = Arc::new(RwLock::new(GlobalIndex::default()));
+
             // 任务 3.2：优先用 NTFS $MFT 加速全盘索引；无管理员权限或全盘
             // 失败时回退到原有 std::fs 递归 walker。
             // 两种路径都记录条目数与耗时，便于实机对比直读收益。
             let t0 = std::time::Instant::now();
-            match crate::search::mft::build_via_mft(&idx, &stop_thread, &exclusions) {
+            match crate::search::mft::build_via_mft(&staging_idx, &stop_thread, &exclusions) {
                 Some(_) => {
                     // MFT 路径：重新统计条目数（build_via_mft 已写入）。
-                    if let Ok(w) = idx.read() {
+                    if let Ok(w) = staging_idx.read() {
                         count = w.entries.len();
                     }
                     logln!(
@@ -159,7 +257,7 @@ fn spawn_builder(idx: SharedIndex) {
                         if count >= MAX_ENTRIES || stop_thread.load(Ordering::Relaxed) {
                             break;
                         }
-                        count += walk(&root, &idx, count, &stop_thread, &exclusions);
+                        count += walk(&root, &staging_idx, count, &stop_thread, &exclusions);
                     }
                     logln!(
                         "index: std::fs walk -> {} entries in {:.1} ms",
@@ -168,16 +266,32 @@ fn spawn_builder(idx: SharedIndex) {
                     );
                 }
             }
-            // 本轮已被更新的重建请求取代：绝不覆盖 ready / 发就绪通知。
-            if BUILD_EPOCH.load(Ordering::SeqCst) != epoch {
-                logln!("index: build epoch {epoch} superseded, discard result");
+
+            if BUILD_EPOCH.load(Ordering::SeqCst) != epoch || stop_thread.load(Ordering::Relaxed) {
+                logln!("index: build epoch {epoch} superseded or stopped, discard result");
                 return;
             }
-            if let Ok(mut w) = idx.write() {
-                w.ready = true;
-                w.built_at = Some(std::time::SystemTime::now());
+
+            // 提取构建完成的条目
+            let Ok(mut staging_guard) = staging_idx.write() else { return; };
+            let entries = std::mem::take(&mut staging_guard.entries);
+            drop(staging_guard);
+
+            // 原子落盘：写 index.bin.tmp -> 原地 rename 到 index.bin
+            if let Err(e) = save_cache(&entries) {
+                logln!("index: save cache failed: {e}");
+            } else {
+                logln!("index: saved {} entries to disk cache", entries.len());
             }
-            logln!("global index built: {} entries", count);
+
+            // 1 微秒原子提交：写入主索引 live 槽
+            let now = std::time::SystemTime::now();
+            if let Ok(mut w) = idx.write() {
+                w.entries = entries;
+                w.ready = true;
+                w.built_at = Some(now);
+            }
+            logln!("global index built and committed: {} entries", count);
             // 通知 UI 索引就绪。用 Slint 原生跨线程投递，而非定时器轮询：
             // 零空转开销，且就绪与刷新落在同一事件循环 tick（微秒级，无视觉延迟）。
             // 事件循环尚未启动时会返回 Err——那种情况下用户还无法交互，

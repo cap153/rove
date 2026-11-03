@@ -1903,7 +1903,9 @@ impl App {
                 return Vec::new();
             };
             let computer_view = pane.path.is_none();
-            let hl_query = pane.filter.trim().to_lowercase();
+            // 剥离盘符前缀（如 c:），避免在文件名中误匹配 c: 里的无关字符
+            let (_, clean_filter) = crate::search::parse_drive_prefix(&pane.filter);
+            let hl_query = clean_filter.trim().to_lowercase();
             let cut = &self.state.cut_paths;
             let mut hl_matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
             let mut hl_bufs = (Vec::new(), Vec::new(), Vec::new());
@@ -2591,8 +2593,9 @@ impl App {
         };
         self.ui.set_search_status_text(status_text.into());
         self.ui.set_search_items_count(format!("{entry_count}").into());
-        let est_bytes = (entry_count * INDEX_ENTRY_BYTES) as u64;
-        self.ui.set_search_size_text(fs::format_size_bytes(est_bytes).into());
+        let real_bytes = crate::search::index::cache_file_size()
+            .unwrap_or_else(|| (entry_count * INDEX_ENTRY_BYTES) as u64);
+        self.ui.set_search_size_text(fs::format_size_bytes(real_bytes).into());
         let last_scan = if is_ready {
             built_at
                 .map(format_ago)

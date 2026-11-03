@@ -85,7 +85,8 @@ fn path_key(p: &Path) -> String {
 
 /// 双轨检索。
 pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
-    let query_lower = query.to_lowercase();
+    let (drive_filter, clean_query) = crate::search::parse_drive_prefix(query);
+    let query_lower = clean_query.to_lowercase();
 
     // 构建历史记录的时间索引，用于快速判断某个命中项是否为历史记录
     let mut history_map: HashMap<String, u64> = HashMap::new();
@@ -96,8 +97,8 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
         }
     }
 
-    // 空查询：直接返回最新的 5 个历史记录
-    if query_lower.is_empty() {
+    // 无盘符且查询词为空：返回最新的 5 个历史记录
+    if drive_filter.is_none() && query_lower.is_empty() {
         let store = history_store().lock().unwrap();
         let mut items = store.clone();
         items.sort_by(|a, b| b.last_time.cmp(&a.last_time));
@@ -123,6 +124,13 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
             .collect();
     }
 
+    let path_matches_drive = |p: &Path| -> bool {
+        let Some(target) = drive_filter else { return true; };
+        let s = p.to_string_lossy();
+        s.chars().next().is_some_and(|c| c.eq_ignore_ascii_case(&target))
+            && s.chars().nth(1) == Some(':')
+    };
+
     let mut hits = Vec::new();
     let mut seen = HashSet::new();
     let mut matcher = Matcher::new(nucleo_matcher::Config::DEFAULT);
@@ -132,23 +140,34 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
     {
         let store = history_store().lock().unwrap();
         for item in store.iter() {
+            if !path_matches_drive(&item.path) {
+                continue;
+            }
             let name = item
                 .path
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| item.path.to_string_lossy().into_owned());
             let fields = crate::search::pinyin_fields(&name);
-            if let Some(score) =
+            let score_opt = if query_lower.is_empty() {
+                Some(100u16)
+            } else {
                 crate::search::score(&name, &fields, &query_lower, &mut matcher, &mut bufs)
-            {
+            };
+
+            if let Some(score) = score_opt {
                 if seen.insert(path_key(&item.path)) {
-                    let parts = crate::search::highlight_parts(
-                        &name,
-                        &fields,
-                        &query_lower,
-                        &mut matcher,
-                        &mut bufs,
-                    );
+                    let parts = if query_lower.is_empty() {
+                        vec![(name.clone(), false)]
+                    } else {
+                        crate::search::highlight_parts(
+                            &name,
+                            &fields,
+                            &query_lower,
+                            &mut matcher,
+                            &mut bufs,
+                        )
+                    };
                     let is_local = current_dir.map_or(false, |dir| item.path.parent() == Some(dir));
                     hits.push(JumpHit {
                         name,
@@ -164,8 +183,8 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
         }
     }
 
-    // 轨道 1：当前目录直接列举
-    if let Some(dir) = current_dir {
+    // 轨道 1：当前目录直接列举（若当前目录不属于指定盘符则跳过）
+    if let Some(dir) = current_dir.filter(|d| path_matches_drive(d)) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
                 if let Ok(ft) = entry.file_type() {
@@ -206,10 +225,10 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
         }
     }
 
-    // 轨道 2：全局索引兜底
+    // 轨道 2：全局索引兜底（直接透传 query，已内置盘符过滤）
     if let Some(idx) = crate::search::index::try_shared() {
         if let Ok(guard) = idx.read() {
-            let res = guard.search(&query_lower, 50);
+            let res = guard.search(query, 50);
             for (entry, score) in res.hits {
                 if entry.is_dir {
                     let key = path_key(&entry.path);

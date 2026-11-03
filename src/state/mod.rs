@@ -166,7 +166,9 @@ impl PaneState {
     /// 下标空间 = 本地条目 [0, entries.len()) ⊕ 深度结果（深度条目已由
     /// 后台按同一查询过滤，直接并入统一打分排序）。
     pub fn rebuild_display(&mut self) {
-        let query = self.filter.trim().to_lowercase();
+        // 剥离盘符限定词（如 c:），避免冒号误杀文件名里的无关字符
+        let (_, clean_query) = crate::search::parse_drive_prefix(&self.filter);
+        let query = clean_query.trim().to_lowercase();
         if query.is_empty() {
             self.display = (0..self.entries.len()).collect();
             return;
