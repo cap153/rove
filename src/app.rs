@@ -5214,20 +5214,25 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
     {
-        let app = Rc::downgrade(app);
+        // 核心修复：在后台线程弹出文件夹选择框，避免阻塞 Slint 主线程导致吸附窗卡死无法渲染。
+        // App 句柄非 Send，故后台线程只负责弹窗取路径，结果通过 SESSION 在主线程事件循环内写回。
         upgrade().on_search_pick_folder_clicked(move || {
-            let Some(app) = app.upgrade() else { return };
-            // 原生目录选择框。用户选定后直接添加到列表，省去二次确认。
-            if let Some(folder) = crate::sys::pick::pick_folder_path() {
-                let mut app = app.borrow_mut();
-                if !app.config.search_excluded_paths.contains(&folder) {
-                    // 头插：新加的排在最左侧，避免被横向滚动条遮挡
-                    app.config.search_excluded_paths.insert(0, folder);
-                    app.config.save();
-                    reindex_if_active();
-                    app.sync_settings();
+            std::thread::spawn(|| {
+                // pick_folder_path 内部已自行初始化 COM(STA)，无需在此重复。
+                if let Some(folder) = crate::sys::pick::pick_folder_path() {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else { return };
+                        let mut app = app.borrow_mut();
+                        if !app.config.search_excluded_paths.contains(&folder) {
+                            // 头插：新加的排在最左侧，避免被横向滚动条遮挡
+                            app.config.search_excluded_paths.insert(0, folder);
+                            app.config.save();
+                            reindex_if_active();
+                            app.sync_settings();
+                        }
+                    });
                 }
-            }
+            });
         });
     }
     {

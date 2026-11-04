@@ -48,7 +48,14 @@ mod imp {
     fn is_own_window(hwnd: HWND) -> bool {
         let mut pid: u32 = 0;
         unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
-        pid == std::process::id()
+        if pid != std::process::id() {
+            return false;
+        }
+        // 核心修复：如果是 Rove 自己弹出的原生文件对话框，放行，允许吸附
+        if probe_file_dialog(hwnd) {
+            return false;
+        }
+        true
     }
 
     fn get_class_name(hwnd: HWND) -> String {
@@ -80,6 +87,14 @@ mod imp {
             || class == "Shell_InputSwitchTopLevelWindow" // 核心修复：输入法切换提示浮层
         {
             return true;
+        }
+
+        // 核心新增：针对 #32770 对话框，直接看标题。属性页通常叫 “xxx 属性” 或 “xxx Properties”
+        if class == "#32770" {
+            let title = get_window_text(hwnd);
+            if title.contains("属性") || title.ends_with("Properties") {
+                return true;
+            }
         }
 
         let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
@@ -152,11 +167,6 @@ mod imp {
         let got = get_window_text(hwnd);
         // 严格比对（忽略结尾反斜杠）：避免 "C:\foo" 把 "C:\foobar" 误判为写入成功
         got.trim_end_matches('\\') == text.trim_end_matches('\\')
-    }
-
-    /// 探测用的文件名输入框。
-    fn find_file_edit(dialog: HWND) -> HWND {
-        edit_candidates(dialog).into_iter().next().unwrap_or(0 as HWND)
     }
 
     /// 跳转并发守卫：同一时刻只允许一个跳转线程改写文件名框，避免连点 / 回车+点击互相覆盖。
@@ -347,8 +357,9 @@ mod imp {
         if hwnd.is_null() || get_class_name(hwnd) != "#32770" {
             return false;
         }
-        // 先用 Shell 视图判断（两个 FindWindowExW，微秒级、更准），命中即返回；
-        // 只有非 Shell 的 #32770（消息框、设置框等）才做全树递归 + 跨进程读按钮的重扫描。
+
+        // 1. 权威指纹：Shell 文件夹视图 (SHELLDLL_DefView 或 DirectUI)。
+        // 只有真正的文件打开/保存框才会有这俩控件；属性页、DiskGenius SMART 绝对没有。
         let has_shell = unsafe {
             let sv = FindWindowExW(hwnd, 0 as HWND, w!("SHELLDLL_DefView"), std::ptr::null::<u16>());
             let dv = FindWindowExW(hwnd, 0 as HWND, w!("DUIViewWndClassName"), std::ptr::null::<u16>());
@@ -357,7 +368,20 @@ mod imp {
         if has_shell {
             return true;
         }
-        !find_file_edit(hwnd).is_null()
+
+        // 2. 兼容指纹：极老式的通用对话框（没有 Shell 视图，但有经典的地址栏 ToolbarWindow32）。
+        // 地址栏是属性页极少会拥有的控件。
+        let has_toolbar = unsafe {
+            let tb = FindWindowExW(hwnd, 0 as HWND, w!("ToolbarWindow32"), std::ptr::null::<u16>());
+            !tb.is_null()
+        };
+        if has_toolbar {
+            return true;
+        }
+
+        // 3. 彻底删除原有的 `!find_file_edit(hwnd).is_null()` 兜底。
+        // 只要不满足以上指纹，即便是 #32770 且带 Edit / Button，也一律视为普通弹窗。
+        false
     }
 
     pub fn extract_current_folder(dialog: HWND) -> Option<PathBuf> {
