@@ -2901,13 +2901,69 @@ impl App {
         self.ui.invoke_open_menu_absolute(x, y);
     }
 
+    /// 解析路径字符串，展开环境变量（如 `%LOCALAPPDATA%`）与主目录（`~`）。
+    fn expand_path(input: &str) -> PathBuf {
+        let mut s = input.trim().trim_matches('"').to_string();
+
+        // 1. 展开 `~` 为当前用户主目录（Windows 下通常为 C:\Users\<name>）
+        if s == "~" || s.starts_with("~\\") || s.starts_with("~/") {
+            let home = std::env::var("USERPROFILE")
+                .or_else(|_| std::env::var("HOME"))
+                .unwrap_or_else(|_| s.clone());
+            if s.len() > 1 {
+                s = format!("{}{}", home, &s[1..]);
+            } else {
+                s = home;
+            }
+        }
+
+        // 2. 展开 `%VAR%` 形式的环境变量
+        let mut result = String::new();
+        let mut chars = s.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let mut var_name = String::new();
+                let mut closed = false;
+                while let Some(&nc) = chars.peek() {
+                    if nc == '%' {
+                        chars.next(); // 消耗闭合的 %
+                        closed = true;
+                        break;
+                    } else {
+                        var_name.push(nc);
+                        chars.next();
+                    }
+                }
+                // 如果找到了成对的 %，且环境变量存在，则替换
+                if closed && !var_name.is_empty() {
+                    if let Ok(val) = std::env::var(&var_name) {
+                        result.push_str(&val);
+                        continue;
+                    }
+                }
+                // 如果没闭合或环境变量不存在，原样保留
+                result.push('%');
+                result.push_str(&var_name);
+                if closed {
+                    result.push('%');
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        PathBuf::from(result)
+    }
+
     /// 面包屑路径编辑提交（点击地址栏输入路径后回车）。
     fn commit_path_edit(&mut self, path: &str) {
         let trimmed = path.trim().trim_matches('"');
         if trimmed.is_empty() {
             return;
         }
-        let p = PathBuf::from(trimmed);
+
+        // 核心修复：使用 expand_path 展开环境变量和 ~
+        let p = Self::expand_path(trimmed);
+
         if !p.exists() {
             self.set_status_job(format!("路径不存在：{trimmed}"));
             return;
