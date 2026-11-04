@@ -429,6 +429,7 @@ pub fn parse_drive_prefix(query: &str) -> (Option<char>, &str) {
     (None, trimmed)
 }
 
+pub mod filter;
 pub mod index;
 pub mod mft;
 pub mod jump;

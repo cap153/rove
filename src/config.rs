@@ -36,7 +36,7 @@ pub struct Config {
     pub shortcuts: std::collections::HashMap<String, Vec<String>>,
     /// 排除建立索引的驱动器盘符（大写，如 ["D", "E"]，为空表示全部索引）。
     pub search_excluded_drives: Vec<String>,
-    /// 用户自定义排除的文件夹路径列表。
+    /// 用户自定义排除的路径/通配符列表（如 `**/*.log`, `C:/Cache`）。
     pub search_excluded_paths: Vec<String>,
     /// 空闲重新索引间隔（分钟，0 表示关闭）。
     pub search_idle_rescan_minutes: u32,

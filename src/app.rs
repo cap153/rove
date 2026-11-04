@@ -5215,17 +5215,54 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
-        upgrade().on_search_add_exclusion_clicked(move || {
+        upgrade().on_search_pick_folder_clicked(move || {
             let Some(app) = app.upgrade() else { return };
-            // 原生目录选择框（不是文件框：排除单位是文件夹子树）。
+            // 原生目录选择框。用户选定后直接添加到列表，省去二次确认。
             if let Some(folder) = crate::sys::pick::pick_folder_path() {
                 let mut app = app.borrow_mut();
                 if !app.config.search_excluded_paths.contains(&folder) {
-                    app.config.search_excluded_paths.push(folder);
+                    // 头插：新加的排在最左侧，避免被横向滚动条遮挡
+                    app.config.search_excluded_paths.insert(0, folder);
                     app.config.save();
                     reindex_if_active();
                     app.sync_settings();
                 }
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_add_exclusion_clicked(move || {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let text = app.ui.get_search_exclude_input().trim().to_string();
+
+            if text.is_empty() {
+                return;
+            }
+
+            if !app.config.search_excluded_paths.contains(&text) {
+                // 头插：新加的排在最左侧
+                app.config.search_excluded_paths.insert(0, text);
+                app.config.save();
+                reindex_if_active();
+                app.sync_settings();
+            }
+            // 添加后清空输入框。
+            app.ui.set_search_exclude_input(SharedString::default());
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_search_reset_exclusions_clicked(move || {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            // 一键清空自定义规则（恢复至仅有硬保护内置项的状态）。
+            if !app.config.search_excluded_paths.is_empty() {
+                app.config.search_excluded_paths.clear();
+                app.config.save();
+                reindex_if_active();
+                app.sync_settings();
             }
         });
     }

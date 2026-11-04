@@ -118,6 +118,7 @@ export component MainWindow inherits Window {
     in-out property <[SettingsDriveItem]> search-drives: [];
     in-out property <[string]> search-builtin-exclusions: [];
     in-out property <[string]> search-custom-exclusions: [];
+    in-out property <string> search-exclude-input: "";
     in-out property <bool> search-idle-enabled: true;
     in-out property <int> search-idle-minutes: 60;
     in-out property <int> search-max-results: 1000;
@@ -125,6 +126,8 @@ export component MainWindow inherits Window {
     callback search_drive_toggled(string, bool); // letter, enabled
     callback search_add_exclusion_clicked();
     callback search_remove_exclusion_clicked(string); // path
+    callback search_pick_folder_clicked();
+    callback search_reset_exclusions_clicked();
     callback search_idle_toggled(bool);
     callback search_idle_minutes_changed(int);
     callback search_max_results_changed(int);
@@ -1057,6 +1060,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     search-drives: root.search-drives;
                     search-builtin-exclusions: root.search-builtin-exclusions;
                     search-custom-exclusions: root.search-custom-exclusions;
+                    exclude-input-text <=> root.search-exclude-input; // 核心修复：改为双向绑定
                     search-idle-enabled: root.search-idle-enabled;
                     search-idle-minutes: root.search-idle-minutes;
                     search-max-results: root.search-max-results;
@@ -1064,6 +1068,8 @@ out property <length> row-height-out: file-list.row-height-out;
                     search_drive_toggled(letter, indexed) => { root.search_drive_toggled(letter, indexed); }
                     search_add_exclusion_clicked() => { root.search_add_exclusion_clicked(); }
                     search_remove_exclusion_clicked(path) => { root.search_remove_exclusion_clicked(path); }
+                    search_pick_folder_clicked() => { root.search_pick_folder_clicked(); }
+                    search_reset_exclusions_clicked() => { root.search_reset_exclusions_clicked(); }
                     search_idle_toggled(enabled) => { root.search_idle_toggled(enabled); }
                     search_idle_minutes_changed(mins) => { root.search_idle_minutes_changed(mins); }
                     search_max_results_changed(res) => { root.search_max_results_changed(res); }

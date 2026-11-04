@@ -361,6 +361,9 @@ export component SettingsPage inherits Rectangle {
     callback search_drive_toggled(string, bool); // letter, enabled
     callback search_add_exclusion_clicked();
     callback search_remove_exclusion_clicked(string); // path
+    callback search_pick_folder_clicked();
+    callback search_reset_exclusions_clicked();
+    in-out property <string> exclude-input-text: "";
     callback search_idle_toggled(bool);
     callback search_idle_minutes_changed(int);
     callback search_max_results_changed(int);
@@ -845,51 +848,132 @@ export component SettingsPage inherits Rectangle {
                         border-radius: 8px;
                         border-width: 1px;
                         border-color: Theme.border;
-                        height: 106px;
+                        height: 126px; // 删减了一行副标题，高度回缩
 
                         VerticalLayout {
                             padding: 12px;
-                            spacing: 8px;
+                            spacing: 12px;
 
+                            // 标题行
+                            HorizontalLayout {
+                                height: 20px;
+                                spacing: 8px;
+                                Text { text: "忽略与剪枝路径 (支持通配符)"; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
+                            }
+
+                            // 操作栏：选择 + 输入框 + 添加 + 恢复
                             HorizontalLayout {
                                 height: 28px;
                                 spacing: 8px;
 
-                                VerticalLayout {
-                                    spacing: 1px;
-                                    horizontal-stretch: 1;
-                                    alignment: center;
-                                    Text { text: "忽略与剪枝路径"; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
-                                    Text { text: "自动跳过匹配的文件夹子树，大幅减少冗余文件干扰"; font-size: 10.5px; color: Theme.text-disabled; overflow: elide; }
+                                // 选择按钮
+                                Rectangle {
+                                    width: 52px;
+                                    height: 100%;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: pick-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+
+                                    Text {
+                                        text: "选择";
+                                        color: Theme.text-primary;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+
+                                    pick-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => { root.search_pick_folder_clicked(); }
+                                    }
                                 }
 
-                                HorizontalLayout {
-                                    spacing: 6px;
-                                    y: (parent.height - self.height) / 2;
+                                // 输入框（自适应拉伸）
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 100%;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: input-ta.has-focus ? Theme.accent : Theme.border;
+                                    background: Theme.bg-main;
 
-                                    Rectangle {
-                                        width: 80px;
-                                        height: 26px;
-                                        border-radius: 5px;
-                                        border-width: 1px;
-                                        border-color: Theme.border;
-                                        background: add-ex-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+                                    input-ta := TextInput {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: 100%;
+                                        text <=> root.exclude-input-text;
+                                        color: Theme.text-primary;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                    }
 
-                                        Text {
-                                            text: "+ 添加路径";
-                                            color: Theme.text-primary;
-                                            font-size: 11px;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                            width: 100%;
-                                            height: 100%;
-                                        }
+                                    // 占位提示：仅当输入为空且未聚焦时显示。
+                                    if (root.exclude-input-text == "" && !input-ta.has-focus) : Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: 100%;
+                                        text: "手动输入路径或通配符 (如 **/*.log)";
+                                        color: Theme.text-disabled;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
 
-                                        add-ex-ta := TouchArea {
-                                            width: 100%;
-                                            height: 100%;
-                                            clicked => { root.search_add_exclusion_clicked(); }
-                                        }
+                                // 添加按钮
+                                Rectangle {
+                                    width: 52px;
+                                    height: 100%;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: add-ex-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+
+                                    Text {
+                                        text: "添加";
+                                        color: Theme.accent;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+
+                                    add-ex-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => { root.search_add_exclusion_clicked(); }
+                                    }
+                                }
+
+                                // 恢复默认按钮
+                                Rectangle {
+                                    width: 52px;
+                                    height: 100%;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: reset-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+
+                                    Text {
+                                        text: "恢复";
+                                        color: Theme.text-secondary;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+
+                                    reset-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => { root.search_reset_exclusions_clicked(); }
                                     }
                                 }
                             }
@@ -906,7 +990,41 @@ export component SettingsPage inherits Rectangle {
                                     height: 26px;
                                     spacing: 8px;
 
-                                    // 内置系统排除项（灰显，不可删除）
+                                    // 核心修复：自定义项排在前面，这样新添加的（insert 0）会直接在最左侧！
+                                    for item in root.search-custom-exclusions : Rectangle {
+                                        height: 26px;
+                                        // 核心防抖逻辑：用隐藏的 ghost-text 测量真实文本的宽度，防止悬停变成“删除”时宽度缩水闪烁
+                                        width: min(max(ghost-text.preferred-width + 24px, 64px), 200px);
+                                        border-radius: 5px;
+                                        background: c-ta.has-hover ? #C0392B : Theme.bg-main;
+                                        border-width: 1px;
+                                        border-color: c-ta.has-hover ? #C0392B : Theme.border;
+
+                                        // 用于测宽度的幽灵元素，不渲染只计算
+                                        ghost-text := Text {
+                                            text: item;
+                                            visible: false;
+                                        }
+
+                                        c-ta := TouchArea {
+                                            width: 100%;
+                                            height: 100%;
+                                            clicked => { root.search_remove_exclusion_clicked(item); }
+                                        }
+
+                                        c-txt := Text {
+                                            text: c-ta.has-hover ? "删除" : item;
+                                            color: c-ta.has-hover ? white : Theme.text-primary;
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    // 内置系统排除项排在后面（灰显，不可删除）
                                     for item in root.search-builtin-exclusions : Rectangle {
                                         height: 26px;
                                         width: bi-txt.preferred-width + 16px;
@@ -924,44 +1042,6 @@ export component SettingsPage inherits Rectangle {
                                             vertical-alignment: center;
                                             width: 100%;
                                             height: 100%;
-                                        }
-                                    }
-
-                                    // 自定义排除项（支持点击右侧 × 删除）
-                                    for item in root.search-custom-exclusions : Rectangle {
-                                        height: 26px;
-                                        width: c-txt.preferred-width + 30px;
-                                        border-radius: 5px;
-                                        background: Theme.bg-main;
-                                        border-width: 1px;
-                                        border-color: Theme.border;
-
-                                        HorizontalLayout {
-                                            padding-left: 8px;
-                                            padding-right: 6px;
-                                            spacing: 4px;
-
-                                            c-txt := Text {
-                                                text: item;
-                                                color: Theme.text-primary;
-                                                font-size: 11px;
-                                                font-family: Theme.mono-font-family;
-                                                vertical-alignment: center;
-                                                horizontal-stretch: 1;
-                                                overflow: elide;
-                                            }
-
-                                            IconClose {
-                                                size: 8px;
-                                                icon-color: Theme.danger;
-                                                y: (parent.height - self.height) / 2;
-                                            }
-                                        }
-
-                                        TouchArea {
-                                            width: 100%;
-                                            height: 100%;
-                                            clicked => { root.search_remove_exclusion_clicked(item); }
                                         }
                                     }
                                 }

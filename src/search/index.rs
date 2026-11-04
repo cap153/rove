@@ -227,7 +227,7 @@ fn spawn_builder(idx: SharedIndex) {
             let mut count = 0usize;
             let roots = list_roots();
             let config = crate::config::Config::load();
-            let exclusions = normalize_exclusions(&config.search_excluded_paths);
+            let filter = std::sync::Arc::new(super::filter::IndexFilter::new(&config.search_excluded_paths));
 
             // 核心隔离：创建临时 staging 索引容器，构建过程完全不抢 live 读写锁
             let staging_idx: SharedIndex = Arc::new(RwLock::new(GlobalIndex::default()));
@@ -236,7 +236,7 @@ fn spawn_builder(idx: SharedIndex) {
             // 失败时回退到原有 std::fs 递归 walker。
             // 两种路径都记录条目数与耗时，便于实机对比直读收益。
             let t0 = std::time::Instant::now();
-            match crate::search::mft::build_via_mft(&staging_idx, &stop_thread, &exclusions) {
+            match crate::search::mft::build_via_mft(&staging_idx, &stop_thread, &filter) {
                 Some(_) => {
                     // MFT 路径：重新统计条目数（build_via_mft 已写入）。
                     if let Ok(w) = staging_idx.read() {
@@ -257,7 +257,7 @@ fn spawn_builder(idx: SharedIndex) {
                         if count >= MAX_ENTRIES || stop_thread.load(Ordering::Relaxed) {
                             break;
                         }
-                        count += walk(&root, &staging_idx, count, &stop_thread, &exclusions);
+                        count += walk(&root, &staging_idx, count, &stop_thread, &filter);
                     }
                     logln!(
                         "index: std::fs walk -> {} entries in {:.1} ms",
@@ -367,35 +367,17 @@ pub(crate) fn is_skipped(name: &str) -> bool {
 ///
 /// 在构建开始时算一次，后续 `walk` / MFT 每条目只做纯字符串比较，
 /// 避免百万级条目反复 `to_lowercase()` 用户配置。
-pub(crate) fn normalize_exclusions(paths: &[String]) -> Vec<String> {
-    paths
-        .iter()
-        .map(|p| p.trim().trim_end_matches(['\\', '/']).to_lowercase())
-        .filter(|p| !p.is_empty())
-        .collect()
-}
-
-/// 已小写的路径是否落在任一排除子树内（按路径分隔符对齐，避免 `C:\\Foo` 误伤 `C:\\Foobar`）。
-pub(crate) fn under_exclusion_lower(p: &str, normalized: &[String]) -> bool {
-    normalized.iter().any(|e| {
-        p == e
-            || p.strip_prefix(e)
-                .is_some_and(|rest| rest.starts_with('\\') || rest.starts_with('/'))
-    })
-}
-
-/// `path` 是否在用户排除的文件夹子树内（大小写不敏感）。
-pub(crate) fn path_is_excluded_ci(path: &Path, normalized: &[String]) -> bool {
-    !normalized.is_empty() && under_exclusion_lower(&path.to_string_lossy().to_lowercase(), normalized)
-}
-
 /// 递归扫描；返回新增条目数。
+///
+/// 剪枝：隐藏目录、系统噪声目录（`is_skipped`）与用户/内置过滤规则
+/// （`filter` 已预编译为 GlobSet）命中的子树一律跳过；文件额外按默认
+/// 垃圾后缀与通配符拦截。
 fn walk(
     dir: &Path,
     idx: &SharedIndex,
     count: usize,
     stop: &Arc<AtomicBool>,
-    exclusions: &[String],
+    filter: &super::filter::IndexFilter,
 ) -> usize {
     if count >= MAX_ENTRIES || stop.load(Ordering::Relaxed) {
         return 0;
@@ -413,12 +395,15 @@ fn walk(
         if name.starts_with('.') && name.len() > 1 && ft.is_dir() {
             continue;
         }
+        let sub_path = entry.path();
         if ft.is_dir() {
-            let sub_path = entry.path();
-            if is_skipped(&name) || path_is_excluded_ci(&sub_path, exclusions) {
+            if is_skipped(&name) || filter.is_skipped_dir(&sub_path) {
                 continue;
             }
             subdirs.push(sub_path);
+        } else if filter.is_skipped_file(&sub_path) {
+            // 核心新增：文件按默认垃圾后缀 + 用户通配符拦截。
+            continue;
         }
         if count + added >= MAX_ENTRIES {
             break;
@@ -444,7 +429,7 @@ fn walk(
         if count + added >= MAX_ENTRIES || stop.load(Ordering::Relaxed) {
             break;
         }
-        added += walk(&sub, idx, count + added, stop, exclusions);
+        added += walk(&sub, idx, count + added, stop, filter);
     }
     added
 }
@@ -604,25 +589,64 @@ mod tests {
 
     #[test]
     fn user_exclusions_align_on_separators() {
-        let ex = normalize_exclusions(&[
-            "D:\\Cache\\".to_string(),
-            "  ".to_string(),
+        // 空规则：不误伤任何路径。
+        let empty = super::super::filter::IndexFilter::new(&[]);
+        assert!(!empty.is_skipped_dir(Path::new(r"D:\other")));
+        assert!(!empty.is_skipped_dir(Path::new(r"D:\Cache\x")));
+
+        // 目录前缀（无通配符）自动追加 /** 匹配整棵子树，且大小写/分隔符不敏感。
+        let f = super::super::filter::IndexFilter::new(&[
+            "D:\\Cache".to_string(),
             "E:/Temp Files".to_string(),
         ]);
-        assert_eq!(
-            ex,
-            vec!["d:\\cache".to_string(), "e:/temp files".to_string()]
-        );
-        // 子树 + 自身都算命中，大小写与分隔符不敏感。
-        assert!(under_exclusion_lower(r"d:\cache\a\b", &ex));
-        assert!(under_exclusion_lower(r"d:\cache", &ex));
-        assert!(under_exclusion_lower(r"e:/temp files/x.txt", &ex));
-        // 同前缀但不在同一层级的目录不能被误伤。
-        assert!(!under_exclusion_lower(r"d:\cache-old\a", &ex));
-        assert!(!under_exclusion_lower(r"d:\other", &ex));
-        assert!(!path_is_excluded_ci(Path::new(r"D:\other"), &ex));
-        assert!(!path_is_excluded_ci(Path::new(r"D:\Cache\x"), &[]));
+        assert!(f.is_skipped_dir(Path::new(r"d:\cache\a\b")));
+        assert!(f.is_skipped_dir(Path::new(r"D:\Cache")));
+        assert!(f.is_skipped_dir(Path::new(r"e:/temp files/x.txt")));
+        assert!(!f.is_skipped_dir(Path::new(r"d:\cache-old\a")));
+        assert!(!f.is_skipped_dir(Path::new(r"d:\other")));
     }
+
+    #[test]
+    fn filter_blocks_garbage_extensions() {
+        // 默认垃圾后缀无论大小写均被拦截。
+        let f = super::super::filter::IndexFilter::new(&[]);
+        assert!(f.is_skipped_file(Path::new(r"D:\\a.LOG")));
+        assert!(f.is_skipped_file(Path::new(r"D:\\b.tmp")));
+        assert!(f.is_skipped_file(Path::new(r"D:\\c.crdownload")));
+        assert!(!f.is_skipped_file(Path::new(r"D:\\src\\main.rs")));
+        assert!(!f.is_skipped_file(Path::new(r"D:\\报告.docx")));
+    }
+
+    #[test]
+    fn filter_builtin_system_dirs() {
+        // 内置系统/缓存目录通配符对任意盘符、任意层级生效。
+        let f = super::super::filter::IndexFilter::new(&[]);
+        assert!(f.is_skipped_dir(Path::new(r"C:\Windows\System32\x.dll")));
+        assert!(f.is_skipped_dir(Path::new(r"c:\windows\winsxs\y.dll")));
+        assert!(f.is_skipped_dir(Path::new(r"D:\$Recycle.Bin\S-1-5-21\z.ini")));
+        assert!(f.is_skipped_dir(Path::new(r"C:\System Volume Information\t.log")));
+        assert!(f.is_skipped_dir(Path::new(r"C:\Users\me\AppData\Local\Temp\s.tmp")));
+        assert!(f.is_skipped_dir(Path::new(r"C:\Program Files\Git\cmd\git.exe")));
+        // 仅子串相同不应命中。
+        assert!(!f.is_skipped_dir(Path::new(r"D:\MyWindows\backup.iso")));
+        assert!(!f.is_skipped_dir(Path::new(r"D:\Projects\rove\src\main.rs")));
+    }
+
+    #[test]
+    fn filter_user_glob_matches() {
+        // 用户通配符（含 */?）按原样匹配。
+        let f = super::super::filter::IndexFilter::new(&[
+            "**/*.log".to_string(),
+            r"D:\cache".to_string(),
+        ]);
+        assert!(f.is_skipped_file(Path::new(r"D:\x\y.log")));
+        assert!(f.is_skipped_dir(Path::new(r"D:\cache\sub\a.bin")));
+        assert!(!f.is_skipped_dir(Path::new(r"D:\cache-old\a.bin")));
+        assert!(!f.is_skipped_dir(Path::new(r"D:\Projects\cache\a.bin")));
+    }
+
+    // appended-marker
+
 
     #[test]
     fn system_drive_detection_is_normalized() {

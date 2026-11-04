@@ -37,7 +37,7 @@ use crate::logln;
 pub fn build_via_mft(
     idx: &SharedIndex,
     stop: &AtomicBool,
-    exclusions: &[String],
+    filter: &super::filter::IndexFilter,
 ) -> Option<usize> {
     let mut total = 0usize;
     let mut any_drive = false;
@@ -45,7 +45,7 @@ pub fn build_via_mft(
         if stop.load(Ordering::Relaxed) || total >= MAX_ENTRIES {
             break;
         }
-        if let Some(n) = scan_drive_mft(&drive, idx, stop, total, exclusions) {
+        if let Some(n) = scan_drive_mft(&drive, idx, stop, total, filter) {
             any_drive = true;
             total += n;
         }
@@ -62,29 +62,9 @@ pub fn build_via_mft(
 pub fn build_via_mft(
     _idx: &SharedIndex,
     _stop: &AtomicBool,
-    _exclusions: &[String],
+    _filter: &super::filter::IndexFilter,
 ) -> Option<usize> {
     None
-}
-
-/// 按**完整路径**判定是否为系统噪音子树。
-///
-/// MFT 是扁平枚举：即便跳过了 `C:\Windows` 这条目录记录，它的子项仍是独立的
-/// MFT 记录、照样会被枚举到。因此只靠目录名 + `depth <= 1` 判定会大量漏网
-/// （`WinSxS`、`AppData\Local\Temp`、`Servicing` 等会占满索引名额）。
-/// 这里对解析出的绝对路径做大小写不敏感的子串判定，与 walker 的剪枝范围对齐。
-#[cfg(windows)]
-fn path_is_noise(path: &Path, exclusions: &[String]) -> bool {
-    let p = path.to_string_lossy().to_lowercase();
-    // `\program files\` 已覆盖 `\program files (x86)\`；`\appdata\` 已覆盖
-    // `\appdata\local\temp\`（保留显式项以示意图）。
-    p.contains(r"\windows\")
-        || p.contains(r"\$recycle.bin\")
-        || p.contains(r"\system volume information\")
-        || p.contains(r"\appdata\local\temp\")
-        || p.contains(r"\appdata\")
-        || p.contains(r"\program files\")
-        || super::index::under_exclusion_lower(&p, exclusions)
 }
 
 /// 解析单个盘的 MFT/USN 并写入索引；该盘不可用时返回 `None`。
@@ -94,7 +74,7 @@ fn scan_drive_mft(
     idx: &SharedIndex,
     stop: &AtomicBool,
     start_total: usize,
-    exclusions: &[String],
+    filter: &super::filter::IndexFilter,
 ) -> Option<usize> {
     let letter = drive
         .to_string_lossy()
@@ -176,10 +156,13 @@ fn scan_drive_mft(
 
         // 兜底：目录名看不出、但解析出的路径落在噪音子树内（理论上已被
         // （一）（二）覆盖，此处防枚举顺序异常）。目录同样登记 fid 惠及子孙。
-        if path_is_noise(&path, exclusions) {
-            if is_dir {
+        // 文件额外按默认垃圾后缀 + 用户通配符拦截。
+        if is_dir {
+            if filter.is_skipped_dir(&path) {
                 noise_fids.insert(entry.fid);
+                continue;
             }
+        } else if filter.is_skipped_file(&path) {
             continue;
         }
 
@@ -217,29 +200,30 @@ mod tests {
 
     #[test]
     fn noise_paths_are_filtered() {
-        // Windows 核心系统目录（任意盘符、任意大小写）。
-        assert!(path_is_noise(Path::new(r"C:\Windows\System32\drivers\etc\hosts"), &[]));
-        assert!(path_is_noise(Path::new(r"c:\windows\winsxs\amd64_x.dll"), &[]));
-        assert!(path_is_noise(Path::new(r"D:\$Recycle.Bin\S-1-5-21\desktop.ini"), &[]));
-        assert!(path_is_noise(
-            Path::new(r"C:\System Volume Information\tracking.log"),
-            &[]
-        ));
-        assert!(path_is_noise(
-            Path::new(r"C:\Users\me\AppData\Local\Temp\scratch.tmp"),
-            &[]
-        ));
-        assert!(path_is_noise(Path::new(r"C:\Program Files\Git\cmd\git.exe"), &[]));
+        // 内置系统/缓存目录通配符对 Windows 核心系统目录（任意盘符、任意大小写）生效。
+        let f = super::super::filter::IndexFilter::new(&[]);
+        assert!(f.is_skipped_dir(Path::new(r"C:\Windows\System32\drivers\etc\hosts")));
+        assert!(f.is_skipped_dir(Path::new(r"c:\windows\winsxs\amd64_x.dll")));
+        assert!(f.is_skipped_dir(Path::new(r"D:\$Recycle.Bin\S-1-5-21\desktop.ini")));
+        assert!(f.is_skipped_dir(Path::new(r"C:\System Volume Information\tracking.log")));
+        assert!(f.is_skipped_dir(Path::new(r"C:\Users\me\AppData\Local\Temp\scratch.tmp")));
+        assert!(f.is_skipped_dir(Path::new(r"C:\Program Files\Git\cmd\git.exe")));
         // 用户数据不应被误伤。
-        assert!(!path_is_noise(Path::new(r"D:\Projects\rove\src\main.rs"), &[]));
-        assert!(!path_is_noise(Path::new(r"D:\文档\报告.docx"), &[]));
-        assert!(!path_is_noise(Path::new(r"D:\MyWindows\backup.iso"), &[]));
+        assert!(!f.is_skipped_dir(Path::new(r"D:\Projects\rove\src\main.rs")));
+        assert!(!f.is_skipped_dir(Path::new(r"D:\文档\报告.docx")));
+        assert!(!f.is_skipped_dir(Path::new(r"D:\MyWindows\backup.iso")));
+        // 默认垃圾后缀：.log/.tmp 等文件被 is_skipped_file 拦截。
+        assert!(f.is_skipped_file(Path::new(r"C:\Users\me\AppData\Local\Temp\scratch.tmp")));
+        assert!(!f.is_skipped_file(Path::new(r"D:\Projects\rove\src\main.rs")));
         // 用户自定义排除路径：整棵子树剪枝，且按分隔符对齐（
         // C:\cache 不应误伤 C:\cache-old）。
-        let ex = vec![r"d:\cache".to_string(), r"d:\temp files".to_string()];
-        assert!(path_is_noise(Path::new(r"D:\Cache\sub\a.bin"), &ex));
-        assert!(path_is_noise(Path::new(r"D:\Temp Files\a.bin"), &ex));
-        assert!(!path_is_noise(Path::new(r"D:\cache-old\a.bin"), &ex));
-        assert!(!path_is_noise(Path::new(r"D:\Projects\cache\a.bin"), &ex));
+        let f2 = super::super::filter::IndexFilter::new(&[
+            r"d:\cache".to_string(),
+            r"d:\temp files".to_string(),
+        ]);
+        assert!(f2.is_skipped_dir(Path::new(r"D:\Cache\sub\a.bin")));
+        assert!(f2.is_skipped_dir(Path::new(r"D:\Temp Files\a.bin")));
+        assert!(!f2.is_skipped_dir(Path::new(r"D:\cache-old\a.bin")));
+        assert!(!f2.is_skipped_dir(Path::new(r"D:\Projects\cache\a.bin")));
     }
 }
