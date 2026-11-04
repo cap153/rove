@@ -2644,7 +2644,8 @@ impl App {
             "System Volume Information".into(),
             "node_modules".into(),
             ".git".into(),
-            "target".into(), // 新增展示
+            "target".into(),
+            "my_program".into(),
         ];
         self.ui
             .set_search_builtin_exclusions(ModelRc::new(VecModel::from(builtin)));
