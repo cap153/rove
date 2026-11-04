@@ -487,7 +487,17 @@ impl App {
         watch_tx: Sender<PathBuf>,
         watch_rx: Receiver<PathBuf>,
     ) -> Self {
-        let state = AppState::new(None);
+        let sort = SortState {
+            key: match config.sort_key.as_str() {
+                "modified" => SortKey::Modified,
+                "type" => SortKey::Type,
+                "size" => SortKey::Size,
+                "path" => SortKey::Path,
+                _ => SortKey::Name,
+            },
+            ascending: config.sort_ascending,
+        };
+        let state = AppState::new(None, sort);
         let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
         let jump_window = DialogJumpWindow::new().unwrap();
         Self {
@@ -656,6 +666,8 @@ impl App {
             } else {
                 result.entries.into_iter().filter(|e| !e.is_hidden).collect()
             };
+            // 核心修复：防止在后台加载期间用户更改了排序，导致旧排序结果覆盖界面。
+            crate::fs::sort_entries(&mut pane.entries, pane.sort);
             // 拼音缓存随 entries 失效（惰性重建）。
             pane.pinyin_cache.clear();
             // 新列表到达即失效全局搜索的截断提示。
@@ -1356,6 +1368,33 @@ impl App {
         self.refresh_visible_rows();
     }
 
+    /// 全局应用排序并持久化。同时刷新所有已打开的面板，确保多标签/分屏统一。
+    fn apply_sort(&mut self, key: SortKey, ascending: bool) {
+        self.config.sort_key = match key {
+            SortKey::Name => "name",
+            SortKey::Size => "size",
+            SortKey::Modified => "modified",
+            SortKey::Type => "type",
+            SortKey::Path => "path",
+        }.to_string();
+        self.config.sort_ascending = ascending;
+        self.config.save();
+
+        for tab in &mut self.state.tabs {
+            if tab.kind == crate::state::TabKind::Settings { continue; }
+            for pane in &mut tab.panes {
+                pane.sort.key = key;
+                pane.sort.ascending = ascending;
+                crate::fs::sort_entries(&mut pane.entries, pane.sort);
+                pane.rebuild_display();
+            }
+        }
+
+        self.visible_cache = None;
+        self.sync_file_list();
+        self.sync_status();
+    }
+
     /// 全局拼音秒搜：查询后台索引，结果写入当前标签（此电脑视图）。
     /// 结果 = FileEntry（文件/文件夹），双击沿用 open_path 行为。
     /// 查询写入 tab.filter：驱动 rebuild_display 排序，并为行高亮提供查询词。
@@ -1999,10 +2038,9 @@ impl App {
             }
             if !tab.is_split {
                 let src = tab.active();
-                let mut pane = crate::state::PaneState::new(src.path.clone());
+                let mut pane = crate::state::PaneState::new(src.path.clone(), src.sort);
                 pane.history = src.history.clone();
                 pane.history_index = src.history_index;
-                pane.sort = src.sort;
                 pane.loading = true;
                 tab.panes.push(pane);
                 tab.is_split = true;
@@ -2368,6 +2406,7 @@ impl App {
                 items.push(item(ACT_SELECT_ALL, "全选", "▣", gray, "normal"));
                 items.push(item(ACT_MANAGE_ACTIONS, "管理右键动作...", "✎", gray, "normal"));
                 items.push(item(ACT_VIEW, "视图", "▦", gray, "submenu"));
+                items.push(item(ACT_SORT, "排序方式", "⇅", gray, "submenu"));
                 items.push(sep());
                 items.push(item("act:builtin.properties", "属性", "ⓘ", gray, "normal"));
             }
@@ -2419,6 +2458,36 @@ impl App {
                 entry("details", "详细信息", current == "details"),
             ];
             let height = items.len() as f32 * 28.0 + 8.0;
+            return (items, height);
+        }
+
+        if id == ACT_SORT {
+            let current = self.state.active().active().sort;
+            let entry = |sid: &str, label: &str, active: bool| MenuItem {
+                id: format!("sort:{sid}").into(),
+                label: if active { format!("● {label}") } else { label.to_string() }.into(),
+                icon_text: SharedString::default(),
+                icon_color: Color::default(),
+                kind: "normal".into(),
+                enabled: true,
+            };
+            let items = vec![
+                entry("name", "名称", current.key == SortKey::Name),
+                entry("modified", "修改日期", current.key == SortKey::Modified),
+                entry("type", "类型", current.key == SortKey::Type),
+                entry("size", "大小", current.key == SortKey::Size),
+                MenuItem {
+                    id: SharedString::default(),
+                    label: SharedString::default(),
+                    icon_text: SharedString::default(),
+                    icon_color: Color::default(),
+                    kind: "separator".into(),
+                    enabled: false,
+                },
+                entry("asc", "递增", current.ascending),
+                entry("desc", "递减", !current.ascending),
+            ];
+            let height = 4.0 * 28.0 + 9.0 + 2.0 * 28.0 + 8.0;
             return (items, height);
         }
 
@@ -2524,6 +2593,7 @@ impl App {
 /// "发送到" 菜单项 ID（在 build_menu 中使用）。
 const ACT_MANAGE_ACTIONS: &str = "manage_actions";
 const ACT_VIEW: &str = "view_menu";
+const ACT_SORT: &str = "sort_menu";
 
 // ---------------------------------------------------------------------------
 // 其余交互动作（键盘快捷键 / 侧边栏 / 列排序 / 重命名 / 暂存盘）
@@ -3163,19 +3233,13 @@ impl App {
             "path" => SortKey::Path,
             _ => return,
         };
-        let tab = self.state.active_mut();
-        if tab.active_mut().sort.key == new_key {
-            tab.active_mut().sort.ascending = !tab.active_mut().sort.ascending;
+        let tab = self.state.active();
+        let current_sort = tab.active().sort;
+        if current_sort.key == new_key {
+            self.apply_sort(new_key, !current_sort.ascending);
         } else {
-            tab.active_mut().sort.key = new_key;
-            tab.active_mut().sort.ascending = true;
+            self.apply_sort(new_key, true);
         }
-        let sort = tab.active_mut().sort;
-        sort_entries(&mut tab.active_mut().entries, sort);
-        tab.active_mut().rebuild_display();
-        self.visible_cache = None;
-        self.sync_file_list();
-        self.sync_status();
     }
 
     /// 提交重命名。
@@ -3299,6 +3363,24 @@ impl App {
         // 1. 视图模式切换（优先执行！不依赖选中的文件 target，杜绝工具栏调用被拦截）
         if let Some(mode) = id.strip_prefix("view:") {
             self.set_view_mode(mode);
+            return;
+        }
+
+        // 1.1 排序方式切换
+        if let Some(sort_mode) = id.strip_prefix("sort:") {
+            let tab = self.state.active().active();
+            let mut key = tab.sort.key;
+            let mut asc = tab.sort.ascending;
+            match sort_mode {
+                "name" => { key = SortKey::Name; asc = true; }
+                "modified" => { key = SortKey::Modified; asc = false; } // 修改时间默认最新在前
+                "type" => { key = SortKey::Type; asc = true; }
+                "size" => { key = SortKey::Size; asc = false; } // 大小默认最大在前
+                "asc" => { asc = true; }
+                "desc" => { asc = false; }
+                _ => {}
+            }
+            self.apply_sort(key, asc);
             return;
         }
 
@@ -4881,8 +4963,11 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_new_tab_requested(move || {
             let Some(app) = app.upgrade() else { return };
-            let current = app.borrow().state.active().active().path.clone();
-            app.borrow_mut().state.new_tab(current);
+            let (current, sort) = {
+                let app = app.borrow();
+                (app.state.active().active().path.clone(), app.state.active().active().sort)
+            };
+            app.borrow_mut().state.new_tab(current, sort);
             let mut app = app.borrow_mut();
             app.sync_active_tab();
             app.reload_active();
@@ -6670,7 +6755,8 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         let mut app = app.borrow_mut();
         app.state.recent = app.config.recent.clone();
         if let Some(path) = initial_path {
-            app.state.new_tab(Some(path));
+            let sort = app.state.active().active().sort;
+            app.state.new_tab(Some(path), sort);
         }
         app.sync_tabs();
         app.sync_nav();

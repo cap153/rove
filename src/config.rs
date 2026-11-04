@@ -30,6 +30,10 @@ pub struct Config {
     pub sidebar_order: Vec<String>,
     /// 视图模式：details | list | icons-small | icons-medium | icons-large | icons-xl。
     pub view_mode: String,
+    /// 全局排序字段：name | size | modified | type | path。
+    pub sort_key: String,
+    /// 全局排序方向：true 递增 / false 递减。
+    pub sort_ascending: bool,
     /// 是否显示隐藏文件/文件夹/驱动器（默认 false，即过滤掉）。
     pub show_hidden: bool,
     /// 用户自定义快捷键映射: ActionId -> [Chord1, Chord2]（空字符串代表已取消绑定）。
@@ -69,6 +73,8 @@ impl Default for Config {
             network_expanded: true, // 默认展开
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
+            sort_key: "name".to_string(),
+            sort_ascending: true,
             show_hidden: false,
             shortcuts: std::collections::HashMap::new(),
             search_excluded_drives: Vec::new(),
@@ -161,6 +167,14 @@ impl Config {
                 config.view_mode = vm.to_string();
             }
         }
+        if let Some(sk) = json.get("sort_key").and_then(|v| v.as_str()) {
+            if matches!(sk, "name" | "size" | "modified" | "type" | "path") {
+                config.sort_key = sk.to_string();
+            }
+        }
+        if let Some(sa) = json.get("sort_ascending").and_then(|v| v.as_bool()) {
+            config.sort_ascending = sa;
+        }
         if let Some(sh) = json.get("show_hidden").and_then(|v| v.as_bool()) {
             config.show_hidden = sh;
         }
@@ -225,6 +239,8 @@ impl Config {
             "network_expanded": self.network_expanded,
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
+            "sort_key": self.sort_key,
+            "sort_ascending": self.sort_ascending,
             "show_hidden": self.show_hidden,
             "shortcuts": self.shortcuts,
             "search_excluded_drives": self.search_excluded_drives,

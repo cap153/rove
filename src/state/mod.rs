@@ -75,14 +75,14 @@ pub struct PaneState {
 }
 
 impl PaneState {
-    pub fn new(path: Option<PathBuf>) -> Self {
+    pub fn new(path: Option<PathBuf>, sort: SortState) -> Self {
         Self {
             path: path.clone(),
             history: vec![path],
             history_index: 0,
             entries: Vec::new(),
             display: Vec::new(),
-            sort: SortState::default(),
+            sort, // 核心修改：使用传入的排序状态
             filter: String::new(),
             selection: HashSet::new(),
             anchor: None,
@@ -302,10 +302,10 @@ pub struct TabState {
 }
 
 impl TabState {
-    pub fn new(id: u32, path: Option<PathBuf>) -> Self {
+    pub fn new(id: u32, path: Option<PathBuf>, sort: SortState) -> Self {
         Self {
             id,
-            panes: vec![PaneState::new(path.clone())],
+            panes: vec![PaneState::new(path.clone(), sort)],
             active_pane: 0,
             is_split: false,
             split_ratio: 0.5,
@@ -316,7 +316,7 @@ impl TabState {
 
     /// 新建一个设置页标签。
     pub fn new_settings(id: u32, subpage: SettingsSubpage) -> Self {
-        let mut tab = Self::new(id, None);
+        let mut tab = Self::new(id, None, SortState::default());
         tab.kind = TabKind::Settings;
         tab.settings_subpage = subpage;
         tab
@@ -380,8 +380,8 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(initial: Option<PathBuf>) -> Self {
-        let first = TabState::new(1, initial);
+    pub fn new(initial: Option<PathBuf>, sort: SortState) -> Self {
+        let first = TabState::new(1, initial, sort);
         Self {
             tabs: vec![first],
             active_tab: 0,
@@ -407,10 +407,10 @@ impl AppState {
         self.tabs.iter().position(|t| t.id == id)
     }
 
-    pub fn new_tab(&mut self, path: Option<PathBuf>) -> u32 {
+    pub fn new_tab(&mut self, path: Option<PathBuf>, sort: SortState) -> u32 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
-        let mut tab = TabState::new(id, path);
+        let mut tab = TabState::new(id, path, sort);
         // 新标签默认继承当前目录（Explorer/Pulse 习惯）：写入当前聚焦面板。
         if tab.active().path.is_none() {
             if let Some(current) = self.active().active().path.clone() {
