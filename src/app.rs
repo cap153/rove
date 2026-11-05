@@ -730,7 +730,7 @@ impl App {
             // “行缺失”还是“行在但图标空”。
             if pane.path.is_none() {
                 let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
-                crate::logln!("[list] this-pc drives n={} {:?}", names.len(), names);
+                crate::logv!("[list] this-pc drives n={} {:?}", names.len(), names);
             }
             pane.entries = entries;
             // 拼音缓存随 entries 失效（惰性重建）。
@@ -1180,9 +1180,9 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                 let spawned = std::thread::Builder::new()
                     .name(format!("rove-thumb-worker-{i}"))
                     .spawn(move || {
-                        crate::logln!("[thumb] worker-{i} started");
+                        crate::logv!("[thumb] worker-{i} started");
                         while let Ok((path, size)) = worker_rx.recv() {
-                            crate::logln!("[thumb] worker-{i} recv {} size={}", path.display(), size);
+                            crate::logv!("[thumb] worker-{i} recv {} size={}", path.display(), size);
                             // 每个工作线程只需在启动时初始化一次 COM (STA)
                             #[cfg(windows)]
                             unsafe {
@@ -1244,10 +1244,10 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                                 }
                             }
                         }
-                        crate::logln!("[thumb] worker-{i} channel closed");
+                        crate::logv!("[thumb] worker-{i} channel closed");
                     });
                 match spawned {
-                    Ok(_) => crate::logln!("[thumb] worker-{i} spawned"),
+                    Ok(_) => crate::logv!("[thumb] worker-{i} spawned"),
                     Err(e) => crate::logln!("[thumb] worker-{i} SPAWN FAILED: {e} (requests on this lane will be LOST)"),
                 }
             }
@@ -1256,7 +1256,7 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
             let mut rr = 0;
             while let Ok(req) = rx.recv() {
                 let lane = rr % NUM_THREADS;
-                crate::logln!(
+                crate::logv!(
                     "[thumb] dispatch lane={} {} size={}",
                     lane,
                     req.0.display(),
@@ -1267,7 +1267,7 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                 }
                 rr += 1;
             }
-            crate::logln!("[thumb] dispatcher loop ended");
+            crate::logv!("[thumb] dispatcher loop ended");
         })
         .ok();
 }
@@ -1984,11 +1984,11 @@ impl App {
             return img.clone();
         }
         if self.thumb_failed.contains(&key) {
-            crate::logln!("[thumb] negative-cached (will stay blank) {} size={}", path.display(), size);
+            crate::logv!("[thumb] negative-cached (will stay blank) {} size={}", path.display(), size);
             return slint::Image::default();
         }
         if !self.thumb_pending.contains(&key) {
-            crate::logln!("[thumb] REQUEST {} size={}", path.display(), size);
+            crate::logv!("[thumb] REQUEST {} size={}", path.display(), size);
             self.thumb_pending.insert(key.clone());
             if self.thumb_tx.send(key.clone()).is_err() {
                 // 通道断开：不能把 key 永远留在 pending 里，否则该行永久空白。
@@ -2019,7 +2019,7 @@ impl App {
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
     #[allow(dead_code)]
     fn fail_thumbnail(&mut self, key: (PathBuf, u32)) {
-        crate::logln!(
+        crate::logv!(
             "[thumb] FAILED -> negative cache {} size={} (row stays blank)",
             key.0.display(),
             key.1
@@ -2036,7 +2036,7 @@ impl App {
         // 尺寸对不上就是“请求尺寸与当前视图尺寸不一致”的信号：
         // 此时缓存 key 永远不会再被命中，表现为图标一直空白。
         let expect = self.thumb_size_for_view();
-        crate::logln!(
+        crate::logv!(
             "[thumb] ARRIVED {} key_size={} bitmap={}x{} expect_size={} cache_len={}",
             key.0.display(),
             key.1,
@@ -2046,7 +2046,7 @@ impl App {
             self.thumb_cache.len()
         );
         if key.1 != expect {
-            crate::logln!(
+            crate::logv!(
                 "[thumb] !! SIZE MISMATCH {} key={} expect={} -> cache will never hit",
                 key.0.display(),
                 key.1,
@@ -2152,7 +2152,7 @@ impl App {
                 .filter(|r| r.thumb.size().width == 0)
                 .map(|r| r.name.to_string())
                 .collect();
-            crate::logln!(
+            crate::logv!(
                 "[rows] EMPTY THUMBS {}/{} {:?} | geom list_h={} (raw={}) cells={} row_h={} rows_visible={} | total={} first={} count={} scroll={:.1} mode={} is_split={} expect_px={} cache_len={} pending={} failed={}",
                 empty_thumbs,
                 rows0.len(),

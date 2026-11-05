@@ -79,7 +79,7 @@ pub fn get_thumbnail(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), Stri
                     || e.contains("数据还不可使用");
                 if transient && attempt < MAX_ATTEMPTS {
                     let wait = 250u64.saturating_mul(1 << (attempt - 1).min(5));
-                    crate::logln!(
+                    crate::logv!(
                         "[thumb] transient E_PENDING (attempt {}/{}) {} size={}: {} -> retry in {}ms",
                         attempt,
                         MAX_ATTEMPTS,
@@ -91,7 +91,7 @@ pub fn get_thumbnail(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), Stri
                     std::thread::sleep(std::time::Duration::from_millis(wait));
                     continue;
                 }
-                crate::logln!(
+                crate::logv!(
                     "[thumb] impl FAILED {} req_size={} attempt={}: {}",
                     path.display(),
                     size,
@@ -104,13 +104,13 @@ pub fn get_thumbnail(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), Stri
                         // （例如请求 264 返回 32），强行塞进大容器会因透明/缩放产生
                         // 不可见的白块。直接返回 Err，让上层走彩色方块（fallback）。
                         if r.0 * 2 < size || r.1 * 2 < size {
-                            crate::logln!(
+                            crate::logv!(
                                 "[thumb] fallback system icon too small ({}x{}) for req_size={}, rejecting -> UI colored block",
                                 r.0, r.1, size
                             );
                             return Err(e);
                         }
-                        crate::logln!(
+                        crate::logv!(
                             "[thumb] fallback system icon {} req_size={} -> {}x{}",
                             path.display(),
                             size,
@@ -120,7 +120,7 @@ pub fn get_thumbnail(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), Stri
                         return Ok(r);
                     }
                     None => {
-                        crate::logln!("[thumb] fallback system icon FAILED {}", path.display());
+                        crate::logv!("[thumb] fallback system icon FAILED {}", path.display());
                         return Err(e);
                     }
                 }
@@ -253,7 +253,7 @@ pub fn get_system_icon(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
             );
             if ret != 0 && !info.hIcon.is_invalid() {
                 if attempt > 0 {
-                    crate::logln!(
+                    crate::logv!(
                         "[sysicon] retry OK on attempt {} {}",
                         attempt + 1,
                         path.display()
@@ -262,7 +262,7 @@ pub fn get_system_icon(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
                 break;
             }
             if attempt < 4 {
-                crate::logln!(
+                crate::logv!(
                     "[sysicon] attempt {} failed for {} -> retry",
                     attempt + 1,
                     path.display()
