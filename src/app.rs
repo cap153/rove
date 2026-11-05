@@ -8,6 +8,7 @@
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -164,6 +165,14 @@ const OVERSCAN: usize = 4;
 /// 单条索引记录的粗估内存占用（路径 + 名称 + 拼音字段）。
 const INDEX_ENTRY_BYTES: usize = 80;
 
+/// 缩略图缓存最大项数（宽松限制，主要受字节预算约束）。
+const THUMB_CACHE_MAX_ITEMS: usize = 4096;
+/// 缩略图缓存字节预算（192 MB）。Rove 的 Image 常驻 CPU 侧 RGBA，
+/// 按最大尺寸(132px*2.0=264px)每张约 278 KB，192 MB 可存约 690 张。
+const THUMB_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
+/// 缩略图磁盘缓存预算（512 MB，对标 Pulse）。超限按最后修改时间淘汰到 80%。
+const THUMB_DISK_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
 // ---- 右键菜单动作 ID ----
 const ACT_OPEN: &str = "open";
 const ACT_COPY: &str = "copy";
@@ -313,7 +322,9 @@ impl DirSizeStore {
     }
 
     fn temp_file_path() -> PathBuf {
-        std::env::temp_dir().join("rove_dir_sizes.json")
+        // 核心修复：迁移到 %LOCALAPPDATA%\Rove\，避免被系统 %tmp% 清理逻辑误删
+        // （误删会导致重启后全部文件夹大小重新计算，造成短暂卡顿）。
+        rove_data_dir().join("dir_sizes.json")
     }
 
     fn load_from_temp(&mut self) {
@@ -372,6 +383,24 @@ impl DirSizeStore {
     }
 }
 
+/// 缩略图缓存 Key：包含 mtime/size，彻底解决「文件被替换后显示旧缩略图」的 Bug。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ThumbKey {
+    path: PathBuf,
+    /// 修改时间（毫秒时间戳），保证文件变动后不命中旧图。
+    mtime_ms: u64,
+    /// 文件大小。
+    file_size: u64,
+    /// 请求的像素尺寸。
+    px_size: u32,
+}
+
+/// 缓存项：原图 + 估算字节数（用于字节预算淘汰）。
+struct CachedThumb {
+    img: slint::Image,
+    bytes: usize,
+}
+
 /// 全局常驻的体积缓存单例（进程级生命周期，窗口关闭不销毁）。
 static GLOBAL_DIR_SIZES: OnceLock<Mutex<DirSizeStore>> = OnceLock::new();
 
@@ -420,18 +449,20 @@ pub struct App {
     preview_shown: bool,
     /// actions.toml 驱动的自定义动作（压缩/解压/自定义）。
     actions: Vec<crate::ops::actions::ActionEntry>,
-    /// 缩略图 LRU（Phase 5）：(路径, 尺寸) → 已生成的 Slint 图像。
-    /// 缩略图管线暂未在视图中启用，保留基础设施。
-    #[allow(dead_code)]
-    thumb_cache: HashMap<(PathBuf, u32), slint::Image>,
-    /// 缩略图缓存插入序（容量淘汰用）。
-    thumb_order: Vec<(PathBuf, u32)>,
+    /// 缩略图 LRU 缓存（Key 包含 mtime/size，防止旧图）。
+    thumb_cache: HashMap<ThumbKey, CachedThumb>,
+    /// LRU 顺序（队首最久未用，命中时移到队尾）。
+    thumb_order: Vec<ThumbKey>,
+    /// 当前缓存的估算总字节数（用于字节预算淘汰）。
+    thumb_cache_bytes: usize,
     /// 已请求未完成的缩略图（防重复提交）。
-    thumb_pending: HashSet<(PathBuf, u32)>,
-    /// 失败负缓存（本会话内不再重试，避免反复 COM 调用）。
-    thumb_failed: HashSet<(PathBuf, u32)>,
+    thumb_pending: HashSet<ThumbKey>,
+    /// 失败负缓存（本会话内不再重试）。
+    thumb_failed: HashSet<ThumbKey>,
+    /// 批量刷新标记：后台有缩略图到达时置位，由 poll_timer 统一刷新。
+    thumb_needs_refresh: bool,
     #[allow(dead_code)]
-    thumb_tx: Sender<(PathBuf, u32)>,
+    thumb_tx: Sender<ThumbKey>,
     list_tx: Sender<ListRequest>,
     list_rx: Receiver<ListResult>,
     /// 深度搜索通道（文件夹视图子树搜索，独立线程执行）。
@@ -491,7 +522,7 @@ impl App {
         list_rx: Receiver<ListResult>,
         deep_tx: Sender<DeepRequest>,
         deep_rx: Receiver<DeepResult>,
-        thumb_tx: Sender<(PathBuf, u32)>,
+        thumb_tx: Sender<ThumbKey>,
         dir_size_tx: Sender<DirSizeRequest>,
         dir_size_rx: Receiver<DirSizeResult>,
         watch_tx: Sender<PathBuf>,
@@ -543,8 +574,10 @@ impl App {
             actions: Vec::new(),
             thumb_cache: HashMap::new(),
             thumb_order: Vec::new(),
+            thumb_cache_bytes: 0,
             thumb_pending: HashSet::new(),
             thumb_failed: HashSet::new(),
+            thumb_needs_refresh: false,
             syncing_tab: false,
             thumb_tx,
             list_tx,
@@ -1051,6 +1084,79 @@ fn is_network_path(path: &Path) -> bool {
     false
 }
 
+/// 获取 Rove 在 %LOCALAPPDATA% 下的专属数据目录（不存在则创建）。
+/// 缩略图 / 索引 / 容量缓存都放在这里，避免被系统 %tmp% 清理逻辑误删。
+fn rove_data_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("Rove");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// 缩略图磁盘缓存路径，使用两级哈希子目录避免单目录文件过多。
+fn thumb_disk_path(key: &ThumbKey) -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    let hash = format!("{:016x}", hasher.finish());
+    rove_data_dir()
+        .join("thumbs")
+        .join(&hash[0..2])
+        .join(format!("{}.bin", hash))
+}
+
+/// 扫描并清理缩略图磁盘缓存：总大小超过预算时，按最后修改时间删除最旧文件到 80%。
+fn maintain_thumb_disk_cache() {
+    let root = rove_data_dir().join("thumbs");
+    if !root.exists() {
+        return;
+    }
+
+    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+    let mut total_bytes = 0u64;
+
+    // 只扫描两级子目录（rove_data_dir/thumbs/<xx>/<hash>.bin）。
+    if let Ok(read_dir) = std::fs::read_dir(&root) {
+        for entry in read_dir.flatten() {
+            if let Ok(ft) = entry.file_type() {
+                if ft.is_dir() {
+                    if let Ok(sub_dir) = std::fs::read_dir(entry.path()) {
+                        for sub_entry in sub_dir.flatten() {
+                            if let Ok(meta) = sub_entry.metadata() {
+                                if meta.is_file() {
+                                    let len = meta.len();
+                                    total_bytes += len;
+                                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                                    files.push((sub_entry.path(), len, mtime));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 超出预算时，按修改时间排序（最旧的在前），删到低于预算的 80%。
+    if total_bytes > THUMB_DISK_MAX_BYTES {
+        crate::logln!(
+            "[thumb] disk cache over budget ({} MB), cleaning...",
+            total_bytes / 1024 / 1024
+        );
+        files.sort_by_key(|(_, _, mtime)| *mtime);
+        let target_bytes = (THUMB_DISK_MAX_BYTES as f64 * 0.8) as u64;
+        for (path, size, _) in files {
+            if total_bytes <= target_bytes {
+                break;
+            }
+            if std::fs::remove_file(&path).is_ok() {
+                total_bytes = total_bytes.saturating_sub(size);
+            }
+        }
+    }
+}
+
 /// 强制把面板的 scroll_y 推送到 UI，让视图与虚拟列表的计算同步。
 ///
 /// 使用 `invoke_set_file_scroll_y` 直接调用 Slint 的公开函数，
@@ -1166,7 +1272,10 @@ fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>
 #[cfg(windows)]
 /// 缩略图工作线程分发器。
 /// 核心修复：使用固定 4 线程并发池 + 轮询分发，彻底杜绝海量文件下的线程爆炸与 COM 崩溃。
-fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
+fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>) {
+    // 启动时执行一次磁盘缓存清理（独立线程，不阻塞主线程/分发器）。
+    std::thread::spawn(maintain_thumb_disk_cache);
+
     std::thread::Builder::new()
         .name("rove-thumbs-dispatcher".into())
         .spawn(move || {
@@ -1175,14 +1284,18 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
 
             // 1. 启动固定数量的后台工作线程
             for i in 0..NUM_THREADS {
-                let (tx, worker_rx) = mpsc::channel::<(PathBuf, u32)>();
+                let (tx, worker_rx) = mpsc::channel::<ThumbKey>();
                 worker_txs.push(tx);
                 let spawned = std::thread::Builder::new()
                     .name(format!("rove-thumb-worker-{i}"))
                     .spawn(move || {
                         crate::logv!("[thumb] worker-{i} started");
-                        while let Ok((path, size)) = worker_rx.recv() {
-                            crate::logv!("[thumb] worker-{i} recv {} size={}", path.display(), size);
+                        while let Ok(key) = worker_rx.recv() {
+                            crate::logv!(
+                                "[thumb] worker-{i} recv {} size={}",
+                                key.path.display(),
+                                key.px_size
+                            );
                             // 每个工作线程只需在启动时初始化一次 COM (STA)
                             #[cfg(windows)]
                             unsafe {
@@ -1197,17 +1310,35 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                             //   thumbs 内部做限次退避重试（盘符等最终仍取不到时返回 Err）；
                             // - 降级系统图标尺寸过小时（如请求 264 返回 32）直接返回 Err，
                             //   由 UI 的彩色方块兜底，避免白块。
-                            // 工作线程这里只调一次、拿一次结果。
-                            let result = crate::ops::thumbs::get_thumbnail(&path, size);
+                            let t0 = std::time::Instant::now();
+                            let result =
+                                crate::ops::thumbs::get_thumbnail(&key.path, key.px_size);
+                            let decode_ms = t0.elapsed().as_millis();
                             match result {
                                 Ok((w, h, rgba)) => {
+                                    // 核心修复：仅「慢图」（耗时 >= 30ms 的视频/网络/大图）才落盘。
+                                    // 廉价格式（本地 jpg/png/小图标）秒解，重读磁盘比解码还慢，无需占用磁盘。
+                                    const MIN_DECODE_MS: u128 = 30;
+                                    if decode_ms >= MIN_DECODE_MS {
+                                        let disk_path = thumb_disk_path(&key);
+                                        if let Ok(bytes) =
+                                            bincode::serialize(&(w, h, &rgba as &[u8]))
+                                        {
+                                            if let Some(parent) = disk_path.parent() {
+                                                let _ = std::fs::create_dir_all(parent);
+                                            }
+                                            let _ = std::fs::write(&disk_path, bytes);
+                                        }
+                                    }
+
+                                    // 2. 交还给主线程构建 Image 并写入内存 LRU。
                                     let _ = slint::invoke_from_event_loop(move || {
                                         let Some(img) = to_slint_image(w, h, &rgba) else {
                                             // 静默丢弃会让 thumb_pending 永远留着该 key →
                                             // 该行永久空白且不再重试。必须记日志。
                                             crate::logln!(
                                                 "[thumb] !! to_slint_image FAILED {} {}x{} bytes={} (row stays blank)",
-                                                path.display(),
+                                                key.path.display(),
                                                 w,
                                                 h,
                                                 rgba.len()
@@ -1215,7 +1346,7 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                                             if let Some(app) =
                                                 SESSION.with(|slot| slot.borrow().clone())
                                             {
-                                                app.borrow_mut().fail_thumbnail((path, size));
+                                                app.borrow_mut().fail_thumbnail(key);
                                             }
                                             return;
                                         };
@@ -1224,22 +1355,22 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                                         else {
                                             crate::logln!(
                                                 "[thumb] !! SESSION None when storing {} (row stays blank)",
-                                                path.display()
+                                                key.path.display()
                                             );
                                             return;
                                         };
-                                        app.borrow_mut().store_thumbnail((path, size), img);
+                                        app.borrow_mut().store_thumbnail(key, img);
                                     });
                                 }
-                                Err(e) => {
-                                    crate::logln!("thumb failed {}: {}", path.display(), e);
+                                Err(_e) => {
+                                    crate::logln!("thumb failed {}: {}", key.path.display(), _e);
                                     let _ = slint::invoke_from_event_loop(move || {
                                         let Some(app) =
                                             SESSION.with(|slot| slot.borrow().clone())
                                         else {
                                             return;
                                         };
-                                        app.borrow_mut().fail_thumbnail((path, size));
+                                        app.borrow_mut().fail_thumbnail(key);
                                     });
                                 }
                             }
@@ -1259,8 +1390,8 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                 crate::logv!(
                     "[thumb] dispatch lane={} {} size={}",
                     lane,
-                    req.0.display(),
-                    req.1
+                    req.path.display(),
+                    req.px_size
                 );
                 if let Err(e) = worker_txs[lane].send(req) {
                     crate::logln!("[thumb] !! lane={} send FAILED: {e} (request LOST)", lane);
@@ -1711,9 +1842,9 @@ impl App {
                 // 回收站使用系统解析名，其余系统目录直接使用物理路径
                 #[cfg(windows)]
                 let icon_img = if label == "回收站" {
-                    self.thumb_for(Path::new("shell:RecycleBinFolder"), SIDEBAR_ICON_PX)
+                    self.thumb_for(Path::new("shell:RecycleBinFolder"), None, 0, SIDEBAR_ICON_PX)
                 } else {
-                    self.thumb_for(&_dir, SIDEBAR_ICON_PX)
+                    self.thumb_for(&_dir, None, 0, SIDEBAR_ICON_PX)
                 };
                 #[cfg(not(windows))]
                 let icon_img = slint::Image::default();
@@ -1767,7 +1898,7 @@ impl App {
                         continue;
                     }
                     #[cfg(windows)]
-                    let icon_img = self.thumb_for(&path, SIDEBAR_ICON_PX);
+                    let icon_img = self.thumb_for(&path, None, 0, SIDEBAR_ICON_PX);
                     #[cfg(not(windows))]
                     let icon_img = slint::Image::default();
 
@@ -1977,22 +2108,75 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn thumb_for(&mut self, path: &Path, size: u32) -> slint::Image {
-        let key = (path.to_path_buf(), size);
-        if let Some(img) = self.thumb_cache.get(&key) {
+    fn thumb_for(
+        &mut self,
+        path: &Path,
+        mtime: Option<SystemTime>,
+        file_size: u64,
+        size: u32,
+    ) -> slint::Image {
+        let mtime_ms = mtime
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let key = ThumbKey {
+            path: path.to_path_buf(),
+            mtime_ms,
+            file_size,
+            px_size: size,
+        };
+
+        // 1. 内存 LRU 命中：提升至队尾（真 LRU，非 FIFO）。
+        if let Some(entry) = self.thumb_cache.get(&key) {
+            let img = entry.img.clone();
+            self.thumb_order.retain(|k| k != &key);
+            self.thumb_order.push(key);
             crate::logv!("[thumb] cache HIT {} size={}", path.display(), size);
-            return img.clone();
+            return img;
         }
+
+        // 2. 负缓存命中：本会话内该图确实取不到，直接空白。
         if self.thumb_failed.contains(&key) {
-            crate::logv!("[thumb] negative-cached (will stay blank) {} size={}", path.display(), size);
+            crate::logv!(
+                "[thumb] negative-cached (will stay blank) {} size={}",
+                path.display(),
+                size
+            );
             return slint::Image::default();
         }
+
+        // 3. 未在 pending 中：先查磁盘缓存，查不到再交给后台 Shell 解码。
         if !self.thumb_pending.contains(&key) {
-            crate::logv!("[thumb] REQUEST {} size={}", path.display(), size);
             self.thumb_pending.insert(key.clone());
+
+            // 磁盘缓存优先：视频海报等慢解码项落盘后，回滚是读盘(毫秒级)
+            // 而非 Shell 解码(几十~几百 ms)，这就是「永不重新渲染」的关键。
+            let disk_path = thumb_disk_path(&key);
+            if let Ok(bytes) = std::fs::read(&disk_path) {
+                if let Ok((w, h, rgba)) =
+                    bincode::deserialize::<(u32, u32, Vec<u8>)>(&bytes)
+                {
+                    if let Some(img) = to_slint_image(w, h, &rgba) {
+                        crate::logv!(
+                            "[thumb] disk-cache HIT {} size={}",
+                            path.display(),
+                            size
+                        );
+                        self.thumb_pending.remove(&key);
+                        self.insert_thumb_cache(key, img.clone());
+                        return img;
+                    }
+                }
+            }
+
+            // 磁盘未命中，发送给后台去解码。
             if self.thumb_tx.send(key.clone()).is_err() {
                 // 通道断开：不能把 key 永远留在 pending 里，否则该行永久空白。
-                crate::logln!("[thumb] !! send to worker channel FAILED {} size={}", path.display(), size);
+                crate::logln!(
+                    "[thumb] !! send to worker channel FAILED {} size={}",
+                    path.display(),
+                    size
+                );
                 self.thumb_pending.remove(&key);
                 self.thumb_failed.insert(key);
             }
@@ -2002,8 +2186,42 @@ impl App {
         slint::Image::default()
     }
 
+    /// 写入 LRU 缓存（内存），按字节预算 + 项数双上限淘汰（队首最久未用）。
+    fn insert_thumb_cache(&mut self, key: ThumbKey, img: slint::Image) {
+        let sz = img.size();
+        // RGBA8 估算：每像素 4 字节。
+        let bytes = (sz.width * sz.height * 4) as usize;
+
+        if let Some(old) = self.thumb_cache.remove(&key) {
+            self.thumb_cache_bytes = self.thumb_cache_bytes.saturating_sub(old.bytes);
+            self.thumb_order.retain(|k| k != &key);
+        }
+
+        self.thumb_cache.insert(key.clone(), CachedThumb { img, bytes });
+        self.thumb_order.push(key);
+        self.thumb_cache_bytes += bytes;
+
+        // 淘汰：从头部（最久未用）移除，直到符合双上限。
+        while (self.thumb_cache.len() > THUMB_CACHE_MAX_ITEMS
+            || self.thumb_cache_bytes > THUMB_CACHE_MAX_BYTES)
+            && !self.thumb_order.is_empty()
+        {
+            let oldest = self.thumb_order.remove(0);
+            if let Some(evicted) = self.thumb_cache.remove(&oldest) {
+                self.thumb_cache_bytes =
+                    self.thumb_cache_bytes.saturating_sub(evicted.bytes);
+            }
+        }
+    }
+
     #[cfg(not(windows))]
-    fn thumb_for(&mut self, _path: &Path, _size: u32) -> slint::Image {
+    fn thumb_for(
+        &mut self,
+        _path: &Path,
+        _mtime: Option<SystemTime>,
+        _file_size: u64,
+        _size: u32,
+    ) -> slint::Image {
         slint::Image::default()
     }
 
@@ -2012,69 +2230,25 @@ impl App {
         44
     }
 
-    /// 缩略图容量上限。
-    #[allow(dead_code)]
-    const THUMB_CACHE_CAP: usize = 512;
-
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
     #[allow(dead_code)]
-    fn fail_thumbnail(&mut self, key: (PathBuf, u32)) {
+    fn fail_thumbnail(&mut self, key: ThumbKey) {
         crate::logv!(
             "[thumb] FAILED -> negative cache {} size={} (row stays blank)",
-            key.0.display(),
-            key.1
+            key.path.display(),
+            key.px_size
         );
         self.thumb_pending.remove(&key);
         self.thumb_failed.insert(key);
     }
 
-    /// 写入缩略图缓存（事件循环线程），并刷新可见行。
+    /// 写入缩略图缓存（事件循环线程）：只打批量刷新标记，由 poll_timer 统一刷新。
     #[allow(dead_code)]
-    fn store_thumbnail(&mut self, key: (PathBuf, u32), img: slint::Image) {
+    fn store_thumbnail(&mut self, key: ThumbKey, img: slint::Image) {
         self.thumb_pending.remove(&key);
-        let sz = img.size();
-        // 尺寸对不上就是“请求尺寸与当前视图尺寸不一致”的信号：
-        // 此时缓存 key 永远不会再被命中，表现为图标一直空白。
-        let expect = self.thumb_size_for_view();
-        crate::logv!(
-            "[thumb] ARRIVED {} key_size={} bitmap={}x{} expect_size={} cache_len={}",
-            key.0.display(),
-            key.1,
-            sz.width,
-            sz.height,
-            expect,
-            self.thumb_cache.len()
-        );
-        if key.1 != expect {
-            crate::logv!(
-                "[thumb] !! SIZE MISMATCH {} key={} expect={} -> cache will never hit",
-                key.0.display(),
-                key.1,
-                expect
-            );
-        }
-        if self.thumb_cache.contains_key(&key) {
-            self.thumb_cache.insert(key.clone(), img);
-            return;
-        }
-        if self.thumb_cache.len() >= Self::THUMB_CACHE_CAP {
-            // 简单 FIFO 淘汰。
-            while self.thumb_order.len() >= Self::THUMB_CACHE_CAP {
-                let oldest = self.thumb_order.remove(0);
-                self.thumb_cache.remove(&oldest);
-            }
-        }
-        self.thumb_order.push(key.clone());
-        self.thumb_cache.insert(key.clone(), img);
-        self.visible_cache = None;
-        self.refresh_visible_rows();
-
-        // 核心修复：当提取完成的图标属于侧栏尺寸时，立即刷新侧边栏（把方块替换为原生图标）。
-        // 侧边栏尺寸已锁定为常量 32，不再动态计算，彻底杜绝启动期 DPI 缩放竞争导致的 key 脱节。
-        if key.1 == 32 {
-            self.sidebar_fingerprint = 0; // 重置指纹
-            self.sync_sidebar();          // 实时将原生图标刷上侧边栏！
-        }
+        self.insert_thumb_cache(key, img);
+        // 核心修复：不再每次 store 都全量 refresh，只置位，由主线程 40ms 批量刷新。
+        self.thumb_needs_refresh = true;
     }
 
     /// 当前列表几何（用于检测布局落定 / 窗口尺寸变化）。
@@ -2248,7 +2422,12 @@ impl App {
         collected
             .into_iter()
             .map(|(index, entry, selected, cut, name_parts)| {
-                let thumb = self.thumb_for(&entry.path, self.thumb_size_for_view());
+                let thumb = self.thumb_for(
+                    &entry.path,
+                    entry.modified,
+                    entry.size,
+                    self.thumb_size_for_view(),
+                );
                 FileRow {
                     index,
                     name: entry.name.clone().into(),
@@ -4919,6 +5098,17 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                     app.apply_dir_size_result(result);
                 }
 
+                // 核心修复：缩略图批量到达后，统一在主线程刷新一次，避免 653 张
+                // 连续 store 触发 653 次全量行重建导致掉帧。
+                if app.thumb_needs_refresh {
+                    app.thumb_needs_refresh = false;
+                    app.visible_cache = None;
+                    app.refresh_visible_rows();
+                    // 含侧栏尺寸(32px)的图标更新时也刷新侧边栏（方块→原生图标）。
+                    app.sidebar_fingerprint = 0;
+                    app.sync_sidebar();
+                }
+
                 // 核心修复：用户空闲时静默重排，绝不打断当前操作。
                 if app.size_sort_pending {
                     // 防抖判定：拖拽中 / 列表加载中 / 800ms 内有过点击（大概率在操作）
@@ -7052,7 +7242,7 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     spawn_deep_worker(deep_worker_rx, deep_worker_tx);
 
     // 缩略图 worker：路径 → 生成缩略图 → 回事件循环写缓存。
-    let (thumb_tx, thumb_rx) = mpsc::channel::<(PathBuf, u32)>();
+    let (thumb_tx, thumb_rx) = mpsc::channel::<ThumbKey>();
     #[cfg(windows)]
     spawn_thumb_worker(thumb_rx);
     #[cfg(not(windows))]
