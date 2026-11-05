@@ -45,16 +45,25 @@ pub fn list_directory(path: &Path) -> Vec<FileEntry> {
         return Vec::new();
     };
     let mut entries = Vec::new();
+    let is_network = path.to_string_lossy().starts_with(r"\\");
+
     for entry in read_dir.flatten() {
         let path = entry.path();
-        // symlink_metadata：不跟随符号链接，避免环与重复统计。
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        let name = entry.file_name().to_string_lossy().into_owned();
+
+        // 核心修复：网络路径下直接使用 entry.metadata()，避免二次跨网络请求；
+        // 本地路径仍用 symlink_metadata 防止 Junction 死循环。
+        let meta = if is_network {
+            entry.metadata().ok()
+        } else {
+            std::fs::symlink_metadata(&path).ok()
         };
+
+        let Some(meta) = meta else { continue; };
+
         let is_dir = meta.is_dir();
         let size = if is_dir { 0 } else { meta.len() };
         let modified = meta.modified().ok();
-        let name = entry.file_name().to_string_lossy().into_owned();
 
         // Windows 隐藏属性（FILE_ATTRIBUTE_HIDDEN = 2）或以 '.' 开头的 Unix 隐藏文件。
         #[cfg(windows)]
@@ -79,13 +88,30 @@ pub fn sort_entries(entries: &mut [FileEntry], sort: SortState) {
             (false, true) => return std::cmp::Ordering::Greater,
             _ => {}
         }
+
         let ord = match sort.key {
             SortKey::Name => natural_cmp(&a.name, &b.name),
-            SortKey::Size => a.size.cmp(&b.size),
+            SortKey::Size => {
+                // 核心修复 1：未知大小视为沉底（不论升序降序都在最后）
+                let a_known = a.dir_size_loaded;
+                let b_known = b.dir_size_loaded;
+                if a_known != b_known {
+                    // 已知的排在前，未知的排在后
+                    return b_known.cmp(&a_known);
+                } else {
+                    a.size.cmp(&b.size)
+                }
+            }
             SortKey::Modified => a.modified.cmp(&b.modified),
             SortKey::Type => a.type_text.cmp(&b.type_text),
             SortKey::Path => a.path.cmp(&b.path),
         };
+
+        if ord == std::cmp::Ordering::Equal && sort.key != SortKey::Name {
+            // 核心修复 2：非名称排序时，如果大小或时间相等（包括都是未知），用名称兜底，保证稳定不乱
+            return natural_cmp(&a.name, &b.name);
+        }
+
         if sort.ascending { ord } else { ord.reverse() }
     });
 }

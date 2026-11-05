@@ -404,6 +404,8 @@ pub struct App {
     drop_timer: Timer,
     /// 拖出待定手势：(按下时行局部 x, y, 待拖路径)。
     drag_pending: Option<(f32, f32, Vec<PathBuf>)>,
+    /// 后台大小变化时置位，等待主线程空闲时静默重排。
+    pub size_sort_pending: bool,
     /// 任务 3.1：QuickLook 预览窗口（独立 Slint Window）。
     preview: PreviewWindow,
     /// 预览窗口是否已 show（首次需 show，之后用 visible 控制）。
@@ -516,6 +518,7 @@ impl App {
             dir_mtimes: HashMap::new(),
             drop_timer: Timer::default(),
             drag_pending: None,
+            size_sort_pending: false,
             recording_shortcut: None,
             dir_size_tx,
             dir_size_rx,
@@ -597,6 +600,12 @@ impl App {
                 Some(p) => p,
                 None => continue,
             };
+
+            // 核心修复 1：跳过网络路径的 mtime 轮询，防止网络 IO 阻塞主线程导致 UI 假死
+            if is_network_path(&path) {
+                continue;
+            }
+
             let mtime = match std::fs::symlink_metadata(&path).and_then(|m| m.modified()) {
                 Ok(m) => m,
                 Err(_) => continue,
@@ -659,15 +668,55 @@ impl App {
         // 按「显示隐藏文件」开关过滤：关闭时剔除具有隐藏属性的条目。
         let show_hidden = self.config.show_hidden;
         let listed_is_active = result.pane == tab.active_pane;
+
+        // 1. 过滤隐藏文件
+        let mut entries: Vec<FileEntry> = if show_hidden {
+            result.entries
+        } else {
+            result.entries.into_iter().filter(|e| !e.is_hidden).collect()
+        };
+
+        // 2. 核心修复：在排序前，先查一遍缓存，把已知的体积回填进去。
+        //    （排序只看 size，若先排后填，缓存命中的目录也会排错。）
+        {
+            let store = global_dir_sizes().lock().unwrap();
+            // 毫秒级一致性比对：NTFS 的 100ns 精度在 JSON 落盘时被截断为 ms，
+            // 若用全等于 == 比对，重启后 loaded 的 mtime 会被误判为"已修改" -> 100% MISS。
+            let mtime_equal = |t1: SystemTime, t2: SystemTime| {
+                let ms1 = t1
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                let ms2 = t2
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                ms1 == ms2
+            };
+            for entry in entries.iter_mut().filter(|e| e.is_dir) {
+                // 昂贵系统目录：不入队扫描，直接呈现 "—"
+                if is_expensive_system_dir(&entry.path) {
+                    entry.dir_size_loaded = true;
+                    entry.dir_size_deferred = true;
+                    continue;
+                }
+                if let Some(&(cached_sz, cached_partial, cached_mtime)) =
+                    store.cache.get(&entry.path)
+                {
+                    if entry.modified.is_some_and(|m| mtime_equal(m, cached_mtime)) {
+                        entry.size = cached_sz;
+                        entry.dir_size_partial = cached_partial;
+                        entry.dir_size_loaded = true;
+                    }
+                }
+            }
+        }
+
+        // 3. 回填后再排序，写入 pane。
         {
             let pane = &mut tab.panes[result.pane];
-            pane.entries = if show_hidden {
-                result.entries
-            } else {
-                result.entries.into_iter().filter(|e| !e.is_hidden).collect()
-            };
-            // 核心修复：防止在后台加载期间用户更改了排序，导致旧排序结果覆盖界面。
-            crate::fs::sort_entries(&mut pane.entries, pane.sort);
+            crate::fs::sort_entries(&mut entries, pane.sort);
+            pane.entries = entries;
             // 拼音缓存随 entries 失效（惰性重建）。
             pane.pinyin_cache.clear();
             // 新列表到达即失效全局搜索的截断提示。
@@ -702,70 +751,31 @@ impl App {
         // ---- 异步统计子文件夹体积 ----
         // 命中缓存则瞬时填入（mtime 严格一致才算），仅未命中/已变动的目录提交后台。
         if let Some(current_path) = self.state.tabs[tab_index].panes[result.pane].path.as_ref() {
-            // ⑥ 网络路径防护：UNC 路径（\\server\share）不自动递归，避免拖垮内网 IO。
-            let is_unc = current_path.to_string_lossy().starts_with(r"\\");
-            if is_unc {
+            // ⑥ 网络路径防护：UNC 路径（\\server\share）与映射网络驱动器（Z:\）
+            // 都不自动递归，避免拖垮内网 IO。
+            let is_net = is_network_path(current_path);
+            if is_net {
                 dirsize_trace(format!(
-                    "UNC path -> skip auto scan: {}",
+                    "Network path -> skip auto scan: {}",
                     current_path.display()
                 ));
             }
 
-            if !is_unc {
+            if !is_net {
                 // 停掉上一批未完成的计算任务，避免旧结果回灌当前视图
                 if let Some(old_stop) = self.dir_size_stop.take() {
                     old_stop.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
 
-                // 1. 校验缓存：仅当目录 mtime 严格一致时复用历史体积
+                // 收集未命中缓存的目录（第 2 步回填时已标记 dir_size_loaded）。
                 let mut missing_dirs: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
-                let mut hit_count = 0usize;
                 {
-                    let store = global_dir_sizes().lock().unwrap();
-                    // 毫秒级一致性比对：NTFS 的 100ns 精度在 JSON 落盘时被截断为 ms，
-                    // 若用全等于 == 比对，重启后 loaded 的 mtime 会被误判为"已修改" -> 100% MISS。
-                    let mtime_equal = |t1: SystemTime, t2: SystemTime| {
-                        let ms1 = t1
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        let ms2 = t2
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis();
-                        ms1 == ms2
-                    };
                     let tab = &mut self.state.tabs[tab_index];
                     for entry in tab.active_mut().entries.iter_mut().filter(|e| e.is_dir) {
-                        // 1a. 昂贵系统目录：不入队扫描，直接呈现 "—"
-                        if is_expensive_system_dir(&entry.path) {
-                            entry.dir_size_loaded = true;
-                            entry.dir_size_deferred = true;
-                            continue;
-                        }
-
-                        // 1b. 查缓存：目录 mtime 毫秒级一致即复用历史体积
-                        let cache_hit = match (entry.modified, store.cache.get(&entry.path)) {
-                            (Some(cur_mtime), Some(&(cached_sz, cached_partial, cached_mtime)))
-                                if mtime_equal(cur_mtime, cached_mtime) =>
-                            {
-                                entry.size = cached_sz;
-                                entry.dir_size_partial = cached_partial;
-                                entry.dir_size_loaded = true;
-                                true
-                            }
-                            _ => false,
-                        };
-                        if !cache_hit {
+                        if !entry.dir_size_loaded {
                             missing_dirs.push((entry.path.clone(), entry.modified));
-                        } else {
-                            hit_count += 1;
                         }
                     }
-                }
-
-                if hit_count > 0 {
-                    dirsize_trace(format!("cache HIT x{} -> instant fill", hit_count));
                 }
 
                 // 有缓存命中且是当前标签时，先刷一遍 UI 让旧值立即显现
@@ -794,8 +804,8 @@ impl App {
 
                 // ---- 文件变更监听：对当前活动目录递归监听整棵子树 ----
                 if let Some(path) = self.state.tabs[tab_index].active().path.clone() {
-                    let is_unc = path.to_string_lossy().starts_with(r"\\");
-                    if tab_index == self.state.active_tab && !is_unc {
+                    let is_net = is_network_path(&path);
+                    if tab_index == self.state.active_tab && !is_net {
                         // 若当前已有监听器且监听的正是该路径，直接复用，不重复重建
                         let already_watching = self
                             .active_watcher
@@ -966,6 +976,16 @@ impl App {
             if is_selected {
                 self.sync_status();
             }
+
+            // 核心修复：不立刻重排，打个标记，等用户空闲时再排。
+            // （体积结果按标签回传、可能属于任一面板，故只要该标签有按大小排序的面板就置位）
+            if self.state.tabs[tab_index]
+                .panes
+                .iter()
+                .any(|p| p.sort.key == SortKey::Size)
+            {
+                self.size_sort_pending = true;
+            }
         }
     }
 }
@@ -981,40 +1001,62 @@ fn tab_loading_flag(ui: &MainWindow, is_active: bool, loading: bool) {
 // 后台线程
 // ---------------------------------------------------------------------------
 
-/// 启动目录列举工作线程。
-fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
-    std::thread::Builder::new()
-        .name("rove-lister".into())
-.spawn(move || {
-            logln!("lister worker started");
-            while let Ok(req) = rx.recv() {
-                logln!("worker req tab={} path={:?}", req.tab_id, req.path);
-                let entries = match &req.path {
-                    None => list_drives().iter().map(FileEntry::drive).collect(),
-                    Some(path) if *path == fs::drives::recycle_virtual_path() => {
-                        // 回收站站内浏览：虚拟目录，条目来自系统回收站。
-                        let mut entries = fs::drives::list_recycle_entries();
-                        sort_entries(&mut entries, req.sort);
-                        entries
-                    }
-                    Some(path) => {
-                        let mut entries = fs::list_directory(path);
-                        sort_entries(&mut entries, req.sort);
-                        entries
-                    }
-                };
-                let sent = tx.send(ListResult {
-                    tab_id: req.tab_id,
-                    pane: req.pane,
-                    generation: req.generation,
-                    entries,
-                });
-                if sent.is_err() {
-                    break;
+/// 判断是否为网络路径（包含 UNC 路径和映射网络驱动器）。
+/// 零系统调用开销：UNC 走前缀字符串判断；映射盘则查 DriveInfo 类型。
+fn is_network_path(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    if s.starts_with(r"\\") {
+        return true;
+    }
+    // 检查是否为映射网络驱动器（如 Z:\）
+    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
+        if let std::path::Prefix::Disk(drive) = prefix.kind() {
+            let letter = (drive as char).to_ascii_uppercase();
+            if let Some(info) = crate::fs::list_drives().iter().find(|d| d.letter == letter) {
+                if info.drive_type == crate::fs::drives::DriveType::Network {
+                    return true;
                 }
             }
+        }
+    }
+    false
+}
+
+/// 启动目录列举工作线程。
+fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
+    // 核心修复 2：改为分发器模式。每个请求独立开启线程，避免网络 I/O 阻塞本地目录列举。
+    std::thread::Builder::new()
+        .name("rove-lister-dispatcher".into())
+        .spawn(move || {
+            logln!("lister dispatcher started");
+            while let Ok(req) = rx.recv() {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    logln!("worker req tab={} path={:?}", req.tab_id, req.path);
+                    let entries = match &req.path {
+                        None => list_drives().iter().map(FileEntry::drive).collect(),
+                        Some(path) if *path == fs::drives::recycle_virtual_path() => {
+                            // 回收站站内浏览：虚拟目录，条目来自系统回收站。
+                            let mut entries = fs::drives::list_recycle_entries();
+                            sort_entries(&mut entries, req.sort);
+                            entries
+                        }
+                        Some(path) => {
+                            let mut entries = fs::list_directory(path);
+                            sort_entries(&mut entries, req.sort);
+                            entries
+                        }
+                    };
+                    let _ = tx.send(ListResult {
+                        tab_id: req.tab_id,
+                        pane: req.pane,
+                        generation: req.generation,
+                        entries,
+                    });
+                });
+            }
         })
-        .expect("spawn rove-lister worker");
+        .expect("spawn rove-lister dispatcher");
 }
 
 /// 启动深度搜索工作线程（文件夹视图子树递归查找）。
@@ -1085,35 +1127,69 @@ fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>
 /// 缩略图工作线程：COM 初始化一次，循环取路径生成缩略图，
 /// 经事件循环回写缓存（线程安全：Image 可跨线程发送）。
 #[cfg(windows)]
+/// 缩略图工作线程分发器。
+/// 核心修复：使用固定 4 线程并发池 + 轮询分发，彻底杜绝海量文件下的线程爆炸与 COM 崩溃。
 fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
     std::thread::Builder::new()
-        .name("rove-thumbs".into())
+        .name("rove-thumbs-dispatcher".into())
         .spawn(move || {
-            while let Ok((path, size)) = rx.recv() {
-                let result = crate::ops::thumbs::get_thumbnail(&path, size);
-                match result {
-                    Ok((w, h, rgba)) => {
-                        // slint::Image 非 Send，事件循环内再构造。
-                        let _ = slint::invoke_from_event_loop(move || {
-                            let Some(img) = to_slint_image(w, h, &rgba) else {
-                                return;
-                            };
-                            let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
-                                return;
-                            };
-                            app.borrow_mut().store_thumbnail((path, size), img);
-                        });
-                    }
-                    Err(e) => {
-                        logln!("thumb failed {}: {}", path.display(), e);
-                        let _ = slint::invoke_from_event_loop(move || {
-                            let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
-                                return;
-                            };
-                            app.borrow_mut().fail_thumbnail((path, size));
-                        });
-                    }
-                }
+            const NUM_THREADS: usize = 4;
+            let mut worker_txs = Vec::with_capacity(NUM_THREADS);
+
+            // 1. 启动固定数量的后台工作线程
+            for i in 0..NUM_THREADS {
+                let (tx, worker_rx) = mpsc::channel::<(PathBuf, u32)>();
+                worker_txs.push(tx);
+                std::thread::Builder::new()
+                    .name(format!("rove-thumb-worker-{i}"))
+                    .spawn(move || {
+                        while let Ok((path, size)) = worker_rx.recv() {
+                            // 每个工作线程只需在启动时初始化一次 COM (STA)
+                            #[cfg(windows)]
+                            unsafe {
+                                use windows::Win32::System::Com::{
+                                    CoInitializeEx, COINIT_APARTMENTTHREADED,
+                                };
+                                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+                            }
+
+                            let result = crate::ops::thumbs::get_thumbnail(&path, size);
+                            match result {
+                                Ok((w, h, rgba)) => {
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        let Some(img) = to_slint_image(w, h, &rgba) else {
+                                            return;
+                                        };
+                                        let Some(app) =
+                                            SESSION.with(|slot| slot.borrow().clone())
+                                        else {
+                                            return;
+                                        };
+                                        app.borrow_mut().store_thumbnail((path, size), img);
+                                    });
+                                }
+                                Err(e) => {
+                                    logln!("thumb failed {}: {}", path.display(), e);
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        let Some(app) =
+                                            SESSION.with(|slot| slot.borrow().clone())
+                                        else {
+                                            return;
+                                        };
+                                        app.borrow_mut().fail_thumbnail((path, size));
+                                    });
+                                }
+                            }
+                        }
+                    })
+                    .ok();
+            }
+
+            // 2. 主分发循环：轮询（Round-Robin）将任务塞进这 4 个线程的通道中
+            let mut rr = 0;
+            while let Ok(req) = rx.recv() {
+                let _ = worker_txs[rr % NUM_THREADS].send(req);
+                rr += 1;
             }
         })
         .ok();
@@ -4603,6 +4679,36 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 }
                 while let Ok(result) = app.dir_size_rx.try_recv() {
                     app.apply_dir_size_result(result);
+                }
+
+                // 核心修复：用户空闲时静默重排，绝不打断当前操作。
+                if app.size_sort_pending {
+                    // 防抖判定：拖拽中 / 列表加载中 / 800ms 内有过点击（大概率在操作）
+                    let is_interacting = app.drag_pending.is_some()
+                        || app.ui.get_file_loading()
+                        || app
+                            .last_click
+                            .as_ref()
+                            .is_some_and(|(_, t)| t.elapsed().as_millis() < 800);
+
+                    if !is_interacting {
+                        app.size_sort_pending = false;
+                        let mut resorted = false;
+                        {
+                            let tab = app.state.active_mut();
+                            for pane in &mut tab.panes {
+                                if pane.sort.key == SortKey::Size {
+                                    crate::fs::sort_entries(&mut pane.entries, pane.sort);
+                                    pane.rebuild_display();
+                                    resorted = true;
+                                }
+                            }
+                        }
+                        if resorted {
+                            app.visible_cache = None;
+                            app.refresh_visible_rows();
+                        }
+                    }
                 }
 
                 // ---- 消费文件变更事件：逆向反查当前视图的直接子目录并防抖重算 ----
