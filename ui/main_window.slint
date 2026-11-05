@@ -306,6 +306,15 @@ out property <length> row-height-out: file-list.row-height-out;
         file-list.scroll-to-top();
     }
 
+    // 供 Rust 强制对齐滚动条（直接操作底层 Flickable，不依赖属性 changed 事件）。
+    public function set-file-scroll-y(pane: int, v: length) {
+        if (pane == 0) {
+            file-list.set-scroll-y(v);
+        } else {
+            file-list-right.set-scroll-y(v);
+        }
+    }
+
     public function scroll_tabs_to_end() {
         tab-bar.scroll-to-end();
     }

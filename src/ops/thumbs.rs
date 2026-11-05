@@ -52,12 +52,80 @@ fn ensure_com() -> Result<(), String> {
 /// COM 路径失败（受保护目录/文件访问被拒）时回退到系统图标，
 /// 保证任何条目都有 Windows 图标可显示。
 pub fn get_thumbnail(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), String> {
-    match get_thumbnail_impl(path, size) {
-        Ok(r) => Ok(r),
-        Err(e) => match get_system_icon(path) {
-            Some(r) => Ok(r),
-            None => Err(e),
-        },
+    // 瞬时错误限次重试：启动初期 Shell 缩略图缓存尚未就绪，GetImage 会返回
+    // 0x8000000A（E_PENDING，“完成该操作所需的数据还不可使用”）。这是可自愈的，
+    // 重试几次即可成功。退避 250ms 起步、每次加倍（250/500/1000/2000/4000ms）。
+    // 注意：重试必须放在这里（thumbs 模块）而非调用方，否则驱动器这类「永远
+    // 拿不到 264px 缩略图」的条目会在调用方空转十几秒才落定，期间一直空白。
+    const MAX_ATTEMPTS: u32 = 6;
+    let mut attempt: u32 = 0;
+    loop {
+        attempt += 1;
+        match get_thumbnail_impl(path, size) {
+            Ok(r) => {
+                crate::logv!(
+                    "[thumb] ok {} req_size={} attempt={} -> {}x{}",
+                    path.display(),
+                    size,
+                    attempt,
+                    r.0,
+                    r.1
+                );
+                return Ok(r);
+            }
+            Err(e) => {
+                let transient = e.contains("0x8000000A")
+                    || e.contains("E_PENDING")
+                    || e.contains("数据还不可使用");
+                if transient && attempt < MAX_ATTEMPTS {
+                    let wait = 250u64.saturating_mul(1 << (attempt - 1).min(5));
+                    crate::logln!(
+                        "[thumb] transient E_PENDING (attempt {}/{}) {} size={}: {} -> retry in {}ms",
+                        attempt,
+                        MAX_ATTEMPTS,
+                        path.display(),
+                        size,
+                        e,
+                        wait
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(wait));
+                    continue;
+                }
+                crate::logln!(
+                    "[thumb] impl FAILED {} req_size={} attempt={}: {}",
+                    path.display(),
+                    size,
+                    attempt,
+                    e
+                );
+                match get_system_icon(path) {
+                    Some(r) => {
+                        // 核心修复：如果降级返回的图标尺寸远小于请求尺寸
+                        // （例如请求 264 返回 32），强行塞进大容器会因透明/缩放产生
+                        // 不可见的白块。直接返回 Err，让上层走彩色方块（fallback）。
+                        if r.0 * 2 < size || r.1 * 2 < size {
+                            crate::logln!(
+                                "[thumb] fallback system icon too small ({}x{}) for req_size={}, rejecting -> UI colored block",
+                                r.0, r.1, size
+                            );
+                            return Err(e);
+                        }
+                        crate::logln!(
+                            "[thumb] fallback system icon {} req_size={} -> {}x{}",
+                            path.display(),
+                            size,
+                            r.0,
+                            r.1
+                        );
+                        return Ok(r);
+                    }
+                    None => {
+                        crate::logln!("[thumb] fallback system icon FAILED {}", path.display());
+                        return Err(e);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -149,7 +217,9 @@ pub fn get_system_icon(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
     use windows::Win32::Graphics::Gdi::{
         DeleteObject, GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
     };
-    use windows::Win32::UI::Shell::{SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON};
+    use windows::Win32::UI::Shell::{
+        SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
     ensure_com().ok()?;
@@ -160,15 +230,46 @@ pub fn get_system_icon(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
         .chain([0])
         .collect();
     let size = 32u32;
+    // 目录 / 盘根：不要传 FILE_ATTRIBUTE_NORMAL（那是“普通文件”），
+    // 用真实属性 + SHGFI_USEFILEATTRIBUTES，才能拿到文件夹/驱动器图标；
+    // 并且 SHGetFileInfoW 在 Shell 初始化早期也可能瞬时失败，做限次重试。
+    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    let file_attrs = if is_dir {
+        windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
+    } else {
+        windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL
+    };
     unsafe {
         let mut info = SHFILEINFOW::default();
-        let ret = SHGetFileInfoW(
-            PCWSTR(wide.as_ptr()),
-            windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
-            Some(&mut info as *mut _ as *mut _),
-            std::mem::size_of::<SHFILEINFOW>() as u32,
-            SHGFI_ICON | SHGFI_LARGEICON,
-        );
+        let mut ret = 0;
+        // 最多 5 次，250ms 起步指数退避（覆盖 Shell 就绪前的窗口期）。
+        for attempt in 0..5u32 {
+            ret = SHGetFileInfoW(
+                PCWSTR(wide.as_ptr()),
+                file_attrs,
+                Some(&mut info as *mut _ as *mut _),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+            );
+            if ret != 0 && !info.hIcon.is_invalid() {
+                if attempt > 0 {
+                    crate::logln!(
+                        "[sysicon] retry OK on attempt {} {}",
+                        attempt + 1,
+                        path.display()
+                    );
+                }
+                break;
+            }
+            if attempt < 4 {
+                crate::logln!(
+                    "[sysicon] attempt {} failed for {} -> retry",
+                    attempt + 1,
+                    path.display()
+                );
+                std::thread::sleep(std::time::Duration::from_millis(250 << attempt));
+            }
+        }
         if ret == 0 || info.hIcon.is_invalid() {
             return None;
         }

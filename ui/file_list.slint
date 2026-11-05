@@ -233,11 +233,23 @@ export component FileList inherits Rectangle {
     private property <length> col-size-x: root.col-type-x + root.w-type;
     private property <length> col-path-x: root.col-size-x + root.w-size;
 
+    // 供 Rust 切换标签时，强制重置滚动条（直接操作底层 Flickable）
+    public function set-scroll-y(v: length) {
+        self.suppress-scroll-event = true;
+        flick.content-y = -v;
+        self.suppress-scroll-event = false;
+    }
+
+    /// 防回环锁：程序主动修改滚动条时，屏蔽回调，防止污染数据
+    private property <bool> suppress-scroll-event: false;
+
     /// 滚动偏移（content-y 的负值）。任何滚动来源（拖拽、惯性、滚轮、
     /// 滚动条、程序重置）都会改变它，从而通知 Rust 更新虚拟窗口。
     private property <length> scroll-pos: -flick.content-y;
     changed scroll-pos => {
-        root.scroll-changed(self.scroll-pos);
+        if (!self.suppress-scroll-event) {
+            root.scroll-changed(self.scroll-pos);
+        }
     }
 
     // 注意：Rectangle 不是布局，直接子元素必须显式给出几何，否则尺寸为 0。

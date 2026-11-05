@@ -406,6 +406,14 @@ pub struct App {
     drag_pending: Option<(f32, f32, Vec<PathBuf>)>,
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
+    /// 切换标签时置位，屏蔽切换过程中 Slint 因内容高度变化自动 Clamp 而
+    /// 产生的残留 scroll-changed 事件污染新标签数据（否则表现为切标签白屏）。
+    syncing_tab: bool,
+    /// 上次重建可见行时的列表几何 (list_height, cells_per_row, row_h, 图标视图)。
+    /// 启动首帧布局未完成时这几个值还不可用（list_height=0 / cells_per_row=1），
+    /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
+    /// （表现为「此电脑」部分盘符空白，直到切标签/重开窗口才恢复）。
+    list_geom: (f32, usize, f32, bool),
     /// 任务 3.1：QuickLook 预览窗口（独立 Slint Window）。
     preview: PreviewWindow,
     /// 预览窗口是否已 show（首次需 show，之后用 visible 控制）。
@@ -519,6 +527,7 @@ impl App {
             drop_timer: Timer::default(),
             drag_pending: None,
             size_sort_pending: false,
+            list_geom: (-1.0, 0, -1.0, false),
             recording_shortcut: None,
             dir_size_tx,
             dir_size_rx,
@@ -536,6 +545,7 @@ impl App {
             thumb_order: Vec::new(),
             thumb_pending: HashSet::new(),
             thumb_failed: HashSet::new(),
+            syncing_tab: false,
             thumb_tx,
             list_tx,
             list_rx,
@@ -716,6 +726,12 @@ impl App {
         {
             let pane = &mut tab.panes[result.pane];
             crate::fs::sort_entries(&mut entries, pane.sort);
+            // 「此电脑」视图：记录本次真正拿到的驱动器，用于区分
+            // “行缺失”还是“行在但图标空”。
+            if pane.path.is_none() {
+                let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+                crate::logln!("[list] this-pc drives n={} {:?}", names.len(), names);
+            }
             pane.entries = entries;
             // 拼音缓存随 entries 失效（惰性重建）。
             pane.pinyin_cache.clear();
@@ -743,6 +759,19 @@ impl App {
             if listed_is_active {
                 self.sync_status();
                 self.sync_nav();
+            }
+            // 核心修复：目录加载完成后，也强制同步一次滚动条位置，确保视图和虚拟窗口计算一致。
+            let (scroll0, is_split, scroll1) = {
+                let tab = &self.state.tabs[tab_index];
+                (
+                    tab.panes.first().map(|p| p.scroll_y).unwrap_or(0.0),
+                    tab.is_split,
+                    tab.panes.get(1).map(|p| p.scroll_y).unwrap_or(0.0),
+                )
+            };
+            push_scroll(&self.ui, 0, scroll0);
+            if is_split {
+                push_scroll(&self.ui, 1, scroll1);
             }
         }
         // 标签标题可能变化（"此电脑" 不变，目录名会变）。
@@ -1022,6 +1051,14 @@ fn is_network_path(path: &Path) -> bool {
     false
 }
 
+/// 强制把面板的 scroll_y 推送到 UI，让视图与虚拟列表的计算同步。
+///
+/// 使用 `invoke_set_file_scroll_y` 直接调用 Slint 的公开函数，
+/// 绕过属性 `changed` 事件的合并延迟，确保切换标签的一瞬间布局立刻复位。
+fn push_scroll(ui: &MainWindow, pane: usize, scroll_y: f32) {
+    ui.invoke_set_file_scroll_y(pane as i32, scroll_y.max(0.0));
+}
+
 /// 启动目录列举工作线程。
 fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
     // 核心修复 2：改为分发器模式。每个请求独立开启线程，避免网络 I/O 阻塞本地目录列举。
@@ -1140,10 +1177,12 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
             for i in 0..NUM_THREADS {
                 let (tx, worker_rx) = mpsc::channel::<(PathBuf, u32)>();
                 worker_txs.push(tx);
-                std::thread::Builder::new()
+                let spawned = std::thread::Builder::new()
                     .name(format!("rove-thumb-worker-{i}"))
                     .spawn(move || {
+                        crate::logln!("[thumb] worker-{i} started");
                         while let Ok((path, size)) = worker_rx.recv() {
+                            crate::logln!("[thumb] worker-{i} recv {} size={}", path.display(), size);
                             // 每个工作线程只需在启动时初始化一次 COM (STA)
                             #[cfg(windows)]
                             unsafe {
@@ -1153,23 +1192,47 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                                 let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
                             }
 
+                            // 取图交给 thumbs 模块统一处理：
+                            // - 启动期 Shell 缩略图缓存未就绪会瞬时返回 E_PENDING(0x8000000A)，
+                            //   thumbs 内部做限次退避重试（盘符等最终仍取不到时返回 Err）；
+                            // - 降级系统图标尺寸过小时（如请求 264 返回 32）直接返回 Err，
+                            //   由 UI 的彩色方块兜底，避免白块。
+                            // 工作线程这里只调一次、拿一次结果。
                             let result = crate::ops::thumbs::get_thumbnail(&path, size);
                             match result {
                                 Ok((w, h, rgba)) => {
                                     let _ = slint::invoke_from_event_loop(move || {
                                         let Some(img) = to_slint_image(w, h, &rgba) else {
+                                            // 静默丢弃会让 thumb_pending 永远留着该 key →
+                                            // 该行永久空白且不再重试。必须记日志。
+                                            crate::logln!(
+                                                "[thumb] !! to_slint_image FAILED {} {}x{} bytes={} (row stays blank)",
+                                                path.display(),
+                                                w,
+                                                h,
+                                                rgba.len()
+                                            );
+                                            if let Some(app) =
+                                                SESSION.with(|slot| slot.borrow().clone())
+                                            {
+                                                app.borrow_mut().fail_thumbnail((path, size));
+                                            }
                                             return;
                                         };
                                         let Some(app) =
                                             SESSION.with(|slot| slot.borrow().clone())
                                         else {
+                                            crate::logln!(
+                                                "[thumb] !! SESSION None when storing {} (row stays blank)",
+                                                path.display()
+                                            );
                                             return;
                                         };
                                         app.borrow_mut().store_thumbnail((path, size), img);
                                     });
                                 }
                                 Err(e) => {
-                                    logln!("thumb failed {}: {}", path.display(), e);
+                                    crate::logln!("thumb failed {}: {}", path.display(), e);
                                     let _ = slint::invoke_from_event_loop(move || {
                                         let Some(app) =
                                             SESSION.with(|slot| slot.borrow().clone())
@@ -1181,16 +1244,30 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<(PathBuf, u32)>) {
                                 }
                             }
                         }
-                    })
-                    .ok();
+                        crate::logln!("[thumb] worker-{i} channel closed");
+                    });
+                match spawned {
+                    Ok(_) => crate::logln!("[thumb] worker-{i} spawned"),
+                    Err(e) => crate::logln!("[thumb] worker-{i} SPAWN FAILED: {e} (requests on this lane will be LOST)"),
+                }
             }
 
             // 2. 主分发循环：轮询（Round-Robin）将任务塞进这 4 个线程的通道中
             let mut rr = 0;
             while let Ok(req) = rx.recv() {
-                let _ = worker_txs[rr % NUM_THREADS].send(req);
+                let lane = rr % NUM_THREADS;
+                crate::logln!(
+                    "[thumb] dispatch lane={} {} size={}",
+                    lane,
+                    req.0.display(),
+                    req.1
+                );
+                if let Err(e) = worker_txs[lane].send(req) {
+                    crate::logln!("[thumb] !! lane={} send FAILED: {e} (request LOST)", lane);
+                }
                 rr += 1;
             }
+            crate::logln!("[thumb] dispatcher loop ended");
         })
         .ok();
 }
@@ -1888,21 +1965,39 @@ impl App {
 
         // 关键修复：向 Windows Shell 索要乘上缩放系数的真实物理分辨率图像，
         // 杜绝位图被强行放大发虚（高 DPI 屏下发虚的根因）。
-        (logical_size * scale).ceil() as u32
+        let px = (logical_size * scale).ceil() as u32;
+        crate::logv!(
+            "[thumb] size_for_view mode={} logical={} scale={} -> {}px",
+            self.config.view_mode,
+            logical_size,
+            scale,
+            px
+        );
+        px
     }
 
     #[cfg(windows)]
     fn thumb_for(&mut self, path: &Path, size: u32) -> slint::Image {
         let key = (path.to_path_buf(), size);
         if let Some(img) = self.thumb_cache.get(&key) {
+            crate::logv!("[thumb] cache HIT {} size={}", path.display(), size);
             return img.clone();
         }
         if self.thumb_failed.contains(&key) {
+            crate::logln!("[thumb] negative-cached (will stay blank) {} size={}", path.display(), size);
             return slint::Image::default();
         }
         if !self.thumb_pending.contains(&key) {
+            crate::logln!("[thumb] REQUEST {} size={}", path.display(), size);
             self.thumb_pending.insert(key.clone());
-            let _ = self.thumb_tx.send(key);
+            if self.thumb_tx.send(key.clone()).is_err() {
+                // 通道断开：不能把 key 永远留在 pending 里，否则该行永久空白。
+                crate::logln!("[thumb] !! send to worker channel FAILED {} size={}", path.display(), size);
+                self.thumb_pending.remove(&key);
+                self.thumb_failed.insert(key);
+            }
+        } else {
+            crate::logv!("[thumb] already pending {} size={}", path.display(), size);
         }
         slint::Image::default()
     }
@@ -1924,6 +2019,11 @@ impl App {
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
     #[allow(dead_code)]
     fn fail_thumbnail(&mut self, key: (PathBuf, u32)) {
+        crate::logln!(
+            "[thumb] FAILED -> negative cache {} size={} (row stays blank)",
+            key.0.display(),
+            key.1
+        );
         self.thumb_pending.remove(&key);
         self.thumb_failed.insert(key);
     }
@@ -1932,6 +2032,27 @@ impl App {
     #[allow(dead_code)]
     fn store_thumbnail(&mut self, key: (PathBuf, u32), img: slint::Image) {
         self.thumb_pending.remove(&key);
+        let sz = img.size();
+        // 尺寸对不上就是“请求尺寸与当前视图尺寸不一致”的信号：
+        // 此时缓存 key 永远不会再被命中，表现为图标一直空白。
+        let expect = self.thumb_size_for_view();
+        crate::logln!(
+            "[thumb] ARRIVED {} key_size={} bitmap={}x{} expect_size={} cache_len={}",
+            key.0.display(),
+            key.1,
+            sz.width,
+            sz.height,
+            expect,
+            self.thumb_cache.len()
+        );
+        if key.1 != expect {
+            crate::logln!(
+                "[thumb] !! SIZE MISMATCH {} key={} expect={} -> cache will never hit",
+                key.0.display(),
+                key.1,
+                expect
+            );
+        }
         if self.thumb_cache.contains_key(&key) {
             self.thumb_cache.insert(key.clone(), img);
             return;
@@ -1956,8 +2077,23 @@ impl App {
         }
     }
 
+    /// 当前列表几何（用于检测布局落定 / 窗口尺寸变化）。
+    fn current_list_geom(&self) -> (f32, usize, f32, bool) {
+        (
+            self.ui.get_list_height(),
+            self.ui.get_cells_per_row().max(1) as usize,
+            self.ui.get_row_height_out(),
+            self.ui.get_is_icons_view_out(),
+        )
+    }
+
     fn refresh_visible_rows(&mut self) {
-        let list_height = self.ui.get_list_height();
+        // 布局未落定时的容错（启动首帧）：此时 list_height 为 0，
+        // 算出的 rows_visible 只剩 2*OVERSCAN，只能渲染前几行
+        // （表现为「此电脑」部分盘符空白）。用典型视口高度占位，
+        // 布局落定后几何监听会立即重算。
+        let raw_list_height = self.ui.get_list_height();
+        let list_height = if raw_list_height > 1.0 { raw_list_height } else { 600.0 };
         let cells_per_row = (self.ui.get_cells_per_row().max(1)) as usize;
         let row_h = if self.ui.get_row_height_out() > 0.0 {
             self.ui.get_row_height_out()
@@ -1965,6 +2101,31 @@ impl App {
             ROW_HEIGHT
         };
         let rows_visible = (list_height / row_h).ceil() as usize + OVERSCAN * 2;
+
+        // 防御性兜底：把每个面板的 scroll_y 夹到内容真实范围。
+        //
+        // Slint 的 Flickable 在 content-height 变小时不会主动重新 clamp 真实的
+        // content-y，所以一旦残留一个巨大偏移（切标签 / 进入目录），
+        // pane_view_range 会把它 clamp 到最后一行，只渲染 1 行 → 白屏/盘符空白。
+        // 这里在每次重建可视窗口前先修正状态并回推 UI，保证视图与内容一致。
+        {
+            let max_scroll_for = |total: usize| -> f32 {
+                let total_rows = total.div_ceil(cells_per_row);
+                (total_rows as f32 * row_h - list_height).max(0.0)
+            };
+            let pane_count = self.state.active().panes.len();
+            for idx in 0..pane_count {
+                let (total, scroll) = {
+                    let pane = &self.state.active().panes[idx];
+                    (pane.display.len(), pane.scroll_y.max(0.0))
+                };
+                let clamped = scroll.min(max_scroll_for(total));
+                if (clamped - scroll).abs() > 0.5 {
+                    self.state.active_mut().panes[idx].scroll_y = clamped;
+                    push_scroll(&self.ui, idx, clamped);
+                }
+            }
+        }
 
         let (is_split, total0, scroll0) = {
             let tab = self.state.active();
@@ -1979,6 +2140,40 @@ impl App {
 
         // 左栏始终绑定 pane 0
         let rows0 = self.build_rows_for_pane(self.state.active_tab, 0, first0, count0);
+        // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
+        // 只在真的有空图时输出，正常滚动不吵。
+        let empty_thumbs = rows0
+            .iter()
+            .filter(|r| r.thumb.size().width == 0)
+            .count();
+        if empty_thumbs > 0 {
+            let names: Vec<String> = rows0
+                .iter()
+                .filter(|r| r.thumb.size().width == 0)
+                .map(|r| r.name.to_string())
+                .collect();
+            crate::logln!(
+                "[rows] EMPTY THUMBS {}/{} {:?} | geom list_h={} (raw={}) cells={} row_h={} rows_visible={} | total={} first={} count={} scroll={:.1} mode={} is_split={} expect_px={} cache_len={} pending={} failed={}",
+                empty_thumbs,
+                rows0.len(),
+                names,
+                list_height,
+                raw_list_height,
+                cells_per_row,
+                row_h,
+                rows_visible,
+                total0,
+                first0,
+                count0,
+                scroll0,
+                self.config.view_mode,
+                is_split,
+                self.thumb_size_for_view(),
+                self.thumb_cache.len(),
+                self.thumb_pending.len(),
+                self.thumb_failed.len()
+            );
+        }
         self.ui.set_file_rows(ModelRc::new(VecModel::from(rows0)));
 
         // 右栏（如果开启分屏）绑定 pane 1
@@ -2086,6 +2281,11 @@ impl App {
 
     /// 切换标签后的完整同步。
     fn sync_active_tab(&mut self) {
+        // 打开保护伞：切换标签时，Slint 会因内容高度变化对 Flickable 自动 Clamp，
+        // 触发残留的 scroll-changed 事件；此刻置位可避免其把旧标签的巨大坐标
+        // 写进新标签的 scroll_y（否则表现为切标签白屏）。
+        self.syncing_tab = true;
+
         // 切换标签后退出地址栏编辑态。
         self.ui.set_path_editing(false);
         self.sync_tabs();
@@ -2095,9 +2295,31 @@ impl App {
         self.sync_split_state();
         let ratio = self.state.active().split_ratio;
         self.ui.set_split_ratio(ratio);
+
+        // 核心修复：先推送正确的滚动条位置，再刷新列表数据。
+        // 否则 Slint 在内容高度重置时先 Clamp（污染），再被我们覆盖。
+        let (scroll0, is_split, scroll1) = {
+            let tab = self.state.active();
+            (
+                tab.panes.first().map(|p| p.scroll_y).unwrap_or(0.0),
+                tab.is_split,
+                tab.panes.get(1).map(|p| p.scroll_y).unwrap_or(0.0),
+            )
+        };
+        push_scroll(&self.ui, 0, scroll0);
+        if is_split {
+            push_scroll(&self.ui, 1, scroll1);
+        } else {
+            push_scroll(&self.ui, 1, 0.0);
+        }
+
+        // 再更新数据和列表
         self.visible_cache = None;
         self.sync_file_list();
         self.sync_sidebar_active();
+
+        // 关闭保护伞
+        self.syncing_tab = false;
     }
 
     /// 切换当前标签的分屏状态。
@@ -4671,6 +4893,22 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     }
 
     let mut app = app.borrow_mut();
+                // 布局落定 / 窗口尺寸变化监听。
+                // 启动首帧时 list_height=0、cells_per_row=1，按当时的几何算出的
+                // 可见窗口偏小；这里一旦检测到几何变化就重算，否则会一直
+                // 停在“只渲染前几行”的状态（「此电脑」部分盘符空白）。
+                let geom = app.current_list_geom();
+                if geom != app.list_geom {
+                    crate::logln!(
+                        "[geom] changed h={} cells={} row_h={} icons={}",
+                        geom.0,
+                        geom.1,
+                        geom.2,
+                        geom.3
+                    );
+                    app.list_geom = geom;
+                    app.refresh_visible_rows();
+                }
                 while let Ok(result) = app.list_rx.try_recv() {
                     app.apply_list_result(result);
                 }
@@ -5198,6 +5436,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_file_scroll_changed(move |offset| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
+            // 核心修复：切标签期间忽略因布局 Clamp 产生的残留滚动事件。
+            if app.syncing_tab { return; }
             // 左栏固定映射 pane 0（活动栏可能已切到右侧）。
             let active_tab = app.state.active_tab;
             if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(0) {
@@ -5211,6 +5451,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_file_scroll_changed_right(move |offset| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
+            // 核心修复：切标签期间忽略因布局 Clamp 产生的残留滚动事件。
+            if app.syncing_tab { return; }
             let active_tab = app.state.active_tab;
             if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(1) {
                 pane.scroll_y = offset;
