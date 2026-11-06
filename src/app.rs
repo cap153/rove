@@ -438,6 +438,9 @@ pub struct App {
     /// 切换标签时置位，屏蔽切换过程中 Slint 因内容高度变化自动 Clamp 而
     /// 产生的残留 scroll-changed 事件污染新标签数据（否则表现为切标签白屏）。
     syncing_tab: bool,
+    /// 切换视图时，暂存待恢复的“逻辑条目索引”，等布局更新后再换算成像素。
+    /// （视图切换会改变 cell 布局，旧像素偏移无法直接复用，必须先换回条目序号。）
+    pending_scroll_index: Option<usize>,
     /// 上次重建可见行时的列表几何 (list_height, cells_per_row, row_h, 图标视图)。
     /// 启动首帧布局未完成时这几个值还不可用（list_height=0 / cells_per_row=1），
     /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
@@ -579,6 +582,7 @@ impl App {
             thumb_failed: HashSet::new(),
             thumb_needs_refresh: false,
             syncing_tab: false,
+            pending_scroll_index: None,
             thumb_tx,
             list_tx,
             list_rx,
@@ -793,7 +797,15 @@ impl App {
                 self.sync_status();
                 self.sync_nav();
             }
-            // 核心修复：目录加载完成后，也强制同步一次滚动条位置，确保视图和虚拟窗口计算一致。
+            // 核心修复：如果是历史导航（后退/前进）产生的加载，列表数据就位后恢复滚动条。
+            // jump_to 已把 scroll_y 设为 scroll_history 中的值并置 pending_scroll_restore；
+            // 此时数据才真正就绪，clamp 已无意义（下面直接用恢复值推 UI）。
+            let mut is_restore = false;
+            if self.state.tabs[tab_index].panes[result.pane].pending_scroll_restore {
+                self.state.tabs[tab_index].panes[result.pane].pending_scroll_restore = false;
+                is_restore = true;
+            }
+
             let (scroll0, is_split, scroll1) = {
                 let tab = &self.state.tabs[tab_index];
                 (
@@ -802,9 +814,19 @@ impl App {
                     tab.panes.get(1).map(|p| p.scroll_y).unwrap_or(0.0),
                 )
             };
-            push_scroll(&self.ui, 0, scroll0);
-            if is_split {
-                push_scroll(&self.ui, 1, scroll1);
+
+            if is_restore {
+                crate::logln!(
+                    "[nav] restore scroll for pane {} to {:.1} (target was history pos)",
+                    result.pane,
+                    if result.pane == 0 { scroll0 } else { scroll1 }
+                );
+                push_scroll(&self.ui, result.pane, if result.pane == 0 { scroll0 } else { scroll1 });
+            } else {
+                push_scroll(&self.ui, 0, scroll0);
+                if is_split {
+                    push_scroll(&self.ui, 1, scroll1);
+                }
             }
         }
         // 标签标题可能变化（"此电脑" 不变，目录名会变）。
@@ -1777,14 +1799,32 @@ impl App {
         if self.config.view_mode == mode {
             return;
         }
+
+        // 1. 记录当前视口顶部是第几个条目（index）：视图切换会改变 cell 布局，
+        //    旧的像素偏移不能直接复用到新视图，必须先换回逻辑条目序号。
+        let old_row_h = match self.config.view_mode.as_str() {
+            "details" => 30.0,
+            "list" => 24.0,
+            "icons-small" => 52.0,
+            "icons-medium" => 108.0,
+            "icons-large" => 148.0,
+            "icons-xl" => 212.0,
+            _ => 30.0,
+        };
+        let old_cells = self.ui.get_cells_per_row().max(1) as usize;
+        let scroll_y = self.state.active().active().scroll_y;
+        let first_row = (scroll_y / old_row_h).floor();
+        let first_index = (first_row * old_cells as f32) as usize;
+
+        // 2. 记录到待定状态，交给 refresh_visible_rows 去换算成新像素位置。
+        self.pending_scroll_index = Some(first_index);
+
+        // 3. 更新视图配置（注意：不再这里清 scroll_y / 滚到顶部）
         self.config.view_mode = mode.to_string();
         self.config.save();
         self.ui.set_view_mode(mode.into());
         self.visible_cache = None;
-        self.state.active_mut().active_mut().scroll_y = 0.0;
-        self.ui.invoke_scroll_list_to_top();
         self.sync_file_list();
-        self.refresh_visible_rows();
     }
 
     /// 全局应用排序并持久化。同时刷新所有已打开的面板，确保多标签/分屏统一。
@@ -2415,6 +2455,21 @@ impl App {
         };
         let rows_visible = (list_height / row_h).ceil() as usize + OVERSCAN * 2;
 
+        // 核心修复：若是切换视图触发的刷新，且拿到了待恢复的条目索引，则换算成
+        // 新的像素位置。必须放在下方的 clamp 块“之前”——否则残留的旧像素大偏移
+        // 会先被 clamp 到内容底部，再恢复就已经晚了。
+        if let Some(first_index) = self.pending_scroll_index.take() {
+            let new_row = first_index / cells_per_row;
+            let new_scroll_y = (new_row as f32) * row_h;
+            for pane in &mut self.state.active_mut().panes {
+                pane.scroll_y = new_scroll_y;
+            }
+            push_scroll(&self.ui, 0, new_scroll_y);
+            if self.state.active().is_split {
+                push_scroll(&self.ui, 1, new_scroll_y);
+            }
+        }
+
         // 防御性兜底：把每个面板的 scroll_y 夹到内容真实范围。
         //
         // Slint 的 Flickable 在 content-height 变小时不会主动重新 clamp 真实的
@@ -2428,10 +2483,15 @@ impl App {
             };
             let pane_count = self.state.active().panes.len();
             for idx in 0..pane_count {
-                let (total, scroll) = {
+                let (total, scroll, pending) = {
                     let pane = &self.state.active().panes[idx];
-                    (pane.display.len(), pane.scroll_y.max(0.0))
+                    (pane.display.len(), pane.scroll_y.max(0.0), pane.pending_scroll_restore)
                 };
+                // 核心修复：如果正在等待加载历史记录（后退/前进），跳过 clamp。
+                // 否则此时 display 还是空的（旧目录已卸载/新目录未到），scroll_y 会被夹到 0 → 跳顶。
+                if pending {
+                    continue;
+                }
                 let clamped = scroll.min(max_scroll_for(total));
                 if (clamped - scroll).abs() > 0.5 {
                     self.state.active_mut().panes[idx].scroll_y = clamped;
@@ -4508,8 +4568,25 @@ impl App {
         self.ui.set_rename_path(SharedString::default());
         self.ui.set_filter_text(SharedString::default());
         self.visible_cache = None;
+
+        // 将内存中正确的 scroll_y 推给 UI，防止 UI 在重绘前乱跳。
+        // 真正的“跨帧防污染”保护靠 pane.pending_scroll_restore：异步列表未回来、
+        // 内容高度被临时置 0 时，Slint 自动 Clamp 触发的 scroll-changed(0) 回调会被
+        // on_file_scroll_changed 里的 pending 检查直接忽略，不会把 scroll_y 覆盖为 0。
+        let (scroll0, is_split, scroll1) = {
+            let tab = self.state.active();
+            (
+                tab.panes.first().map(|p| p.scroll_y).unwrap_or(0.0),
+                tab.is_split,
+                tab.panes.get(1).map(|p| p.scroll_y).unwrap_or(0.0),
+            )
+        };
+        push_scroll(&self.ui, 0, scroll0);
+        if is_split {
+            push_scroll(&self.ui, 1, scroll1);
+        }
+
         self.sync_file_list();
-        self.ui.invoke_scroll_list_to_top();
         self.reload_active();
     }
 
@@ -4520,6 +4597,12 @@ impl App {
         }
         let index = tab.active().history_index - 1;
         self.state.active_mut().active_mut().jump_to(index);
+        crate::logln!(
+            "[nav] jump_to index={} target_scroll={:.1} (is_restore={})",
+            index,
+            self.state.active().active().scroll_y,
+            self.state.active().active().pending_scroll_restore
+        );
         self.sync_after_navigate();
     }
 
@@ -4530,6 +4613,12 @@ impl App {
         }
         let index = tab.active().history_index + 1;
         self.state.active_mut().active_mut().jump_to(index);
+        crate::logln!(
+            "[nav] jump_to index={} target_scroll={:.1} (is_restore={})",
+            index,
+            self.state.active().active().scroll_y,
+            self.state.active().active().pending_scroll_restore
+        );
         self.sync_after_navigate();
     }
 
@@ -5764,6 +5853,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let mut app = app.borrow_mut();
             // 核心修复：切标签期间忽略因布局 Clamp 产生的残留滚动事件。
             if app.syncing_tab { return; }
+
+            // 核心修复：如果是历史导航，在数据回来前，UI 会因为列表清空自动 Clamp 到 0，
+            // 此时必须忽略这个假事件，否则刚恢复的 scroll_y 会被覆盖为 0。
+            // （syncing_tab 伞是同步关闭的，挡不住下一帧才触发的 UI Clamp 回调，
+            //  真正跨帧的保护靠 pending_scroll_restore 标记。）
+            if app.state.tabs[app.state.active_tab].panes.get(0).is_some_and(|p| p.pending_scroll_restore) {
+                return;
+            }
             // 左栏固定映射 pane 0（活动栏可能已切到右侧）。
             let active_tab = app.state.active_tab;
             if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(0) {
@@ -5779,6 +5876,11 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let mut app = app.borrow_mut();
             // 核心修复：切标签期间忽略因布局 Clamp 产生的残留滚动事件。
             if app.syncing_tab { return; }
+
+            // 核心修复：同上，保护分屏右侧面板。
+            if app.state.tabs[app.state.active_tab].panes.get(1).is_some_and(|p| p.pending_scroll_restore) {
+                return;
+            }
             let active_tab = app.state.active_tab;
             if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(1) {
                 pane.scroll_y = offset;

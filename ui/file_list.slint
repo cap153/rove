@@ -371,7 +371,11 @@ export component FileList inherits Rectangle {
                 x: 0px;
                 y: 0px;
                 width: parent.width;
-                height: parent.height;
+                // 核心修复：撑满整个滚动内容区域，而非仅视口高度。
+                // Flickable 会按 content-height 裁剪子元素，背景 TouchArea 默认只有
+                // parent.height（视口高）——滚动后下方内容在视口外，空白处点不到，
+                // 右键也会落空。改成 max(视口高, 内容高) 让空白处始终可点。
+                height: max(parent.height, parent.content-height);
 
                 scroll-event(event) => {
                     if (event.delta-y != 0px) {
@@ -399,7 +403,11 @@ export component FileList inherits Rectangle {
                             root.background-pointer-event(event, self.mouse-x, self.mouse-y);
                             return EventResult.accept;
                         } else if (event.button == PointerEventButton.right) {
-                            root.background-pointer-event(event, self.mouse-x, self.mouse-y);
+                            // 核心修复：加上 flick.content-y 补偿滚动偏移，还原为视口坐标。
+                            // flick.content-y 是负值（向下滚动为负），加它等于减去滚动偏移。
+                            let header-h = root.view-mode == "details" ? 30px : 0px;
+                            let viewport_y = self.mouse-y + flick.content-y + header-h;
+                            root.background-pointer-event(event, self.mouse-x, viewport_y);
                             return EventResult.accept;
                         }
                     }
@@ -457,14 +465,22 @@ export component FileList inherits Rectangle {
 
                     pointer-event(event) => {
                         if (event.kind == PointerEventKind.down) {
-                            root.row-pointer-event(row.index, event, self.mouse-x, row.index * root.row-h + self.mouse-y);
+                            // 核心修复：绝对内容Y + 滚动偏移 + 表头高度 = 视口Y。
+                            // flick.content-y 是负值（向下滚动为负），加它等于减去滚动偏移。
+                            let header-h = root.view-mode == "details" ? 30px : 0px;
+                            let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y);
                             return EventResult.accept;
                         }
                         // 拖拽手势：move/up 继续转发给按下时捕获的行 TouchArea。
+                        // 关键：必须与 down 分支用完全相同的视口Y变换，否则滚动后首次 move
+                        // 会和 down 差一个 content-y 偏移，位移阈值被瞬间越过 → 零位移误触发拖出。
                         if (event.kind == PointerEventKind.move
                             || event.kind == PointerEventKind.up
                             || event.kind == PointerEventKind.cancel) {
-                            root.row-pointer-event(row.index, event, self.mouse-x, row.index * root.row-h + self.mouse-y);
+                            let header-h = root.view-mode == "details" ? 30px : 0px;
+                            let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y);
                             return EventResult.accept;
                         }
                         return EventResult.reject;
@@ -697,9 +713,13 @@ export component FileList inherits Rectangle {
                     }
 
                     pointer-event(event) => {
+                        // 核心修复：视口Y = 行的内容绝对Y + 鼠标在行内偏移 + 滚动偏移(加上负值) + 表头高度。
+                        // flick.content-y 是负值（向下滚动为负），加它即把内容坐标折算回视口坐标。
+                        let header-h = root.view-mode == "details" ? 30px : 0px;
+                        let viewport_y = floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y + flick.content-y + header-h;
                         root.row-pointer-event(row.index, event,
                             Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px + self.mouse-x,
-                            floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y);
+                            viewport_y);
                     }
                 }
 
