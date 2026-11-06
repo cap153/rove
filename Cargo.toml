@@ -51,6 +51,9 @@ windows = { version = "0.59", features = [
     "Win32_System_SystemServices",
     "Win32_System_Com",
     "Win32_Graphics_Gdi",
+    # WIC（Windows Imaging Component）：缩略图磁盘缓存用 JPEG q90 / PNG 编解码。
+    "Win32_Graphics_Imaging",
+    "Win32_System_Variant",
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
     "Win32_UI_WindowsAndMessaging",

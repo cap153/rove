@@ -1065,6 +1065,92 @@ fn tab_loading_flag(ui: &MainWindow, is_active: bool, loading: bool) {
 
 /// 判断是否为网络路径（包含 UNC 路径和映射网络驱动器）。
 /// 零系统调用开销：UNC 走前缀字符串判断；映射盘则查 DriveInfo 类型。
+/// 是否为本地固定磁盘（排除 U 盘/光驱/网络盘）。
+/// 缩略图磁盘缓存只对固定盘生效：可移动介质拔掉后缓存会变成垃圾，
+/// 网络盘重读代价本来就高且缓存命中率低（对标 Pulse 的 `Eligible()`）。
+#[cfg(windows)]
+fn is_fixed_drive(path: &Path) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+
+    let Some(std::path::Component::Prefix(prefix)) = path.components().next() else {
+        return false;
+    };
+    let std::path::Prefix::Disk(drive) = prefix.kind() else {
+        return false;
+    };
+    let root: Vec<u16> = format!("{}:\\\0", (drive as char).to_ascii_uppercase())
+        .encode_utf16()
+        .collect();
+    // DRIVE_FIXED = 3
+    unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) == 3 }
+}
+
+#[cfg(not(windows))]
+fn is_fixed_drive(_path: &Path) -> bool {
+    false
+}
+
+/// 判断是否为「必须永远落盘」的格式（无视 30ms 门槛）。
+///
+/// 对标 Pulse 的 `AlwaysKept()`：这些格式一旦 Windows 自带缩略图缓存被清理，
+/// 重新冷抽帧的代价极大（本次实测 max 1369ms），所以即使本次取得很快也要存一份。
+///
+/// 注：**目录不在白名单内**。目录解析只有 30–106ms，且绝大多数是同一张“文件夹
+/// 图形”；落 96px 小图会在 icons-xl（显示 264px）下放大 2.75× 发糊，
+/// 存原尺寸又要 19.4KB/个。所以目录干脆不落盘，只靠内存 LRU。
+fn is_always_kept(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "mp4" | "m4v"
+            | "mkv"
+            | "mov"
+            | "avi"
+            | "wmv"
+            | "webm"
+            | "flv"
+            | "mpg"
+            | "mpeg"
+            | "vob"
+            | "ts"
+            | "mts"
+            | "m2ts"
+            | "3gp"
+            | "3g2"
+            | "ogv"
+            | "asf"
+            | "rm"
+            | "rmvb"
+            | "heic"
+            | "heif"
+            | "hif"
+            | "avif"
+            | "jxl"
+            | "psd"
+            | "psb"
+            | "pdf"
+            | "tif"
+            | "tiff"
+            | "cr2"
+            | "cr3"
+            | "nef"
+            | "arw"
+            | "dng"
+            | "orf"
+            | "rw2"
+            | "raf"
+            | "pef"
+            | "srw"
+            | "rwl"
+            | "srf"
+            | "sr2"
+    )
+}
+
 fn is_network_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
     if s.starts_with(r"\\") {
@@ -1107,54 +1193,80 @@ fn thumb_disk_path(key: &ThumbKey) -> PathBuf {
 }
 
 /// 扫描并清理缩略图磁盘缓存：总大小超过预算时，按最后修改时间删除最旧文件到 80%。
-fn maintain_thumb_disk_cache() {
-    let root = rove_data_dir().join("thumbs");
-    if !root.exists() {
-        return;
-    }
+/// 磁盘缓存当前总字节数（原子）。启动时扫描一次填充，此后每次写入 `fetch_add`，
+/// 越过预算就异步 trim。避免每次写盘都递归扫描目录（Pulse 的做法）。
+static THUMB_DISK_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
-    let mut total_bytes = 0u64;
-
-    // 只扫描两级子目录（rove_data_dir/thumbs/<xx>/<hash>.bin）。
-    if let Ok(read_dir) = std::fs::read_dir(&root) {
-        for entry in read_dir.flatten() {
-            if let Ok(ft) = entry.file_type() {
-                if ft.is_dir() {
-                    if let Ok(sub_dir) = std::fs::read_dir(entry.path()) {
-                        for sub_entry in sub_dir.flatten() {
-                            if let Ok(meta) = sub_entry.metadata() {
-                                if meta.is_file() {
-                                    let len = meta.len();
-                                    total_bytes += len;
-                                    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                                    files.push((sub_entry.path(), len, mtime));
-                                }
+/// 触发一次异步磁盘缓存清理（不阻塞调用线程）。
+fn trigger_thumb_disk_trim() {
+    std::thread::spawn(|| {
+        let root = rove_data_dir().join("thumbs");
+        let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(&root) {
+            for entry in read_dir.flatten() {
+                if let Ok(sub_dir) = std::fs::read_dir(entry.path()) {
+                    for sub_entry in sub_dir.flatten() {
+                        if let Ok(meta) = sub_entry.metadata() {
+                            if meta.is_file() {
+                                let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+                                files.push((sub_entry.path(), meta.len(), mtime));
                             }
                         }
                     }
                 }
             }
         }
-    }
-
-    // 超出预算时，按修改时间排序（最旧的在前），删到低于预算的 80%。
-    if total_bytes > THUMB_DISK_MAX_BYTES {
-        crate::logln!(
-            "[thumb] disk cache over budget ({} MB), cleaning...",
-            total_bytes / 1024 / 1024
-        );
         files.sort_by_key(|(_, _, mtime)| *mtime);
-        let target_bytes = (THUMB_DISK_MAX_BYTES as f64 * 0.8) as u64;
+        let mut current = THUMB_DISK_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+        let target = (THUMB_DISK_MAX_BYTES as f64 * 0.8) as u64;
         for (path, size, _) in files {
-            if total_bytes <= target_bytes {
+            if current <= target {
                 break;
             }
             if std::fs::remove_file(&path).is_ok() {
-                total_bytes = total_bytes.saturating_sub(size);
+                current = current.saturating_sub(size);
+            }
+        }
+        THUMB_DISK_BYTES.store(current, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+
+/// 启动时初始化磁盘缓存统计：只计数，不做全量删除（写入时按需淘汰）。
+fn init_thumb_disk_cache() {
+    let root = rove_data_dir().join("thumbs");
+    let mut total = 0u64;
+    if let Ok(read_dir) = std::fs::read_dir(&root) {
+        for entry in read_dir.flatten() {
+            if let Ok(sub_dir) = std::fs::read_dir(entry.path()) {
+                for sub_entry in sub_dir.flatten() {
+                    if let Ok(meta) = sub_entry.metadata() {
+                        if meta.is_file() {
+                            total += meta.len();
+                        }
+                    }
+                }
             }
         }
     }
+    THUMB_DISK_BYTES.store(total, std::sync::atomic::Ordering::Relaxed);
+    crate::logln!("[thumb] disk cache {} KB", total / 1024);
+    if total > THUMB_DISK_MAX_BYTES {
+        trigger_thumb_disk_trim();
+    }
+}
+
+/// 是否位于 Rove 自身的数据目录（`%LOCALAPPDATA%\Rove`）下。
+///
+/// 这类文件（`dir_sizes.json` / `index.bin` / `thumbs\`）每次运行都会被重写，
+/// mtime/size 变化 → `ThumbKey` 变化 → 每次会话多生成一份新缩略图，白占预算。
+///
+/// 注意：Windows 路径大小写不敏感，而 `Path::starts_with` 是字节级比较。
+/// 磁盘上目录名可能是早期版本建的 `rove`（小写），而 `rove_data_dir()` 拼的是
+/// `Rove`，直接用 `starts_with` 永远不会匹配，所以统一转小写再比。
+fn is_rove_data_path(path: &Path) -> bool {
+    static ROOT: OnceLock<String> = OnceLock::new();
+    let root = ROOT.get_or_init(|| rove_data_dir().to_string_lossy().to_lowercase());
+    path.to_string_lossy().to_lowercase().starts_with(root.as_str())
 }
 
 /// 强制把面板的 scroll_y 推送到 UI，让视图与虚拟列表的计算同步。
@@ -1273,8 +1385,8 @@ fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>
 /// 缩略图工作线程分发器。
 /// 核心修复：使用固定 4 线程并发池 + 轮询分发，彻底杜绝海量文件下的线程爆炸与 COM 崩溃。
 fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>) {
-    // 启动时执行一次磁盘缓存清理（独立线程，不阻塞主线程/分发器）。
-    std::thread::spawn(maintain_thumb_disk_cache);
+    // 启动时初始化磁盘字节统计（仅计数，超预算才异步裁剪）。
+    std::thread::spawn(init_thumb_disk_cache);
 
     std::thread::Builder::new()
         .name("rove-thumbs-dispatcher".into())
@@ -1310,24 +1422,47 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>) {
                             //   thumbs 内部做限次退避重试（盘符等最终仍取不到时返回 Err）；
                             // - 降级系统图标尺寸过小时（如请求 264 返回 32）直接返回 Err，
                             //   由 UI 的彩色方块兜底，避免白块。
-                            let t0 = std::time::Instant::now();
-                            let result =
-                                crate::ops::thumbs::get_thumbnail(&key.path, key.px_size);
-                            let decode_ms = t0.elapsed().as_millis();
+                            // 纯解码耗时（不含 E_PENDING 退避 sleep），用于判断是否值得落盘。
+                            let result = crate::ops::thumbs::get_thumbnail_timed(
+                                &key.path,
+                                key.px_size,
+                            );
                             match result {
-                                Ok((w, h, rgba)) => {
-                                    // 核心修复：仅「慢图」（耗时 >= 30ms 的视频/网络/大图）才落盘。
-                                    // 廉价格式（本地 jpg/png/小图标）秒解，重读磁盘比解码还慢，无需占用磁盘。
+                                Ok((w, h, rgba, pure_decode_ms)) => {
                                     const MIN_DECODE_MS: u128 = 30;
-                                    if decode_ms >= MIN_DECODE_MS {
+                                    let force_keep = is_always_kept(&key.path);
+
+                                    // 目录不落盘：解析仅 30–106ms，且图标几乎都是同一张“文件夹图形”；
+                                    // 落小图会在 icons-xl（显示 264px）下放大发糊，落原图又要 19.4KB/个。
+                                    // 文件：视频/RAW/PDF 等白名单无视耗时门槛，其他格式仍要求 >= 30ms。
+                                    // 且只写到本地固定盘（U 盘/光驱/网络盘不写）。
+                                    // Rove 自有数据文件（dir_sizes.json / index.bin）每次重写，一律排除。
+                                    if !key.path.is_dir()
+                                        && (pure_decode_ms >= MIN_DECODE_MS || force_keep)
+                                        && is_fixed_drive(&key.path)
+                                        && !is_rove_data_path(&key.path)
+                                    {
                                         let disk_path = thumb_disk_path(&key);
-                                        if let Ok(bytes) =
-                                            bincode::serialize(&(w, h, &rgba as &[u8]))
+                                        if let Some(parent) = disk_path.parent() {
+                                            let _ = std::fs::create_dir_all(parent);
+                                        }
+                                        // WIC 编码：不透明→JPEG q90，带 alpha→PNG（原分辨率）。
+                                        if crate::ops::thumbs::encode_wic_to_file(
+                                            &disk_path, w, h, &rgba, None,
+                                        )
+                                        .is_ok()
                                         {
-                                            if let Some(parent) = disk_path.parent() {
-                                                let _ = std::fs::create_dir_all(parent);
+                                            if let Ok(meta) = std::fs::metadata(&disk_path) {
+                                                let total = THUMB_DISK_BYTES
+                                                    .fetch_add(
+                                                        meta.len(),
+                                                        std::sync::atomic::Ordering::Relaxed,
+                                                    )
+                                                    + meta.len();
+                                                if total > THUMB_DISK_MAX_BYTES {
+                                                    trigger_thumb_disk_trim();
+                                                }
                                             }
-                                            let _ = std::fs::write(&disk_path, bytes);
                                         }
                                     }
 
@@ -2097,13 +2232,6 @@ impl App {
         // 关键修复：向 Windows Shell 索要乘上缩放系数的真实物理分辨率图像，
         // 杜绝位图被强行放大发虚（高 DPI 屏下发虚的根因）。
         let px = (logical_size * scale).ceil() as u32;
-        crate::logv!(
-            "[thumb] size_for_view mode={} logical={} scale={} -> {}px",
-            self.config.view_mode,
-            logical_size,
-            scale,
-            px
-        );
         px
     }
 
@@ -2131,7 +2259,6 @@ impl App {
             let img = entry.img.clone();
             self.thumb_order.retain(|k| k != &key);
             self.thumb_order.push(key);
-            crate::logv!("[thumb] cache HIT {} size={}", path.display(), size);
             return img;
         }
 
@@ -2151,20 +2278,32 @@ impl App {
 
             // 磁盘缓存优先：视频海报等慢解码项落盘后，回滚是读盘(毫秒级)
             // 而非 Shell 解码(几十~几百 ms)，这就是「永不重新渲染」的关键。
+            // 格式为 WIC 编码的 JPEG/PNG（非旧版 bincode 裸 RGBA）。
             let disk_path = thumb_disk_path(&key);
-            if let Ok(bytes) = std::fs::read(&disk_path) {
-                if let Ok((w, h, rgba)) =
-                    bincode::deserialize::<(u32, u32, Vec<u8>)>(&bytes)
-                {
-                    if let Some(img) = to_slint_image(w, h, &rgba) {
+            if disk_path.exists() {
+                match crate::ops::thumbs::decode_wic_from_file(&disk_path) {
+                    Ok((w, h, rgba)) => {
+                        if let Some(img) = to_slint_image(w, h, &rgba) {
+                            crate::logv!(
+                                "[thumb] disk-cache HIT {} size={} {}x{}",
+                                path.display(),
+                                size,
+                                w,
+                                h
+                            );
+                            self.thumb_pending.remove(&key);
+                            self.insert_thumb_cache(key, img.clone());
+                            return img;
+                        }
+                    }
+                    Err(e) => {
+                        // 旧版 bincode 裸 RGBA 条目 / 损坏文件：删掉重新解码。
                         crate::logv!(
-                            "[thumb] disk-cache HIT {} size={}",
-                            path.display(),
-                            size
+                            "[thumb] disk-cache STALE (removing) {}: {}",
+                            disk_path.display(),
+                            e
                         );
-                        self.thumb_pending.remove(&key);
-                        self.insert_thumb_cache(key, img.clone());
-                        return img;
+                        let _ = std::fs::remove_file(&disk_path);
                     }
                 }
             }
@@ -2180,9 +2319,9 @@ impl App {
                 self.thumb_pending.remove(&key);
                 self.thumb_failed.insert(key);
             }
-        } else {
-            crate::logv!("[thumb] already pending {} size={}", path.display(), size);
         }
+        // 命中 pending 分支不记日志：此处在热路径上（每行每次刷新都会调用），
+        // 1538 张图加载期间可达 6 万行、占日志 79%。
         slint::Image::default()
     }
 
@@ -2316,21 +2455,18 @@ impl App {
         let rows0 = self.build_rows_for_pane(self.state.active_tab, 0, first0, count0);
         // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
         // 只在真的有空图时输出，正常滚动不吵。
+        // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
+        // 只输出计数，不列文件名（104 个长文件名会让单行达到 ~800 字节）。
+        // 正常滚动时如果一直没有空图，此处不会产生任何日志。
         let empty_thumbs = rows0
             .iter()
             .filter(|r| r.thumb.size().width == 0)
             .count();
         if empty_thumbs > 0 {
-            let names: Vec<String> = rows0
-                .iter()
-                .filter(|r| r.thumb.size().width == 0)
-                .map(|r| r.name.to_string())
-                .collect();
             crate::logv!(
-                "[rows] EMPTY THUMBS {}/{} {:?} | geom list_h={} (raw={}) cells={} row_h={} rows_visible={} | total={} first={} count={} scroll={:.1} mode={} is_split={} expect_px={} cache_len={} pending={} failed={}",
+                "[rows] EMPTY THUMBS {}/{} | geom list_h={} (raw={}) cells={} row_h={} rows_visible={} | total={} first={} count={} scroll={:.1} mode={} is_split={} expect_px={} cache_len={} pending={} failed={}",
                 empty_thumbs,
                 rows0.len(),
-                names,
                 list_height,
                 raw_list_height,
                 cells_per_row,
