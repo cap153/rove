@@ -76,6 +76,9 @@ export component FileList inherits Rectangle {
     in-out property <bool> sort-ascending: true;
     /// 非空时，对应路径的行进入内联重命名态。
     in-out property <string> rename-path: "";
+    /// 重命名输入框的当前文本（供“点击别处即提交”时取用）。
+    /// Slint 无法从外部直接读取 for 循环内的 TextInput，所以由输入框自己同步到这里。
+    in-out property <string> rename-text: "";
     /// 目录读取中。
     in-out property <bool> loading: false;
     /// 拖拽悬停命中的行索引（-1 为无悬停）
@@ -88,6 +91,15 @@ export component FileList inherits Rectangle {
     callback background-pointer-event(event: PointerEvent, x: length, y: length);
     callback rename-committed(path: string, new_name: string);
     callback rename-cancelled();
+
+    /// 外部点击（背景/侧栏/工具栏等）时调用：若有进行中的重命名，按已输入文本提交。
+    /// 只在明确的用户点击路径上调用（不用 has-focus 失焦：那个会在输入框刚创建时
+    /// 假触发，导致进入重命名后几十毫秒就用原名自动提交、根本没法输入）。
+    public function commit-rename() {
+        if (root.rename-path != "") {
+            root.rename-committed(root.rename-path, root.rename-text);
+        }
+    }
 
     /// 列表可视高度（供 Rust 计算虚拟窗口行数）。
     out property <length> view-height: root.height;
@@ -450,20 +462,19 @@ export component FileList inherits Rectangle {
                     width: 100%;
                     height: 100%;
 
-                    scroll-event(event) => {
-                        if (event.delta-y != 0px) {
-                            flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
-                            root.scroll-changed(-flick.content-y);
-                            return EventResult.accept;
-                        }
-                        if (event.delta-x != 0px) {
-                            flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-x));
-                            return EventResult.accept;
-                        }
-                        return EventResult.reject;
-                    }
-
                     pointer-event(event) => {
+                        // 核心修复：如果当前行正在重命名，拒绝事件，让点击穿透到 TextInput。
+                        // 不能把整个 TouchArea 的 enabled 设为 false，否则 scroll-event 也会失效，
+                        // 导致鼠标悬停在该行时滚轮卡死。
+                        if (root.rename-path == row.path) {
+                            return EventResult.reject;
+                        }
+                        // 点击到另一行也算“点击其他位置”：先按已输入文本提交重命名。
+                        // （TouchArea 不抢焦点，所以光靠 has-focus 失焦是等不到的。）
+                        if (root.rename-path != "" && event.kind == PointerEventKind.down) {
+                            root.commit-rename();
+                        }
+
                         if (event.kind == PointerEventKind.down) {
                             // 核心修复：绝对内容Y + 滚动偏移 + 表头高度 = 视口Y。
                             // flick.content-y 是负值（向下滚动为负），加它等于减去滚动偏移。
@@ -487,7 +498,22 @@ export component FileList inherits Rectangle {
                     }
 
                     double-clicked => {
-                        root.row-double-clicked(row.index);
+                        if (root.rename-path != row.path) {
+                            root.row-double-clicked(row.index);
+                        }
+                    }
+
+                    scroll-event(event) => {
+                        if (event.delta-y != 0px) {
+                            flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
+                            root.scroll-changed(-flick.content-y);
+                            return EventResult.accept;
+                        }
+                        if (event.delta-x != 0px) {
+                            flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-x));
+                            return EventResult.accept;
+                        }
+                        return EventResult.reject;
                     }
                 }
 
@@ -533,7 +559,10 @@ export component FileList inherits Rectangle {
                     x: root.col-name-x;
                     width: root.col-name-w;
                     height: parent.height;
+                    z: 10; // 确保处于最上层，不被背景或其他透明图层拦截点击
                     text: row.name;
+                    // 核心修复：必须显式指定颜色，否则沿用主题默认白字 —— 在白底上就看不见了。
+                    color: Theme.text-primary;
                     vertical-alignment: center;
                     font-size: 13px;
                     selection-background-color: Theme.accent;
@@ -542,9 +571,15 @@ export component FileList inherits Rectangle {
                     init => {
                         self.select-all();
                         self.focus();
+                        root.rename-text = self.text;
+                    }
+
+                    edited => {
+                        root.rename-text = self.text;
                     }
 
                     accepted => {
+                        root.rename-text = self.text;
                         root.rename-committed(row.path, self.text);
                     }
 
@@ -701,6 +736,10 @@ export component FileList inherits Rectangle {
                     }
 
                     clicked => {
+                        // 核心修复：图标视图也支持内联重命名，重命名时点击不应改选区。
+                        if (root.rename-path == row.path) {
+                            return;
+                        }
                         // 坐标换算为 FileList 内容坐标(列/行偏移 + 单元格内偏移),
                         // 供右键菜单在窗口中正确定位。
                         root.row-pointer-event(row.index, { kind: PointerEventKind.down, button: PointerEventButton.left },
@@ -709,10 +748,21 @@ export component FileList inherits Rectangle {
                     }
 
                     double-clicked => {
-                        root.row-double-clicked(row.index);
+                        if (root.rename-path != row.path) {
+                            root.row-double-clicked(row.index);
+                        }
                     }
 
                     pointer-event(event) => {
+                        // 核心修复：本单元正在重命名时拒绝指针事件，让点击穿透到 TextInput。
+                        // 不能禁用整个 TouchArea，否则 scroll-event 也会失效、滚轮卡死。
+                        if (root.rename-path == row.path) {
+                            return EventResult.reject;
+                        }
+                        // 点击到另一个单元也算“点击其他位置”：先按已输入文本提交重命名。
+                        if (root.rename-path != "" && event.kind == PointerEventKind.down) {
+                            root.commit-rename();
+                        }
                         // 核心修复：视口Y = 行的内容绝对Y + 鼠标在行内偏移 + 滚动偏移(加上负值) + 表头高度。
                         // flick.content-y 是负值（向下滚动为负），加它即把内容坐标折算回视口坐标。
                         let header-h = root.view-mode == "details" ? 30px : 0px;
@@ -720,6 +770,7 @@ export component FileList inherits Rectangle {
                         root.row-pointer-event(row.index, event,
                             Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px + self.mouse-x,
                             viewport_y);
+                        return EventResult.accept;
                     }
                 }
 
@@ -745,14 +796,49 @@ export component FileList inherits Rectangle {
                     }
 
                     // 名称:搜索命中时高亮,否则普通 elide。
-                    if (row.name-parts.length > 0) : HighlightName {
+                    // 核心修复：重命名时就地渲染 TextInput（图标视图之前完全没有输入框，
+                    // 导致 F2/菜单进入重命名后什么都不出现，键盘还会被“重命名中”状态全吞）。
+                    if (root.rename-path == row.path) : TextInput {
+                        width: parent.width - 50px;
+                        height: 44px;
+                        text: row.name;
+                        color: Theme.text-primary;
+                        vertical-alignment: center;
+                        font-size: 12px;
+                        selection-background-color: Theme.accent;
+                        selection-foreground-color: Theme.accent-text;
+
+                        init => {
+                            self.select-all();
+                            self.focus();
+                            root.rename-text = self.text;
+                        }
+
+                        edited => {
+                            root.rename-text = self.text;
+                        }
+
+                        accepted => {
+                            root.rename-text = self.text;
+                            root.rename-committed(row.path, self.text);
+                        }
+
+                        key-pressed(event) => {
+                            if (event.text == Key.Escape) {
+                                root.rename-cancelled();
+                                return EventResult.accept;
+                            }
+                            return EventResult.reject;
+                        }
+                    }
+                    if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
                         width: parent.width - 50px;
                         height: 44px;
                         parts: row.name-parts;
                         font-size: 12px;
                         is-dir: row.is-dir;
                     }
-                    if (row.name-parts.length == 0) : Text {
+                    if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
                         width: parent.width - 50px;
                         height: 44px;
                         text: row.name;
@@ -793,14 +879,47 @@ export component FileList inherits Rectangle {
                         alignment: start;
 
                         // 名称:搜索命中时单行高亮;否则根据是否有容量行自适应 1~2 行
-                        if (row.name-parts.length > 0) : HighlightName {
+                        // 核心修复：图标视图重命名时渲染 TextInput（否则本视图无法重命名）。
+                        if (root.rename-path == row.path) : TextInput {
+                            text: row.name;
+                            color: Theme.text-primary;
+                            font-size: 11.5px;
+                            horizontal-alignment: center;
+                            vertical-alignment: top;
+                            selection-background-color: Theme.accent;
+                            selection-foreground-color: Theme.accent-text;
+
+                            init => {
+                                self.select-all();
+                                self.focus();
+                                root.rename-text = self.text;
+                            }
+
+                            edited => {
+                                root.rename-text = self.text;
+                            }
+
+                            accepted => {
+                                root.rename-text = self.text;
+                                root.rename-committed(row.path, self.text);
+                            }
+
+                            key-pressed(event) => {
+                                if (event.text == Key.Escape) {
+                                    root.rename-cancelled();
+                                    return EventResult.accept;
+                                }
+                                return EventResult.reject;
+                            }
+                        }
+                        if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
                             parts: row.name-parts;
                             font-size: 11.5px;
                             is-dir: row.is-dir;
                             align-top: true;
                             horizontal-center: true;
                         }
-                        if (row.name-parts.length == 0) : Text {
+                        if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
                             text: row.name;
                             color: Theme.text-primary;
                             font-size: 11.5px;

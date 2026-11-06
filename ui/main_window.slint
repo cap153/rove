@@ -88,6 +88,9 @@ export component MainWindow inherits Window {
     in-out property <bool> tab-loading: false;
     /// 当前激活的是否为设置页标签。
     in-out property <bool> settings-open: false;
+    /// 设置页内是否有文本框持有键盘焦点（由 SettingsPage 上报）。
+    /// 键盘处理器据此放行按键，否则全局 keymap 会把 Enter 吃掉。
+    in-out property <bool> settings-text-focus: false;
     // 设置页数据。
     in-out property <[SettingsNavItem]> settings-nav-items: [];
     in-out property <[SettingsActionGroup]> settings-action-groups: [];
@@ -167,6 +170,17 @@ export component MainWindow inherits Window {
     in-out property <string> status-job: "";
     /// 面包屑路径编辑态（点击地址栏空白处进入，Enter 确认 / Esc 取消）。
     in-out property <bool> path-editing: false;
+    /// 本次地址栏编辑中，输入框是否确实获得过焦点。
+    /// 与重命名同理：只有确认“真获过焦”，才能用“失焦”去做退出编辑的判断，
+    /// 否则创建阶段的假失焦会让编辑框刚弹出就自行关闭。
+    ///
+    /// 注：本想按规则把 focus() 移到父级 changed 里，但 Slint 不允许访问 `if` 块内声明的
+    /// 元素 id（Cannot access id 'path-edit-input'），所以焦点仍由输入框自身 init 请求；
+    /// 退出编辑本来就由所有点击路径的 clear-all-focus() 确定性覆盖，不依赖失焦。
+    private property <bool> path-edit-had-focus: false;
+    changed path-editing => {
+        root.path-edit-had-focus = false;
+    }
     in-out property <string> path-edit-text: "";
     /// 侧栏分区拖拽排序指示器（Rust 计算落点）。
     in-out property <bool> sidebar-drop-visible: false;
@@ -360,6 +374,11 @@ out property <length> row-height-out: file-list.row-height-out;
 
     /// 统一失焦：同时释放搜索框光标并退出地址栏编辑态。
     public function clear-all-focus() {
+        // 核心修复：点击背景/侧栏/工具栏等位置时，若有进行中的重命名，先按已输入文本提交，
+        // 与资源管理器一致（失焦即确认）。必须在上面的 clear-focus 之前做，
+        // 否则输入框已被销毁、取不到用户输入的文本。
+        file-list.commit-rename();
+        file-list-right.commit-rename();
         filter-input.clear-focus();
         root.path-editing = false;
     }
@@ -498,13 +517,18 @@ out property <length> row-height-out: file-list.row-height-out;
                             return EventResult.reject;
                         }
 
+                        // 失焦即退出编辑（视为取消）。
+                        // 必须先确认本次确实获过焦，否则创建初期的假失焦会立即关掉编辑框。
                         changed has-focus => {
-                            // 失焦即退出编辑（视为取消）。
-                            if (!self.has-focus && root.path-editing) {
+                            if (self.has-focus) {
+                                root.path-edit-had-focus = true;
+                            } else if (root.path-edit-had-focus && root.path-editing) {
                                 root.path-editing = false;
                             }
                         }
 
+                        // 注：焦点仍在 init 里请求（Slint 不允许从 if 块外部访问其内元素 id）。
+                        // 退出编辑不依赖失焦：所有点击路径都会走 clear-all-focus()。
                         init => {
                             self.focus();
                             self.select-all();
@@ -743,6 +767,17 @@ out property <length> row-height-out: file-list.row-height-out;
 
                             edited => {
                                 root.filter_edited(self.text);
+                            }
+
+                            // 点击搜索框（搜聚焦）也是“点击其他位置”：先提交进行中的重命名，
+                            // 并确定性退出地址栏编辑（不依赖失焦时序）。
+                            // 用“获得焦距”而非“失去焦距”判定，避开输入框创建初期的假失焦。
+                            changed has-focus => {
+                                if (self.has-focus) {
+                                    file-list.commit-rename();
+                                    file-list-right.commit-rename();
+                                    root.path-editing = false;
+                                }
                             }
 
                             key-pressed(event) => {
@@ -1070,6 +1105,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     search-builtin-exclusions: root.search-builtin-exclusions;
                     search-custom-exclusions: root.search-custom-exclusions;
                     exclude-input-text <=> root.search-exclude-input; // 核心修复：改为双向绑定
+                    text_focus_changed(v) => { root.settings-text-focus = v; }
                     search-idle-enabled: root.search-idle-enabled;
                     search-idle-minutes: root.search-idle-minutes;
                     search-max-results: root.search-max-results;

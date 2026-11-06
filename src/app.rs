@@ -97,8 +97,42 @@ fn format_ago(t: SystemTime) -> String {
 }
 
 /// 配置变更后，若索引已启用则后台重建（未启用则维持懒加载，不无端扫盘）。
+/// 索引重建的合并窗口：设置页里连续改多项时，只真正重建一次。
+/// 不合并的话，每改一项（磁盘开关 / 增删/重置排除路径）都会触发一次全量重扫，
+/// 实测日志里就出现过 1.5 秒内两次完整 walk（342ms + 386ms）并落盘两次。
+const REINDEX_DEBOUNCE_MS: u64 = 600;
+
+/// 待执行的索引重建截止时刻（None = 无待办）。
+static REINDEX_DEADLINE: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock::new();
+
+/// 安排一次索引重建（合并窗口内的多次调用只算一次）。
+/// 实际执行在 40ms 主轮询里检查截止时刻，到点才调 `index::rebuild()`。
 fn reindex_if_active() {
-    if crate::search::index::try_shared().is_some() {
+    if crate::search::index::try_shared().is_none() {
+        return;
+    }
+    let slot = REINDEX_DEADLINE.get_or_init(|| Mutex::new(None));
+    if let Ok(mut g) = slot.lock() {
+        *g = Some(std::time::Instant::now() + Duration::from_millis(REINDEX_DEBOUNCE_MS));
+    }
+}
+
+/// 主轮询定期调用：合并窗口结束则真正触发重建。
+/// 重建本身是异步的（spawn_builder 另开线程），不会阻塞 UI。
+fn maybe_run_pending_reindex() {
+    let Some(slot) = REINDEX_DEADLINE.get() else { return };
+    let due = match slot.lock() {
+        Ok(mut g) => match *g {
+            Some(deadline) if std::time::Instant::now() >= deadline => {
+                *g = None; // 先取出，避免重建期间重复触发
+                true
+            }
+            _ => false,
+        },
+        Err(_) => false,
+    };
+    if due && crate::search::index::try_shared().is_some() {
+        crate::logln!("index: rebuild (debounced {REINDEX_DEBOUNCE_MS}ms)");
         crate::search::index::rebuild();
     }
 }
@@ -417,8 +451,19 @@ pub struct App {
     drives: Vec<DriveInfo>,
     /// 侧边栏数据指纹，避免无变化时重建模型打断滚动。
     sidebar_fingerprint: u64,
-    /// 虚拟列表当前窗口 (first, count)。
+    /// 虚拟列表当前窗口 (first, count) 的失效标志（各处置 None 表示需重建）。
     visible_cache: Option<(usize, usize)>,
+    /// 上次真正写入行模型时的签名 (generation, first, count, total)。
+    /// 仅用于「重命名期间」抑制无意义重建：缩略图/体积陆续到达会不停触发刷新，
+    /// 若每次都换 VecModel，行内 TextInput 会被销毁重建 → 输入丢失、焦点被抢。
+    ///
+    /// 与 `visible_cache` 分开存放：后者会被各处清成 None 作为“失效”信号
+    /// （如 40ms 轮询里缩略图到达就置 None），若共用会在这里反复失效导致重建。
+    ///
+    /// 必须包含 generation：列举结果到达（导航/刷新/外部变更）时 generation 递增，
+    /// 必须重建；否则重命名期间列表会冻住在旧数据上（完全看不到目录刷新）。
+    /// 必须包含 total：新建/删除条目即使可见窗口不变，内容已变。
+    rows_sig: Option<(u64, usize, usize, usize)>,
     /// 当前右键菜单目标。
     menu_target: Option<MenuTarget>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
@@ -553,6 +598,7 @@ impl App {
             drives: Vec::new(),
             sidebar_fingerprint: 0,
             visible_cache: None,
+            rows_sig: None,
             menu_target: None,
             last_click: None,
             sidebar_drag: None,
@@ -782,6 +828,18 @@ impl App {
             pane.rebuild_display();
         }
         let listed_path = tab.panes[result.pane].path.clone();
+
+        // 核心修复：列举完成后立即记下目录 mtime，供 poll_dir_changes 比对。
+        // 否则该目录在 dir_mtimes 里没有条目，下一次轮询（约几十 ms 后）会判定“已变化”，
+        // 立即再全量列举一遍 —— 表现日志里就是每次导航/重命名后都出现两条同样的
+        // request_listing + list_result。网络路径不参与轮询，无需记录。
+        if let Some(p) = listed_path.as_ref() {
+            if !is_network_path(p) {
+                if let Ok(m) = std::fs::symlink_metadata(p).and_then(|m| m.modified()) {
+                    self.dir_mtimes.insert(p.clone(), m);
+                }
+            }
+        }
         // 记录最近目录（仅当前聚焦面板才写入）。
         if listed_is_active {
             if let Some(path) = listed_path {
@@ -797,9 +855,9 @@ impl App {
                 self.sync_status();
                 self.sync_nav();
             }
-            // 核心修复：如果是历史导航（后退/前进）产生的加载，列表数据就位后恢复滚动条。
-            // jump_to 已把 scroll_y 设为 scroll_history 中的值并置 pending_scroll_restore；
-            // 此时数据才真正就绪，clamp 已无意义（下面直接用恢复值推 UI）。
+            // 核心修复：如果是导航（后退/前进/地址栏/面包屑均可）产生的加载，列表数据
+            // 就位后恢复滚动条。navigate/jump_to 已按路径从 path_scroll_memo 取出 scroll_y
+            // 并置 pending_scroll_restore；此时数据才真正就绪，clamp 已无意义（下面直接用恢复值推 UI）。
             let mut is_restore = false;
             if self.state.tabs[tab_index].panes[result.pane].pending_scroll_restore {
                 self.state.tabs[tab_index].panes[result.pane].pending_scroll_restore = false;
@@ -816,7 +874,7 @@ impl App {
             };
 
             if is_restore {
-                crate::logln!(
+                crate::logv!(
                     "[nav] restore scroll for pane {} to {:.1} (target was history pos)",
                     result.pane,
                     if result.pane == 0 { scroll0 } else { scroll1 }
@@ -827,6 +885,13 @@ impl App {
                 if is_split {
                     push_scroll(&self.ui, 1, scroll1);
                 }
+            }
+
+            // 安全网：本次列举已完成，本标签下所有面板都解除“恢复中”标记。
+            // 否则若某 pane 的列举因故没走到上面那条分支，标记会永久残留，
+            // 导致该面板的滚动回调被一直忽略（表现为列表永远不跟随滚动）。
+            for pane in &mut self.state.tabs[tab_index].panes {
+                pane.pending_scroll_restore = false;
             }
         }
         // 标签标题可能变化（"此电脑" 不变，目录名会变）。
@@ -1309,7 +1374,7 @@ fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
             while let Ok(req) = rx.recv() {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
-                    logln!("worker req tab={} path={:?}", req.tab_id, req.path);
+                    logv!("worker req tab={} path={:?}", req.tab_id, req.path);
                     let entries = match &req.path {
                         None => list_drives().iter().map(FileEntry::drive).collect(),
                         Some(path) if *path == fs::drives::recycle_virtual_path() => {
@@ -2544,7 +2609,44 @@ impl App {
                 self.thumb_failed.len()
             );
         }
-        self.ui.set_file_rows(ModelRc::new(VecModel::from(rows0)));
+        // 核心修复：内联重命名期间，若可见窗口（首行/行数）未变，就不要重建行模型。
+        // set_file_rows 换整个 VecModel 会让 Slint 重建每一行 → 行内的 TextInput
+        // 被销毁重建 → 已输入的字丢失、焦点被抢走（表现为“无法重命名”）。
+        // 40ms 轮询里的 thumb_needs_refresh 会频繁触发本函数，因此必须抑制这种无效重建。
+        // 注：滚动会改变 (first0, count0) → 依然正常重建，不影响滚动。
+        let sig = (
+            self.state.active().active().generation,
+            first0,
+            count0,
+            total0,
+        );
+        let renaming = !self.ui.get_rename_path().is_empty();
+        if renaming {
+            // 只在异常时输出（重命名中却没有任何可见行匹配）——这是“输入框不出现 / 键盘全吞”的病灶。
+            let rp = self.ui.get_rename_path();
+            let hit = rows0.iter().any(|r| r.path.as_str() == rp.as_str());
+            if !hit {
+                logln!(
+                    "[rename] !! no visible row matches rename-path={} rows={} first={} count={} total={}",
+                    rp, rows0.len(), first0, count0, total0
+                );
+            }
+        }
+        let reuse_rows = renaming && self.rows_sig == Some(sig);
+        if reuse_rows {
+            logv!("[rename] keep row model (sig={:?})", sig);
+        } else {
+            if renaming {
+                // 异常：重命名期间还在换行模型。换模型会销毁行内 TextInput，
+                // 造成失焦/输入丢失。看到这条就说明 rows_sig 没拦住。
+                logv!(
+                    "[rename] !! row model rebuilt during rename sig={:?} prev={:?}",
+                    sig, self.rows_sig
+                );
+            }
+            self.ui.set_file_rows(ModelRc::new(VecModel::from(rows0)));
+            self.rows_sig = Some(sig);
+        }
 
         // 右栏（如果开启分屏）绑定 pane 1
         if is_split {
@@ -3917,7 +4019,33 @@ impl App {
 
     /// 提交重命名。
     fn commit_rename(&mut self, path: &Path, new_name: &str) {
+        logln!(
+            "[rename] commit_rename path={:?} new_name={} (drag_armed before reset)",
+            path, new_name
+        );
+
+        // 核心修复：防重复提交。输入框的 accepted 与 changed has-focus 可能先后都触发
+        // （回车后 rename-path 被清空 → 输入框销毁 → 失焦），点击别处也可能重入。
+        // 首次提交后 Rust 已把 rename-path 清空，所以这里用“当前 rename_path 是否仍等于
+        // 目标路径”做幂等守门，避免第二次对已不存在的旧名 rename 报错。
+        let current = self.ui.get_rename_path();
+        let target = path.to_string_lossy();
+        if current.as_str() != target.as_ref() {
+            logv!(
+                "[rename] commit ignored (already handled) path={:?} current={}",
+                path, current
+            );
+            return;
+        }
+
         self.ui.set_rename_path(SharedString::default());
+
+        // 核心修复：不管输入的名字是否为空、是否包含非法字符、是否重名、是否重命名成功，
+        // 只要触发了 commit 就代表退出重命名态，必须立刻释放拖拽锁。
+        // 否则空名/非法名/重名等提前 return 的分支会漏掉解锁，锁残留 → 滚轮冻结。
+        self.drag_pending = None;
+        self.ui.invoke_set_drag_armed(false);
+
         let new_name = new_name.trim();
         if new_name.is_empty() {
             return;
@@ -3983,9 +4111,15 @@ impl App {
     }
 
     /// 开始重命名选中项（仅单项）。
-    fn start_rename(&self) {
+    fn start_rename(&mut self) {
+        // 核心修复：强行清空拖拽上膛锁，防止在行上按下时残留 drag-armed，
+        // 导致重命名弹出输入框接管鼠标后 TouchArea 收不到 up 事件，锁永久残留、滚轮冻结。
+        self.drag_pending = None;
+        self.ui.invoke_set_drag_armed(false);
+
         let paths = self.state.active().active().selected_paths();
         if paths.len() == 1 {
+            logv!("[rename] start_rename for {:?}", paths[0]);
             self.ui
                 .set_rename_path(paths[0].to_string_lossy().into_owned().into());
         }
@@ -4228,6 +4362,11 @@ impl App {
             ACT_RENAME => {
                 if let MenuTarget::Files(paths) = &target {
                     if let Some(path) = paths.first() {
+                        // 核心修复：右键菜单重命名也绕过了 start_rename，这里必须同样清锁，
+                        // 否则之前左键点击行留下的 drag-armed 会滞留 → 重命名后滚轮冻结。
+                        self.drag_pending = None;
+                        self.ui.invoke_set_drag_armed(false);
+                        logv!("[rename] menu rename for {:?}", path);
                         self.ui
                             .set_rename_path(path.to_string_lossy().into_owned().into());
                     }
@@ -4487,6 +4626,12 @@ impl App {
         }
         match std::fs::create_dir(&path) {
             Ok(()) => {
+                // 核心修复：清除拖拽上膛锁，防止新建后滚动被禁用（drag-armed 为 true 时
+                // Flickable 的 interactive 滚动被关，必须等下次目录刷新才重置）。
+                self.drag_pending = None;
+                self.ui.invoke_set_drag_armed(false);
+
+                logv!("[rename] create_folder -> {:?}", path);
                 self.reload_active();
                 self.ui
                     .set_rename_path(path.to_string_lossy().into_owned().into());
@@ -4658,6 +4803,7 @@ impl App {
             PointerEventKind::Up | PointerEventKind::Cancel => {
                 self.drag_pending = None;
                 self.ui.invoke_set_drag_armed(false);
+                logv!("[drag] armed=false (up/cancel)");
             }
             PointerEventKind::Move => {
                 // 仅当位移越过阈值才取走待定手势并启动拖出；否则保留，
@@ -4762,6 +4908,7 @@ impl App {
                     self.drag_pending = Some((x, y, paths));
                     // 上膛：禁用 flick 交互滚动，使行拖动仅用于发起拖出。
                     self.ui.invoke_set_drag_armed(true);
+                    logv!("[drag] armed=true for row {}", index);
                 }
             }
             _ => {}
@@ -5139,10 +5286,11 @@ impl App {
         let left = x1.min(x2);
         let right = x1.max(x2);
 
-        // 核心修复：加上当前视口的滚动偏移，转换为虚拟列表的绝对坐标
-        let scroll_y = self.state.active().active().scroll_y;
-        let top = y1.min(y2) + scroll_y;
-        let bottom = y1.max(y2) + scroll_y;
+        // 核心修复：背景 TouchArea 已撑满整个 content-height，传来的 y1/y2 已经是
+        // 包含滚动偏移的绝对内容坐标（与单元格 AABB 同一坐标系），无需再补 scroll_y，
+        // 否则越往下滚偏得越多（实测框选内容偏下）。
+        let top = y1.min(y2);
+        let bottom = y1.max(y2);
 
         let is_icons = self.ui.get_is_icons_view_out();
         let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
@@ -5191,10 +5339,9 @@ impl App {
         let left = x1.min(x2);
         let right = x1.max(x2);
 
-        // 核心修复：加上当前视口的滚动偏移，转换为虚拟列表的绝对坐标
-        let scroll_y = self.state.active().active().scroll_y;
-        let top = y1.min(y2) + scroll_y;
-        let bottom = y1.max(y2) + scroll_y;
+        // 核心修复：同上，不再补偿 scroll_y，直接使用绝对内容坐标（避免框选偏下）。
+        let top = y1.min(y2);
+        let bottom = y1.max(y2);
 
         let is_icons = self.ui.get_is_icons_view_out();
         let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
@@ -5281,6 +5428,9 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
         return;
     };
 
+    // 合并窗口到点则触发索引重建（设置页连续改多项只重建一次）。
+    maybe_run_pending_reindex();
+
     // 无边框标题栏钩子的延迟安装兜底。
     // show() 刚返回时 winit 窗口往往还没 realize，window_handle()
     // 取不到 HWND（实测日志确认会走这条分支）；事件循环跑起来后
@@ -5303,7 +5453,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 // 停在“只渲染前几行”的状态（「此电脑」部分盘符空白）。
                 let geom = app.current_list_geom();
                 if geom != app.list_geom {
-                    crate::logln!(
+                    crate::logv!(
                         "[geom] changed h={} cells={} row_h={} icons={}",
                         geom.0,
                         geom.1,
@@ -5599,10 +5749,13 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             return EventResult::Propagate;
         };
         let mut app = key_app.borrow_mut();
-        // 焦点在过滤框 / 重命名输入框 / 地址栏编辑框时，按键归输入框所有。
+        // 焦点在过滤框 / 重命名输入框 / 地址栏编辑框 / 设置页文本框时，按键归输入框所有。
+        // 关键：设置页文本框若不在此放行，全局 keymap 会先把 Enter 等按键 PreventDefault 掉，
+        // 导致 TextInput 的 accepted 永远不触发（表现为“回车无效、点按钮却可以”）。
         if app.ui.get_filter_has_focus()
             || !app.ui.get_rename_path().is_empty()
             || app.ui.get_path_editing()
+            || app.ui.get_settings_text_focus()
         {
             return EventResult::Propagate;
         }
@@ -5854,11 +6007,18 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             // 核心修复：切标签期间忽略因布局 Clamp 产生的残留滚动事件。
             if app.syncing_tab { return; }
 
-            // 核心修复：如果是历史导航，在数据回来前，UI 会因为列表清空自动 Clamp 到 0，
-            // 此时必须忽略这个假事件，否则刚恢复的 scroll_y 会被覆盖为 0。
-            // （syncing_tab 伞是同步关闭的，挡不住下一帧才触发的 UI Clamp 回调，
-            //  真正跨帧的保护靠 pending_scroll_restore 标记。）
-            if app.state.tabs[app.state.active_tab].panes.get(0).is_some_and(|p| p.pending_scroll_restore) {
+            // 核心修复：历史导航等待数据期间，UI 会因列表清空把滚动条自动 Clamp 到 0，
+            // 并触发 scroll-changed 假回调。必须全部忽略（含程序 push 的回显——
+            // set-scroll-y 的 suppress 只能覆盖赋值那一瞬，changed 是下一帧才跑，
+            // 回显仍会打进来；如果用“非 0 就当真实滚动”去解标记，就会在数据到之前
+            // 提前解掉保护，随后真实的 clamp-to-0 就会把位置冲掉——这就是记忆丢失的原因）。
+            // 标记的解除统一由 apply_list_result 在数据就位时负责，且有兵底清理保证不会卡死。
+            if app.state.tabs[app.state.active_tab]
+                .panes
+                .get(0)
+                .is_some_and(|p| p.pending_scroll_restore)
+            {
+                logv!("[scroll] ignore while restoring (left) offset={:.1}", offset);
                 return;
             }
             // 左栏固定映射 pane 0（活动栏可能已切到右侧）。
@@ -5878,7 +6038,12 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             if app.syncing_tab { return; }
 
             // 核心修复：同上，保护分屏右侧面板。
-            if app.state.tabs[app.state.active_tab].panes.get(1).is_some_and(|p| p.pending_scroll_restore) {
+            if app.state.tabs[app.state.active_tab]
+                .panes
+                .get(1)
+                .is_some_and(|p| p.pending_scroll_restore)
+            {
+                logv!("[scroll] ignore while restoring (right) offset={:.1}", offset);
                 return;
             }
             let active_tab = app.state.active_tab;
@@ -5940,6 +6105,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     {
         let app = Rc::downgrade(app);
         upgrade().on_file_rename_committed(move |path, new_name| {
+            logv!("[rename] UI committed path={} name={}", path, new_name);
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut()
                 .commit_rename(&PathBuf::from(path.as_str()), new_name.as_str());
@@ -5949,7 +6115,11 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_file_rename_cancelled(move || {
             let Some(app) = app.upgrade() else { return };
-            app.borrow().ui.set_rename_path(SharedString::default());
+            let mut app = app.borrow_mut();
+            app.ui.set_rename_path(SharedString::default());
+            // 核心修复：取消重命名时也必须解锁，否则锁残留 → 滚轮冻结。
+            app.drag_pending = None;
+            app.ui.invoke_set_drag_armed(false);
         });
     }
 

@@ -91,7 +91,8 @@ fn scan_drive_mft(
     let volume = match usn_journal_rs::volume::Volume::from_drive_letter(drive_char) {
         Ok(v) => v,
         Err(e) => {
-            logln!("mft: {letter}: open volume handle failed (need admin / non-NTFS): {e}");
+            // 非管理员运行时的预期现像（每个卷一次），降为详细级避免刷屏。
+            crate::logv!("mft: {letter}: open volume handle failed (need admin / non-NTFS): {e}");
             return None;
         }
     };

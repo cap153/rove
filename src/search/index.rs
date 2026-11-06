@@ -281,7 +281,7 @@ fn spawn_builder(idx: SharedIndex) {
             if let Err(e) = save_cache(&entries) {
                 logln!("index: save cache failed: {e}");
             } else {
-                logln!("index: saved {} entries to disk cache", entries.len());
+                crate::logv!("index: saved {} entries to disk cache", entries.len());
             }
 
             // 1 微秒原子提交：写入主索引 live 槽

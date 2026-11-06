@@ -41,9 +41,9 @@ pub struct PaneState {
     pub path: Option<PathBuf>,
     /// 导航历史（含当前位置）。
     pub history: Vec<Option<PathBuf>>,
-    /// 导航历史对应的滚动偏移（与 history 严格平行）。
-    /// 切换视图/后退时据此恢复位置，避免每次都跳回顶部。
-    pub scroll_history: Vec<f32>,
+    /// 记录每个目录的滚动位置。只要标签不关，不管用什么方式回到该目录，都能精准恢复。
+    /// 用 `Option<PathBuf>` 作为 Key，是为了兼容“此电脑（None）”视图的滚动记忆。
+    pub path_scroll_memo: std::collections::HashMap<Option<PathBuf>, f32>,
     pub history_index: usize,
     /// 是否正在恢复滚动位置（导航时，加载完成前不要被 clamp 逻辑清零）。
     /// 关键：打开子文件夹再后退时，jump_to 恢复了 scroll_y，但异步列表结果尚未来，
@@ -87,7 +87,7 @@ impl PaneState {
         Self {
             path: path.clone(),
             history: vec![path],
-            scroll_history: vec![0.0], // 与 history 平行，初始位置顶部
+            path_scroll_memo: std::collections::HashMap::new(), // 按路径记忆滚动位置
             history_index: 0,
             pending_scroll_restore: false,
             entries: Vec::new(),
@@ -127,22 +127,19 @@ impl PaneState {
 
     /// 导航到新路径（压入历史，丢弃前进记录）。
     pub fn navigate(&mut self, path: Option<PathBuf>) {
-        // 核心修复：离开当前目录前，必须保存当前滚动位置！
-        // 否则历史栈里存的永远是 0，后退时就会回到顶部。
-        if self.history_index < self.scroll_history.len() {
-            self.scroll_history[self.history_index] = self.scroll_y;
-        }
+        // 核心修复：离开当前页面时，按路径保存它的滚动位置
+        self.path_scroll_memo.insert(self.path.clone(), self.scroll_y);
 
         self.history.truncate(self.history_index + 1);
-        self.scroll_history.truncate(self.history_index + 1); // 与 history 平行截断
         self.history.push(path.clone());
-        self.scroll_history.push(0.0); // 新目录默认顶部
         self.history_index = self.history.len() - 1;
-        self.path = path;
+        self.path = path.clone();
         self.selection.clear();
         self.anchor = None;
-        self.scroll_y = 0.0;
-        self.pending_scroll_restore = false; // 新目录无需恢复
+
+        // 核心修复：检查是否有记忆，有则恢复，无则顶部
+        self.scroll_y = self.path_scroll_memo.get(&path).copied().unwrap_or(0.0);
+        self.pending_scroll_restore = true; // 只要导航了，就等数据回来再推 UI
         self.generation += 1;
         self.loading = true;
         self.filter.clear();
@@ -155,16 +152,17 @@ impl PaneState {
         if index >= self.history.len() {
             return;
         }
-        // 核心修复：离开当前页面时，保存它的滚动位置
-        self.scroll_history[self.history_index] = self.scroll_y;
+        // 核心修复：离开当前页面时，按路径保存滚动位置
+        self.path_scroll_memo.insert(self.path.clone(), self.scroll_y);
 
         self.history_index = index;
         self.path = self.history[index].clone();
         self.selection.clear();
         self.anchor = None;
-        // 核心修复：恢复目标页面的滚动位置
-        self.scroll_y = self.scroll_history[index];
-        self.pending_scroll_restore = true; // 等列表数据就位再真正推 UI（期间禁止 clamp）
+
+        // 核心修复：恢复目标路径的滚动位置
+        self.scroll_y = self.path_scroll_memo.get(&self.path).copied().unwrap_or(0.0);
+        self.pending_scroll_restore = true;
         self.generation += 1;
         self.loading = true;
         self.filter.clear();
