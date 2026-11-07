@@ -4053,6 +4053,11 @@ impl App {
         if trimmed.is_empty() {
             return;
         }
+        // 虚拟根：地址栏在“此电脑”下会以标签作为初始文本，回车视为回到此电脑
+        if trimmed == "此电脑" || trimmed.eq_ignore_ascii_case("this pc") {
+            self.navigate_active(None);
+            return;
+        }
 
         // 核心修复：使用 expand_path 展开环境变量和 ~
         let p = Self::expand_path(trimmed);
@@ -4267,8 +4272,9 @@ impl App {
 
     /// 提交重命名。
     fn commit_rename(&mut self, path: &Path, new_name: &str) {
-        logln!(
-            "[rename] commit_rename path={:?} new_name={} (drag_armed before reset)",
+        // 正常交互路径（回车/失焦/点空白都会走到），降为详细级；异常分支仍留在 logln。
+        logv!(
+            "[rename] commit_rename path={:?} new_name={}",
             path, new_name
         );
 
@@ -5080,7 +5086,7 @@ impl App {
         }
         let index = tab.active().history_index - 1;
         self.state.active_mut().active_mut().jump_to(index);
-        crate::logln!(
+        crate::logv!(
             "[nav] jump_to index={} target_scroll={:.1} (is_restore={})",
             index,
             self.state.active().active().scroll_y,
@@ -5096,7 +5102,7 @@ impl App {
         }
         let index = tab.active().history_index + 1;
         self.state.active_mut().active_mut().jump_to(index);
-        crate::logln!(
+        crate::logv!(
             "[nav] jump_to index={} target_scroll={:.1} (is_restore={})",
             index,
             self.state.active().active().scroll_y,
@@ -6324,6 +6330,22 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
     {
+        // 诊断：地址栏面包屑流几何。窄窗口出现“地址栏空白”时，看这三个数就知道
+        // 是内容宽度算错（content_w <= view_w 但 n > 0 仍看不到）、还是偏移越界。
+        upgrade().on_crumb_dbg(move |view_w, content_w, content_x, n| {
+            logv!(
+                "[crumb] n={} view={:.1} content={:.1} x={:.1}",
+                n, view_w, content_w, content_x
+            );
+        });
+    }
+    {
+        // 诊断：地址栏空白处点击。没这行就说明点击没有被那一层接住。
+        upgrade().on_crumb_edit_clicked(move |x, content_x| {
+            logv!("[crumb] edit-click x={:.1} content-x={:.1}", x, content_x);
+        });
+    }
+    {
         let app = Rc::downgrade(app);
         // 侧栏分区拖拽排序。
         upgrade().on_sidebar_header_drag(move |index, phase, y| {
@@ -7491,12 +7513,22 @@ mod drag_hittest {
     ) -> windows_sys::Win32::Foundation::LRESULT {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CallWindowProcW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
-            HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, WNDPROC, WM_NCHITTEST,
-            WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN,
+            HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, SC_MOVE, WNDPROC, WM_NCHITTEST,
+            WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_SYSCOMMAND,
         };
 
-        // 核心修复：点击标题栏空白拖拽区（非客户区）时，立即派发失焦通知
+        // 标题栏空白是**非客户区**（HTCAPTION），Slint 收不到这次点击，
+        // 所以只能在这里清焦点：否则编辑态/重命名退不出去。
+        // 必须同步——Windows 随后会进入自己的模态移动循环，
+        // invoke_from_event_loop 排队的闭包要等循环结束才跑（表现为“点了没反应”）。
         if msg == WM_NCLBUTTONDOWN || msg == WM_NCRBUTTONDOWN {
+            logv!("[nc] nclbuttondown msg={} ht={}", msg, wparam);
+            super::clear_global_focus();
+        }
+        // 键盘/系统发起的“移动窗口”（Alt+Space → M）不走上面的路径，补一道。
+        // 特意不接 WM_ENTERSIZEMOVE：拖边框**缩放**窗口在资源管理器里不会中断重命名，
+        // 接了就变成“拉一下窗口边就把重命名提交了”。
+        if msg == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_MOVE as usize {
             super::clear_global_focus();
         }
 
@@ -7678,11 +7710,31 @@ thread_local! {
 /// 在事件循环线程清空全部输入聚焦（供跨模块 / 窗口消息钩子调用）。
 #[cfg(windows)]
 pub(crate) fn clear_global_focus() {
-    let _ = slint::invoke_from_event_loop(|| {
-        if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
-            app.borrow().ui.invoke_clear_all_focus();
-        }
+    // 关键：**不能持有 App 的 RefCell 借用**去调 Slint。
+    // clear-all-focus() 会回调 file_rename_committed 之类的 Rust 处理器，
+    // 它们内部要 app.borrow_mut()，包着借用进去会直接 panic（重命名后点标题栏必崩）。
+    // 所以只取出可 clone 的 UI 句柄，借用立即释放。
+    let ui = SESSION.with(|slot| {
+        let app = slot.borrow().clone()?;
+        let app = app.try_borrow().ok()?;
+        Some(slint::ComponentHandle::clone_strong(&app.ui))
     });
+    if let Some(ui) = ui {
+        logv!("[nc] clear_global_focus sync");
+        ui.invoke_clear_all_focus();
+    } else {
+        logln!("[nc] !! clear_global_focus deferred (sync path unavailable)");
+        let _ = slint::invoke_from_event_loop(|| {
+            let ui = SESSION.with(|slot| {
+                let app = slot.borrow().clone()?;
+                let app = app.try_borrow().ok()?;
+                Some(slint::ComponentHandle::clone_strong(&app.ui))
+            });
+            if let Some(ui) = ui {
+                ui.invoke_clear_all_focus();
+            }
+        });
+    }
 }
 
 /// 按吸附方向重定位吸附窗（参考 Pulse 行为：搜索框钉在对话框边缘不动，结果向对话框内侧生长）。
@@ -8068,7 +8120,7 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         ui.window().set_size(WindowSize::Logical(LogicalSize::new(w, h)));
     }
     ui.set_staging_expanded(config.staging_expanded);
-    logln!("[sidebar] want={}px (persisted)", config.sidebar_width);
+    logv!("[sidebar] want={}px (persisted)", config.sidebar_width);
     ui.set_sidebar_want(config.sidebar_width as f32);
     ui.set_view_mode(config.view_mode.clone().into());
 
