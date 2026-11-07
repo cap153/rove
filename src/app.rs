@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use slint::language::{PointerEvent, PointerEventButton, PointerEventKind};
 use slint::{
@@ -486,6 +486,12 @@ pub struct App {
     /// 切换视图时，暂存待恢复的“逻辑条目索引”，等布局更新后再换算成像素。
     /// （视图切换会改变 cell 布局，旧像素偏移无法直接复用，必须先换回条目序号。）
     pending_scroll_index: Option<usize>,
+    /// 重命名期间的“真滚动锁”：(pane0 位置, pane1 位置, 失效时刻)。
+    /// Slint 在焦点元素获得焦点时会自动把它滚进视野（window.rs:1531
+    /// `item.try_scroll_into_visible()`，无 API 可关），表现为“开始重命名滚动条
+    /// 自己往上跳”，并连带把行模型推出可见窗口 → 重建 → 行内输入框被销毁 →
+    /// 焦点/全选丢失。这里记住预期位置，把无用户输入迹象的滚动事件丢弃并推回。
+    rename_scroll_guard: Option<(f32, f32, Instant)>,
     /// 上次重建可见行时的列表几何 (list_height, cells_per_row, row_h, 图标视图)。
     /// 启动首帧布局未完成时这几个值还不可用（list_height=0 / cells_per_row=1），
     /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
@@ -629,6 +635,7 @@ impl App {
             thumb_needs_refresh: false,
             syncing_tab: false,
             pending_scroll_index: None,
+            rename_scroll_guard: None,
             thumb_tx,
             list_tx,
             list_rx,
@@ -1361,6 +1368,10 @@ fn is_rove_data_path(path: &Path) -> bool {
 /// 使用 `invoke_set_file_scroll_y` 直接调用 Slint 的公开函数，
 /// 绕过属性 `changed` 事件的合并延迟，确保切换标签的一瞬间布局立刻复位。
 fn push_scroll(ui: &MainWindow, pane: usize, scroll_y: f32) {
+    // 排查：重命名期间的任何程序推值都记下来（正常路径不会推，除非 clamp/导航）。
+    if !ui.get_rename_path().is_empty() {
+        crate::logv!("[push] !! pane={} -> {:.1}", pane, scroll_y.max(0.0));
+    }
     ui.invoke_set_file_scroll_y(pane as i32, scroll_y.max(0.0));
 }
 
@@ -2559,6 +2570,20 @@ impl App {
                 }
                 let clamped = scroll.min(max_scroll_for(total));
                 if (clamped - scroll).abs() > 0.5 {
+                    // 排查：重命名期间任何“程序改滚动位置”都是嫌疑犯（会把行模型推出
+                    // 可见窗口 → 重建 → 行内 TextInput 被销毁 → 焦点丢失）。
+                    if !self.ui.get_rename_path().is_empty() {
+                        logln!(
+                            "[clamp] !! pane={} scroll {:.1} -> {:.1} (max={:.1} total={} list_h={} row_h={})",
+                            idx,
+                            scroll,
+                            clamped,
+                            max_scroll_for(total),
+                            total,
+                            list_height,
+                            row_h
+                        );
+                    }
                     self.state.active_mut().panes[idx].scroll_y = clamped;
                     push_scroll(&self.ui, idx, clamped);
                 }
@@ -2624,6 +2649,22 @@ impl App {
         if renaming {
             // 只在异常时输出（重命名中却没有任何可见行匹配）——这是“输入框不出现 / 键盘全吞”的病灶。
             let rp = self.ui.get_rename_path();
+            // 排查：重命名期间把影响滚动/虚拟窗口的关键几何一次性打出来。
+            // 低频（仅重命名中），但能同时回答三个问题：视口高度倒底是多少、
+            // 滚动位置是否被动过、行模型是否被重建（重建=行内 TextInput 被销毁=失焦）。
+            logv!(
+                "[rename] refresh list_h={} raw={} cells={} row_h={} rows_vis={} scroll={:.1} first={} count={} total={} icons={}",
+                list_height,
+                raw_list_height,
+                cells_per_row,
+                row_h,
+                rows_visible,
+                scroll0,
+                first0,
+                count0,
+                total0,
+                self.ui.get_is_icons_view_out()
+            );
             let hit = rows0.iter().any(|r| r.path.as_str() == rp.as_str());
             if !hit {
                 logln!(
@@ -2639,13 +2680,18 @@ impl App {
             if renaming {
                 // 异常：重命名期间还在换行模型。换模型会销毁行内 TextInput，
                 // 造成失焦/输入丢失。看到这条就说明 rows_sig 没拦住。
-                logv!(
+                logln!(
                     "[rename] !! row model rebuilt during rename sig={:?} prev={:?}",
                     sig, self.rows_sig
                 );
             }
+            // 重建可见行（重命名中重建会得到新输入框实例，必须重新抢焦点）。
             self.ui.set_file_rows(ModelRc::new(VecModel::from(rows0)));
             self.rows_sig = Some(sig);
+            if renaming {
+                // 新实例获得焦点时 Slint 又会自动 reveal 一次，重新锁住当前位置。
+                self.arm_rename_scroll_guard();
+            }
         }
 
         // 右栏（如果开启分屏）绑定 pane 1
@@ -4110,6 +4156,45 @@ impl App {
         }
     }
 
+    /// 锁住当前滚动位置，供重命名期间拦下 Slint 的自动 reveal（详见字段注释）。
+    fn arm_rename_scroll_guard(&mut self) {
+        let (s0, s1) = {
+            let tab = self.state.active();
+            (
+                tab.panes.first().map(|p| p.scroll_y).unwrap_or(0.0),
+                tab.panes.get(1).map(|p| p.scroll_y).unwrap_or(0.0),
+            )
+        };
+        self.rename_scroll_guard =
+            Some((s0, s1, Instant::now() + Duration::from_millis(250)));
+    }
+
+    /// 判断并拦下重命名期间“非用户发起”的滚动事件（Slint 自动 reveal 造成）。
+    ///
+    /// 返回 true 表示已丢弃该事件（并把视图推回原位置），调用方应直接 return。
+    /// 用户真的在滚轮/拖滚动条时，`on_file_scroll_user_input` 已经把 guard 清掉，
+    /// 所以这里不会误杀。
+    fn reject_spurious_rename_scroll(&mut self, pane: usize, offset: f32) -> bool {
+        let Some((keep0, keep1, until)) = self.rename_scroll_guard else {
+            return false;
+        };
+        if Instant::now() >= until {
+            self.rename_scroll_guard = None;
+            return false;
+        }
+        let keep = if pane == 0 { keep0 } else { keep1 };
+        if (offset - keep).abs() <= 1.0 {
+            // 回显（我们自己推的值又打回来）——归一化为预期值，不算异常。
+            return false;
+        }
+        logln!(
+            "[rename] !! drop spurious scroll pane={} {:.1} -> keep {:.1}",
+            pane, offset, keep
+        );
+        push_scroll(&self.ui, pane, keep);
+        true
+    }
+
     /// 开始重命名选中项（仅单项）。
     fn start_rename(&mut self) {
         // 核心修复：强行清空拖拽上膛锁，防止在行上按下时残留 drag-armed，
@@ -4122,6 +4207,7 @@ impl App {
             logv!("[rename] start_rename for {:?}", paths[0]);
             self.ui
                 .set_rename_path(paths[0].to_string_lossy().into_owned().into());
+            self.arm_rename_scroll_guard();
         }
     }
 
@@ -4227,7 +4313,9 @@ impl App {
                 "builtin.rename" => {
                     if let MenuTarget::Files(paths) = &target {
                         if let Some(path) = paths.first() {
+                            logv!("[rename] menu rename for {:?}", path);
                             self.ui.set_rename_path(path.to_string_lossy().into_owned().into());
+                            self.arm_rename_scroll_guard();
                         }
                     }
                     return;
@@ -4369,6 +4457,7 @@ impl App {
                         logv!("[rename] menu rename for {:?}", path);
                         self.ui
                             .set_rename_path(path.to_string_lossy().into_owned().into());
+                        self.arm_rename_scroll_guard();
                     }
                 }
             }
@@ -4635,6 +4724,7 @@ impl App {
                 self.reload_active();
                 self.ui
                     .set_rename_path(path.to_string_lossy().into_owned().into());
+                self.arm_rename_scroll_guard();
             }
             Err(e) => self.set_status_job(format!("创建文件夹失败：{e}")),
         }
@@ -6001,6 +6091,26 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        upgrade().on_file_scroll_dbg(move |pane, offset, ch, vh, miny, cy| {
+            let Some(app) = app.upgrade() else { return };
+            let app = app.borrow();
+            // 只在重命名期间落日志（正是排查窗口），平时完全静默。
+            if app.ui.get_rename_path().is_empty() {
+                return;
+            }
+            crate::logv!(
+                "[scroll-dbg] pane={} pos={:.1} content_h={} view_h={} min_y={} content_y={}",
+                pane,
+                offset,
+                ch,
+                vh,
+                miny,
+                cy
+            );
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
         upgrade().on_file_scroll_changed(move |offset| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -6021,12 +6131,44 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 logv!("[scroll] ignore while restoring (left) offset={:.1}", offset);
                 return;
             }
+            // 排查：重命名期间用户的每次滚动都记下来，用于确认“滚动条往上跑”
+            // 是用户/惯性造成的，还是程序 clamp 反向推的。
+            if !app.ui.get_rename_path().is_empty() {
+                logv!("[rename] scroll (left) -> {:.1}", offset);
+            }
+            // 重命名期间拦下 Slint 的自动 reveal 滚动（详见 rename_scroll_guard 注释）。
+            if app.reject_spurious_rename_scroll(0, offset) {
+                return;
+            }
             // 左栏固定映射 pane 0（活动栏可能已切到右侧）。
             let active_tab = app.state.active_tab;
             if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(0) {
                 pane.scroll_y = offset;
             }
             app.refresh_visible_rows();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_rename_dbg(move |pane, kind, has_focus| {
+            let Some(app) = app.upgrade() else { return };
+            let app = app.borrow();
+            crate::logv!(
+                "[rename-dbg] pane={} kind={} has_focus={} rename_path_len={}",
+                pane,
+                kind,
+                has_focus,
+                app.ui.get_rename_path().len()
+            );
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_scroll_user_input(move |_pane| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            // 用户真的在滚轮/拖滚动条：立即解除重命名期的假滚动拦截。
+            app.rename_scroll_guard = None;
         });
     }
     {
@@ -6044,6 +6186,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 .is_some_and(|p| p.pending_scroll_restore)
             {
                 logv!("[scroll] ignore while restoring (right) offset={:.1}", offset);
+                return;
+            }
+            if app.reject_spurious_rename_scroll(1, offset) {
                 return;
             }
             let active_tab = app.state.active_tab;

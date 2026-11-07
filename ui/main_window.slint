@@ -266,6 +266,12 @@ out property <length> row-height-out: file-list.row-height-out;
     callback file_row_double_clicked(index: int);
     callback file_header_clicked(key: string);
     callback file_scroll_changed(offset: length);
+    /// 排查用：滚动位置变化时连同几何一并上报（Rust 仅在重命名期间落日志）。
+    callback file_scroll_dbg(pane: int, offset: length, content-h: length, view-h: length, min-y: length, content-y: length);
+    /// 用户主动滚动信号（滚轮/拖滚动条），用于解除重命名期的假滚动拦截。
+    callback file_scroll_user_input(pane: int);
+    /// 排查用：重命名输入框生命周期/焦点状态。
+    callback file_rename_dbg(pane: int, kind: string, has_focus: bool);
     // 分屏右栏滚动 / 分隔条比例落盘
     callback file_scroll_changed_right(offset: length);
     callback split_ratio_changed(ratio: float);
@@ -932,6 +938,15 @@ out property <length> row-height-out: file-list.row-height-out;
                     scroll_changed(offset) => {
                         root.file_scroll_changed(offset);
                     }
+                    scroll_dbg(offset, ch, vh, miny, cy) => {
+                        root.file_scroll_dbg(0, offset, ch, vh, miny, cy);
+                    }
+                    scroll_user_input() => {
+                        root.file_scroll_user_input(0);
+                    }
+                    rename_dbg(kind, hf) => {
+                        root.file_rename_dbg(0, kind, hf);
+                    }
                     background_pointer_event(event, x, y) => {
                         if (event.kind == PointerEventKind.down) {
                             root.clear-all-focus();
@@ -1039,6 +1054,15 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                         scroll_changed(offset) => {
                             root.file_scroll_changed_right(offset);
+                        }
+                        scroll_dbg(offset, ch, vh, miny, cy) => {
+                            root.file_scroll_dbg(1, offset, ch, vh, miny, cy);
+                        }
+                        scroll_user_input() => {
+                            root.file_scroll_user_input(1);
+                        }
+                        rename_dbg(kind, hf) => {
+                            root.file_rename_dbg(1, kind, hf);
                         }
                         background_pointer_event(event, x, y) => {
                             if (event.kind == PointerEventKind.down) {

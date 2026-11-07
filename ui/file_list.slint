@@ -88,6 +88,13 @@ export component FileList inherits Rectangle {
     callback row-double-clicked(index: int);
     callback header-clicked(key: string);
     callback scroll-changed(offset: length);
+    /// 排查用：滚动位置变化时连同几何一并上报（Rust 仅在重命名期间落日志）。
+    callback scroll-dbg(offset: length, content-h: length, view-h: length, min-y: length, content-y: length);
+    /// 用户主动滚动（滚轮/拖滚动条）信号：用于区分“真实滚动”与
+    /// Slint 自动 reveal 焦点元素造成的假滚动。
+    callback scroll-user-input();
+    /// 排查用：重命名输入框的生命周期/焦点状态（只在重命名期间输出）。
+    callback rename-dbg(kind: string, has-focus: bool);
     callback background-pointer-event(event: PointerEvent, x: length, y: length);
     callback rename-committed(path: string, new_name: string);
     callback rename-cancelled();
@@ -265,7 +272,17 @@ export component FileList inherits Rectangle {
         if (!self.suppress-scroll-event) {
             root.scroll-changed(self.scroll-pos);
         }
-    }
+        // 排查用：把“位置+当时几何”一起抛给 Rust。
+        // 只有这样才能看出位置上跳是因为 content-height/view-height 算错
+        // （min-content-y 把滚动量卡在某个值），还是程序主动 push。
+        root.scroll-dbg(
+            self.scroll-pos,
+            flick.content-height,
+            flick.height,
+            root.min-content-y,
+            flick.content-y,
+        );
+    };
 
     // 注意：Rectangle 不是布局，直接子元素必须显式给出几何，否则尺寸为 0。
     VerticalLayout {
@@ -394,6 +411,7 @@ export component FileList inherits Rectangle {
 
                 scroll-event(event) => {
                     if (event.delta-y != 0px) {
+                        root.scroll-user-input();
                         flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
                         root.scroll-changed(-flick.content-y);
                         return EventResult.accept;
@@ -508,6 +526,7 @@ export component FileList inherits Rectangle {
 
                     scroll-event(event) => {
                         if (event.delta-y != 0px) {
+                            root.scroll-user-input();
                             flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
                             root.scroll-changed(-flick.content-y);
                             return EventResult.accept;
@@ -558,7 +577,7 @@ export component FileList inherits Rectangle {
                 }
 
                 // 名称 / 内联重命名
-                if (root.rename-path == row.path) : TextInput {
+                if (root.rename-path == row.path) : rename-input-details := TextInput {
                     x: root.col-name-x;
                     width: root.col-name-w;
                     height: parent.height;
@@ -572,9 +591,59 @@ export component FileList inherits Rectangle {
                     selection-foreground-color: Theme.accent-text;
 
                     init => {
-                        self.select-all();
-                        self.focus();
+                        // init 里不调 focus()：此时元素刚创建、几何未定，Slint 收到焦点事件会
+                        // 调 Flickable 的 reveal 把“焦点元素”滚进视野，且用的是未定几何 ——
+                        // 实测把滚动位置从底部 180 直接推到 55（滚动条自己往上跳，
+                        // 连带把行模型推出可见窗口 → 重建 → 输入框被销毁 → 焦点丢失）。
+                        // 统一改由下面的定时器拽，那里已能同步抵消 reveal。
                         root.rename-text = self.text;
+                        root.rename-dbg("init", self.has-focus);
+                    }
+
+                    changed has-focus => {
+                        root.rename-dbg("focus-changed", self.has-focus);
+                    }
+
+                    // 延迟一拍再抢焦点（同步抵消 Slint 的自动 reveal）。
+                    // 为何用定时器：init 阶段 focus() 会被同帧焦点重算覆盖；且模型重建会
+                    // 得到全新实例，旧实例的焦点随之丢。`changed` 写不了限定名（
+                    // `changed root.x` 语法错误），而 `if`/`for` 内元素 id 无法从外部访问，
+                    // 定时器是唯一可靠的跨帧触发点。
+                    rename-focus := Timer {
+                        interval: 60ms;
+                        running: true;
+                        triggered => {
+                            self.running = false;
+                            // 核心修复：必须限定“当前确实在使用本输入框的视图”。
+                            // `visible: !is-icons-view` 只影响渲染，不阻止元素实例化 ——
+                            // 图标视图的重命名输入框在详细视图下同样会被创建，它们
+                            // 的定时器也会 focus()，最后一个赢 → 焦点被抢到不可见的
+                            // 图标输入框上（表现为“没全选、打不了字”）。实测日志：
+                            //   kind=timer has_focus=true → 8ms 后 kind=icon2-timer
+                            //   → kind=focus-changed has_focus=false。
+                            if (root.rename-path == row.path && !root.is-icons-view) {
+                                // 必须先 focus 再 select-all：获得焦点会把光标重置到文末。
+                                let keep-y = flick.content-y;
+                                rename-input-details.focus();
+                                rename-input-details.select-all();
+                                // focus() 会触发 Slint 的自动 reveal 把滚动位置推走，
+                                // 这里立刻恢复，抵消那次自动滚动（同步，无闪烁）。
+                                flick.content-y = keep-y;
+                                root.rename-dbg("timer", rename-input-details.has-focus);
+                            }
+                        }
+                    }
+
+                    // 250ms 后再报一次，确认 focus 是否被后续处理抢走。
+                    rename-focus-late := Timer {
+                        interval: 250ms;
+                        running: true;
+                        triggered => {
+                            self.running = false;
+                            if (root.rename-path == row.path && !root.is-icons-view) {
+                                root.rename-dbg("late", rename-input-details.has-focus);
+                            }
+                        }
                     }
 
                     edited => {
@@ -731,6 +800,7 @@ export component FileList inherits Rectangle {
 
                     scroll-event(event) => {
                         if (event.delta-y != 0px) {
+                            root.scroll-user-input();
                             flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
                             root.scroll-changed(-flick.content-y);
                             return EventResult.accept;
@@ -801,7 +871,7 @@ export component FileList inherits Rectangle {
                     // 名称:搜索命中时高亮,否则普通 elide。
                     // 核心修复：重命名时就地渲染 TextInput（图标视图之前完全没有输入框，
                     // 导致 F2/菜单进入重命名后什么都不出现，键盘还会被“重命名中”状态全吞）。
-                    if (root.rename-path == row.path) : TextInput {
+                    if (root.rename-path == row.path) : rename-input-icon-small := TextInput {
                         width: parent.width - 50px;
                         height: 44px;
                         text: row.name;
@@ -812,9 +882,25 @@ export component FileList inherits Rectangle {
                         selection-foreground-color: Theme.accent-text;
 
                         init => {
-                            self.select-all();
-                            self.focus();
+                            // 不在 init 里 focus（详见详细视图输入框的说明）。
                             root.rename-text = self.text;
+                        }
+
+                        // 延迟一拍再抢焦点（详见详细视图里的说明）。
+                        rename-focus-icon := Timer {
+                            interval: 60ms;
+                            running: true;
+                            triggered => {
+                                self.running = false;
+                                // 只在 icons-small 生效（视图限定，理由见详细视图输入框）。
+                                if (root.rename-path == row.path && root.view-mode == "icons-small") {
+                                    let keep-y = flick.content-y;
+                                    rename-input-icon-small.focus();
+                                    rename-input-icon-small.select-all();
+                                    flick.content-y = keep-y;
+                                    root.rename-dbg("icon-timer", rename-input-icon-small.has-focus);
+                                }
+                            }
                         }
 
                         edited => {
@@ -883,7 +969,7 @@ export component FileList inherits Rectangle {
 
                         // 名称:搜索命中时单行高亮;否则根据是否有容量行自适应 1~2 行
                         // 核心修复：图标视图重命名时渲染 TextInput（否则本视图无法重命名）。
-                        if (root.rename-path == row.path) : TextInput {
+                        if (root.rename-path == row.path) : rename-input-icon-vert := TextInput {
                             text: row.name;
                             color: Theme.text-primary;
                             font-size: 11.5px;
@@ -893,9 +979,25 @@ export component FileList inherits Rectangle {
                             selection-foreground-color: Theme.accent-text;
 
                             init => {
-                                self.select-all();
-                                self.focus();
+                                // 不在 init 里 focus（详见详细视图输入框的说明）。
                                 root.rename-text = self.text;
+                            }
+
+                            // 延迟一拍再抢焦点（详见详细视图里的说明）。
+                            rename-focus-icon2 := Timer {
+                                interval: 60ms;
+                                running: true;
+                                triggered => {
+                                    self.running = false;
+                                    // 只在 icons-medium/large/xl 生效（视图限定）。
+                                    if (root.rename-path == row.path && root.is-icons-view && root.view-mode != "icons-small") {
+                                        let keep-y = flick.content-y;
+                                        rename-input-icon-vert.focus();
+                                        rename-input-icon-vert.select-all();
+                                        flick.content-y = keep-y;
+                                        root.rename-dbg("icon2-timer", rename-input-icon-vert.has-focus);
+                                    }
+                                }
                             }
 
                             edited => {
@@ -1053,6 +1155,7 @@ export component FileList inherits Rectangle {
 
             moved => {
                 if (self.pressed) {
+                    root.scroll-user-input();
                     let max-travel = max(scrollbar.track-h - scrollbar.thumb-h, 1px);
                     let target-y = self.mouse-y - root.sb-drag-grab-y;
                     let ratio = max(0.0, min(1.0, target-y / max-travel));
@@ -1064,6 +1167,7 @@ export component FileList inherits Rectangle {
 
             scroll-event(event) => {
                 if (event.delta-y != 0px) {
+                    root.scroll-user-input();
                     flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
                     root.scroll-changed(-flick.content-y);
                     return EventResult.accept;
