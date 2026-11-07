@@ -492,6 +492,10 @@ pub struct App {
     /// 自己往上跳”，并连带把行模型推出可见窗口 → 重建 → 行内输入框被销毁 →
     /// 焦点/全选丢失。这里记住预期位置，把无用户输入迹象的滚动事件丢弃并推回。
     rename_scroll_guard: Option<(f32, f32, Instant)>,
+    /// 重命名后“钉住原位置”：资源管理器同款行为 —— 改名不引起排序跳变，
+    /// 只有用户显式重排 / 换目录 / 窗口过期（3 秒）后才归位。
+    /// (目录, 条目新路径, 原显示位置, 失效时刻)
+    rename_pin: Option<(PathBuf, PathBuf, usize, Instant)>,
     /// 上次重建可见行时的列表几何 (list_height, cells_per_row, row_h, 图标视图)。
     /// 启动首帧布局未完成时这几个值还不可用（list_height=0 / cells_per_row=1），
     /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
@@ -636,6 +640,7 @@ impl App {
             syncing_tab: false,
             pending_scroll_index: None,
             rename_scroll_guard: None,
+            rename_pin: None,
             thumb_tx,
             list_tx,
             list_rx,
@@ -813,9 +818,30 @@ impl App {
         }
 
         // 3. 回填后再排序，写入 pane。
+        // 先清掉已过期的重命名“钉位”（见 rename_pin）。
+        if self
+            .rename_pin
+            .as_ref()
+            .is_some_and(|(_, _, _, until)| Instant::now() >= *until)
+        {
+            self.rename_pin = None;
+        }
+        let rename_pin = self.rename_pin.clone();
         {
             let pane = &mut tab.panes[result.pane];
             crate::fs::sort_entries(&mut entries, pane.sort);
+            // 重命名后不重排：把刚改名的条目钉回它原来的显示位置，
+            // 其余条目的相对顺序完全不变。（资源管理器同款：改名不引起跳变。）
+            if let Some((dir, pin_path, pin_index, _)) = rename_pin {
+                if pane.path.as_deref() == Some(dir.as_path()) {
+                    if let Some((from, to)) = pin_entry_at(&mut entries, &pin_path, pin_index) {
+                        crate::logv!(
+                            "[rename] keep position: {:?} {} -> {}",
+                            pin_path, from, to
+                        );
+                    }
+                }
+            }
             // 「此电脑」视图：记录本次真正拿到的驱动器，用于区分
             // “行缺失”还是“行在但图标空”。
             if pane.path.is_none() {
@@ -1688,6 +1714,60 @@ mod tests {
         assert_eq!(format_pulse_size(12 * 1024 * gib), "12TB");
     }
 
+    /// 重命名后不重排：被改名的条目回到原位置，其余条目相对顺序不变。
+    #[test]
+    fn rename_pin_keeps_position_without_disturbing_others() {
+        let mut entries: Vec<crate::fs::entry::FileEntry> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| crate::fs::dir::test_entry(n, true, 0))
+            .collect();
+        // 模拟“按名称排序后 d 改名为 "aa"”：重排后 aa 会跑到最前。
+        let mut sorted: Vec<_> = entries.iter().map(|e| e.name.clone()).collect();
+        sorted.sort();
+        entries.sort_by(|x, y| x.name.cmp(&y.name));
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
+
+        // 改名为 "aa" 后再排序 → 位置变成 0。
+        let mut renamed = crate::fs::dir::test_entry("aa", true, 0);
+        renamed.path = std::path::Path::new("d").to_path_buf();
+        entries[3] = renamed;
+        entries.sort_by(|x, y| x.name.cmp(&y.name));
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "aa", "b", "c"]
+        );
+
+        // 钉回原显示位置 3：条目自己回到下标 3，其余顺序不变。
+        let moved = pin_entry_at(&mut entries, std::path::Path::new("d"), 3);
+        assert_eq!(moved, Some((1, 3)));
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b", "c", "aa"]
+        );
+    }
+
+    /// 越界的目标下标要夹到末尾，且找不到路径时不应改动列表。
+    #[test]
+    fn rename_pin_clamps_and_tolerates_missing_entry() {
+        let mut entries: Vec<crate::fs::entry::FileEntry> = ["a", "b"]
+            .iter()
+            .map(|n| crate::fs::dir::test_entry(n, false, 0))
+            .collect();
+        assert_eq!(pin_entry_at(&mut entries, std::path::Path::new("a"), 99), Some((0, 1)));
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+        assert_eq!(pin_entry_at(&mut entries, std::path::Path::new("zzz"), 0), None);
+        assert_eq!(
+            entries.iter().map(|e| e.name.as_str()).collect::<Vec<_>>(),
+            vec!["b", "a"]
+        );
+    }
+
     #[test]
     fn pulse_drive_palette_rotates_and_warns_on_full() {
         let drive = |used_gib: u64, total_gib: u64| DriveInfo {
@@ -1905,6 +1985,8 @@ impl App {
 
     /// 全局应用排序并持久化。同时刷新所有已打开的面板，确保多标签/分屏统一。
     fn apply_sort(&mut self, key: SortKey, ascending: bool) {
+        // 显式重排优先：丢掉重命名后临时钉住的位置。
+        self.rename_pin = None;
         self.config.sort_key = match key {
             SortKey::Name => "name",
             SortKey::Size => "size",
@@ -2962,6 +3044,22 @@ impl App {
         };
         self.ui.set_sidebar_active_id(active_id);
     }
+}
+
+/// 把 `path` 对应的条目移动到 `index`（重命名后保持原位置）。
+/// 其余条目的相对顺序完全不变。返回 `(原位置, 新位置)`；找不到该路径则返回 `None`。
+fn pin_entry_at(
+    entries: &mut Vec<crate::fs::entry::FileEntry>,
+    path: &Path,
+    index: usize,
+) -> Option<(usize, usize)> {
+    let from = entries.iter().position(|e| e.path == path)?;
+    let to = index.min(entries.len().saturating_sub(1));
+    if from != to {
+        let pinned = entries.remove(from);
+        entries.insert(to, pinned);
+    }
+    Some((from, to))
 }
 
 /// 计算某面板的虚拟窗口条目区间（行区间 × cells-per-row）。
@@ -4113,12 +4211,29 @@ impl App {
         }
         match std::fs::rename(path, &new_path) {
             Ok(()) => {
+                // 记下该条目当前的显示位置：新列表到达后把它钉回原位，
+                // 避免“改名即重排”造成行跳动（与资源管理器一致）。
+                let pin_index = {
+                    let pane = self.state.active().active();
+                    pane.display
+                        .iter()
+                        .position(|&ei| pane.entries.get(ei).is_some_and(|e| e.path == *path))
+                };
                 // 更新选择/暂存/剪切集合中的旧路径。
                 let tab = self.state.active_mut();
                 if tab.active_mut().selection.remove(path) {
                     tab.active_mut().selection.insert(new_path.clone());
                 }
                 self.state.cut_paths.remove(path);
+                if let Some(idx) = pin_index {
+                    logv!("[rename] pin new={:?} at display index {}", new_path, idx);
+                    self.rename_pin = Some((
+                        parent.to_path_buf(),
+                        new_path.clone(),
+                        idx,
+                        Instant::now() + Duration::from_secs(3),
+                    ));
+                }
                 self.reload_active();
             }
             Err(e) => self.set_status_job(format!("重命名失败：{e}")),
