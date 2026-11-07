@@ -501,6 +501,11 @@ pub struct App {
     scroll_to_paths: Vec<PathBuf>,
     /// 显现后是否把它们选中（粘贴/还原 = true；新建文件夹 = false）。
     scroll_select: bool,
+    /// 是否有原生 Shell 文件操作正在进行（复制/移动/删除）。
+    /// 这类操作会弹 Shell 自己的确认/进度对话框，期间必须拒绝文件类按键。
+    shell_op_running: bool,
+    /// 本轮操作里是否已经记过“按键被拦”的日志（避免长按回车刷屏）。
+    shell_key_suppressed_logged: bool,
     /// 待滚到可视区的条目索引（由 scroll_to_path 解析而来，在 refresh_visible_rows 里消费）。
     scroll_to_index: Option<usize>,
     /// 上次重建可见行时的列表几何 (list_height, cells_per_row, row_h, 图标视图)。
@@ -650,6 +655,8 @@ impl App {
             rename_pin: None,
             scroll_to_paths: Vec::new(),
             scroll_select: false,
+            shell_op_running: false,
+            shell_key_suppressed_logged: false,
             scroll_to_index: None,
             thumb_tx,
             list_tx,
@@ -4422,6 +4429,12 @@ impl App {
     fn delete_selection(&mut self, to_trash: bool) {
         let paths = self.state.active().active().selected_paths();
         if !paths.is_empty() {
+            // 低频、关键时刻：Shell 确认框会在此期间拦截打开/删除类按键。
+            logln!(
+                "[delete] submit n={} to_trash={}",
+                paths.len(),
+                to_trash
+            );
             self.submit_job(JobKind::Delete { paths, to_trash });
         }
     }
@@ -4937,6 +4950,8 @@ impl App {
     }
 
     fn submit_job(&mut self, kind: JobKind) {
+        self.shell_op_running = true;
+        self.shell_key_suppressed_logged = false;
         if !self.jobs.submit(kind) {
             self.set_status_job("有任务正在进行，请稍候");
         }
@@ -4948,6 +4963,7 @@ impl App {
 
     /// 任务完成后的处理：刷新受影响目录。
     fn on_job_finished(&mut self, summary: JobSummary) {
+        self.shell_op_running = false;
         self.set_status_job(summary.message.clone());
         let affected = &summary.affected_dirs;
         let mut requests = Vec::new();
@@ -5737,6 +5753,9 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     {
         let hwnd = get_window_hwnd(&app.borrow().ui);
         if let Some(hwnd) = hwnd {
+            // 登记主窗 HWND：后台 Shell 操作（复制/移动/删除）用它做对话框宿主，
+            // 否则确认框无主、我们的窗口不会被禁用，回车会同时落回 Rove。
+            crate::sys::shell::set_owner_hwnd(hwnd);
             if !drag_hittest::is_installed(hwnd) {
                 drag_hittest::install(hwnd);
                 sync_drag_bounds(&app.borrow());
@@ -6111,6 +6130,27 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         let Some(action) = app.keymap.resolve(&chord).map(|s| s.to_string()) else {
             return EventResult::Propagate;
         };
+
+        // 原生 Shell 文件操作进行中（删除/复制/移动会弹 Shell 自己的确认/进度框）。
+        // 实测：Shell 在后台线程调 SHFileOperationW，它的对话框只对自己的线程模态，
+        // 我们的主窗仍是 enabled —— 确认框里敲的回车会同时投递到 Rove。
+        // 所以这里把所有“会作用到可能已被删路径”的动作全部拦下（导航不受影响）。
+        if app.shell_op_running
+            && matches!(
+                action.as_str(),
+                "open" | "delete" | "delete_perm" | "rename" | "paste" | "copy" | "cut"
+            )
+        {
+            if !app.shell_key_suppressed_logged {
+                app.shell_key_suppressed_logged = true;
+                // 这是已知且预期的路径（Shell 对话框只对后台线程模态），故降为详细级。
+                logv!(
+                    "[keys] suppress action={} while shell file op running",
+                    action
+                );
+            }
+            return EventResult::PreventDefault;
+        }
 
         match action.as_str() {
             "preview" => app.toggle_preview(),

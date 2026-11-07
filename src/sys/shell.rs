@@ -6,11 +6,33 @@ mod imp {
     use std::path::{Path, PathBuf};
     use windows_sys::core::w;
     use windows_sys::Win32::Foundation::HWND;
+    use std::sync::atomic::{AtomicIsize, Ordering};
     use windows_sys::Win32::UI::Shell::{
         ShellExecuteExW, SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FO_COPY, FO_DELETE,
         FO_MOVE, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, SHFILEOPSTRUCTW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
+
+    /// 主窗口 HWND（UI 线程写入，后台 Shell 操作线程读取）。
+    /// 必须传给 SHFileOperationW：否则确认/进度对话框没有宿主窗口，
+    /// 我们主窗不会被禁用——对话框里的回车会同时落回 Rove，
+    /// 导致“永久删除后回车把删掉的文件夹打开”这类跨窗跳键。
+    static OWNER_HWND: AtomicIsize = AtomicIsize::new(0);
+
+    /// 登记主窗口 HWND（获取到后调用一次即可，也允许重复调用）。
+    pub fn set_owner_hwnd(hwnd: isize) {
+        if hwnd != 0 {
+            OWNER_HWND.store(hwnd, Ordering::Relaxed);
+        }
+    }
+
+    /// 取当前可用宿主窗口：优先传入值，否则用登记过的全局值。
+    fn owner_hwnd(hwnd: isize) -> HWND {
+        if hwnd != 0 {
+            return hwnd as HWND;
+        }
+        OWNER_HWND.load(Ordering::Relaxed) as HWND
+    }
 
     /// 将路径列表转换为 Windows Shell 要求的多字符串双空结尾 (double null-terminated) 宽字符流。
     fn to_double_null_wide(paths: &[PathBuf]) -> Vec<u16> {
@@ -36,7 +58,7 @@ mod imp {
             let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
             sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
             sei.fMask = SEE_MASK_INVOKEIDLIST;
-            sei.hwnd = hwnd as HWND;
+            sei.hwnd = owner_hwnd(hwnd);
             sei.lpVerb = w!("properties");
             sei.lpFile = wide.as_ptr();
             sei.nShow = SW_SHOW as i32;
@@ -67,7 +89,7 @@ mod imp {
         };
 
         let mut sh_op = SHFILEOPSTRUCTW {
-            hwnd: hwnd as HWND,
+            hwnd: owner_hwnd(hwnd),
             wFunc: op,
             pFrom: from_wide.as_ptr(),
             pTo: pto,
@@ -123,6 +145,7 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     pub fn show_properties(_paths: &[PathBuf], _hwnd: isize) {}
+    pub fn set_owner_hwnd(_hwnd: isize) {}
     pub fn shell_copy(
         _from: &[PathBuf],
         _dest_dir: &Path,
