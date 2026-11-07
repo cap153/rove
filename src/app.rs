@@ -1957,35 +1957,61 @@ impl App {
                 return;
             }
             // 驱动器段使用卷标（"Win11 (C:)"），其余为目录名。
+            //
+            // 网络路径必须特殊处理：`Path::components()` 把整个 UNC 前缀
+            // （\\服务器\共享）当成**一段**，直接用会把
+            // `\\192.168.1.5\Video` 粘成一个不可分的新户，
+            // 而服务器根与共享目录其实都是可浏览路径，必须拆成两段。
             let mut cumulative = PathBuf::new();
-            let components: Vec<String> = path
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect();
-            for (i, comp) in components.iter().enumerate() {
-                // 根目录分隔符已被驱动器段覆盖，跳过（避免单独的 "\" 段）。
-                if i > 0 && comp == "\\" {
-                    continue;
+            for comp in path.components() {
+                match comp {
+                    std::path::Component::Prefix(prefix) => match prefix.kind() {
+                        std::path::Prefix::UNC(server, share)
+                        | std::path::Prefix::VerbatimUNC(server, share) => {
+                            let server_root =
+                                PathBuf::from(format!("\\\\{}", server.to_string_lossy()));
+                            segments.push(BreadcrumbSegment {
+                                label: server.to_string_lossy().into_owned().into(),
+                                path: server_root.to_string_lossy().into_owned().into(),
+                            });
+                            cumulative = if share.is_empty() {
+                                server_root
+                            } else {
+                                let share_path = server_root.join(share);
+                                segments.push(BreadcrumbSegment {
+                                    label: share.to_string_lossy().into_owned().into(),
+                                    path: share_path.to_string_lossy().into_owned().into(),
+                                });
+                                share_path
+                            };
+                        }
+                        _ => {
+                            let text = comp.as_os_str().to_string_lossy().into_owned();
+                            // "C:" → 补上根
+                            cumulative = PathBuf::from(format!("{text}\\"));
+                            let label = self
+                                .drives
+                                .iter()
+                                .find(|d| cumulative.starts_with(format!("{}:", d.letter).as_str()))
+                                .map(|d| d.display_label())
+                                .unwrap_or_else(|| format!("{text}\\"));
+                            segments.push(BreadcrumbSegment {
+                                label: label.into(),
+                                path: cumulative.to_string_lossy().into_owned().into(),
+                            });
+                        }
+                    },
+                    // 根分隔符已由前缀段覆盖，不单独出段。
+                    std::path::Component::RootDir => {}
+                    std::path::Component::Normal(name) => {
+                        cumulative = cumulative.join(name);
+                        segments.push(BreadcrumbSegment {
+                            label: name.to_string_lossy().into_owned().into(),
+                            path: cumulative.to_string_lossy().into_owned().into(),
+                        });
+                    }
+                    _ => {}
                 }
-                if i == 0 {
-                    // "C:" → 补上根
-                    cumulative = PathBuf::from(format!("{comp}\\"));
-                } else {
-                    cumulative = cumulative.join(comp);
-                }
-                let label = if i == 0 {
-                    self.drives
-                        .iter()
-                        .find(|d| cumulative.starts_with(format!("{}:", d.letter).as_str()))
-                        .map(|d| d.display_label())
-                        .unwrap_or_else(|| format!("{comp}\\"))
-                } else {
-                    comp.clone()
-                };
-                segments.push(BreadcrumbSegment {
-                    label: label.into(),
-                    path: cumulative.to_string_lossy().into_owned().into(),
-                });
             }
         }
         self.ui.set_breadcrumbs(ModelRc::new(VecModel::from(segments)));
