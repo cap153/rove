@@ -101,8 +101,11 @@ export component FileList inherits Rectangle {
         }
     }
 
-    /// 列表可视高度（供 Rust 计算虚拟窗口行数）。
-    out property <length> view-height: root.height;
+    /// 列表可视高度（供 Rust 计算虚拟窗口行数与最大滚动量）。
+    /// 核心修复：必须用 Flickable 的真实视口高度，不能用 root.height。
+    /// 详细信息视图上方有 30px 表头（名称/修改时间/类型/大小），它不参与滚动，
+    /// 若把表头算进视口，Rust 的 max_scroll 会少 30px 导致“永远滚不到最底”。
+    out property <length> view-height: flick.height;
 
     /// 视图模式（Pulse 式）：details | list | icons-small | icons-medium | icons-large | icons-xl。
     in-out property <string> view-mode: "details";
@@ -1011,9 +1014,12 @@ export component FileList inherits Rectangle {
     // ---- 自绘垂直滚动条（现代浮动呼吸胶囊，绝不消失） ----
     scrollbar := Rectangle {
         x: parent.width - self.width - 2px;
-        y: 2px;
+        // 核心修复：轨道必须精确覆盖 Flickable 视口（即表头下沿到列表底部），
+        // 不能用整个 root 高度。否则轨道顶部伸进 30px 表头区，
+        // 滑块在顶部时压住表头、且滑块长度按多 30px 的轨道换算而偏长。
+        y: flick.y + 2px;
         width: 8px;
-        height: parent.height - 4px;
+        height: flick.height - 4px;
         visible: flick.content-height > flick.height + 1px;
 
         property <length> track-h: self.height;
