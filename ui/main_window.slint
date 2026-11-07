@@ -204,28 +204,82 @@ out property <length> row-height-out: file-list.row-height-out;
     // ---- 分屏（步骤 1：UI 搭建，核心逻辑待后续） ----
     in-out property <bool> is-split: false;
     in-out property <int> active-pane: 0;
-    in-out property <float> split-ratio: 0.5; // 左右分屏比例，0~1 之间
+    in-out property <float> split-ratio: 0.5; // 左右分屏**显示**比例（受限后）
+    // 分屏**期望**比例：用户拖出来的值（Rust 存 tab.split_ratio 并回推这个），
+    // 窗口变窄时只降级 split-ratio，窗口变宽后可自动回到 want。
+    in-out property <float> split-ratio-want: 0.5;
 
-    // 辅助函数：根据当前窗口总宽，重新核算并安全钳制侧边栏宽度
-    function clamp-sidebar-on-resize() {
-        let min_pane_w = 216px;
-        let right_min = root.is-split ? (min_pane_w * 2 + 8px) : min_pane_w;
-        let max_allowed_sidebar = max(70px, root.width - right_min);
-        if (root.sidebar-w > max_allowed_sidebar) {
-            root.sidebar-w = max_allowed_sidebar;
-            root.sidebar_width_changed(root.sidebar-w / 1px);
-        }
+    // 单栏最小宽度：容纳 1 列超大图标（196px）+ 内容边距，再留一点余量
+    pure function min-pane-width() -> length {
+        return 240px;
     }
 
-    // 核心修改 2：窗口尺寸变化（如从全屏贴靠到半屏）时，侧边栏自动退让，绝不挤压内容区
+    // 辅助函数：当前窗口下侧边栏可用宽度上限
+    // 单栏至少留 min-pane-width；双栏 min-pane-width*2 + 8px
+    pure function max-sidebar-width() -> length {
+        let right_min = root.is-split ? (root.min-pane-width() * 2 + 8px) : root.min-pane-width();
+        return max(70px, root.width - right_min);
+    }
+
+    // 核心修改 3：侧边栏宽度分“用户期望宽”与“实际显示宽”两层。
+    //
+    // 旧实现只有一个 sidebar-w，窗口变窄（最小化时 winit 甚至上报 0x0）
+    // 会把用户设定的宽度永久改写并落盘，还原后自然变窄。
+    // 现在：
+    //   sidebar-want = 用户拖拽设定的宽度，唯一被持久化的值；
+    //   sidebar-w     = min(want, 当前窗口允许的最大值)，只是显示层降级。
+    // 于是“窗口挤压”只是暂时受限，窗口恢复后自动长回 want。
+    // 注：这里不用属性绑定而是用 changed 处理器——绑定会让
+    // max-sidebar-width() 依赖 root.width，而 root.width 又受布局反哺，形成绑定环。
+    in-out property <length> sidebar-want: 236px;
+    in-out property <length> sidebar-w: 236px;
+
+    function sync-sidebar-width() {
+        root.sidebar-w = min(root.sidebar-want, root.max-sidebar-width());
+    }
+
+    // 分屏比例约束：任何一栏都不得窄于 min-pane-width（否则图标被裁切并出现横向滚动条）。
+    // 窗口变窄（最大化→还原、缩放、贴靠）时必须重新钳制：比例是在宽窗口下拖出来的，
+    // 直接沿用会让某一栏被压到几十像素。
+    // 只用 root.width / sidebar-w 推算，不读布局派生值（避免处理器内拿到上帧的几何）。
+    function clamp-split-ratio() {
+        if (!root.is-split) {
+            return;
+        }
+        let avail = root.width - root.sidebar-w - 8px;
+        if (avail < 1px) {
+            return;
+        }
+        let min_ratio = max(0.2, min(0.45, root.min-pane-width() / avail));
+        root.split-ratio = max(min_ratio, min(1.0 - min_ratio, root.split-ratio-want));
+    }
+
+    // 窗口宽度变化（最小化/还原/贴靠/缩放）：只降级显示，绝不动 want
     changed width => {
-        root.clamp-sidebar-on-resize();
+        root.sync-sidebar-width();
+        root.clamp-split-ratio();
+    }
+
+    // 用户拖拽了宽度：want 变化后同步显示（保持两栏最小值约束）
+    changed sidebar-want => {
+        root.sync-sidebar-width();
+    }
+
+    // 页面/标签切换时 Rust 会回推 want，这里重新受限
+    changed split-ratio-want => {
+        root.clamp-split-ratio();
+    }
+
+    // 侧栏显示宽变化（被窗口挤压或拖拽）后，可分配给两栏的空间也变了
+    changed sidebar-w => {
+        root.clamp-split-ratio();
     }
 
     // 切换分屏状态时执行约束重置
     changed is-split => {
         if (root.is-split) {
-            root.clamp-sidebar-on-resize();
+            root.sync-sidebar-width();
+            root.split-ratio-want = 0.5;
             root.split-ratio = 0.5;
         }
     }
@@ -261,6 +315,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback path_edit_committed(path: string);
     callback sidebar_header_drag(index: int, phase: int, y: length);
     callback sidebar_item_activated(id: string);
+    /// 仅在用户拖拽结束时上报（落盘用）；窗口尺寸变化导致的被动收缩不上报。
     callback sidebar_width_changed(float);
     callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length);
     callback file_row_double_clicked(index: int);
@@ -317,7 +372,6 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <bool> can-paste: false;
 
     // ---- 布局常量 ----
-    in-out property <length> sidebar-w: 236px;
     private property <length> topbar-h: 82px; // 标签栏 38 + 工具栏 44
     private property <length> statusbar-h: 28px;
 
@@ -999,16 +1053,18 @@ out property <length> row-height-out: file-list.row-height-out;
                                 if (self.pressed) {
                                     if (file-split.width > 1px) {
                                         let mx = splitter-ta.absolute-position.x + self.mouse-x - file-split.absolute-position.x;
-                                        let min_pane_w = 240px;
+                                        let min_pane_w = root.min-pane-width();
                                         let max_left_w = file-split.width - min_pane_w - 8px;
                                         let clamped_left_w = max(min_pane_w, min(max_left_w, mx));
-                                        root.split-ratio = clamped_left_w / file-split.width;
+                                        let want = clamped_left_w / file-split.width;
+                                        root.split-ratio-want = max(0.2, min(0.8, want));
+                                        root.clamp-split-ratio();
                                     }
                                 }
                             }
                             pointer-event(e) => {
                                 if (e.kind == PointerEventKind.up) {
-                                    root.split_ratio_changed(root.split-ratio);
+                                    root.split_ratio_changed(root.split-ratio-want);
                                 }
                             }
                         }
@@ -1193,22 +1249,14 @@ out property <length> row-height-out: file-list.row-height-out;
                     moved => {
                         if (self.pressed) {
                             let new_w = self.absolute-position.x + self.mouse-x;
-                            // 核心设定：单栏最小 216px（容纳 1 列超大图标 196px + 边距）；双栏最小 216*2 + 8 = 440px
-                            let min_pane_w = 216px;
-                            let right_min = root.is-split ? (min_pane_w * 2 + 8px) : min_pane_w;
-                            let max_w = max(70px, root.width - right_min);
-                            let clamped_w = max(70px, min(max_w, new_w));
-                            root.sidebar-w = clamped_w;
-                            if (root.is-split) {
-                                let remaining_w = max(1px, root.width - root.sidebar-w - 8px);
-                                let min_ratio = min_pane_w / remaining_w;
-                                let clamped_ratio = max(min_ratio, min(1.0 - min_ratio, root.split-ratio));
-                                if (clamped_ratio != root.split-ratio) { root.split-ratio = clamped_ratio; }
-                            }
+                            // 单栏最小 70px；上限由当前窗口宽度决定（双栏另算）
+                            let clamped_w = max(70px, min(root.max-sidebar-width(), new_w));
+                            root.sidebar-want = clamped_w;
+                            root.clamp-split-ratio();
                         }
                     }
                     pointer-event(e) => {
-                        if (e.kind == PointerEventKind.up) { root.sidebar_width_changed(root.sidebar-w / 1px); }
+                        if (e.kind == PointerEventKind.up) { root.sidebar_width_changed(root.sidebar-want / 1px); }
                     }
                 }
             }

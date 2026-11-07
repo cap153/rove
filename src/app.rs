@@ -3003,7 +3003,7 @@ impl App {
         self.sync_status();
         self.sync_split_state();
         let ratio = self.state.active().split_ratio;
-        self.ui.set_split_ratio(ratio);
+        self.ui.set_split_ratio_want(ratio);
 
         // 核心修复：先推送正确的滚动条位置，再刷新列表数据。
         // 否则 Slint 在内容高度重置时先 Clamp（污染），再被我们覆盖。
@@ -3072,7 +3072,7 @@ impl App {
         let ratio = self.state.active().split_ratio;
         self.visible_cache = None;
         self.sync_split_state();
-        self.ui.set_split_ratio(ratio);
+        self.ui.set_split_ratio_want(ratio);
         self.sync_nav();
         self.sync_breadcrumbs();
         self.sync_status();
@@ -7355,12 +7355,25 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
 
-    // 侧边栏宽度拖拽落盘。
+    // 侧边栏宽度拖拽落盘（只由用户拖拽触发；窗口挤压导致的收缩不落盘）。
     {
         let app = Rc::downgrade(app);
         upgrade().on_sidebar_width_changed(move |w| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
+            // 防御：窗口最小化时上报的宽度可能是 0/异常小值，不写配置。
+            if !(70.0..=1200.0).contains(&w) {
+                logln!("[sidebar] !! ignore width {} (out of range)", w);
+                return;
+            }
+            if (app.config.sidebar_width - w).abs() < 0.5 {
+                return;
+            }
+            logv!(
+                "[sidebar] persist width {} -> {}",
+                app.config.sidebar_width,
+                w
+            );
             app.config.sidebar_width = w;
             app.config.save();
             // 核心修复：侧栏宽度改变后必须让可见行缓存失效，重新计算列数排版！
@@ -8055,7 +8068,8 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         ui.window().set_size(WindowSize::Logical(LogicalSize::new(w, h)));
     }
     ui.set_staging_expanded(config.staging_expanded);
-    ui.set_sidebar_w(config.sidebar_width as f32);
+    logln!("[sidebar] want={}px (persisted)", config.sidebar_width);
+    ui.set_sidebar_want(config.sidebar_width as f32);
     ui.set_view_mode(config.view_mode.clone().into());
 
     // 目录列举通道 + 工作线程（会话私有，销毁时工作线程随之退出）。

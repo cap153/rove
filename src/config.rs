@@ -48,6 +48,8 @@ pub struct Config {
     pub search_max_results: usize,
     /// 是否首次启动（用于触发 SSD 检测与初始自动化配置）。
     pub is_first_run: bool,
+    /// 是否已完成侧边栏宽度的历史数据修复（旧版 bug 会把被动挤压后的宽度落盘）。
+    pub sidebar_width_repaired: bool,
 }
 
 /// 侧栏分区的默认顺序。
@@ -82,6 +84,7 @@ impl Default for Config {
             search_idle_rescan_minutes: 60,
             search_max_results: 1000,
             is_first_run: true,
+            sidebar_width_repaired: false,
         }
     }
 }
@@ -213,6 +216,18 @@ impl Config {
         if let Some(b) = json.get("is_first_run").and_then(|v| v.as_bool()) {
             config.is_first_run = b;
         }
+        config.sidebar_width_repaired = json
+            .get("sidebar_width_repaired")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        // 一次性修复：旧版在窗口最小化/变窄时会把被挤压的宽度写进配置，
+        // 导致用户“自定义宽度被永久吃掉”。宽于 120px 才算用户可接受的正常值。
+        if !config.sidebar_width_repaired && config.sidebar_width < 120.0 {
+            config.sidebar_width = Self::default().sidebar_width;
+            let mut fixed = config.clone();
+            fixed.sidebar_width_repaired = true;
+            fixed.save();
+        }
         config
     }
 
@@ -248,6 +263,7 @@ impl Config {
             "search_idle_rescan_minutes": self.search_idle_rescan_minutes,
             "search_max_results": self.search_max_results,
             "is_first_run": self.is_first_run,
+            "sidebar_width_repaired": self.sidebar_width_repaired,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);
