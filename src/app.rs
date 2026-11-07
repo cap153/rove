@@ -496,6 +496,13 @@ pub struct App {
     /// 只有用户显式重排 / 换目录 / 窗口过期（3 秒）后才归位。
     /// (目录, 条目新路径, 原显示位置, 失效时刻)
     rename_pin: Option<(PathBuf, PathBuf, usize, Instant)>,
+    /// 待滚到可视区的条目路径（新建文件夹 / 粘贴完成后）。
+    /// 列举是异步的，所以先存路径，数据就位后再换算成显示索引。
+    scroll_to_paths: Vec<PathBuf>,
+    /// 显现后是否把它们选中（粘贴/还原 = true；新建文件夹 = false）。
+    scroll_select: bool,
+    /// 待滚到可视区的条目索引（由 scroll_to_path 解析而来，在 refresh_visible_rows 里消费）。
+    scroll_to_index: Option<usize>,
     /// 上次重建可见行时的列表几何 (list_height, cells_per_row, row_h, 图标视图)。
     /// 启动首帧布局未完成时这几个值还不可用（list_height=0 / cells_per_row=1），
     /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
@@ -641,6 +648,9 @@ impl App {
             pending_scroll_index: None,
             rename_scroll_guard: None,
             rename_pin: None,
+            scroll_to_paths: Vec::new(),
+            scroll_select: false,
+            scroll_to_index: None,
             thumb_tx,
             list_tx,
             list_rx,
@@ -859,6 +869,30 @@ impl App {
             }
             pane.loading = false;
             pane.rebuild_display();
+            // 新建文件夹 / 粘贴完成：数据就位后把新条目换算成显示索引，交给
+            // refresh_visible_rows 做“最小位移滚进可视区”（否则它们按排序沉到底部，看不到）。
+            // 多条时取最靠前的一条，保证粘贴块的起始处可见。
+            if !self.scroll_to_paths.is_empty() && result.pane == tab.active_pane {
+                let mut matched: Vec<(usize, PathBuf)> = Vec::new();
+                for (pos, &ei) in pane.display.iter().enumerate() {
+                    if let Some(e) = pane.entries.get(ei) {
+                        if self.scroll_to_paths.iter().any(|p| *p == e.path) {
+                            matched.push((pos, e.path.clone()));
+                        }
+                    }
+                }
+                if let Some((pos, first)) = matched.first() {
+                    self.scroll_to_index = Some(*pos);
+                    // 粘贴/还原后选中它们（资源管理器同款）；新建文件夹不选（正在重命名）。
+                    if self.scroll_select {
+                        pane.anchor = Some(first.clone());
+                        pane.selection = matched.iter().map(|(_, p)| p.clone()).collect();
+                        self.visible_cache = None;
+                    }
+                    self.scroll_to_paths.clear();
+                    self.scroll_select = false;
+                }
+            }
         }
         let listed_path = tab.panes[result.pane].path.clone();
 
@@ -2628,6 +2662,43 @@ impl App {
             }
         }
 
+        // 新建文件夹后把对应条目滚进可视区（最小位移：已在视口内则不动）。
+        // 必须在下面计算 first0/count0 之前做，否则新行不在本帧渲染窗口里。
+        if let Some(index) = self.scroll_to_index.take() {
+            let row = index / cells_per_row;
+            let item_top = row as f32 * row_h;
+            let item_bottom = item_top + row_h;
+            let pane_idx = {
+                let tab = self.state.active();
+                tab.active_pane.min(tab.panes.len().saturating_sub(1))
+            };
+            let current = self.state.active().panes[pane_idx].scroll_y.max(0.0);
+            let target = if item_top < current {
+                item_top
+            } else if item_bottom > current + list_height {
+                item_bottom - list_height
+            } else {
+                current
+            };
+            if (target - current).abs() > 0.5 {
+                self.state.active_mut().panes[pane_idx].scroll_y = target;
+                push_scroll(&self.ui, pane_idx, target);
+                // 这次改位置是我们自己的意图：把重命名“假滚动锁”的预期值同步到新位置，
+                // 否则紧接着的回显会被当成 spurious 又推回旧位置（新建文件夹仍看不到）。
+                if let Some((k0, k1, until)) = self.rename_scroll_guard {
+                    self.rename_scroll_guard = Some(if pane_idx == 0 {
+                        (target, k1, until)
+                    } else {
+                        (k0, target, until)
+                    });
+                }
+                crate::logv!(
+                    "[scroll] reveal index={} row={} {:.1} -> {:.1} (view_h={})",
+                    index, row, current, target, list_height
+                );
+            }
+        }
+
         // 防御性兜底：把每个面板的 scroll_y 夹到内容真实范围。
         //
         // Slint 的 Flickable 在 content-height 变小时不会主动重新 clamp 真实的
@@ -4240,6 +4311,17 @@ impl App {
         }
     }
 
+    /// 预测复制/移动完成后在目标目录里出现的新路径，让列表把它们滚进可视区。
+    /// Shell 的同名冲突可能改名，预测不准时列举结果里找不到 → 不会滚动，不会误滚。
+    fn expect_new_entries(&mut self, sources: &[PathBuf], dest_dir: &Path) {
+        self.scroll_to_paths = sources
+            .iter()
+            .filter_map(|s| s.file_name().map(|n| dest_dir.join(n)))
+            .collect();
+        // 粘贴/移动/还原完成后选中新条目（与资源管理器一致）。
+        self.scroll_select = !self.scroll_to_paths.is_empty();
+    }
+
     /// 暂存盘内容复制/移动到当前目录。
     fn staging_transfer(&mut self, is_move: bool) {
         let entries = self.state.staging_present();
@@ -4253,6 +4335,7 @@ impl App {
             return;
         };
         let sources: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+        self.expect_new_entries(&sources, &dest);
         let kind = if is_move {
             JobKind::Move {
                 sources,
@@ -4776,12 +4859,15 @@ impl App {
                 .collect();
 
             if !to_move.is_empty() {
+                self.expect_new_entries(&to_move, &dest);
                 self.submit_job(JobKind::Move {
                     sources: to_move,
                     dest_dir: dest,
                 });
             } else {
                 self.set_status_job(format!("已从回收站还原 {} 个项目到当前目录", paths.len()));
+                self.scroll_to_paths = paths.clone();
+                self.scroll_select = true;
                 self.reload_active();
             }
             self.sidebar_fingerprint = 0;
@@ -4801,6 +4887,7 @@ impl App {
         let is_move = files.operation == "move" || self.state.clipboard_operation == "move";
         self.state.clipboard_paths = paths.clone();
         self.state.clipboard_operation = if is_move { "move".into() } else { "copy".into() };
+        self.expect_new_entries(&paths, &dest);
         let kind = if is_move {
             JobKind::Move {
                 sources: paths,
@@ -4836,6 +4923,10 @@ impl App {
                 self.ui.invoke_set_drag_armed(false);
 
                 logv!("[rename] create_folder -> {:?}", path);
+                // 新条目会按当前排序插到任意位置（名称排序 + 全英文目录 → 沉到底部），
+                // 所以要告诉列表：数据就位后把这条滚进可视区，否则用户得自己找。
+                self.scroll_to_paths = vec![path.clone()];
+                self.scroll_select = false;
                 self.reload_active();
                 self.ui
                     .set_rename_path(path.to_string_lossy().into_owned().into());
@@ -5300,6 +5391,8 @@ impl App {
         } else {
             same_volume(&paths[0], &target_dir)
         };
+        // 预测粘贴后的新路径，供列举就位后滚进可视区（预测不准也不会误滚）。
+        self.expect_new_entries(&paths, &target_dir);
         let kind = if is_move {
             JobKind::Move { sources: paths, dest_dir: target_dir }
         } else {
