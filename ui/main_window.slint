@@ -3,7 +3,6 @@ import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
 import { StagingTray } from "staging_tray.slint";
-import { ContextMenu, SubMenuPopover, MenuItem } from "context_menu.slint";
 import { SettingsPage } from "settings_page.slint";
 import { ActionEditorDialog } from "action_editor.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
@@ -307,20 +306,6 @@ out property <length> row-height-out: file-list.row-height-out;
         }
     }
 
-    // ---- 右键菜单状态 ----
-    in-out property <[MenuItem]> menu-items: [];
-    in-out property <length> menu-items-height: 0px;
-    in-out property <[MenuItem]> submenu-items: [];
-    in-out property <length> submenu-items-height: 0px;
-    in-out property <bool> menu-open: false;
-    property <length> click-x;
-    property <length> click-y;
-    // 主菜单最终位置(窗口坐标,四向钳制到内容区),供二级菜单对齐引用。
-    property <length> menu-x: max(sidebar-w + 8px, min(sidebar-w + click-x, root.width - 232px));
-    property <length> menu-y: max(topbar-h + 8px, min(topbar-h + click-y, root.height - menu-items-height - 8px));
-    // 悬停的子菜单项相对主菜单顶部的 y(Rust 按行高累计),二级菜单顶部对齐该项。
-    in-out property <length> submenu-row-y: 0px;
-
     // ---- 回调（Rust 处理） ----
     callback new_tab_requested();
     callback tab_activated(id: int);
@@ -372,8 +357,6 @@ out property <length> row-height-out: file-list.row-height-out;
     callback staging_clear_requested();
     callback staging_copy_here_requested();
     callback staging_move_here_requested();
-    callback menu_item_triggered(id: string);
-    callback menu_submenu_hovered(index: int, entered: bool);
     callback filter_edited(text: string);
     callback new_folder_requested();
     callback refresh_requested();
@@ -1425,57 +1408,6 @@ out property <length> row-height-out: file-list.row-height-out;
         }
     }
 
-    // ---- 右键菜单（含遮罩：点击空白处关闭） ----
-    if (root.menu-open) : Rectangle {
-        x: 0px;
-        y: 0px;
-        width: 100%;
-        height: 100%;
-        z: 90;
-        background: transparent;
-
-        TouchArea {
-            width: 100%;
-            height: 100%;
-            pointer-event(event) => {
-                if (event.kind == PointerEventKind.down) {
-                    root.close-menu();
-                    return EventResult.accept;
-                }
-                return EventResult.reject;
-            }
-        }
-    }
-
-    ContextMenu {
-        x: root.menu-x;
-        y: root.menu-y;
-        visible: root.menu-open;
-        items: root.menu-items;
-        items-height: root.menu-items-height;
-        item_triggered(id) => {
-            root.menu_item_triggered(id);
-        }
-        submenu_hovered(index, entered) => {
-            root.menu_submenu_hovered(index, entered);
-        }
-    }
-
-    SubMenuPopover {
-        // 优先展开在主菜单右侧;窗口右缘放不下时翻转到主菜单左侧。
-        x: (root.menu-x + 224px + self.width > root.width - 8px)
-            ? max(root.sidebar-w + 8px, root.menu-x - self.width - 4px)
-            : (root.menu-x + 224px);
-        // 顶部与主菜单中悬停的项对齐,越界时钳回窗口内。
-        y: max(8px, min(root.menu-y + root.submenu-row-y, root.height - self.height - 8px));
-        visible: root.menu-open && root.submenu-items.length > 0;
-        items: root.submenu-items;
-        items-height: root.submenu-items-height;
-        item_triggered(id) => {
-            root.menu_item_triggered(id);
-        }
-    }
-
     // 动作编辑器弹窗（新增 / 编辑自定义右键菜单）。
     ActionEditorDialog {
         visible: root.settings-editor-open;
@@ -1505,30 +1437,6 @@ out property <length> row-height-out: file-list.row-height-out;
         cancel => {
             root.settings_editor_cancel();
         }
-    }
-
-    // 供 Rust 调用的公开函数。
-    public function close-menu() {
-        root.menu-open = false;
-        root.menu-items = [];
-        root.submenu-items = [];
-        root.click-x = 0px;
-        root.click-y = 0px;
-    }
-
-    // 打开右键菜单：记录窗口坐标，Rust 随后填充模型。
-    public function open-menu(x: length, y: length) {
-        root.click-x = x;
-        root.click-y = y;
-        root.menu-open = true;
-    }
-
-    // 供 Rust 调用的公开函数：绝对坐标弹出菜单（用于工具栏下拉，消除侧栏与工具栏的叠加偏移）。
-    // x/y 为窗口绝对坐标，内部换算为内容区坐标（减去侧栏与顶栏），与 open-menu 同一体系。
-    public function open-menu-absolute(x: length, y: length) {
-        root.click-x = x - root.sidebar-w;
-        root.click-y = y - root.topbar-h;
-        root.menu-open = true;
     }
 
 }

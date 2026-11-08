@@ -19,23 +19,12 @@ use std::path::{Path, PathBuf};
 
 use crate::logln;
 
-/// 压缩软件探测结果。
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub struct DetectedTool {
-    pub id: &'static str,
-    pub label: &'static str,
-    pub exe: PathBuf,
-    /// 该工具默认生成的压缩包扩展名。
-    pub archive_ext: &'static str,
-}
-
 /// 一条右键动作（兼容用户手写 schema：program/working_dir/target/extensions）。
 #[derive(Clone, Debug)]
 pub struct ActionEntry {
     pub id: String,
     pub label: String,
-    /// 归属压缩工具 id（自愈时用于重新探测；可为空 = 自定义）。
+    /// 归属工具 id（历史字段：旧版自动生成的压缩动作曾用它重新探测；现已不再生成）。
     pub tool: String,
     /// 可执行文件（兼容旧字段名 command）。
     pub program: String,
@@ -47,7 +36,7 @@ pub struct ActionEntry {
     /// 适用扩展名（仅 target = file 时生效；空 = 全部）。
     pub extensions: Vec<String>,
     pub enabled: bool,
-    /// 二级菜单分组名（空 = 一级独立菜单项）。
+    /// 二级菜单分组名（空 = 一级菜单或系统菜单）。
     pub group: String,
     /// 是否系统内置（true = 只许开关，不许改命令/删除）。
     pub builtin: bool,
@@ -79,7 +68,8 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             target: "any".into(),
             extensions: vec![],
             enabled: true,
-            group: "打开方式".into(),
+            // 一级菜单项：真正的子菜单由系统提供（设置页也就不能单独成组）。
+            group: "".into(),
             builtin: true,
         },
         ActionEntry {
@@ -97,7 +87,7 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
         },
         ActionEntry {
             id: "builtin.move".into(),
-            label: "移动".into(),
+            label: "剪切".into(),
             tool: "".into(),
             program: "".into(),
             args: "".into(),
@@ -144,7 +134,8 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             target: "any".into(),
             extensions: vec![],
             enabled: true,
-            group: "发送到".into(),
+            // 同上：发送到也是系统提供的子菜单，这里只留开关。
+            group: "".into(),
             builtin: true,
         },
         ActionEntry {
@@ -220,110 +211,22 @@ pub fn config_path() -> Option<PathBuf> {
     Some(appdata.join("Rove").join("actions.toml"))
 }
 
-/// 判断选中路径是否为受支持的压缩包（保留：供未来压缩包检测增强）。
-#[allow(dead_code)]
-pub fn is_archive_file(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    matches!(
-        ext.as_str(),
-        "zip" | "rar" | "7z" | "tar" | "gz" | "bz2" | "xz" | "cab" | "iso" | "jar"
-    )
-}
-
-// ---------------------------------------------------------------------------
-// 探测
-// ---------------------------------------------------------------------------
-
-/// 探测全部支持的压缩软件（按优先级：WinRAR > 7-Zip > Bandizip）。
-pub fn detect_all() -> Vec<DetectedTool> {
-    let mut out = Vec::new();
-    if let Some(exe) = detect_winrar() {
-        out.push(DetectedTool { id: "winrar", label: "WinRAR", exe, archive_ext: "rar" });
-    }
-    if let Some(exe) = detect_7zip() {
-        out.push(DetectedTool { id: "7zip", label: "7-Zip", exe, archive_ext: "7z" });
-    }
-    if let Some(exe) = detect_bandizip() {
-        out.push(DetectedTool { id: "bandizip", label: "Bandizip", exe, archive_ext: "zip" });
-    }
-    out
-}
-
-/// 按工具 id 探测单个软件（自愈时使用）。
-pub fn detect_by_id(id: &str) -> Option<PathBuf> {
-    match id {
-        "winrar" => detect_winrar(),
-        "7zip" => detect_7zip(),
-        "bandizip" => detect_bandizip(),
-        _ => None,
-    }
-}
-
-fn detect_winrar() -> Option<PathBuf> {
-    #[cfg(windows)]
-    if let Some(p) = win::reg_app_paths("WinRAR.exe") {
-        return Some(p);
-    }
-    program_files_candidates("WinRAR\\WinRAR.exe")
-        .into_iter()
-        .find(|p| p.is_file())
-}
-
-fn detect_7zip() -> Option<PathBuf> {
-    #[cfg(windows)]
-    if let Some(dir) = win::reg_value_hklm("SOFTWARE\\7-Zip", "Path") {
-        let p = PathBuf::from(&dir).join("7z.exe");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    program_files_candidates("7-Zip\\7z.exe")
-        .into_iter()
-        .find(|p| p.is_file())
-}
-
-fn detect_bandizip() -> Option<PathBuf> {
-    #[cfg(windows)]
-    if let Some(dir) = win::reg_value_hklm("SOFTWARE\\Bandizip", "Path") {
-        let p = PathBuf::from(&dir).join("bz.exe");
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    program_files_candidates("Bandizip\\bz.exe")
-        .into_iter()
-        .find(|p| p.is_file())
-}
-
-fn program_files_candidates(rel: &str) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(base) = std::env::var_os(var) {
-            out.push(PathBuf::from(base).join(rel));
-        }
-    }
-    out
-}
-
 // ---------------------------------------------------------------------------
 // 配置生成与自愈
 // ---------------------------------------------------------------------------
 
-/// 首次运行的默认配置：内置动作 + 探测到的压缩软件动作。
-fn generate_default(detected: &[DetectedTool]) -> String {
+/// 首次运行的默认配置：内置动作（只含开关）+ 字段说明。
+fn generate_default() -> String {
     let mut s = String::from(
         "# Rove 右键自定义动作配置\n\
          #\n\
          # 本文件由 Rove 在每次启动时自动维护：\n\
-         #   - 压缩软件路径变化 → 自动更新 program；\n\
-         #   - 软件被卸载       → 对应条目标记 enabled = false；\n\
+         #   - 新增/重命名内置动作 → 自动补全对应开关；\n\
+         #   - 命令行程序不存在   → 对应条目标记 enabled = false；\n\
          #   - 手动添加的注释与排版会被保留。\n\
          #\n\
-         # 字段：kind = \"action\"；target = any | file | dir；\n\
-         # group = 二级菜单分组名（空 = 一级独立项）；\n\
+         # 字段：target = any | file | dir；\n\
+         # group = 二级菜单分组名（空 = 一级菜单或系统菜单）；\n\
          # builtin = true 表示系统内置（仅允许开关）；\n\
          # extensions = 适用扩展名（仅 target = file）；\n\
          # 参数模板占位符：\n\
@@ -333,62 +236,8 @@ fn generate_default(detected: &[DetectedTool]) -> String {
          #   {name}         第一个选中项的文件名\n\
          #   {stem}         第一个选中项的文件名（不含扩展名）\n\n",
     );
-    // 内置动作（仅允许开关，不显示命令）。
     for a in builtin_actions() {
         s.push_str(&action_to_toml(&a));
-    }
-    // 压缩软件动作。
-    for tool in detected {
-        let (label, compress_args, extract_args) = match tool.id {
-            "winrar" => (
-                "WinRAR",
-                "a -r -ep1 \"{target_dir}\\{stem}.rar\" \"{target_path}\"",
-                "x -r \"{target_path}\" \"{target_dir}\\{stem}\"",
-            ),
-            "7zip" => (
-                "7-Zip",
-                "a -r \"{target_dir}\\{stem}.7z\" \"{target_path}\"",
-                "x -r \"{target_path}\" -o{target_dir}\\{stem} -y",
-            ),
-            _ => (
-                "Bandizip",
-                "c -t:zip \"{target_dir}\\{stem}.zip\" \"{target_path}\"",
-                "bx -y -o:{target_dir}\\{stem} \"{target_path}\"",
-            ),
-        };
-        let exe = tool.exe.to_string_lossy().into_owned();
-        let compress = ActionEntry {
-            id: format!("archive.{id}.compress", id = tool.id),
-            label: format!("压缩为 {label}"),
-            tool: tool.id.into(),
-            program: exe.clone(),
-            args: compress_args.into(),
-            working_dir: "{target_dir}".into(),
-            target: "any".into(),
-            extensions: vec![],
-            enabled: true,
-            group: "压缩与解压".into(),
-            builtin: true,
-        };
-        let extract = ActionEntry {
-            id: format!("archive.{id}.extract", id = tool.id),
-            label: "解压到同名文件夹".into(),
-            tool: tool.id.into(),
-            program: exe,
-            args: extract_args.into(),
-            working_dir: "{target_dir}".into(),
-            target: "file".into(),
-            extensions: vec![
-                "zip".into(), "7z".into(), "rar".into(), "tar".into(), "gz".into(),
-                "tgz".into(), "bz2".into(), "xz".into(), "zst".into(), "cab".into(),
-                "iso".into(),
-            ],
-            enabled: true,
-            group: "压缩与解压".into(),
-            builtin: true,
-        };
-        s.push_str(&action_to_toml(&compress));
-        s.push_str(&action_to_toml(&extract));
     }
     s
 }
@@ -434,13 +283,12 @@ pub fn load_or_create() -> Vec<ActionEntry> {
         let _ = std::fs::create_dir_all(dir);
     }
     if !path.exists() {
-        let detected = detect_all();
-        let text = generate_default(&detected);
+        let text = generate_default();
         if std::fs::write(&path, &text).is_err() {
             logln!("actions.toml write failed");
             return Vec::new();
         }
-        logln!("actions.toml created with {} tools", detected.len());
+        logln!("actions.toml created");
     }
     heal_and_load(&path)
 }
@@ -501,42 +349,18 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
             .and_then(|v| v.as_bool())
             .unwrap_or(true);
 
-        // 自愈：压缩类动作（tool 非空）按 tool 重新探测。
-        if !tool.is_empty() {
-            // program 仍有效 → 尊重用户自定义安装位置，不改动。
-            let program_valid = !program.is_empty() && Path::new(&program).is_file();
-            if !program_valid {
-                match detect_by_id(&tool) {
-                    Some(exe) => {
-                        let current = exe.to_string_lossy().into_owned();
-                        if current != program {
-                            logln!("heal {}: {} -> {}", id, program, current);
-                            set_str_field(table, "program", &current);
-                            set_str_field(table, "command", &current);
-                        }
-                    }
-                    None => {
-                        if enabled {
-                            logln!("heal {}: tool missing, disable", id);
-                            enabled = false;
-                            table["enabled"] = toml_edit::value(false);
-                        }
-                    }
-                }
-            }
-        } else {
-            // 内置动作由 Rust 内部实现（无外部程序），不做程序存在性校验，
-            // 否则会被误判为「命令缺失」而整批禁用。
-            let builtin = table.get("builtin").and_then(|v| v.as_bool()).unwrap_or(false);
-            if !builtin && !program.is_empty() {
-                // 自定义动作：仅当填写的是绝对路径且已失效时才禁用；
-                // 裸程序名（如 notepad.exe）运行时按 PATH 解析，不予禁用。
-                let is_path = program.contains('\\') || program.contains('/');
-                if is_path && !Path::new(&program).is_file() && enabled {
-                    logln!("heal {}: command missing, disable", id);
-                    enabled = false;
-                    table["enabled"] = toml_edit::value(false);
-                }
+        // 内置动作由 Rust 内部实现（无外部程序），不做程序存在性校验，
+        // 否则会被误判为「命令缺失」而整批禁用。
+        // 历史配置里遗留的压缩类条目（tool 非空）不再进菜单，由 `heal_full` 丢弃。
+        let builtin = table.get("builtin").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !builtin && tool.is_empty() && !program.is_empty() {
+            // 自定义动作：仅当填写的是绝对路径且已失效时才禁用；
+            // 裸程序名（如 notepad.exe）运行时按 PATH 解析，不予禁用。
+            let is_path = program.contains('\\') || program.contains('/');
+            if is_path && !Path::new(&program).is_file() && enabled {
+                logln!("heal {}: command missing, disable", id);
+                enabled = false;
+                table["enabled"] = toml_edit::value(false);
             }
         }
 
@@ -645,93 +469,13 @@ pub fn heal_full(entries: &[ActionEntry]) -> Vec<ActionEntry> {
         out.push(e);
     }
 
-    // 2) 压缩软件动作：按当前探测结果自愈。
-    let detected = detect_all();
-    for tool in detected {
-        let ids = [
-            format!("archive.{id}.compress", id = tool.id),
-            format!("archive.{id}.extract", id = tool.id),
-        ];
-        for (i, id) in ids.iter().enumerate() {
-            if let Some(user) = by_id.remove(id) {
-                let mut e = user;
-                // program 失效时更新为当前探测路径；enabled 尊重用户开关。
-                let exe = tool.exe.to_string_lossy().into_owned();
-                if e.program.is_empty() || !Path::new(&e.program).is_file() {
-                    e.program = exe.clone();
-                }
-                // 旧版配置无 group 字段：归一化到「压缩与解压」，
-                // 否则设置页里会与一级独立项混在一组。
-                if e.group.is_empty() {
-                    e.group = "压缩与解压".into();
-                }
-                out.push(e);
-            } else {
-                // 新增探测到的压缩动作。
-                let (label, compress_args, extract_args) = match tool.id {
-                    "winrar" => (
-                        "WinRAR",
-                        "a -r -ep1 \"{target_dir}\\{stem}.rar\" \"{target_path}\"",
-                        "x -r \"{target_path}\" \"{target_dir}\\{stem}\"",
-                    ),
-                    "7zip" => (
-                        "7-Zip",
-                        "a -r \"{target_dir}\\{stem}.7z\" \"{target_path}\"",
-                        "x -r \"{target_path}\" -o{target_dir}\\{stem} -y",
-                    ),
-                    _ => (
-                        "Bandizip",
-                        "c -t:zip \"{target_dir}\\{stem}.zip\" \"{target_path}\"",
-                        "bx -y -o:{target_dir}\\{stem} \"{target_path}\"",
-                    ),
-                };
-                out.push(ActionEntry {
-                    id: id.clone(),
-                    label: if i == 0 {
-                        format!("压缩为 {label}")
-                    } else {
-                        "解压到同名文件夹".into()
-                    },
-                    tool: tool.id.into(),
-                    program: tool.exe.to_string_lossy().into_owned(),
-                    args: if i == 0 {
-                        compress_args.into()
-                    } else {
-                        extract_args.into()
-                    },
-                    working_dir: "{target_dir}".into(),
-                    target: if i == 0 { "any".into() } else { "file".into() },
-                    extensions: if i == 0 {
-                        vec![]
-                    } else {
-                        vec![
-                            "zip".into(), "7z".into(), "rar".into(), "tar".into(), "gz".into(),
-                            "tgz".into(), "bz2".into(), "xz".into(), "zst".into(), "cab".into(),
-                            "iso".into(),
-                        ]
-                    },
-                    enabled: true,
-                    group: "压缩与解压".into(),
-                    builtin: true,
-                });
-            }
-        }
-    }
-
-    // 3) 剩余条目：用户自定义动作（非 builtin、非压缩），保留原顺序。
+    // 2) 剩余条目：用户自定义动作，保留原顺序。
     for e in entries {
         if !e.builtin && e.tool.is_empty() && by_id.contains_key(&e.id) {
             out.push(e.clone());
         }
     }
     out
-}
-
-/// 写字符串字段（兼容 program/command 双字段名）。
-fn set_str_field(table: &mut toml_edit::Table, key: &str, value: &str) {
-    if table.get(key).is_some() {
-        table[key] = toml_edit::value(value);
-    }
 }
 
 fn str_field(table: &toml_edit::Table, key: &str) -> Option<String> {
@@ -741,30 +485,6 @@ fn str_field(table: &toml_edit::Table, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 // 执行
 // ---------------------------------------------------------------------------
-
-/// 为压缩动作生成压缩包路径（{archive} 占位符，保留：供 {archive} 模板用户）。
-#[allow(dead_code)]
-pub fn make_archive_path(tool: &str, targets: &[PathBuf]) -> Option<PathBuf> {
-    let ext = match tool {
-        "winrar" => "rar",
-        "7zip" => "7z",
-        "bandizip" => "zip",
-        _ => "zip",
-    };
-    let first = targets.first()?;
-    let dir = first.parent()?;
-    let base = if targets.len() == 1 {
-        first
-            .file_stem()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Archive".to_string())
-    } else {
-        dir.file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Archive".to_string())
-    };
-    Some(crate::ops::jobs::unique_dest(dir, &format!("{base}.{ext}"), false))
-}
 
 /// 执行一条动作（参数模板替换 + 启动进程）。
 pub fn run_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String> {
@@ -875,30 +595,14 @@ mod tests {
     }
 
     #[test]
-    fn archive_detection() {
-        assert!(is_archive_file(Path::new("a.RAR")));
-        assert!(is_archive_file(Path::new("b.7z")));
-        assert!(!is_archive_file(Path::new("c.txt")));
-    }
-
-    #[test]
-    fn generate_default_contains_actions() {
-        let tools = vec![DetectedTool {
-            id: "winrar",
-            label: "WinRAR",
-            exe: PathBuf::from(r"C:\Program Files\WinRAR\WinRAR.exe"),
-            archive_ext: "rar",
-        }];
-        let text = generate_default(&tools);
+    fn generate_default_contains_builtins() {
+        let text = generate_default();
         let doc = text.parse::<toml_edit::DocumentMut>().unwrap();
         let arr = doc.get("action").unwrap().as_array_of_tables().unwrap();
-        // 内置动作 + 每个探测到的压缩工具各 2 条（压缩 / 解压）。
-        assert_eq!(arr.len(), builtin_actions().len() + 2);
+        assert_eq!(arr.len(), builtin_actions().len());
         assert!(text.contains("# Rove 右键自定义动作配置"));
-        // 关键条目齐备。
         assert!(text.contains("id = \"builtin.open\""));
-        assert!(text.contains("id = \"archive.winrar.compress\""));
-        assert!(text.contains("id = \"archive.winrar.extract\""));
+        assert!(text.contains("id = \"builtin.copy\""));
     }
 
     #[test]
@@ -926,83 +630,5 @@ mod tests {
         let targets = vec![PathBuf::from("C:/a.txt"), PathBuf::from("C:/b.txt")];
         let out = build_substituted("{target_paths}", &targets);
         assert_eq!(out, "\"C:/a.txt\" \"C:/b.txt\"");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Windows 注册表探测
-// ---------------------------------------------------------------------------
-
-#[cfg(windows)]
-pub(crate) mod win {
-    use std::path::PathBuf;
-    use windows_sys::Win32::System::Registry::{
-        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER,
-        HKEY_LOCAL_MACHINE, KEY_READ, REG_SZ,
-    };
-
-    fn wide(s: &str) -> Vec<u16> {
-        s.encode_utf16().chain([0]).collect()
-    }
-
-    fn read_string(root: HKEY, subkey: &str, value: &str) -> Option<String> {
-        unsafe {
-            let mut key: HKEY = std::ptr::null_mut();
-            if RegOpenKeyExW(root, wide(subkey).as_ptr(), 0, KEY_READ, &mut key) != 0 {
-                return None;
-            }
-            let name = if value.is_empty() { vec![0u16] } else { wide(value) };
-            let mut size = 0u32;
-            let mut kind = 0u32;
-            let status = RegQueryValueExW(
-                key,
-                name.as_ptr(),
-                std::ptr::null(),
-                &mut kind,
-                std::ptr::null_mut(),
-                &mut size,
-            );
-            if status != 0 || kind != REG_SZ || size == 0 {
-                RegCloseKey(key);
-                return None;
-            }
-            let mut buf = vec![0u8; size as usize];
-            let status = RegQueryValueExW(
-                key,
-                name.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null_mut(),
-                buf.as_mut_ptr().cast(),
-                &mut size,
-            );
-            RegCloseKey(key);
-            if status != 0 {
-                return None;
-            }
-            // 去掉结尾 NUL 后按 UTF-16 解码。
-            let u16_len = size as usize / 2;
-            let units: Vec<u16> = buf
-                .chunks_exact(2)
-                .take(u16_len)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect();
-            let s = String::from_utf16_lossy(&units);
-            Some(s.trim_end_matches('\0').to_string())
-        }
-    }
-
-    /// App Paths 注册：`HKCU/HKLM\...\App Paths\<name>` 默认值。
-    pub fn reg_app_paths(exe_name: &str) -> Option<PathBuf> {
-        let sub = format!("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\{exe_name}");
-        read_string(HKEY_CURRENT_USER, &sub, "")
-            .or_else(|| read_string(HKEY_LOCAL_MACHINE, &sub, ""))
-            .map(|s| s.trim_matches('"').to_string())
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-    }
-
-    /// HKLM 指定键的字符串值。
-    pub fn reg_value_hklm(subkey: &str, value: &str) -> Option<String> {
-        read_string(HKEY_LOCAL_MACHINE, subkey, value)
     }
 }

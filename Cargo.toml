@@ -43,6 +43,9 @@ windows = { version = "0.59", features = [
     "Win32_UI_Shell",
     # IFileDialog / COMDLG_FILTERSPEC（原生文件选择对话框）。
     "Win32_UI_Shell_Common",
+    # 右键菜单：GetKeyState（Shift/Ctrl 修饰键）。
+    "Win32_UI_Input",
+    "Win32_UI_Input_KeyboardAndMouse",
     # 拖出：Ole 拖放（DoDragDrop/IDropSource）、格式注册、全局内存。
     "Win32_System_DataExchange",
     "Win32_System_Ole",
@@ -50,6 +53,8 @@ windows = { version = "0.59", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_SystemServices",
     "Win32_System_Com",
+    # DEFCONTEXTMENU 结构体在 windows crate 里受此 feature 门控（原生右键菜单用）。
+    "Win32_System_Registry",
     "Win32_Graphics_Gdi",
     # WIC（Windows Imaging Component）：缩略图磁盘缓存用 JPEG q90 / PNG 编解码。
     "Win32_Graphics_Imaging",

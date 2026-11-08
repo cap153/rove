@@ -27,7 +27,7 @@ use crate::fs::{
     list_network_locations, quick_access_dirs, recycle_bin_stats, sort_entries,
 };
 use crate::ops::{
-    self, clipboard, jobs::{JobKind, JobManager, JobSummary, status_text}, shortcut,
+    self, clipboard, jobs::{JobKind, JobManager, JobSummary, status_text},
 };
 use crate::state::AppState;
 
@@ -208,26 +208,19 @@ const THUMB_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
 const THUMB_DISK_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
 // ---- 右键菜单动作 ID ----
-const ACT_OPEN: &str = "open";
-const ACT_COPY: &str = "copy";
-const ACT_CUT: &str = "cut";
-const ACT_PASTE: &str = "paste";
-const ACT_RENAME: &str = "rename";
-const ACT_DELETE: &str = "delete";
-const ACT_STAGE: &str = "stage";
-const ACT_TERMINAL: &str = "terminal";
-const ACT_NEW_FOLDER: &str = "new_folder";
-const ACT_REFRESH: &str = "refresh";
-const ACT_SELECT_ALL: &str = "select_all";
-const ACT_SENDTO_DESKTOP: &str = "sendto_desktop";
-const ACT_SENDTO_STARTMENU: &str = "sendto_startmenu";
+const CMD_PASTE: &str = "paste";
+const CMD_TERMINAL: &str = "terminal";
+const CMD_NEW_FOLDER: &str = "new_folder";
+const CMD_REFRESH: &str = "refresh";
+const CMD_SELECT_ALL: &str = "select_all";
+const CMD_MANAGE_ACTIONS: &str = "manage_actions";
 
-/// 右键菜单目标。
+/// 右键菜单作用范围（决定挂哪些项、以及结果要作用于谁）。
 #[derive(Clone, Debug)]
-enum MenuTarget {
-    /// 选中项（非空）。
-    Files(Vec<PathBuf>),
-    /// 列表空白处。
+enum MenuScope {
+    /// 选中的项（非空）。
+    Selection(Vec<PathBuf>),
+    /// 列表空白处（作用于当前目录）。
     Background,
 }
 
@@ -464,8 +457,8 @@ pub struct App {
     /// 必须重建；否则重命名期间列表会冻住在旧数据上（完全看不到目录刷新）。
     /// 必须包含 total：新建/删除条目即使可见窗口不变，内容已变。
     rows_sig: Option<(u64, usize, usize, usize)>,
-    /// 当前右键菜单目标。
-    menu_target: Option<MenuTarget>,
+    /// 当前右键菜单的作用范围（结果回投时用它决定作用于谁）。
+    menu_scope: Option<MenuScope>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
     last_click: Option<(PathBuf, std::time::Instant)>,
     /// 侧栏分区拖拽：正在拖动的分区 header 行索引。
@@ -517,7 +510,7 @@ pub struct App {
     preview: PreviewWindow,
     /// 预览窗口是否已 show（首次需 show，之后用 visible 控制）。
     preview_shown: bool,
-    /// actions.toml 驱动的自定义动作（压缩/解压/自定义）。
+    /// actions.toml 驱动的右键动作（内置动作开关 + 自定义）。
     actions: Vec<crate::ops::actions::ActionEntry>,
     /// 缩略图 LRU 缓存（Key 包含 mtime/size，防止旧图）。
     thumb_cache: HashMap<ThumbKey, CachedThumb>,
@@ -621,7 +614,7 @@ impl App {
             sidebar_fingerprint: 0,
             visible_cache: None,
             rows_sig: None,
-            menu_target: None,
+            menu_scope: None,
             last_click: None,
             sidebar_drag: None,
             drop_buffer: Vec::new(),
@@ -3440,315 +3433,300 @@ fn group_options(actions: &[crate::ops::actions::ActionEntry]) -> Vec<SharedStri
 }
 
 impl App {
-    /// 依据目标构建右键菜单模型；同时返回内容高度（逻辑像素）。
-    /// 自 Sprint 2 起，Files 视图菜单完全由 actions.toml（含内置动作）驱动，
-    /// 按 group 字段自动组织一级项与二级子菜单。
-    fn build_menu(&self, target: &MenuTarget) -> (Vec<MenuItem>, f32) {
-        let mut items: Vec<MenuItem> = Vec::new();
-        let sep = || MenuItem {
-            id: SharedString::default(),
-            label: SharedString::default(),
-            icon_text: SharedString::default(),
-            icon_color: Color::default(),
-            kind: "separator".into(),
-            enabled: false,
+    /// 右键菜单里 Rove 自己那一部分（Shell 项之外）——直接产出原生菜单节点。
+    ///
+    /// Files 视图完全由 actions.toml（含内置动作）驱动，按 `group` 字段组织
+    /// 一级项与二级子菜单；空白处菜单是固定的一组。
+    /// `shell_present`：本次菜单挂了 Shell 项，那些已经由系统提供的动作就不再重复输出。
+    #[cfg(windows)]
+    fn build_app_nodes(
+        &self,
+        target: &MenuScope,
+        shell_present: bool,
+    ) -> Vec<crate::sys::menu::MenuNode> {
+        use crate::sys::menu::MenuNode;
+        let item = |key: &str, label: &str, enabled: bool| MenuNode::Item {
+            key: key.to_string(),
+            label: label.to_string(),
+            enabled,
+            checked: false,
         };
-        let item = |id: &str, label: &str, icon: &str, color: Color, kind: &str| MenuItem {
-            id: id.into(),
-            label: label.into(),
-            icon_text: icon.into(),
-            icon_color: color,
-            kind: kind.into(),
-            enabled: true,
-        };
-        let accent = Color::from_rgb_u8(0x0E, 0x8A, 0x4A);
-        let blue = Color::from_rgb_u8(0x3E, 0x7B, 0xC4);
-        let amber = Color::from_rgb_u8(0xE8, 0xB3, 0x3C);
-        let gray = Color::from_rgb_u8(0x8A, 0x8F, 0x98);
-        let danger = Color::from_rgb_u8(0xC4, 0x2B, 0x1C);
+        let dup = |id: &str| shell_present && Self::is_shell_duplicate(id);
 
         // 回收站视图：专用菜单（还原 / 彻底删除 / 清空）。
-        if self.state.active().active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()) {
-            let mut items: Vec<MenuItem> = Vec::new();
-            match target {
-                MenuTarget::Files(_) => {
-                    items.push(item("recycle-restore", "还原到原位置", "\u{21a9}", accent, "normal"));
-                    items.push(sep());
-                    items.push(item("recycle-purge", "彻底删除", "✕", danger, "danger"));
-                }
-                MenuTarget::Background => {
-                    items.push(item("recycle-empty", "清空回收站", "🗑", danger, "danger"));
-                    items.push(sep());
-                    items.push(item(ACT_REFRESH, "刷新", "⟳", gray, "normal"));
-                }
-            }
-            let height = items
-                .iter()
-                .map(|i| if i.kind == "separator" { 9.0 } else { 28.0 })
-                .sum::<f32>()
-                + 8.0;
-            return (items, height);
+        if self.state.active().active().path.as_deref()
+            == Some(fs::drives::recycle_virtual_path().as_path())
+        {
+            return match target {
+                MenuScope::Selection(_) => vec![
+                    item("recycle-restore", "还原到原位置", true),
+                    MenuNode::Separator,
+                    item("recycle-purge", "彻底删除", true),
+                ],
+                MenuScope::Background => vec![
+                    item("recycle-empty", "清空回收站", true),
+                    MenuNode::Separator,
+                    item(CMD_REFRESH, "刷新", true),
+                ],
+            };
         }
 
         match target {
-            MenuTarget::Files(paths) => {
+            MenuScope::Selection(paths) => {
                 let single = paths.len() == 1;
-                // 从 actions.toml 过滤出适用当前选中的动作，按 group 分组。
-                let mut groups: std::collections::BTreeMap<String, Vec<&crate::ops::actions::ActionEntry>> =
-                    std::collections::BTreeMap::new();
-                let mut root_order: Vec<String> = Vec::new();
-                for a in self.actions.iter().filter(|a| a.enabled && a.matches_selection(paths)) {
-                    let g = a.group.clone();
-                    if !groups.contains_key(&g) {
-                        root_order.push(g.clone());
+                let mut nodes: Vec<MenuNode> = Vec::new();
+                // 按 group 聚合："" 为一级项，其余按首次出现顺序输出为二级子菜单。
+                let mut groups: std::collections::BTreeMap<
+                    String,
+                    Vec<&crate::ops::actions::ActionEntry>,
+                > = std::collections::BTreeMap::new();
+                let mut order: Vec<String> = Vec::new();
+                for a in self
+                    .actions
+                    .iter()
+                    .filter(|a| a.enabled && a.matches_selection(paths) && !dup(&a.id))
+                {
+                    if !groups.contains_key(&a.group) {
+                        order.push(a.group.clone());
                     }
-                    groups.entry(g).or_default().push(a);
+                    groups.entry(a.group.clone()).or_default().push(a);
                 }
 
-                // group="" 的项作为一级菜单项直接输出。
-                if let Some(root_items) = groups.remove("") {
-                    for a in root_items {
-                        let mut m = self.action_menu_item(a);
-                        // 重命名在单选外置灰。
-                        if a.id == "builtin.rename" && !single {
-                            m.enabled = false;
-                        }
-                        // 终端：非目录时改标签。
-                        if a.id == "builtin.terminal" {
-                            let first_is_dir = paths.first().map(|p| p.is_dir()).unwrap_or(false);
-                            m.label = if first_is_dir { "在此处打开终端".into() } else { "在终端中打开".into() };
-                        }
-                        items.push(m);
+                for a in groups.remove("").unwrap_or_default() {
+                    let mut enabled = true;
+                    let mut label = a.label.clone();
+                    // 重命名在单选外置灰。
+                    if a.id == "builtin.rename" && !single {
+                        enabled = false;
                     }
-                }
-
-                // 非空 group 输出为二级子菜单；顺序保留 actions.toml 中首次出现顺序。
-                for g in root_order.iter().filter(|g| !g.is_empty()) {
-                    let Some(_) = groups.get(g) else { continue };
-                    items.push(MenuItem {
-                        id: format!("group:{g}").into(),
-                        label: g.clone().into(),
-                        icon_text: "▣".into(),
-                        icon_color: amber,
-                        kind: "submenu".into(),
-                        enabled: true,
+                    // 终端：非目录时改标签。
+                    if a.id == "builtin.terminal" {
+                        let first_is_dir = paths.first().map(|p| p.is_dir()).unwrap_or(false);
+                        label = if first_is_dir {
+                            "在此处打开终端"
+                        } else {
+                            "在终端中打开"
+                        }
+                        .to_string();
+                    }
+                    nodes.push(MenuNode::Item {
+                        key: format!("act:{}", a.id),
+                        label,
+                        enabled,
+                        checked: false,
                     });
                 }
+
+                for g in order.iter().filter(|g| !g.is_empty()) {
+                    let Some(children) = groups.remove(g) else { continue };
+                    nodes.push(MenuNode::Submenu {
+                        label: g.clone(),
+                        enabled: true,
+                        children: children
+                            .into_iter()
+                            .map(|a| MenuNode::Item {
+                                key: format!("act:{}", a.id),
+                                label: a.label.clone(),
+                                enabled: true,
+                                checked: false,
+                            })
+                            .collect(),
+                    });
+                }
+                nodes
             }
-            MenuTarget::Background => {
-                let has_clipboard = !self.state.clipboard_paths.is_empty();
-                items.push(MenuItem {
-                    id: ACT_PASTE.into(),
-                    label: if self.state.clipboard_operation == "move" {
-                        "粘贴（移动）"
-                    } else {
-                        "粘贴"
-                    }
-                    .into(),
-                    icon_text: "⧉".into(),
-                    icon_color: blue,
-                    kind: "normal".into(),
-                    enabled: has_clipboard,
-                });
-                items.push(item(ACT_NEW_FOLDER, "新建文件夹", "＋", amber, "normal"));
-                items.push(sep());
-                items.push(item(ACT_TERMINAL, "在此处打开终端", ">_", gray, "normal"));
-                items.push(item(ACT_REFRESH, "刷新", "⟳", gray, "normal"));
-                items.push(item(ACT_SELECT_ALL, "全选", "▣", gray, "normal"));
-                items.push(item(ACT_MANAGE_ACTIONS, "管理右键动作...", "✎", gray, "normal"));
-                items.push(item(ACT_VIEW, "视图", "▦", gray, "submenu"));
-                items.push(item(ACT_SORT, "排序方式", "⇅", gray, "submenu"));
-                items.push(sep());
-                items.push(item("act:builtin.properties", "属性", "ⓘ", gray, "normal"));
+            MenuScope::Background => {
+                // 「属性」不在这里：真实文件夹由系统菜单提供，
+                // 虚拟根（此电脑 / 回收站）本来也拿不到它。
+                vec![
+                    MenuNode::Item {
+                        key: CMD_PASTE.to_string(),
+                        label: if self.state.clipboard_operation == "move" {
+                            "粘贴（移动）"
+                        } else {
+                            "粘贴"
+                        }
+                        .to_string(),
+                        enabled: !self.state.clipboard_paths.is_empty(),
+                        checked: false,
+                    },
+                    item(CMD_NEW_FOLDER, "新建文件夹", true),
+                    MenuNode::Separator,
+                    item(CMD_TERMINAL, "在此处打开终端", true),
+                    item(CMD_REFRESH, "刷新", true),
+                    item(CMD_SELECT_ALL, "全选", true),
+                    item(CMD_MANAGE_ACTIONS, "管理右键动作...", true),
+                    MenuNode::Submenu {
+                        label: "视图".to_string(),
+                        enabled: true,
+                        children: self.view_menu_nodes(),
+                    },
+                    MenuNode::Submenu {
+                        label: "排序方式".to_string(),
+                        enabled: true,
+                        children: self.sort_menu_nodes(),
+                    },
+                    MenuNode::Separator,
+                ]
             }
         }
-
-        let height = items
-            .iter()
-            .map(|i| if i.kind == "separator" { 9.0 } else { 28.0 })
-            .sum::<f32>()
-            + 8.0;
-        (items, height)
     }
 
-    /// 动作条目 → 菜单项。
-    fn action_menu_item(&self, a: &crate::ops::actions::ActionEntry) -> MenuItem {
-        let icon = if a.label.contains("解压") { "▾" } else { "▣" };
-        MenuItem {
-            id: format!("act:{}", a.id).into(),
-            label: a.label.clone().into(),
-            icon_text: icon.into(),
-            icon_color: Color::from_rgb_u8(0xE8, 0xB3, 0x3C),
-            kind: "normal".into(),
+    /// 「视图」子菜单：当前模式打勾。
+    #[cfg(windows)]
+    fn view_menu_nodes(&self) -> Vec<crate::sys::menu::MenuNode> {
+        let current = self.config.view_mode.as_str();
+        use crate::sys::menu::MenuNode;
+        [
+            ("icons-xl", "超大图标"),
+            ("icons-large", "大图标"),
+            ("icons-medium", "中等图标"),
+            ("icons-small", "小图标"),
+            ("list", "列表"),
+            ("details", "详细信息"),
+        ]
+        .iter()
+        .map(|(id, label)| MenuNode::Item {
+            key: format!("view:{id}"),
+            label: label.to_string(),
             enabled: true,
+            checked: current == *id,
+        })
+        .collect()
+    }
+
+    /// 「排序方式」子菜单：当前键与升降序打勾。
+    #[cfg(windows)]
+    fn sort_menu_nodes(&self) -> Vec<crate::sys::menu::MenuNode> {
+        let sort = self.state.active().active().sort;
+        use crate::sys::menu::MenuNode;
+        let item = |key: &str, label: &str, checked: bool| MenuNode::Item {
+            key: format!("sort:{key}"),
+            label: label.to_string(),
+            enabled: true,
+            checked,
+        };
+        vec![
+            item("name", "名称", sort.key == SortKey::Name),
+            item("modified", "修改日期", sort.key == SortKey::Modified),
+            item("type", "类型", sort.key == SortKey::Type),
+            item("size", "大小", sort.key == SortKey::Size),
+            MenuNode::Separator,
+            item("asc", "递增", sort.ascending),
+            item("desc", "递减", !sort.ascending),
+        ]
+    }
+
+    /// 打开右键菜单：Shell 菜单（系统项）+ Rove 自己的项。
+    fn open_menu(&self, target: MenuScope) {
+        #[cfg(windows)]
+        {
+            let native_target = self.shell_menu_target(&target);
+            let shell_present = !matches!(native_target, crate::sys::menu::Target::AppOnly);
+            let nodes = self.build_app_nodes(&target, shell_present);
+            // Shift + 右键 = 扩展动词（「以管理员身份运行」这类）。
+            let extended = key_down(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT as i32);
+            if !self.open_native_menu(native_target, nodes, extended) {
+                logln!("[menu] 原生菜单不可用，本次右键被忽略");
+            }
+        }
+        #[cfg(not(windows))]
+        let _ = target;
+    }
+
+    /// 菜单范围 → Shell 菜单目标（哪些交给 Shell，哪些只显示应用项）。
+    #[cfg(windows)]
+    fn shell_menu_target(&self, target: &MenuScope) -> crate::sys::menu::Target {
+        // 回收站是虚拟目录：里面的路径不是真实路径，给 Shell 也解析不出来，
+        // 只显示应用自己的项。其余情况（含「此电脑」里的磁盘行、搜索结果）
+        // 都是真实路径，交给 Shell。
+        let is_recycle = self
+            .state
+            .active()
+            .active()
+            .path
+            .as_deref()
+            .map(|p| p == fs::drives::recycle_virtual_path().as_path())
+            .unwrap_or(false);
+        match target {
+            MenuScope::Selection(paths) if !is_recycle && !paths.is_empty() => {
+                crate::sys::menu::Target::Items(paths.clone())
+            }
+            MenuScope::Background if !is_recycle => match self.state.active().active().path.clone()
+            {
+                Some(dir) => crate::sys::menu::Target::Background(dir),
+                None => crate::sys::menu::Target::AppOnly,
+            },
+            _ => crate::sys::menu::Target::AppOnly,
         }
     }
 
-    /// 按子菜单 id 构建二级菜单内容。
-    fn build_submenu_for(&self, id: &str) -> (Vec<MenuItem>, f32) {
-        if id == ACT_VIEW {
-            let current = self.config.view_mode.clone();
-            let entry = |vid: &str, label: &str, active: bool| MenuItem {
-                id: format!("view:{vid}").into(),
-                label: if active {
-                    format!("● {label}").into()
-                } else {
-                    label.to_string().into()
-                },
-                icon_text: SharedString::default(),
-                icon_color: Color::default(),
-                kind: "normal".into(),
-                enabled: true,
-            };
-            let items = vec![
-                entry("icons-xl", "超大图标", current == "icons-xl"),
-                entry("icons-large", "大图标", current == "icons-large"),
-                entry("icons-medium", "中等图标", current == "icons-medium"),
-                entry("icons-small", "小图标", current == "icons-small"),
-                entry("list", "列表", current == "list"),
-                entry("details", "详细信息", current == "details"),
-            ];
-            let height = items.len() as f32 * 28.0 + 8.0;
-            return (items, height);
-        }
 
-        if id == ACT_SORT {
-            let current = self.state.active().active().sort;
-            let entry = |sid: &str, label: &str, active: bool| MenuItem {
-                id: format!("sort:{sid}").into(),
-                label: if active { format!("● {label}") } else { label.to_string() }.into(),
-                icon_text: SharedString::default(),
-                icon_color: Color::default(),
-                kind: "normal".into(),
-                enabled: true,
-            };
-            let items = vec![
-                entry("name", "名称", current.key == SortKey::Name),
-                entry("modified", "修改日期", current.key == SortKey::Modified),
-                entry("type", "类型", current.key == SortKey::Type),
-                entry("size", "大小", current.key == SortKey::Size),
-                MenuItem {
-                    id: SharedString::default(),
-                    label: SharedString::default(),
-                    icon_text: SharedString::default(),
-                    icon_color: Color::default(),
-                    kind: "separator".into(),
-                    enabled: false,
-                },
-                entry("asc", "递增", current.ascending),
-                entry("desc", "递减", !current.ascending),
-            ];
-            let height = 4.0 * 28.0 + 9.0 + 2.0 * 28.0 + 8.0;
-            return (items, height);
-        }
-
-        // 动作分组二级菜单（打开方式 / 发送到 / 压缩与解压 / 自定义分组）。
-        if let Some(group_name) = id.strip_prefix("group:") {
-            let targets = match &self.menu_target {
-                Some(MenuTarget::Files(p)) => p.clone(),
-                _ => Vec::new(),
-            };
-            let amber = Color::from_rgb_u8(0xE8, 0xB3, 0x3C);
-            let gray = Color::from_rgb_u8(0x8A, 0x8F, 0x98);
-
-            if group_name == "打开方式" {
-                let items = vec![
-                    MenuItem {
-                        id: "act:builtin.open_with".into(),
-                        label: "打开方式...".into(),
-                        icon_text: "◈".into(),
-                        icon_color: gray,
-                        kind: "normal".into(),
-                        enabled: true,
-                    },
-                ];
-                let n = items.len();
-                return (items, n as f32 * 28.0 + 8.0);
-            }
-
-            if group_name == "发送到" {
-                let items = vec![
-                    MenuItem {
-                        id: ACT_SENDTO_DESKTOP.into(),
-                        label: "桌面快捷方式".into(),
-                        icon_text: "\u{2302}".into(),
-                        icon_color: amber,
-                        kind: "normal".into(),
-                        enabled: true,
-                    },
-                    MenuItem {
-                        id: ACT_SENDTO_STARTMENU.into(),
-                        label: "开始菜单快捷方式".into(),
-                        icon_text: "\u{229e}".into(),
-                        icon_color: amber,
-                        kind: "normal".into(),
-                        enabled: true,
-                    },
-                ];
-                let n = items.len();
-                return (items, n as f32 * 28.0 + 8.0);
-            }
-
-            let items: Vec<MenuItem> = self
-                .actions
-                .iter()
-                .filter(|a| a.enabled && a.group == group_name && a.matches_selection(&targets))
-                .map(|a| self.action_menu_item(a))
-                .collect();
-            let n = items.len();
-            return (items, n as f32 * 28.0 + 8.0);
-        }
-
-        // 默认：发送到。
-        self.build_sendto_submenu()
+    /// 与 Shell 菜单重复的内置动作 / 分组（仅在挂了 Shell 项时跳过）。
+    ///
+    /// 复制/剪切不在其中：系统的 copy 在我们这儿不可用（写进去的 CF_HDROP 读不到），
+    /// 所以这两个始终用 Rove 自己的内置动作（还能给剪切态加变淡效果）。
+    #[cfg(windows)]
+    fn is_shell_duplicate(id: &str) -> bool {
+        matches!(
+            id,
+            "builtin.open"
+                | "builtin.open_with"
+                | "builtin.sendto"
+                | "builtin.rename"
+                | "builtin.delete"
+                | "builtin.properties"
+        )
     }
 
-    /// 「发送到」二级菜单兜底。
-    fn build_sendto_submenu(&self) -> (Vec<MenuItem>, f32) {
-        let amber = Color::from_rgb_u8(0xE8, 0xB3, 0x3C);
-        let items = vec![
-            MenuItem {
-                id: ACT_SENDTO_DESKTOP.into(),
-                label: "桌面快捷方式".into(),
-                icon_text: "\u{2302}".into(),
-                icon_color: amber,
-                kind: "normal".into(),
-                enabled: true,
-            },
-            MenuItem {
-                id: ACT_SENDTO_STARTMENU.into(),
-                label: "开始菜单快捷方式".into(),
-                icon_text: "\u{229e}".into(),
-                icon_color: amber,
-                kind: "normal".into(),
-                enabled: true,
-            },
+
+    /// 弹出原生菜单。返回 false 表示原生菜单线程不可用（菜单线程起不来）。
+    #[cfg(windows)]
+    fn open_native_menu(
+        &self,
+        target: crate::sys::menu::Target,
+        nodes: Vec<crate::sys::menu::MenuNode>,
+        extended: bool,
+    ) -> bool {
+        let owner = get_window_hwnd(&self.ui).unwrap_or(0);
+        let hidden = Self::hidden_shell_verbs(&self.actions);
+        let sink: crate::sys::menu::Sink = std::sync::Arc::new(|action| {
+            let _ = slint::invoke_from_event_loop(move || handle_native_menu_action(action));
+        });
+        crate::sys::menu::open(target, nodes, hidden, extended, owner, sink)
+    }
+
+    /// 设置页的内置动作开关 → 要从 Shell 菜单里摘掉的命令。
+    ///
+    /// 标准命令（打开/复制·剪切/重命名/删除/属性/打开方式/发送到）现在全部由
+    /// Shell 提供，所以开关不再控制「Rove 自己的那一项」，而是控制「Shell 的那一项」。
+    ///
+    /// 常驻例外（与开关无关）：
+    /// * `copy` / `cut`：系统的那两项拿到 Rove 里读不出剪贴板内容，始终用 Rove 的内置动作；
+    /// * `paste`：始终用 Rove 自己的粘贴（粘贴后自动滚动选中、回收站还原语义）；
+    /// * `refresh`：始终用 Rove 自己的刷新（它还会清空目录大小的缓存）。
+    #[cfg(windows)]
+    fn hidden_shell_verbs(actions: &[crate::ops::actions::ActionEntry]) -> Vec<String> {
+        let mut hidden: Vec<String> = vec![
+            "copy".to_string(),
+            "cut".to_string(),
+            "paste".to_string(),
+            "refresh".to_string(),
         ];
-        (items, 2.0 * 28.0 + 8.0)
-    }
-
-    /// 打开右键菜单（坐标为 FileList 内坐标，Slint 侧再加布局偏移）。
-    fn open_menu(&self, target: MenuTarget, x: f32, y: f32) {
-        let (items, height) = self.build_menu(&target);
-        self.ui.set_menu_items(ModelRc::new(VecModel::from(items)));
-        self.ui.set_menu_items_height(height);
-        self.ui
-            .invoke_open_menu(x, y);
-    }
-
-    fn close_menu(&self) {
-        self.ui.invoke_close_menu();
+        for action in actions.iter().filter(|a| a.builtin && !a.enabled) {
+            match action.id.as_str() {
+                "builtin.open" => hidden.push("open".into()),
+                "builtin.rename" => hidden.push("rename".into()),
+                "builtin.delete" => hidden.push("delete".into()),
+                "builtin.properties" => hidden.push("properties".into()),
+                "builtin.open_with" => hidden.push("openas".into()),
+                "builtin.sendto" => hidden.push("sendto".into()),
+                _ => {}
+            }
+        }
+        hidden
     }
 }
-
-/// "发送到" 菜单项 ID（在 build_menu 中使用）。
-const ACT_MANAGE_ACTIONS: &str = "manage_actions";
-const ACT_VIEW: &str = "view_menu";
-const ACT_SORT: &str = "sort_menu";
-
-// ---------------------------------------------------------------------------
-// 其余交互动作（键盘快捷键 / 侧边栏 / 列排序 / 重命名 / 暂存盘）
-// ---------------------------------------------------------------------------
 
 /// 累加各分组卡片高度，得到内容总高（与 `GroupCard` 的 Slint 侧公式一致：
 /// 44px 头 + 42px/行，收起仅留头部，外加 12px 卡片间距）。
@@ -3783,7 +3761,7 @@ impl App {
         self.sync_settings();
     }
 
-    /// 保存当前 actions 并重新加载（自愈压缩软件路径、合并内置动作）。
+    /// 保存当前 actions 并重新加载（合并内置动作、校验自定义命令）。
     fn save_actions_and_reload(&mut self) {
         if let Err(e) = crate::ops::actions::save(&self.actions) {
             self.set_status_job(e);
@@ -4065,7 +4043,7 @@ impl App {
             .into_iter()
             .map(|g| {
                 let name = if g.is_empty() {
-                    "一级独立菜单项".into()
+                    "一级菜单或系统菜单".into()
                 } else {
                     g.clone().into()
                 };
@@ -4081,45 +4059,17 @@ impl App {
         self.ui.set_settings_action_groups(ModelRc::new(groups_model));
     }
 
-    /// 打开视图模式下拉菜单（Pulse 式）。
+    /// 工具栏 ▦ 按钮：原生下拉菜单切换视图模式。
     fn open_view_picker(&mut self) {
-        let current = self.config.view_mode.clone();
-        let entry = |vid: &str, label: &str, active: bool| MenuItem {
-            id: format!("view:{vid}").into(),
-            label: if active {
-                format!("● {label}").into()
-            } else {
-                label.to_string().into()
-            },
-            icon_text: SharedString::default(),
-            icon_color: Color::default(),
-            kind: "normal".into(),
-            enabled: true,
-        };
-        let items = vec![
-            entry("icons-xl", "超大图标", current == "icons-xl"),
-            entry("icons-large", "大图标", current == "icons-large"),
-            entry("icons-medium", "中等图标", current == "icons-medium"),
-            entry("icons-small", "小图标", current == "icons-small"),
-            entry("list", "列表", current == "list"),
-            entry("details", "详细信息", current == "details"),
-        ];
-        let height = items.len() as f32 * 28.0 + 8.0;
-        self.ui.set_menu_items(ModelRc::new(VecModel::from(items)));
-        self.ui.set_menu_items_height(height);
-
-        // 设置菜单目标兜底
-        self.menu_target = Some(MenuTarget::Background);
-
-        // 精准对齐 ▦ 按钮下方：
-        // ▦ 按钮在搜索框左侧约 220px 处，菜单宽 224px
-        // x 计算为对齐 ▦ 按钮中心，y 严格落在 44px 工具栏下边缘 (84px)
-        let scale = self.ui.window().scale_factor() as f32;
-        let win_w = self.ui.window().size().width as f32 / scale;
-        let x = (win_w - 330.0).max(10.0);
-        let y = 84.0f32; // 38px 标签栏 + 44px 工具栏 + 2px 间隙
-
-        self.ui.invoke_open_menu_absolute(x, y);
+        // 视图切换不依赖选中项，菜单目标给个空白处兜底。
+        self.menu_scope = Some(MenuScope::Background);
+        #[cfg(windows)]
+        {
+            let nodes = self.view_menu_nodes();
+            if !self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false) {
+                logln!("[menu] 原生菜单不可用，视图下拉被忽略");
+            }
+        }
     }
 
     /// 解析路径字符串，展开环境变量（如 `%LOCALAPPDATA%`）与主目录（`~`）。
@@ -4640,8 +4590,6 @@ impl App {
 impl App {
     /// 执行右键菜单动作。
     fn run_menu_action(&mut self, id: &str) {
-        self.close_menu();
-
         // 1. 视图模式切换（优先执行！不依赖选中的文件 target，杜绝工具栏调用被拦截）
         if let Some(mode) = id.strip_prefix("view:") {
             self.set_view_mode(mode);
@@ -4667,30 +4615,14 @@ impl App {
         }
 
         // 2. 需要操作目标的常规文件动作
-        let Some(target) = self.menu_target.clone() else {
+        let Some(target) = self.menu_scope.clone() else {
             return;
         };
-        // actions.toml 驱动的动作（Phase 4 / Sprint 2）。
+        // actions.toml 驱动的动作。
+        // 标准命令（打开 / 打开方式 / 重命名 / 删除 / 属性 / 发送到）由系统菜单提供，
+        // 不再有 `act:builtin.*` 的菜单分支；它们的实现函数仍在快捷键路径上使用。
         if let Some(action_id) = id.strip_prefix("act:") {
             match action_id {
-                "builtin.open" => {
-                    if let MenuTarget::Files(paths) = &target {
-                        if let Some(path) = paths.first() {
-                            self.open_path(path);
-                        }
-                    }
-                    return;
-                }
-                "builtin.open_with" => {
-                    if let MenuTarget::Files(paths) = &target {
-                        if let Some(path) = paths.first() {
-                            let _ = std::process::Command::new("rundll32.exe")
-                                .args(["shell32.dll,OpenAs_RunDLL", &path.to_string_lossy()])
-                                .spawn();
-                        }
-                    }
-                    return;
-                }
                 "builtin.copy" => {
                     self.copy_selection(false);
                     return;
@@ -4699,27 +4631,8 @@ impl App {
                     self.copy_selection(true);
                     return;
                 }
-                "builtin.rename" => {
-                    if let MenuTarget::Files(paths) = &target {
-                        if let Some(path) = paths.first() {
-                            logv!("[rename] menu rename for {:?}", path);
-                            let path = path.clone();
-                            self.begin_rename(&path);
-                        }
-                    }
-                    return;
-                }
-                "builtin.delete" => {
-                    if let MenuTarget::Files(paths) = &target {
-                        self.submit_job(JobKind::Delete {
-                            paths: paths.clone(),
-                            to_trash: true,
-                        });
-                    }
-                    return;
-                }
                 "builtin.stage" => {
-                    if let MenuTarget::Files(paths) = &target {
+                    if let MenuScope::Selection(paths) = &target {
                         let added = self.state.stage_paths(paths);
                         self.sync_staging();
                         self.set_status_job(format!("已加入暂存盘 {added} 项"));
@@ -4728,10 +4641,10 @@ impl App {
                 }
                 "builtin.terminal" => {
                     let dir = match &target {
-                        MenuTarget::Files(paths) => paths
+                        MenuScope::Selection(paths) => paths
                             .first()
                             .and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }),
-                        MenuTarget::Background => self.state.active().active().path.clone(),
+                        MenuScope::Background => self.state.active().active().path.clone(),
                     };
                     if let Some(dir) = dir {
                         if let Err(e) = ops::open_terminal(&dir) {
@@ -4740,28 +4653,11 @@ impl App {
                     }
                     return;
                 }
-                "builtin.properties" => {
-                    let paths = match &target {
-                        MenuTarget::Files(p) => p.clone(),
-                        MenuTarget::Background => {
-                            // 空白处右键属性：查看当前目录属性
-                            self.state.active().active().path.clone().into_iter().collect()
-                        }
-                    };
-                    if !paths.is_empty() {
-                        #[cfg(windows)]
-                        {
-                            let hwnd = get_window_hwnd(&self.ui).unwrap_or(0);
-                            crate::sys::shell::show_properties(&paths, hwnd);
-                        }
-                    }
-                    return;
-                }
                 _ => {
                     let entry = self.actions.iter().find(|a| a.id == action_id).cloned();
                     if let Some(entry) = entry {
                         let targets = match &target {
-                            MenuTarget::Files(p) => p.clone(),
+                            MenuScope::Selection(p) => p.clone(),
                             _ => Vec::new(),
                         };
                         match crate::ops::actions::run_action(&entry, &targets) {
@@ -4776,7 +4672,7 @@ impl App {
                 }
             }
         }
-        if id == ACT_MANAGE_ACTIONS {
+        if id == CMD_MANAGE_ACTIONS {
             // 显式管理动作：force_subpage = true，聚焦并切换到本地右键菜单页
             self.open_settings_tab(crate::state::SettingsSubpage::ContextMenu, true);
             return;
@@ -4784,7 +4680,7 @@ impl App {
         // 回收站视图动作。
         match id {
             "recycle-restore" => {
-                if let MenuTarget::Files(paths) = &target {
+                if let MenuScope::Selection(paths) = &target {
                     let mut restored = 0;
                     for p in paths {
                         restored += fs::drives::restore_recycle_entry(p);
@@ -4799,7 +4695,7 @@ impl App {
                 }
             }
             "recycle-purge" => {
-                if let MenuTarget::Files(paths) = &target {
+                if let MenuScope::Selection(paths) = &target {
                     let n = fs::drives::purge_recycle_entries(paths);
                     self.set_status_job(if n > 0 {
                         format!("已彻底删除 {n} 项")
@@ -4825,51 +4721,13 @@ impl App {
             return;
         }
         match id {
-            // 旧硬编码 ID 仍保留，防止外部旧调用；新菜单统一走 act:builtin.*。
-            ACT_OPEN => {
-                if let MenuTarget::Files(paths) = &target {
-                    if let Some(path) = paths.first() {
-                        self.open_path(path);
-                    }
-                }
-            }
-            ACT_COPY => self.copy_selection(false),
-            ACT_CUT => self.copy_selection(true),
-            ACT_PASTE => self.paste_clipboard(),
-            ACT_RENAME => {
-                if let MenuTarget::Files(paths) = &target {
-                    if let Some(path) = paths.first() {
-                        // 核心修复：右键菜单重命名也绕过了 start_rename，这里必须同样清锁，
-                        // 否则之前左键点击行留下的 drag-armed 会滞留 → 重命名后滚轮冻结。
-                        self.drag_pending = None;
-                        self.ui.invoke_set_drag_armed(false);
-                        logv!("[rename] menu rename for {:?}", path);
-                        let path = path.clone();
-                        self.begin_rename(&path);
-                    }
-                }
-            }
-            ACT_DELETE => {
-                if let MenuTarget::Files(paths) = &target {
-                    self.submit_job(JobKind::Delete {
-                        paths: paths.clone(),
-                        to_trash: true,
-                    });
-                }
-            }
-            ACT_STAGE => {
-                if let MenuTarget::Files(paths) = &target {
-                    let added = self.state.stage_paths(paths);
-                    self.sync_staging();
-                    self.set_status_job(format!("已加入暂存盘 {added} 项"));
-                }
-            }
-            ACT_TERMINAL => {
+            CMD_PASTE => self.paste_clipboard(),
+            CMD_TERMINAL => {
                 let dir = match &target {
-                    MenuTarget::Files(paths) => paths
+                    MenuScope::Selection(paths) => paths
                         .first()
                         .and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }),
-                    MenuTarget::Background => self.state.active().active().path.clone(),
+                    MenuScope::Background => self.state.active().active().path.clone(),
                 };
                 if let Some(dir) = dir {
                     if let Err(e) = ops::open_terminal(&dir) {
@@ -4877,9 +4735,9 @@ impl App {
                     }
                 }
             }
-            ACT_NEW_FOLDER => self.create_folder(),
-            ACT_REFRESH => self.user_refresh_active(),
-            ACT_SELECT_ALL => {
+            CMD_NEW_FOLDER => self.create_folder(),
+            CMD_REFRESH => self.user_refresh_active(),
+            CMD_SELECT_ALL => {
                 let tab = self.state.active_mut().active_mut();
                 let all: Vec<PathBuf> = tab.display
                     .iter()
@@ -4888,25 +4746,6 @@ impl App {
                 tab.selection = all.into_iter().collect();
                 self.refresh_visible_rows();
                 self.sync_status();
-            }
-            ACT_SENDTO_DESKTOP | ACT_SENDTO_STARTMENU => {
-                if let MenuTarget::Files(paths) = &target {
-                    let dir = if id == ACT_SENDTO_DESKTOP {
-                        shortcut::desktop_dir()
-                    } else {
-                        shortcut::start_menu_programs_dir()
-                    };
-                    match dir {
-                        Some(dir) => match shortcut::create_shortcut_in(&dir, &paths[0]) {
-                            Ok(lnk) => self.set_status_job(format!(
-                                "已创建快捷方式：{}",
-                                lnk.file_name().unwrap_or_default().to_string_lossy()
-                            )),
-                            Err(e) => self.set_status_job(e),
-                        },
-                        None => self.set_status_job("找不到目标目录"),
-                    }
-                }
             }
             _ => {}
         }
@@ -5319,12 +5158,12 @@ impl App {
                     tab.selection.insert(path.clone());
                     tab.anchor = Some(path.clone());
                 }
-                let target = MenuTarget::Files(self.state.active().active().selected_paths());
-                self.menu_target = Some(target.clone());
+                let target = MenuScope::Selection(self.state.active().active().selected_paths());
+                self.menu_scope = Some(target.clone());
                 self.visible_cache = None;
                 self.refresh_visible_rows();
                 self.sync_status();
-                self.open_menu(target, x, y);
+                self.open_menu(target);
             }
             PointerEventButton::Left => {
                 // 双击检测在 Rust 侧做（500ms 内同一路径二次按下）：
@@ -5749,7 +5588,7 @@ impl App {
         });
     }
 
-    fn background_pointer_event(&mut self, event: &PointerEvent, x: f32, y: f32) {
+    fn background_pointer_event(&mut self, event: &PointerEvent, _x: f32, _y: f32) {
         if event.kind != PointerEventKind::Down {
             return;
         }
@@ -5763,9 +5602,9 @@ impl App {
                 self.sync_status();
             }
             PointerEventButton::Right => {
-                let target = MenuTarget::Background;
-                self.menu_target = Some(target.clone());
-                self.open_menu(target, x, y);
+                let target = MenuScope::Background;
+                self.menu_scope = Some(target.clone());
+                self.open_menu(target);
             }
             _ => {}
         }
@@ -6240,14 +6079,7 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         {
             return EventResult::Propagate;
         }
-        // 菜单打开时只处理 Escape。
-        if app.ui.get_menu_open() {
-            if matches!(logical_key, Key::Named(slint::winit_030::winit::keyboard::NamedKey::Escape)) {
-                app.close_menu();
-                return EventResult::Propagate;
-            }
-            return EventResult::Propagate;
-        }
+        // 原生菜单打开时前台在菜单线程的窗口上，按键根本不会到 Rove；这里不再需要菜单开关。
 
         let ctrl = key_down(VK_CONTROL);
         let shift = key_down(VK_SHIFT);
@@ -6774,52 +6606,6 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_staging_move_here_requested(move || {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut().staging_transfer(true);
-        });
-    }
-
-    // ---- 右键菜单 ----
-    {
-        let app = Rc::downgrade(app);
-        upgrade().on_menu_item_triggered(move |id| {
-            let Some(app) = app.upgrade() else { return };
-            app.borrow_mut().run_menu_action(&id);
-        });
-    }
-    {
-        let app = Rc::downgrade(app);
-        upgrade().on_menu_submenu_hovered(move |index, _entered| {
-            let Some(app) = app.upgrade() else { return };
-            let app = app.borrow_mut();
-            if index < 0 {
-                app.ui.set_submenu_items(ModelRc::new(VecModel::from(Vec::<MenuItem>::new())));
-                app.ui.set_submenu_row_y(0.0);
-                return;
-            }
-            // 二级菜单顶部与悬停项对齐:累计该项之前的行高(含菜单 padding-top)。
-            {
-                let model = app.ui.get_menu_items();
-                let mut row_y = 4.0f32;
-                for i in 0..(index as usize).min(model.row_count()) {
-                    if let Some(it) = model.row_data(i) {
-                        row_y += if it.kind == "separator" { 9.0 } else { 28.0 };
-                    }
-                }
-                app.ui.set_submenu_row_y(row_y);
-            }
-            // 仅当悬停的是带子菜单的项时展开（按 id 分发内容）。
-            let hover_id = app
-                .ui
-                .get_menu_items()
-                .row_data(index as usize)
-                .filter(|item| item.kind == "submenu")
-                .map(|item| item.id.to_string());
-            if let Some(hover_id) = hover_id {
-                let (items, height) = app.build_submenu_for(&hover_id);
-                app.ui.set_submenu_items(ModelRc::new(VecModel::from(items)));
-                app.ui.set_submenu_items_height(height);
-            } else {
-                app.ui.set_submenu_items(ModelRc::new(VecModel::from(Vec::<MenuItem>::new())));
-            }
         });
     }
 
@@ -7914,6 +7700,44 @@ fn work_area_logical(_scale: f32) -> Option<(f32, f32)> {
 // `invoke_from_event_loop`（空捕获、可跨线程）在本线程执行时访问。
 thread_local! {
     static SESSION: RefCell<Option<Rc<RefCell<App>>>> = const { RefCell::new(None) };
+}
+
+/// 原生菜单的结果回投（由菜单线程经 `invoke_from_event_loop` 调回 UI 线程）。
+///
+/// 这里**不能**在刚拿到结果时就同步执行——它会从后台线程被调度过来，
+/// 只靠 SESSION 取 App，不存在借用冲突。
+#[cfg(windows)]
+pub(crate) fn handle_native_menu_action(action: crate::sys::menu::MenuAction) {
+    use crate::sys::menu::MenuAction;
+    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    let mut app = app.borrow_mut();
+    match action {
+        MenuAction::App(key) => app.run_menu_action(&key),
+        MenuAction::Rename => {
+            // Shell 的「重命名」回到应用内的就地重命名（不弹系统小窗）。
+            if let Some(MenuScope::Selection(paths)) = app.menu_scope.clone() {
+                if paths.len() == 1 {
+                    let path = paths[0].clone();
+                    app.begin_rename(&path);
+                }
+            }
+        }
+        // Shell 的「打开 / 在新窗口中打开」：文件夹回应用内导航，
+        // 不要跳去资源管理器。
+        MenuAction::Navigate(dir) => app.open_path(&dir),
+        MenuAction::ShellOpBegin => {
+            // 与自带任务共用同一个闸门：Shell 的确认/进度框只对自己的线程模态，
+            // 不拦住的话回车会穿透到 Rove（Shift+Delete 那个坑）。
+            app.shell_op_running = true;
+            app.shell_key_suppressed_logged = false;
+        }
+        MenuAction::ShellOpEnd => {
+            app.shell_op_running = false;
+        }
+        MenuAction::Refresh => app.user_refresh_active(),
+    }
 }
 
 /// 在事件循环线程清空全部输入聚焦（供跨模块 / 窗口消息钩子调用）。

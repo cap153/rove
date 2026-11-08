@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 一次文件操作任务。
 #[derive(Clone, Debug)]
@@ -328,6 +327,8 @@ fn run_delete(
 }
 
 /// 目标已存在时生成 "名称 - 副本.ext" / "名称 - 副本 (2).ext"。
+/// 仅非 Windows 的逐文件回退实现使用（Windows 走原生 Shell 复制/移动）。
+#[cfg(not(windows))]
 pub fn unique_dest(dest_dir: &Path, name: &str, is_dir: bool) -> PathBuf {
     let direct = dest_dir.join(name);
     if !direct.exists() {
@@ -351,8 +352,8 @@ pub fn unique_dest(dest_dir: &Path, name: &str, is_dir: bool) -> PathBuf {
         }
     }
     // 极端情况：追加时间戳。
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     dest_dir.join(format!("{stem} - 副本 {stamp}.{}", ext.unwrap_or_default()))
@@ -413,6 +414,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(windows))]
     fn unique_dest_appends_suffix() {
         let dir = std::env::temp_dir().join("rove-test-unique-dest");
         let _ = std::fs::create_dir_all(&dir);

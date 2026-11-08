@@ -6,4 +6,5 @@
 pub mod pick;
 pub mod dnd;
 pub mod shell;
+pub mod menu;
 pub mod dialog_jump;
