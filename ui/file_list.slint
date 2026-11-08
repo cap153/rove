@@ -98,6 +98,20 @@ export component FileList inherits Rectangle {
     callback background-pointer-event(event: PointerEvent, x: length, y: length);
     callback rename-committed(path: string, new_name: string);
     callback rename-cancelled();
+    /// 排查用：图标视图名字区/浮层的全部尺寸与判断结果（仅几何或展开目标变化时上报）。
+    callback name-debug(info: string, name: string);
+    /// 排查用：列表/滚动条宽度几何（窗口缩放、滚动条显隐时各一行）
+    callback sb-debug(info: string);
+    public function sb-debug-info() -> string {
+        return "list_w=\{round(root.width / 1px)} list_abs_r=\{round((root.absolute-position.x + root.width) / 1px)}"
+            + " flick_w=\{round(flick.width / 1px)} flick_abs_x=\{round(flick.absolute-position.x / 1px)}"
+            + " sb_x=\{round(scrollbar.x / 1px)} sb_w=\{round(scrollbar.width / 1px)}"
+            + " sb_abs_r=\{round((scrollbar.absolute-position.x + scrollbar.width) / 1px)}"
+            + " view=\{root.view-mode}";
+    }
+    changed width => { root.sb-debug(root.sb-debug-info()); }
+    /// 重命名输入内容变了（Rust 用它把超长名字截到 Windows 上限）。
+    callback rename-text-changed(text: string);
 
     /// 外部点击（背景/侧栏/工具栏等）时调用：若有进行中的重命名，按已输入文本提交。
     /// 只在明确的用户点击路径上调用（不用 has-focus 失焦：那个会在输入框刚创建时
@@ -126,11 +140,26 @@ export component FileList inherits Rectangle {
         : root.view-mode == "icons-medium" ? 96px
         : root.view-mode == "icons-small" ? 190px
         : 0px;
-    private property <length> cell-h: root.view-mode == "icons-xl" ? 212px
-        : root.view-mode == "icons-large" ? 148px
-        : root.view-mode == "icons-medium" ? 108px
-        : root.view-mode == "icons-small" ? 52px
-        : 0px;
+    /// 字体行高（真实测出来的）：直接量“3 行汉字”的总高，与真正渲染名字
+    /// 用的是同一套字体回退和行高，所以不多不少刚好装 3 行。
+    /// （不能用拉丁字 "M\nM" 量：中文字体行高比拉丁字体大，量小了就会
+    /// 把第 3 行挤掉。）
+    fm-name-3 := Text { visible: false; font-size: 11.5px; text: "国\n国\n国"; }
+    /// 同上，但带符号字（♡/❤）：表情/符号字体往往行高更高，
+    /// 行里有它就整行变高。取两者最大值，保证任何名字的 3 行都装得下。
+    fm-name-3e := Text { visible: false; font-size: 11.5px; text: "国♡❤\n国♡❤\n国♡❤"; }
+    fm-size-1 := Text { visible: false; font-size: 11px; font-family: Theme.mono-font-family; text: "0"; }
+    /// 名字固定展示 3 行的高度。
+    /// **必须 +2px**：Slint 内部用 `floor(高度 / 行高)` 算“能放几行”，
+    /// 当高度恰好等于 3×行高 时，浮点误差会算出 2.999… → floor 成 2 行，
+    /// 第三个行就被丢掉（表现为“第二行就打了省略号”）。
+    private property <length> name-h: max(30px, max(fm-name-3.preferred-height, fm-name-3e.preferred-height) + 2px);
+    private property <length> size-line-h: max(9px, fm-size-1.preferred-height);
+    /// 文字区总高（仅用做浮层“4 行”阀值）
+    private property <length> text-h: root.name-h + 1px + root.size-line-h + 4px;
+    private property <length> cell-h: root.view-mode == "icons-small" ? 52px
+        : root.view-mode == "details" || root.view-mode == "list" ? 0px
+        : root.cell-thumb + root.text-h + 20px;
     private property <length> cell-thumb: root.view-mode == "icons-xl" ? 132px
         : root.view-mode == "icons-large" ? 88px
         : root.view-mode == "icons-medium" ? 60px
@@ -145,10 +174,123 @@ export component FileList inherits Rectangle {
         ? 1
         : max(1, floor((flick.width - 8px) / max(40px, root.cell-w)));
     out property <length> row-height-out: root.view-row-h;
+    /// 格子实际宽/高（Rust 卡选、拖放定位需要，不再在 Rust 里写一份固定数字）。
+    out property <length> cell-w-out: root.cell-w;
+    out property <length> cell-h-out: root.cell-h;
     /// 列表可视宽度（icons 网格列数计算用，供调试观测）。
     out property <length> view-width: flick.width;
     /// 当前视图是否为图标网格。
     out property <bool> is-icons-view: root.view-mode != "details" && root.view-mode != "list";
+
+    // ---- 展开名称层（单个选中 / 重命名）----
+    /// 本行是否正被“展开名称层”接管（接管时行内不画名字/容量，避免浮层下方漏字）
+    pure function row-expanded(idx: int) -> bool {
+        return root.expand-active && root.expand-index == idx;
+    }
+
+    /// 需要“展开名称”的条目**绝对索引**（-1 = 无）。由 Rust 计算：
+    /// 正在重命名的条目，或本栏恰好只选中一个条目时。
+    in-out property <int> expand-index: -1;
+    /// 该条目的完整名称（Slint 无法按索引读模型，由 Rust 直接给）。
+    in-out property <string> expand-name: "";
+
+    /// 只在中/大/超大图标视图生效；小图标视图（横排单行）保持原样。
+    /// 两个条件之一：正在重命名（必须有输入框），或常态下名字被截断（3 行装不下）。
+    /// 名字 3 行就能完整显示时，选中不弹浮层。
+    private property <bool> expand-active: root.is-icons-view
+        && root.view-mode != "icons-small"
+        && root.expand-index >= 0
+        && (root.rename-path != "" || root.ex-needs);
+    private property <int> ex-col: Math.mod(max(0, root.expand-index), max(1, root.cells-per-row));
+    private property <int> ex-row: floor(max(0, root.expand-index) / max(1, root.cells-per-row));
+    private property <length> ex-item-x: ex-col * root.cell-w + 4px;
+    /// 框内文本：重命名中跟随输入，否则是完整文件名。
+    private property <string> ex-text: root.rename-path != "" ? root.rename-text : root.expand-name;
+    /// 框的最小宽度（= 格子的可见宽，左右各留 4px 边距）
+    private property <length> ex-cell-w: root.cell-w - 8px;
+    /// 格子内名字的真实文字宽度（行内边距左右各 4 + 布局左右各 4）
+    private property <length> ex-cell-text-w: max(20px, root.cell-w - 16px);
+    /// 先按**格子宽度**换行，量出需要多高
+    ex-measure-cell := Text {
+        visible: false;
+        text: root.ex-text;
+        font-size: 11.5px;
+        wrap: char-wrap;
+        width: root.ex-cell-text-w;
+    }
+    /// 常态下会不会被截断（超过 3 行才需要浮层）
+    private property <bool> ex-needs: ex-measure-cell.preferred-height > root.name-h + 1px;
+    /// 格子宽下 4 行（名字 3 行 + 容量 1 行）都装不下 → 才向外变宽
+    private property <bool> ex-wide: ex-measure-cell.preferred-height > root.text-h;
+
+    // 变宽候选宽度：按 **1.25 倍格宽**一级一级递增，取“刚好能装进 4 行”的最小宽度。
+    // 这样不会为了一个中等长的名字直接撑到整个窗格宽、变成孤零零的一行。
+    private property <length> ex-limit-w: max(root.ex-cell-w, root.width - 12px);
+    private property <length> ex-w1: min(root.ex-limit-w, root.ex-cell-w * 125 / 100);
+    private property <length> ex-w2: min(root.ex-limit-w, root.ex-cell-w * 150 / 100);
+    private property <length> ex-w3: min(root.ex-limit-w, root.ex-cell-w * 175 / 100);
+    private property <length> ex-w4: min(root.ex-limit-w, root.ex-cell-w * 200 / 100);
+    private property <length> ex-w5: min(root.ex-limit-w, root.ex-cell-w * 250 / 100);
+    ex-m-w1 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w1 - 8px; }
+    ex-m-w2 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w2 - 8px; }
+    ex-m-w3 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w3 - 8px; }
+    ex-m-w4 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w4 - 8px; }
+    ex-m-w5 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w5 - 8px; }
+
+    /// 宽度：默认就是格子宽；装不下才一级一级加宽。
+    private property <length> ex-box-w: !root.ex-wide ? root.ex-cell-w
+        : ex-m-w1.preferred-height <= root.text-h ? root.ex-w1
+        : ex-m-w2.preferred-height <= root.text-h ? root.ex-w2
+        : ex-m-w3.preferred-height <= root.text-h ? root.ex-w3
+        : ex-m-w4.preferred-height <= root.text-h ? root.ex-w4
+        : ex-m-w5.preferred-height <= root.text-h ? root.ex-w5
+        : root.ex-limit-w;
+    /// 按**最终框宽**重新量高：短名字就矮（不再固定 4 行），长名字继续往下长。
+    /// 框内文本宽 = 框宽 - 8（左右各 4px 内边距，与格子里文字同宽）。
+    ex-measure-box := Text {
+        visible: false;
+        text: root.ex-text;
+        font-size: 11.5px;
+        wrap: char-wrap;
+        width: root.ex-box-w - 8px;
+    }
+    /// 高度：变宽的浮层保持“四行块”的体型（不要变成孤零零的一行）；
+    /// 没变宽时按内容高，短名字就矮，内容超过四行则继续往下长。
+    /// 排查用：重命名中 = 1（字符串模板里不能嵌套引号比较，所以先算好）
+    private property <int> ex-renaming: root.rename-path == "" ? 0 : 1;
+    private property <length> ex-box-h: root.ex-wide
+        ? max(root.text-h + 14px, ex-measure-box.preferred-height + 14px)
+        : max(ex-measure-box.preferred-height + 14px, 30px);
+
+    /// 排查用：把“为什么截断 / 浮层为什么这样”的全部数字拼成一行。
+    public function name-debug-info() -> string {
+        return "mode=\{root.view-mode} cell=\{round(root.cell-w / 1px)}x\{round(root.cell-h / 1px)}"
+            + " thumb=\{round(root.cell-thumb / 1px)} name-h=\{round(root.name-h / 1px)}"
+            + " size-h=\{round(root.size-line-h / 1px)} text-h=\{round(root.text-h / 1px)}"
+            + " text-w=\{round(root.ex-cell-text-w / 1px)} m3=\{round(fm-name-3.preferred-height / 1px)}"
+            + " m3e=\{round(fm-name-3e.preferred-height / 1px)} m1s=\{round(fm-size-1.preferred-height / 1px)}"
+            + " idx=\{root.expand-index} renaming=\{root.ex-renaming}"
+            + " need=\{root.ex-needs ? 1 : 0} wide=\{root.ex-wide ? 1 : 0}"
+            + " m-cell=\{round(ex-measure-cell.preferred-height / 1px)}"
+            + " box=\{round(root.ex-box-w / 1px)}x\{round(root.ex-box-h / 1px)}"
+            + " m-box=\{round(ex-measure-box.preferred-height / 1px)}";
+    }
+    changed cell-h => { root.name-debug(root.name-debug-info(), root.expand-name); }
+    changed expand-name => {
+        if (root.expand-index >= 0) {
+            root.name-debug(root.name-debug-info(), root.expand-name);
+        }
+    }
+    changed rename-path => { root.name-debug(root.name-debug-info(), root.expand-name); }
+    /// 居中在格子上；最左列向右长，最右列向左长。
+    private property <length> ex-want-x: ex-col == 0
+        ? ex-item-x
+        : ex-col >= root.cells-per-row - 1
+            ? ex-item-x + root.cell-w - 8px - ex-box-w
+            : ex-item-x + (root.cell-w - 8px - ex-box-w) / 2;
+    private property <length> ex-box-x: max(4px, min(ex-want-x, root.width - 4px - ex-box-w));
+    private property <length> ex-box-y: flick.y + flick.content-y + ex-row * root.cell-h
+        + 4px + root.cell-thumb + 3px;
 
     /// 滚动到顶端（导航/过滤变化时由 Rust 调用）。
     public function scroll-to-top() {
@@ -940,14 +1082,21 @@ export component FileList inherits Rectangle {
                 }
 
                 // 中/大/超大图标：竖排（缩略图上 + 名称/大小下）。
-                if (root.view-mode != "icons-small") : VerticalLayout {
+                // 这里全部用**绝对定位**，不用 VerticalLayout：
+                // 用布局时容量行会把自己的真实行高算进去，比预想的略高一点，
+                // Slint 就会从名字那里扣掉几个像素，导致第 3 行被挤成省略号。
+                // 绝对定位后名字区高度是写死的，谁也挤不掉。
+                if (root.view-mode != "icons-small") : Rectangle {
                     x: 4px;
                     y: 4px;
                     width: parent.width - 8px;
                     height: parent.height - 8px;
-                    spacing: 3px;
+                    background: transparent;
 
                     Rectangle {
+                        x: 0px;
+                        y: 0px;
+                        width: 100%;
                         height: root.cell-thumb;
                         border-radius: 6px;
                         background: Theme.bg-input;
@@ -961,91 +1110,53 @@ export component FileList inherits Rectangle {
                         }
                     }
 
-                    // 文字区域：包含名称与容量信息
-                    VerticalLayout {
-                        height: parent.height - root.cell-thumb - 7px;
-                        spacing: 1px;
-                        alignment: start;
+                    // 名称区：高度写死 3 行。
+                    // 重命名不在这里渲染：中/大/超大图标的重命名输入框统一放到
+                    // 列表最上层的“展开名称层”（见文件末尾），因为行内元素
+                    // 无法盖到下一行上面，而需求是允许盖住邻居。
+                    if (!root.row-expanded(row.index) && row.name-parts.length > 0) : HighlightName {
+                        x: 0px;
+                        y: root.cell-thumb + 3px;
+                        width: 100%;
+                        height: root.name-h;
+                        parts: row.name-parts;
+                        font-size: 11.5px;
+                        is-dir: row.is-dir;
+                        align-top: true;
+                        horizontal-center: true;
+                    }
+                    if (!root.row-expanded(row.index) && row.name-parts.length == 0) : Text {
+                        x: 0px;
+                        y: root.cell-thumb + 3px;
+                        width: 100%;
+                        height: root.name-h;
+                        text: row.name;
+                        color: Theme.text-primary;
+                        font-size: 11.5px;
+                        font-weight: row.is-dir ? 500 : 400;
+                        horizontal-alignment: center;
+                        vertical-alignment: top;
+                        // 中文按字换行（char-wrap）：英文按词换行会在
+                        // 中英混排的名字里留下大片空白。
+                        wrap: char-wrap;
+                        overflow: elide;
+                        // 常态固定 3 行名字
+                        max-lines: 3;
+                    }
 
-                        // 名称:搜索命中时单行高亮;否则根据是否有容量行自适应 1~2 行
-                        // 核心修复：图标视图重命名时渲染 TextInput（否则本视图无法重命名）。
-                        if (root.rename-path == row.path) : rename-input-icon-vert := TextInput {
-                            text: row.name;
-                            color: Theme.text-primary;
-                            font-size: 11.5px;
-                            horizontal-alignment: center;
-                            vertical-alignment: top;
-                            selection-background-color: Theme.accent;
-                            selection-foreground-color: Theme.accent-text;
-
-                            init => {
-                                // 不在 init 里 focus（详见详细视图输入框的说明）。
-                                root.rename-text = self.text;
-                            }
-
-                            // 延迟一拍再抢焦点（详见详细视图里的说明）。
-                            rename-focus-icon2 := Timer {
-                                interval: 60ms;
-                                running: true;
-                                triggered => {
-                                    self.running = false;
-                                    // 只在 icons-medium/large/xl 生效（视图限定）。
-                                    if (root.rename-path == row.path && root.is-icons-view && root.view-mode != "icons-small") {
-                                        let keep-y = flick.content-y;
-                                        rename-input-icon-vert.focus();
-                                        rename-input-icon-vert.select-all();
-                                        flick.content-y = keep-y;
-                                        root.rename-dbg("icon2-timer", rename-input-icon-vert.has-focus);
-                                    }
-                                }
-                            }
-
-                            edited => {
-                                root.rename-text = self.text;
-                            }
-
-                            accepted => {
-                                root.rename-text = self.text;
-                                root.rename-committed(row.path, self.text);
-                            }
-
-                            key-pressed(event) => {
-                                if (event.text == Key.Escape) {
-                                    root.rename-cancelled();
-                                    return EventResult.accept;
-                                }
-                                return EventResult.reject;
-                            }
-                        }
-                        if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
-                            parts: row.name-parts;
-                            font-size: 11.5px;
-                            is-dir: row.is-dir;
-                            align-top: true;
-                            horizontal-center: true;
-                        }
-                        if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
-                            text: row.name;
-                            color: Theme.text-primary;
-                            font-size: 11.5px;
-                            font-weight: row.is-dir ? 500 : 400;
-                            horizontal-alignment: center;
-                            vertical-alignment: top;
-                            wrap: word-wrap;
-                            overflow: elide;
-                            max-lines: row.size-text != "" ? 1 : 2;
-                        }
-
-                        // 容量文本：灰色居中显示（文件夹异步统计完成后出现）
-                        if (row.size-text != "") : Text {
-                            text: row.size-text;
-                            color: Theme.text-secondary;
-                            font-size: 11px;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            font-family: Theme.mono-font-family;
-                        }
+                    // 容量行：紧跟在名字区下面（被浮层接管的那一行不画，避免漏底）。
+                    if (row.size-text != "" && !root.row-expanded(row.index)) : Text {
+                        x: 0px;
+                        y: root.cell-thumb + 4px + root.name-h;
+                        width: 100%;
+                        height: root.size-line-h + 4px;
+                        text: row.size-text;
+                        color: Theme.text-secondary;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        font-family: Theme.mono-font-family;
                     }
                 }
 
@@ -1123,6 +1234,7 @@ export component FileList inherits Rectangle {
         width: 8px;
         height: flick.height - 4px;
         visible: flick.content-height > flick.height + 1px;
+        changed visible => { root.sb-debug(root.sb-debug-info()); }
 
         property <length> track-h: self.height;
         property <length> thumb-h: max(32px, min(self.track-h, self.track-h * flick.height / max(flick.content-height, 1px)));
@@ -1213,6 +1325,91 @@ export component FileList inherits Rectangle {
                 font-size: 14px;
                 horizontal-alignment: center;
             }
+        }
+    }
+
+    // ---- 展开名称层（单个选中 / 重命名）----
+    //
+    // 为什么必须画在这里：网格里的每一行是 Flickable 的**同级**元素，
+    // 行内的浮层只能盖住自己所在的那一行（z 只在同一父级里排序）。
+    // 放到整个 FileList 的最上层，才能盖住左右邻居、并突破格子宽度。
+    //
+    // 两种状态：
+    //   · 只是“选中一个” → 纯文字，没有任何 TouchArea，鼠标穿透（双击/拖拽照常）；
+    //   · “重命名中” → 里面放多行输入框，可以正常打字。
+    if (root.expand-active) : Rectangle {
+        x: root.ex-box-x;
+        y: root.ex-box-y;
+        width: root.ex-box-w;
+        height: root.ex-box-h;
+        border-radius: 6px;
+        background: Theme.bg-input;
+        border-width: root.rename-path != "" ? 1.5px : 1px;
+        border-color: root.rename-path != "" ? Theme.accent : Theme.border;
+        // 轻微阴影，让它看起来“浮”在格子上
+        drop-shadow-blur: 8px;
+        drop-shadow-color: #00000022;
+        drop-shadow-offset-y: 2px;
+
+        if (root.rename-path != "") : rename-input-expand := TextInput {
+            x: 4px;
+            y: 6px;
+            width: parent.width - 8px;
+            height: parent.height - 12px;
+            text <=> root.rename-text;
+            edited => {
+                root.rename-text-changed(self.text);
+            }
+            color: Theme.text-primary;
+            font-size: 11.5px;
+            horizontal-alignment: center;
+            vertical-alignment: top;
+            single-line: false;
+            wrap: char-wrap;
+            selection-background-color: Theme.accent;
+            selection-foreground-color: Theme.accent-text;
+
+            // 多行模式下回车会被当成换行；改用 key-pressed 提前拦下当作“提交”。
+            key-pressed(event) => {
+                if (event.text == Key.Return) {
+                    root.rename-committed(root.rename-path, root.rename-text);
+                    return EventResult.accept;
+                }
+                if (event.text == Key.Escape) {
+                    root.rename-cancelled();
+                    return EventResult.accept;
+                }
+                return EventResult.reject;
+            }
+
+            // 延迟一拍再抢焦点：输入框刚创建时 Slint 还会再布局一次。
+            // 本层不在 Flickable 内部，focus() 不会把列表滚动位置推走。
+            Timer {
+                interval: 60ms;
+                running: true;
+                triggered => {
+                    self.running = false;
+                    if (root.rename-path != "") {
+                        rename-input-expand.focus();
+                        rename-input-expand.select-all();
+                        root.rename-dbg("expand-timer", rename-input-expand.has-focus);
+                    }
+                }
+            }
+        }
+        ex-display-text := Text {
+            visible: root.rename-path == "";
+            x: 4px;
+            y: 6px;
+            width: parent.width - 8px;
+            height: parent.height - 12px;
+            text: root.expand-name;
+            color: Theme.text-primary;
+            font-size: 11.5px;
+            horizontal-alignment: center;
+            vertical-alignment: top;
+            wrap: char-wrap;
+            overflow: elide;
         }
     }
 }

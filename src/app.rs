@@ -1736,6 +1736,41 @@ fn drag_gesture_paths(
 mod tests {
     use super::*;
 
+    /// 超长名字截断时必须保留扩展名（否则文件失去关联类型）。
+    #[test]
+    fn clamp_file_name_keeps_extension() {
+        let long_stem = "文".repeat(300);
+        let name = format!("{}.mp4", long_stem);
+        let out = clamp_file_name(&name);
+        assert!(out.ends_with(".mp4"), "扩展名丢了: {:?}", &out[out.len() - 8..]);
+        assert_eq!(utf16_len(&out), MAX_FILE_NAME_UNITS);
+
+        // 短名字不动
+        assert_eq!(clamp_file_name("a.mp4"), "a.mp4");
+
+        // 无扩展名 → 直接截到上限
+        let no_ext = "文".repeat(300);
+        assert_eq!(utf16_len(&clamp_file_name(&no_ext)), MAX_FILE_NAME_UNITS);
+
+        // 开头点（.gitignore 风格）不算扩展名
+        let hidden = format!(".{}", "文".repeat(300));
+        assert_eq!(utf16_len(&clamp_file_name(&hidden)), MAX_FILE_NAME_UNITS);
+
+        // 多后缀只保留最后一段
+        let multi = format!("{}.tar.gz", "文".repeat(300));
+        assert!(clamp_file_name(&multi).ends_with(".gz"));
+    }
+
+    /// 截断不能把一个 emoji（代理对）切成半个。
+    #[test]
+    fn clamp_file_name_does_not_split_surrogates() {
+        let name = "🦀".repeat(200); // 每个 2 个 UTF-16 码元
+        let out = clamp_file_name(&name);
+        assert!(utf16_len(&out) <= MAX_FILE_NAME_UNITS);
+        assert_eq!(out.chars().count(), MAX_FILE_NAME_UNITS / 2);
+        assert!(out.chars().all(|c| c == '🦀'));
+    }
+
     #[test]
     fn pulse_size_format_matches_pulse_sidebar() {
         let kib = 1024u64;
@@ -2025,15 +2060,8 @@ impl App {
 
         // 1. 记录当前视口顶部是第几个条目（index）：视图切换会改变 cell 布局，
         //    旧的像素偏移不能直接复用到新视图，必须先换回逻辑条目序号。
-        let old_row_h = match self.config.view_mode.as_str() {
-            "details" => 30.0,
-            "list" => 24.0,
-            "icons-small" => 52.0,
-            "icons-medium" => 108.0,
-            "icons-large" => 148.0,
-            "icons-xl" => 212.0,
-            _ => 30.0,
-        };
+        //    行高统一从 UI 读（图标视图的行高按字体行高算出来，不再在 Rust 写死）。
+        let old_row_h = self.ui.get_row_height_out() as f32;
         let old_cells = self.ui.get_cells_per_row().max(1) as usize;
         let scroll_y = self.state.active().active().scroll_y;
         let first_row = (scroll_y / old_row_h).floor();
@@ -2898,6 +2926,57 @@ impl App {
             self.ui.set_file_total_right(0);
             self.ui.set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
         }
+
+        self.sync_expand_targets();
+    }
+
+    /// 算出图标视图“展开名称层”的目标：正在重命名的条目，或本栏只选中一个条目时。
+    ///
+    /// 给出的是**绝对显示索引**（与 `FileRow.index` 同一坐标系）。
+    /// 只在中/大/超大图标视图生效——小图标视图是横排单行，保持原样。
+    fn sync_expand_targets(&mut self) {
+        let icons_big = matches!(
+            self.config.view_mode.as_str(),
+            "icons-medium" | "icons-large" | "icons-xl"
+        );
+        if !icons_big {
+            self.ui.set_file_expand_index(-1);
+            self.ui.set_file_expand_name(SharedString::default());
+            self.ui.set_file_expand_index_right(-1);
+            self.ui.set_file_expand_name_right(SharedString::default());
+            return;
+        }
+
+        let rename = self.ui.get_rename_path().to_string();
+        let is_split = self.state.active().is_split;
+        let mut targets: [(i32, String); 2] = [(-1, String::new()), (-1, String::new())];
+        for pane in 0..2 {
+            if pane == 1 && !is_split {
+                break;
+            }
+            let tab = self.state.active();
+            let Some(p) = tab.panes.get(pane) else { continue };
+            // 重命名只发生在左栏（右栏的 rename-path 恒为空）。
+            let target: Option<PathBuf> = if pane == 0 && !rename.is_empty() {
+                Some(PathBuf::from(&rename))
+            } else if p.selection.len() == 1 {
+                p.selection.iter().next().cloned()
+            } else {
+                None
+            };
+            let Some(target) = target else { continue };
+            let hit = (0..p.display.len()).find_map(|di| {
+                let e = p.display_entry(di)?;
+                (e.path == target).then(|| (di as i32, e.name.clone()))
+            });
+            if let Some(hit) = hit {
+                targets[pane] = hit;
+            }
+        }
+        self.ui.set_file_expand_index(targets[0].0);
+        self.ui.set_file_expand_name(targets[0].1.as_str().into());
+        self.ui.set_file_expand_index_right(targets[1].0);
+        self.ui.set_file_expand_name_right(targets[1].1.as_str().into());
     }
 
     /// 为指定面板构建可视窗口的行模型（左栏 pane 0 / 右栏 pane 1）。
@@ -3164,6 +3243,55 @@ fn pin_entry_at(
         entries.insert(to, pinned);
     }
     Some((from, to))
+}
+
+/// 图标视图格子尺寸从 UI 读（UI 里按真实字体行高算，保证 3 行名字装得下）。
+/// Windows 文件名长度上限（UTF-16 码元）。超过这个名字的条目系统会拒绝创建，
+/// 所以重命名输入框提前截断，而不是等系统报错。
+const MAX_FILE_NAME_UNITS: usize = 255;
+
+/// 按 Windows 文件名上限截断，**保留扩展名**（超长时只截主名）。
+/// 不切断代理对（emoji 不会被截成半个）。
+fn clamp_file_name(name: &str) -> String {
+    let total = utf16_len(name);
+    if total <= MAX_FILE_NAME_UNITS {
+        return name.to_string();
+    }
+    // 先切出扩展名（含点）：“.gitignore” 这种开头点的、末尾是点的都算无扩展名。
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    let ext_units = utf16_len(ext);
+    if ext_units == 0 || ext_units >= MAX_FILE_NAME_UNITS {
+        return clamp_units(name, MAX_FILE_NAME_UNITS).to_string();
+    }
+    let keep = MAX_FILE_NAME_UNITS - ext_units;
+    // 截断后主名可能以空格结尾（“abc .mp4”），去掉更好看。
+    let stem = clamp_units(stem, keep).trim_end_matches(' ');
+    format!("{}{}", stem, ext)
+}
+
+/// UTF-16 码元个数（Windows 的“文件名长度”就是数这个）。
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+/// 截到 `max` 个 UTF-16 码元，不切断代理对。
+fn clamp_units(s: &str, max: usize) -> &str {
+    let mut units = 0usize;
+    for (idx, ch) in s.char_indices() {
+        let w = ch.len_utf16();
+        if units + w > max {
+            return &s[..idx];
+        }
+        units += w;
+    }
+    s
+}
+
+fn cell_metrics(ui: &MainWindow) -> (f32, f32) {
+    (ui.get_cell_w_out() as f32, ui.get_cell_h_out() as f32)
 }
 
 /// 计算某面板的虚拟窗口条目区间（行区间 × cells-per-row）。
@@ -4293,6 +4421,8 @@ impl App {
         }
 
         self.ui.set_rename_path(SharedString::default());
+        // 重命名结束，展开层要回到“单选 / 无”的状态。
+        self.sync_expand_targets();
 
         // 核心修复：不管输入的名字是否为空、是否包含非法字符、是否重名、是否重命名成功，
         // 只要触发了 commit 就代表退出重命名态，必须立刻释放拖拽锁。
@@ -4300,7 +4430,9 @@ impl App {
         self.drag_pending = None;
         self.ui.invoke_set_drag_armed(false);
 
-        let new_name = new_name.trim();
+        // 超长名字直接截断到系统上限（截断后可能留下尾部空格，一并去掉）。
+        let clamped = clamp_file_name(new_name.trim());
+        let new_name = clamped.trim_end();
         if new_name.is_empty() {
             return;
         }
@@ -4433,6 +4565,21 @@ impl App {
     }
 
     /// 开始重命名选中项（仅单项）。
+    /// 进入重命名态（所有入口统一走这里）。
+    /// 除了设置目标路径，还要把当前文件名填进 `rename-text`，
+    /// 因为图标视图的重命名输入框是列表最上层的浮层，不在行内，拿不到 `row.name`。
+    fn begin_rename(&mut self, path: &Path) {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.ui
+            .set_rename_path(path.to_string_lossy().into_owned().into());
+        self.ui.set_rename_text(name.as_str().into());
+        self.arm_rename_scroll_guard();
+        self.sync_expand_targets();
+    }
+
     fn start_rename(&mut self) {
         // 核心修复：强行清空拖拽上膛锁，防止在行上按下时残留 drag-armed，
         // 导致重命名弹出输入框接管鼠标后 TouchArea 收不到 up 事件，锁永久残留、滚轮冻结。
@@ -4442,9 +4589,8 @@ impl App {
         let paths = self.state.active().active().selected_paths();
         if paths.len() == 1 {
             logv!("[rename] start_rename for {:?}", paths[0]);
-            self.ui
-                .set_rename_path(paths[0].to_string_lossy().into_owned().into());
-            self.arm_rename_scroll_guard();
+            let path = paths[0].clone();
+            self.begin_rename(&path);
         }
     }
 
@@ -4557,8 +4703,8 @@ impl App {
                     if let MenuTarget::Files(paths) = &target {
                         if let Some(path) = paths.first() {
                             logv!("[rename] menu rename for {:?}", path);
-                            self.ui.set_rename_path(path.to_string_lossy().into_owned().into());
-                            self.arm_rename_scroll_guard();
+                            let path = path.clone();
+                            self.begin_rename(&path);
                         }
                     }
                     return;
@@ -4698,9 +4844,8 @@ impl App {
                         self.drag_pending = None;
                         self.ui.invoke_set_drag_armed(false);
                         logv!("[rename] menu rename for {:?}", path);
-                        self.ui
-                            .set_rename_path(path.to_string_lossy().into_owned().into());
-                        self.arm_rename_scroll_guard();
+                        let path = path.clone();
+                        self.begin_rename(&path);
                     }
                 }
             }
@@ -4973,9 +5118,8 @@ impl App {
                 self.scroll_to_paths = vec![path.clone()];
                 self.scroll_select = false;
                 self.reload_active();
-                self.ui
-                    .set_rename_path(path.to_string_lossy().into_owned().into());
-                self.arm_rename_scroll_guard();
+                let new_path = path.clone();
+                self.begin_rename(&new_path);
             }
             Err(e) => self.set_status_job(format!("创建文件夹失败：{e}")),
         }
@@ -5641,6 +5785,7 @@ impl App {
         let is_icons = self.ui.get_is_icons_view_out();
         let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
         let row_h = self.ui.get_row_height_out();
+        let (cell_w, cell_h) = cell_metrics(&self.ui);
 
         let tab = self.state.active_mut().active_mut();
         let mut newly_selected = HashSet::new();
@@ -5656,9 +5801,9 @@ impl App {
             let (ix, iy, iw, ih) = if is_icons {
                 let col = di % cells_per_row;
                 let row = di / cells_per_row;
-                let x = col as f32 * 196.0 + 4.0; // 默认最大图标 196px
-                let y = row as f32 * 212.0 + 4.0; // 默认最大图标 212px
-                (x, y, 196.0 - 8.0, 212.0 - 8.0)
+                let x = col as f32 * cell_w + 4.0;
+                let y = row as f32 * cell_h + 4.0;
+                (x, y, cell_w - 8.0, cell_h - 8.0)
             } else {
                 let y = di as f32 * row_h;
                 (0.0, y, 5000.0, row_h) // 列表视图横向全宽
@@ -5692,6 +5837,7 @@ impl App {
         let is_icons = self.ui.get_is_icons_view_out();
         let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
         let row_h = self.ui.get_row_height_out();
+        let (cell_w, cell_h) = cell_metrics(&self.ui);
         let ctrl = key_down(VK_CONTROL);
         let shift = key_down(VK_SHIFT);
 
@@ -5708,20 +5854,6 @@ impl App {
             let (ix, iy, iw, ih) = if is_icons {
                 let col = di % cells_per_row;
                 let row = di / cells_per_row;
-                let cell_w = match self.config.view_mode.as_str() {
-                    "icons-xl" => 196.0,
-                    "icons-large" => 132.0,
-                    "icons-medium" => 96.0,
-                    "icons-small" => 190.0,
-                    _ => 96.0,
-                };
-                let cell_h = match self.config.view_mode.as_str() {
-                    "icons-xl" => 212.0,
-                    "icons-large" => 148.0,
-                    "icons-medium" => 108.0,
-                    "icons-small" => 52.0,
-                    _ => 108.0,
-                };
                 let x = col as f32 * cell_w + 4.0;
                 let y = row as f32 * cell_h + 4.0;
                 (x, y, cell_w - 8.0, cell_h - 8.0)
@@ -6460,6 +6592,48 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        upgrade().on_file_name_debug(move |pane, info, name| {
+            let Some(app) = app.upgrade() else { return };
+            let _app = app.borrow();
+            let n = name.to_string();
+            let total = n.chars().count();
+            let head: String = n.chars().take(14).collect();
+            let tail: String = {
+                let v: Vec<char> = n.chars().collect();
+                v[total.saturating_sub(14)..].iter().collect()
+            };
+            crate::logv!(
+                "[name] pane={} {} len={} head={:?} tail={:?}",
+                pane,
+                info,
+                total,
+                head,
+                tail
+            );
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_sb_debug(move |pane, info| {
+            let Some(app) = app.upgrade() else { return };
+            let _app = app.borrow();
+            crate::logv!("[sb] pane={} {}", pane, info);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_rename_text_changed(move |_pane, text| {
+            let Some(app) = app.upgrade() else { return };
+            let app = app.borrow();
+            let clamped = clamp_file_name(text.as_str());
+            if clamped.len() != text.len() {
+                app.ui.set_rename_text(clamped.as_str().into());
+                logv!("[rename] input clamped to {} units", MAX_FILE_NAME_UNITS);
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
         upgrade().on_file_scroll_user_input(move |_pane| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -6558,6 +6732,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
             app.ui.set_rename_path(SharedString::default());
+            // 退出重命名后，图标视图的展开层回到“只显示名字 / 隐藏”。
+            app.sync_expand_targets();
             // 核心修复：取消重命名时也必须解锁，否则锁残留 → 滚轮冻结。
             app.drag_pending = None;
             app.ui.invoke_set_drag_armed(false);
