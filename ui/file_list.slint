@@ -629,7 +629,14 @@ export component FileList inherits Rectangle {
                         // 核心修复：如果当前行正在重命名，拒绝事件，让点击穿透到 TextInput。
                         // 不能把整个 TouchArea 的 enabled 设为 false，否则 scroll-event 也会失效，
                         // 导致鼠标悬停在该行时滚轮卡死。
+                        //
+                        // 例外：点“自己这一行、但不在输入框上”的地方（图标、其它列、行尾空白）
+                        // = 提交重命名。输入框会自己吃掉它范内的点击，能走到这里的就一定是
+                        // 输入框以外，所以直接提交不会误伤打字。
                         if (root.rename-path == row.path) {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.commit-rename();
+                            }
                             return EventResult.reject;
                         }
                         // 点击到另一行也算“点击其他位置”：先按已输入文本提交重命名。
@@ -971,7 +978,14 @@ export component FileList inherits Rectangle {
                     pointer-event(event) => {
                         // 核心修复：本单元正在重命名时拒绝指针事件，让点击穿透到 TextInput。
                         // 不能禁用整个 TouchArea，否则 scroll-event 也会失效、滚轮卡死。
+                        //
+                        // 例外：点“自己的图标/格子里的空白”= 提交重命名（与资源管理器一致）。
+                        // 浮层输入框在上面一层，落在它范围内的点击会被输入框吃掉，
+                        // 能走到这里的就只剩图标和格子空白。
                         if (root.rename-path == row.path) {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.commit-rename();
+                            }
                             return EventResult.reject;
                         }
                         // 点击到另一个单元也算“点击其他位置”：先按已输入文本提交重命名。
