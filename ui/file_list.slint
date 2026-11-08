@@ -1,4 +1,5 @@
 import { Theme, FileRow, HighlightName } from "common.slint";
+import { SingleLineEdit } from "single_line_edit.slint";
 
 // 可排序表头单元格（公共部分）。
 component SortCell inherits Rectangle {
@@ -726,18 +727,17 @@ export component FileList inherits Rectangle {
                 }
 
                 // 名称 / 内联重命名
-                if (root.rename-path == row.path) : rename-input-details := TextInput {
+                if (root.rename-path == row.path) : rename-input-details := SingleLineEdit {
                     x: root.col-name-x;
                     width: root.col-name-w;
                     height: parent.height;
                     z: 10; // 确保处于最上层，不被背景或其他透明图层拦截点击
-                    text: row.name;
+                    text <=> root.rename-text;
                     // 核心修复：必须显式指定颜色，否则沿用主题默认白字 —— 在白底上就看不见了。
-                    color: Theme.text-primary;
-                    vertical-alignment: center;
+                    text-color: Theme.text-primary;
                     font-size: 13px;
-                    selection-background-color: Theme.accent;
-                    selection-foreground-color: Theme.accent-text;
+                    selection-background: Theme.accent;
+                    selection-foreground: Theme.accent-text;
 
                     init => {
                         // init 里不调 focus()：此时元素刚创建、几何未定，Slint 收到焦点事件会
@@ -745,12 +745,12 @@ export component FileList inherits Rectangle {
                         // 实测把滚动位置从底部 180 直接推到 55（滚动条自己往上跳，
                         // 连带把行模型推出可见窗口 → 重建 → 输入框被销毁 → 焦点丢失）。
                         // 统一改由下面的定时器拽，那里已能同步抵消 reveal。
-                        root.rename-text = self.text;
+                        root.rename-text = row.name;
                         root.rename-dbg("init", self.has-focus);
                     }
 
-                    changed has-focus => {
-                        root.rename-dbg("focus-changed", self.has-focus);
+                    focus-changed(has) => {
+                        root.rename-dbg("focus-changed", has);
                     }
 
                     // 延迟一拍再抢焦点（同步抵消 Slint 的自动 reveal）。
@@ -773,8 +773,8 @@ export component FileList inherits Rectangle {
                             if (root.rename-path == row.path && !root.is-icons-view) {
                                 // 必须先 focus 再 select-all：获得焦点会把光标重置到文末。
                                 let keep-y = flick.content-y;
-                                rename-input-details.focus();
-                                rename-input-details.select-all();
+                                rename-input-details.focus-input();
+                                rename-input-details.select-all-text();
                                 // focus() 会触发 Slint 的自动 reveal 把滚动位置推走，
                                 // 这里立刻恢复，抵消那次自动滚动（同步，无闪烁）。
                                 flick.content-y = keep-y;
@@ -795,13 +795,14 @@ export component FileList inherits Rectangle {
                         }
                     }
 
-                    edited => {
-                        root.rename-text = self.text;
+                    edited(t) => {
+                        root.rename-text = t;
+                        root.rename-text-changed(t);
                     }
 
-                    accepted => {
-                        root.rename-text = self.text;
-                        root.rename-committed(row.path, self.text);
+                    accepted(t) => {
+                        root.rename-text = t;
+                        root.rename-committed(row.path, t);
                     }
 
                     key-pressed(event) => {
@@ -1025,21 +1026,20 @@ export component FileList inherits Rectangle {
                     }
 
                     // 名称:搜索命中时高亮,否则普通 elide。
-                    // 核心修复：重命名时就地渲染 TextInput（图标视图之前完全没有输入框，
+                    // 核心修复：重命名时就地渲染输入框（图标视图之前完全没有输入框，
                     // 导致 F2/菜单进入重命名后什么都不出现，键盘还会被“重命名中”状态全吞）。
-                    if (root.rename-path == row.path) : rename-input-icon-small := TextInput {
+                    if (root.rename-path == row.path) : rename-input-icon-small := SingleLineEdit {
                         width: parent.width - 50px;
                         height: 44px;
-                        text: row.name;
-                        color: Theme.text-primary;
-                        vertical-alignment: center;
+                        text <=> root.rename-text;
+                        text-color: Theme.text-primary;
                         font-size: 12px;
-                        selection-background-color: Theme.accent;
-                        selection-foreground-color: Theme.accent-text;
+                        selection-background: Theme.accent;
+                        selection-foreground: Theme.accent-text;
 
                         init => {
                             // 不在 init 里 focus（详见详细视图输入框的说明）。
-                            root.rename-text = self.text;
+                            root.rename-text = row.name;
                         }
 
                         // 延迟一拍再抢焦点（详见详细视图里的说明）。
@@ -1051,21 +1051,22 @@ export component FileList inherits Rectangle {
                                 // 只在 icons-small 生效（视图限定，理由见详细视图输入框）。
                                 if (root.rename-path == row.path && root.view-mode == "icons-small") {
                                     let keep-y = flick.content-y;
-                                    rename-input-icon-small.focus();
-                                    rename-input-icon-small.select-all();
+                                    rename-input-icon-small.focus-input();
+                                    rename-input-icon-small.select-all-text();
                                     flick.content-y = keep-y;
                                     root.rename-dbg("icon-timer", rename-input-icon-small.has-focus);
                                 }
                             }
                         }
 
-                        edited => {
-                            root.rename-text = self.text;
+                        edited(t) => {
+                            root.rename-text = t;
+                            root.rename-text-changed(t);
                         }
 
-                        accepted => {
-                            root.rename-text = self.text;
-                            root.rename-committed(row.path, self.text);
+                        accepted(t) => {
+                            root.rename-text = t;
+                            root.rename-committed(row.path, t);
                         }
 
                         key-pressed(event) => {

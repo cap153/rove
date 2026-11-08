@@ -1,4 +1,5 @@
 import { Theme, HighlightName, NamePart, IconSearch } from "common.slint";
+import { SingleLineEdit } from "single_line_edit.slint";
 
 export struct JumpResult {
     name: string,
@@ -36,8 +37,8 @@ export component DialogJumpWindow inherits Window {
     callback focus-changed();
 
     public function init-focus() {
-        input.focus();
-        input.select-all();
+        input.focus-input();
+        input.select-all-text();
     }
 
     public function clear-query() {
@@ -103,30 +104,28 @@ export component DialogJumpWindow inherits Window {
                         icon-color: Theme.accent;
                     }
 
-                    input := TextInput {
+                    input := SingleLineEdit {
                         horizontal-stretch: 1;
                         height: parent.height;
                         text <=> root.query;
                         font-size: 13px;
-                        color: Theme.text-primary;
-                        vertical-alignment: center;
-                        single-line: true;
+                        text-color: Theme.text-primary;
 
-                        // 用 changed text 而非 edited：edited 只在「用户编辑」时触发，
+                        // 用 text-changed 而非 edited：edited 只在「用户编辑」时触发，
                         // IME 预编辑 / 程序化改写等路径可能不触发，表现为「能输入但不出结果」。
-                        changed text => {
+                        text-changed(t) => {
                             root.selected-index = 0;
-                            root.text_changed(self.text);
+                            root.text_changed(t);
                         }
 
-                        changed has-focus => {
+                        focus-changed(_has) => {
                             root.focus-changed();
                         }
 
                         key-pressed(event) => {
                             if (event.text == Key.Escape) {
                                 // Esc 仅取消聚焦：结果随即收缩回单行，吸附条保持挂载不隐藏
-                                input.clear-focus();
+                                self.blur-input();
                                 return EventResult.accept;
                             }
                             if (event.text == Key.UpArrow) {

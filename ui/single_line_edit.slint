@@ -1,0 +1,142 @@
+// 单行文本输入（统一封装，带“光标跟随横向滚动”）。
+//
+// 为什么需要这个组件：
+//   Slint 的 TextInput 内容超长时只会被裁掉，不会跟着光标横向移动，
+//   于是长文件名 / 长路径 / 长搜索词在单行框里永远看不到后半段。
+//
+// 做法：
+//   外层 Rectangle 负责裁切（clip），里面放一个“按文本自然宽度撑开”的 TextInput，
+//   再用 cursor-position-changed 拿到光标自身坐标，光标靠近右边界就把文本往左推，
+//   回到左边界就推回 0。
+//
+// 新增单行输入框时直接用它，不要再各自实现滚动：
+//   SingleLineEdit {
+//       text <=> some-writable-string;      // 必须用双向绑定（<=>），组件内部也靠它写回
+//       font-size: 12px;
+//       edited(t) => { ... }
+//       accepted(t) => { ... }
+//   }
+import { Theme } from "common.slint";
+
+export component SingleLineEdit inherits Rectangle {
+    /// 文本。**必须双向绑定**到外部可写属性，否则外部清空/回填不会反映到输入框。
+    in-out property <string> text;
+    in property <length> font-size: 12px;
+    in property <int> font-weight: 400;
+    in property <color> text-color: Theme.text-primary;
+    in property <color> selection-background: Theme.accent;
+    in property <color> selection-foreground: Theme.accent-text;
+    in property <bool> enabled: true;
+    /// 光标离右边界多近时开始推动文本（也是光标两侧保留的最小可见余量）
+    in property <length> caret-margin: 10px;
+
+    out property <bool> has-focus: input.has-focus;
+
+    /// 用户编辑（参数为当前完整文本）
+    callback edited(text: string);
+    /// 回车
+    callback accepted(text: string);
+    callback key-pressed(event: KeyEvent) -> EventResult;
+    /// 文本变化（含程序化写入），供需要“文字一变就做点什么”的调用方使用
+    callback text-changed(text: string);
+    /// 焦点变化（参数 = 当前是否持有焦点）
+    callback focus-changed(has-focus: bool);
+
+    // 下面的方法名带 -input / -text 后缀：`focus`/`color` 等名字是 Slint 内置属性/方法，
+    // 组件里不能重名。
+    public function focus-input() {
+        input.focus();
+    }
+    public function blur-input() {
+        input.clear-focus();
+    }
+    public function select-all-text() {
+        input.select-all();
+    }
+    public function clear-text-selection() {
+        input.clear-selection();
+    }
+
+    clip: true;
+    background: transparent;
+    // 组件本身的布局参与宽度必须为 0：内部那个「按文字自然宽度撑开」的输入框
+    // 会把组件报成一个很大的首选宽度，父级布局据此分配空间，结果就是
+    // 邻居（比如搜索框右侧的清空按钮）被挤出可视区。
+    preferred-width: 0px;
+    min-width: 0px;
+
+    // 不可见测量文本：算出这段文字的自然宽度（与输入框同字体、不换行）。
+    measure := Text {
+        visible: false;
+        text: root.text;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        wrap: no-wrap;
+    }
+    private property <length> content-w: measure.preferred-width;
+    /// 文本向左偏移的量（0 = 显示文本开头）
+    private property <length> scroll-x: 0px;
+    /// 用户是否已真正动过这个框（敲键盘）。
+    /// 没动过时不做光标跟随：刚打开重命名/地址栏编辑时通常会 select-all，
+    /// 光标在文末，若立即跟随会一开始就只看到名字尾巴；
+    /// 保持 0 偏移就能像资源管理器一样先看到开头的名字。
+    private property <bool> user-touched: false;
+
+    input := TextInput {
+        x: -root.scroll-x;
+        y: 0px;
+        // 输入框按“文本宽度”撑开，绝不小于视口，否则光标定位会错位
+        width: max(root.width, root.content-w + 2px);
+        height: 100%;
+        text <=> root.text;
+        font-size: root.font-size;
+        font-weight: root.font-weight;
+        color: root.text-color;
+        enabled: root.enabled;
+        single-line: true;
+        vertical-alignment: center;
+        selection-background-color: root.selection-background;
+        selection-foreground-color: root.selection-foreground;
+
+        edited => {
+            root.user-touched = true;
+            root.edited(self.text);
+        }
+
+        accepted => {
+            root.accepted(self.text);
+        }
+
+        key-pressed(event) => {
+            root.user-touched = true;
+            return root.key-pressed(event);
+        }
+
+        // 光标跟随：把光标保持在视口内（左右各留 caret-margin 余量）。
+        cursor-position-changed(pos) => {
+            if (root.user-touched) {
+                let visible-x = pos.x - root.scroll-x;
+                if (visible-x < 0px) {
+                    root.scroll-x = max(0px, pos.x);
+                } else if (visible-x > root.width - root.caret-margin) {
+                    root.scroll-x = pos.x - root.width + root.caret-margin;
+                }
+            }
+        }
+    }
+
+    // 文本变短 / 视口变宽后，把偏移拉回有效范围，避免右侧出现空白。
+    changed text => {
+        root.clamp-scroll();
+        root.text-changed(root.text);
+    }
+    changed width => {
+        root.clamp-scroll();
+    }
+    changed has-focus => {
+        root.focus-changed(root.has-focus);
+    }
+    function clamp-scroll() {
+        root.scroll-x = max(0px, min(root.scroll-x, root.content-w - root.width + root.caret-margin));
+    }
+}

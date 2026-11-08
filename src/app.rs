@@ -1053,7 +1053,7 @@ impl App {
     /// 统一应用搜索词（搜索框编辑 / 外部唤起预填共用）：
     /// 「此电脑」= 全局索引秒搜；目录视图 = 本地过滤 + 异步深度搜索。
     fn apply_search_query(&mut self, text: &str) {
-        logln!("search query: {text:?}");
+        logv!("search query: {text:?}");
         let is_root = self.state.active().active().path.is_none();
         // 「此电脑」视图：搜索框 = 全局拼音秒搜（Phase 5 索引）。
         if is_root {
@@ -1105,7 +1105,7 @@ impl App {
 
     /// 深度搜索结果到达：标签存在、代号与查询都匹配才应用。
     fn apply_deep_result(&mut self, result: DeepResult) {
-        logln!(
+        logv!(
             "deep result tab={} gen={} dgen={} n={}",
             result.tab_id,
             result.generation,
@@ -7520,12 +7520,28 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                     };
                     // 已最大化则还原，否则最大化——与原生标题栏按钮行为一致。
                     let cmd = if IsZoomed(hwnd as _) != 0 { SW_RESTORE } else { SW_MAXIMIZE };
+                    // 一行记完前后状态：最大化失效时（曾被「固定宽度」的布局信息卡死）
+                    // 能直接从这一行看出是系统没切还是 Slint 尺寸没跟上。
+                    let (was_zoomed, before_w, before_h) = {
+                        let w = app.borrow();
+                        let scale = w.ui.window().scale_factor() as f32;
+                        let sz = w.ui.window().size();
+                        (
+                            IsZoomed(hwnd as _),
+                            (sz.width as f32 / scale).round(),
+                            (sz.height as f32 / scale).round(),
+                        )
+                    };
                     ShowWindow(hwnd as _, cmd);
+                    let now_zoomed = IsZoomed(hwnd as _) != 0;
+                    logln!(
+                        "[max] cmd={} zoomed {}->{} size {}x{}",
+                        cmd, was_zoomed, now_zoomed, before_w, before_h
+                    );
                     // 立即回传最大化状态，驱动 resize-border-width 归零/恢复。
                     // 用独立的 win-maximized 而非 Slint 内置 maximized：后者是
                     // 命令属性，回传会形成最大化/还原的回路。
-                    let was_zoomed = IsZoomed(hwnd as _) != 0;
-                    app.borrow().ui.set_win_maximized(!was_zoomed);
+                    app.borrow().ui.set_win_maximized(!now_zoomed);
                 }
             }
         });
@@ -7689,8 +7705,8 @@ mod drag_hittest {
     ) -> windows_sys::Win32::Foundation::LRESULT {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CallWindowProcW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
-            HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, SC_MOVE, WNDPROC, WM_NCHITTEST,
-            WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_SYSCOMMAND,
+            HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, SC_MOVE, WNDPROC, WM_GETMINMAXINFO,
+            WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_SYSCOMMAND,
         };
 
         // 标题栏空白是**非客户区**（HTCAPTION），Slint 收不到这次点击，
@@ -7709,6 +7725,23 @@ mod drag_hittest {
         }
 
         let prev: WNDPROC = std::mem::transmute(PREV_WNDPROC.load(Ordering::Relaxed));
+
+        // 诊断：窗口能被拉到的极限尺寸（winit/Slint 会按布局信息写 min/max track）。
+        // 只打日志，不干预，目的是排查「无法拉宽 / 无法最大化」。
+        if msg == WM_GETMINMAXINFO {
+            let res = CallWindowProcW(prev, hwnd, msg, wparam, lparam);
+            let info = &*(lparam as *const windows_sys::Win32::UI::WindowsAndMessaging::MINMAXINFO);
+            logv!(
+                "[max] mmi min_track={}x{} max_track={}x{} max_size={}x{}",
+                info.ptMinTrackSize.x,
+                info.ptMinTrackSize.y,
+                info.ptMaxTrackSize.x,
+                info.ptMaxTrackSize.y,
+                info.ptMaxSize.x,
+                info.ptMaxSize.y
+            );
+            return res;
+        }
 
         if msg == WM_NCHITTEST {
             // Rove 自身发起的拖拽期间，拦截所有非客户区，防止系统用缩放光标

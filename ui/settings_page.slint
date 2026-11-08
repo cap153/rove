@@ -2,6 +2,7 @@
 // 目前实现：左侧子导航 + 右侧「本地右键菜单」分组管理。
 
 import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem, SettingsShortcutGroup, SettingsShortcutItem, SettingsDriveItem, IconRefresh, IconClose } from "common.slint";
+import { SingleLineEdit } from "single_line_edit.slint";
 
 component Toggle inherits Rectangle {
     in-out property <bool> checked: true;
@@ -617,7 +618,7 @@ export component SettingsPage inherits Rectangle {
                     width: 100%;
                     height: 100%;
                     clicked => {
-                        input-ta.clear-focus();
+                        input-ta.blur-input();
                     }
                 }
 
@@ -916,27 +917,25 @@ export component SettingsPage inherits Rectangle {
                                     border-color: input-ta.has-focus ? Theme.accent : Theme.border;
                                     background: Theme.bg-main;
 
-                                    input-ta := TextInput {
+                                    input-ta := SingleLineEdit {
                                         x: 8px;
                                         width: parent.width - 16px;
                                         height: 100%;
                                         text <=> root.exclude-input-text;
-                                        color: Theme.text-primary;
+                                        text-color: Theme.text-primary;
                                         font-size: 11px;
-                                        vertical-alignment: center;
-                                        single-line: true;
 
                                         // 与“添加”按钮完全同一个回调：回车即添加。
                                         // 注：这里刻意不做任何「失焦即提交」——文本框失焦时序不可靠
                                         // （focus() 写在自身 init 里时，“获得焦点”不会被 changed 观察到，
                                         //  “失去焦点”却可能假触发），状态变更只挂在可确定的用户动作上。
-                                        accepted => {
+                                        accepted(_t) => {
                                             root.search_add_exclusion_clicked();
                                         }
 
                                         // 上报聚焦态，供 Rust 放行按键（否则 Enter 被全局 keymap 吃掉）。
-                                        changed has-focus => {
-                                            root.text_focus_changed(self.has-focus);
+                                        focus-changed(has) => {
+                                            root.text_focus_changed(has);
                                         }
 
                                         // 点击页面空白处 → 释放焦点（见下方背景 TouchArea）。
