@@ -48,13 +48,6 @@ fn ensure_com() -> Result<(), String> {
     Ok(())
 }
 
-/// 取缩略图，返回 (宽, 高, RGBA 字节)。
-/// COM 路径失败（受保护目录/文件访问被拒）时回退到系统图标，
-/// 保证任何条目都有 Windows 图标可显示。
-pub fn get_thumbnail(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), String> {
-    get_thumbnail_timed(path, size).map(|(w, h, data, _)| (w, h, data))
-}
-
 /// 取缩略图，并额外返回「纯解码耗时」毫秒数。
 ///
 /// 纯解码耗时 **不含** 退避重试的 sleep：只有这样才能用 `>= 30ms` 准确判断

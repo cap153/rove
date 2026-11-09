@@ -17,12 +17,10 @@ pub struct ShortcutMeta {
 /// 现有核心快捷键定义表（Escape 锁定）
 pub const DEFAULT_SHORTCUTS: &[ShortcutMeta] = &[
     // 文件操作
-    ShortcutMeta { id: "preview", name: "快速预览", group: "文件操作", default_chord: "Space", is_readonly: false },
     ShortcutMeta { id: "open", name: "打开选中项", group: "文件操作", default_chord: "Enter", is_readonly: false },
     ShortcutMeta { id: "rename", name: "重命名", group: "文件操作", default_chord: "F2", is_readonly: false },
     ShortcutMeta { id: "delete", name: "删除至回收站", group: "文件操作", default_chord: "Delete", is_readonly: false },
     ShortcutMeta { id: "delete_perm", name: "永久删除", group: "文件操作", default_chord: "Shift+Delete", is_readonly: false },
-    ShortcutMeta { id: "properties", name: "属性", group: "文件操作", default_chord: "Alt+Enter", is_readonly: false },
     // 导航与查看
     ShortcutMeta { id: "refresh", name: "刷新当前目录", group: "导航与查看", default_chord: "F5", is_readonly: false },
     ShortcutMeta { id: "clear_filter", name: "清空筛选 / 取消", group: "导航与查看", default_chord: "Escape", is_readonly: true },

@@ -506,10 +506,6 @@ pub struct App {
     /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
     /// （表现为「此电脑」部分盘符空白，直到切标签/重开窗口才恢复）。
     list_geom: (f32, usize, f32, bool),
-    /// 任务 3.1：QuickLook 预览窗口（独立 Slint Window）。
-    preview: PreviewWindow,
-    /// 预览窗口是否已 show（首次需 show，之后用 visible 控制）。
-    preview_shown: bool,
     /// actions.toml 驱动的右键动作（内置动作开关 + 自定义）。
     actions: Vec<crate::ops::actions::ActionEntry>,
     /// 缩略图 LRU 缓存（Key 包含 mtime/size，防止旧图）。
@@ -633,8 +629,6 @@ impl App {
             pending_invalidated_subdirs: HashSet::new(),
             last_watch_event: None,
             last_rescan_times: HashMap::new(),
-            preview: PreviewWindow::new().expect("failed to create preview window"),
-            preview_shown: false,
             actions: Vec::new(),
             thumb_cache: HashMap::new(),
             thumb_order: Vec::new(),
@@ -3898,12 +3892,6 @@ impl App {
                 icon: "◫".into(),
                 selected: current == SettingsSubpage::Duplicates,
             },
-            SettingsNavItem {
-                id: "quicklook".into(),
-                label: "快速预览".into(),
-                icon: "⏵".into(),
-                selected: current == SettingsSubpage::QuickLook,
-            },
         ];
         self.ui.set_settings_nav_items(ModelRc::new(VecModel::from(nav_items)));
         // 向设置页「通用」开关灌入当前状态。
@@ -3924,7 +3912,6 @@ impl App {
                 false,
             ),
             SettingsSubpage::Duplicates => ("重复文件", "重复项扫描规则与清理策略。", false),
-            SettingsSubpage::QuickLook => ("快速预览", "空格键快速预览的行为配置。", false),
         };
         self.ui.set_settings_page_title(title.into());
         self.ui.set_settings_page_desc(desc.into());
@@ -5405,162 +5392,6 @@ impl App {
         self.submit_job(kind);
     }
 
-    /// 任务 3.1：Space 触发的 QuickLook 预览开关。
-    fn toggle_preview(&mut self) {
-        if self.preview.window().is_visible() {
-            self.close_preview();
-            return;
-        }
-        let Some(path) = self.state.active().active().selected_paths().into_iter().next() else {
-            self.set_status_job("请先选中一项以预览");
-            return;
-        };
-        self.load_preview(&path);
-    }
-
-    fn close_preview(&mut self) {
-        let _ = self.preview.window().hide();
-        focus_window(&self.ui);
-    }
-
-    /// 显示预览窗口：居中到主窗口并以 show() 显示（hide 后再 show 可重新显示）。
-    fn show_preview_window(&mut self) {
-        let pos = self.ui.window().position();
-        let size = self.ui.window().size();
-        let pw = 720i32;
-        let ph = 540i32;
-        let cx = pos.x + ((size.width as i32) - pw) / 2;
-        let cy = pos.y + ((size.height as i32) - ph) / 2;
-        self.preview
-            .window()
-            .set_position(slint::PhysicalPosition { x: cx, y: cy });
-        let _ = self.preview.window().show();
-        self.preview_shown = true;
-    }
-
-    /// 按类型加载预览内容（图片/视频/文本/元数据）。
-    fn load_preview(&mut self, path: &Path) {
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.preview.set_title_text(name.into());
-        self.preview.set_sub_title(path.to_string_lossy().into_owned().into());
-
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-
-        let is_image = matches!(
-            ext.as_str(),
-            "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "ico"
-        );
-        let is_video = matches!(
-            ext.as_str(),
-            "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "m4v" | "mpg" | "mpeg"
-        );
-        let is_text = matches!(
-            ext.as_str(),
-            "txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml"
-                | "xml" | "html" | "htm" | "css" | "c" | "cpp" | "h" | "hpp" | "java" | "go"
-                | "log" | "ini" | "bat" | "ps1" | "sh"
-        );
-
-        if is_image || is_video {
-            // 先显示元数据兜底，图片异步加载完成后切换为图片视图。
-            self.set_preview_meta(path, is_video);
-            #[cfg(windows)]
-            self.start_preview_image(path.to_path_buf());
-            self.show_preview_window();
-        } else if is_text {
-            match std::fs::read(&path) {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(200_000)]).into_owned();
-                    self.preview.set_text_content(text.into());
-                    self.preview.set_preview_kind(1);
-                    self.show_preview_window();
-                }
-                Err(e) => {
-                    self.preview.set_meta_text(format!("无法读取：{e}").into());
-                    self.preview.set_preview_kind(2);
-                    self.show_preview_window();
-                }
-            }
-        } else {
-            self.set_preview_meta(path, false);
-            self.show_preview_window();
-        }
-    }
-
-    /// 构造元数据预览文本（文件信息卡片）。
-    fn set_preview_meta(&mut self, path: &Path, is_video: bool) {
-        let meta = std::fs::symlink_metadata(path);
-        let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-        let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
-        let modified = meta.as_ref().ok().and_then(|m| m.modified().ok());
-        let kind = if is_dir {
-            "文件夹".to_string()
-        } else if is_video {
-            "视频文件".to_string()
-        } else {
-            path.extension()
-                .map(|e| format!("{} 文件", e.to_string_lossy().to_uppercase()))
-                .unwrap_or_else(|| "文件".to_string())
-        };
-        let mut lines = vec![
-            format!("类型：{kind}"),
-            format!("路径：{}", path.to_string_lossy()),
-        ];
-        if !is_dir {
-            lines.push(format!("大小：{}", crate::fs::format_size_bytes(size)));
-        }
-        if let Some(t) = modified {
-            lines.push(format!("修改时间：{}", crate::fs::format_time(Some(t))));
-        }
-        self.preview.set_meta_text(lines.join("\n").into());
-        self.preview.set_preview_kind(2);
-    }
-
-    /// 任务 3.1：异步加载大尺寸缩略图（图片/视频首帧）并切换到图片视图。
-    /// 仅在 Windows 可用（依赖 Shell 缩略图管线），其余平台仅显示元数据兜底。
-    #[cfg(windows)]
-    fn start_preview_image(&mut self, path: PathBuf) {
-        let preview_weak = slint::ComponentHandle::as_weak(&self.preview);
-        std::thread::spawn(move || {
-            unsafe {
-                use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
-                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-            }
-            match crate::ops::thumbs::get_thumbnail(&path, 640) {
-                Ok((w, h, rgba)) => {
-                    // 仅把可发送的 RGBA 字节送回 UI 线程，Image 在事件循环内构造
-                    // （slint::Image 含裸指针，不可跨线程）。
-                    let path2 = path.clone();
-                    let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(preview) = preview_weak.upgrade() {
-                            if let Some(img) = to_slint_image(w, h, &rgba) {
-                                preview.set_preview_image(img);
-                                preview.set_preview_kind(0);
-                                preview.set_sub_title(
-                                    format!(
-                                        "{} · {}",
-                                        path2.to_string_lossy(),
-                                        crate::fs::format_size_bytes(
-                                            std::fs::metadata(&path2).map(|m| m.len()).unwrap_or(0)
-                                        )
-                                    )
-                                    .into(),
-                                );
-                            }
-                        }
-                    });
-                }
-                Err(_) => {}
-            }
-        });
-    }
-
     fn background_pointer_event(&mut self, event: &PointerEvent, _x: f32, _y: f32) {
         if event.kind != PointerEventKind::Down {
             return;
@@ -6045,10 +5876,14 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         // 焦点在过滤框 / 重命名输入框 / 地址栏编辑框 / 设置页文本框时，按键归输入框所有。
         // 关键：设置页文本框若不在此放行，全局 keymap 会先把 Enter 等按键 PreventDefault 掉，
         // 导致 TextInput 的 accepted 永远不触发（表现为“回车无效、点按钮却可以”）。
+        //
+        // 动作编辑器（新增/编辑自定义动作）也在此列：它是模态弹窗，里面的文本框
+        // 没有逐个上报焦点，统一用“弹窗开着”作为开关，否则 Delete / Enter 等全局按键会把输入吃掉。
         if app.ui.get_filter_has_focus()
             || !app.ui.get_rename_path().is_empty()
             || app.ui.get_path_editing()
             || app.ui.get_settings_text_focus()
+            || app.ui.get_settings_editor_open()
         {
             return EventResult::Propagate;
         }
@@ -6122,28 +5957,10 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         }
 
         match action.as_str() {
-            "preview" => app.toggle_preview(),
             "open" => app.open_selection(),
             "rename" => app.start_rename(),
             "delete" => app.delete_selection(true),
             "delete_perm" => app.delete_selection(false),
-            "properties" => {
-                let paths = app.state.active().active().selected_paths();
-                let target: Vec<std::path::PathBuf> = if paths.is_empty() {
-                    app.state.active().active().path.clone().into_iter().collect()
-                } else {
-                    paths
-                };
-                #[cfg(windows)]
-                {
-                    let hwnd = get_window_hwnd(&app.ui).unwrap_or(0);
-                    crate::sys::shell::show_properties(&target, hwnd);
-                }
-                #[cfg(not(windows))]
-                {
-                    let _ = target;
-                }
-            }
             "refresh" => app.user_refresh_active(),
             "focus_search" => {
                 app.ui.invoke_focus_search_box();
@@ -6640,7 +6457,6 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 "context" => crate::state::SettingsSubpage::ContextMenu,
                 "shortcuts" => crate::state::SettingsSubpage::Shortcuts,
                 "duplicates" => crate::state::SettingsSubpage::Duplicates,
-                "quicklook" => crate::state::SettingsSubpage::QuickLook,
                 _ => crate::state::SettingsSubpage::General,
             };
             app.state.active_mut().settings_subpage = subpage;
@@ -7252,6 +7068,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
+            // 层级归属：空 / 「一级菜单」= 一级项；其他文本直接作为二级菜单名。
+            let group = group.trim();
+            let group = if group == "一级菜单" { "" } else { group };
             let action = crate::ops::actions::ActionEntry {
                 id: id.clone(),
                 label: label.to_string(),
@@ -7987,46 +7806,6 @@ pub fn run() {
     }
 }
 
-/// 任务 3.1：预览窗口的 Esc/Space 关闭 + 焦点归还主窗口。
-fn setup_preview_keys(app: &Rc<RefCell<App>>) {
-    use slint::winit_030::{
-        EventResult, WinitWindowAccessor,
-    };
-    use slint::winit_030::winit::event::{ElementState, WindowEvent};
-    use slint::winit_030::winit::keyboard::Key;
-
-    let weak = Rc::downgrade(app);
-    app.borrow()
-        .preview
-        .window()
-        .on_winit_window_event(move |_window, event| {
-            let WindowEvent::KeyboardInput {
-                event:
-                    slint::winit_030::winit::event::KeyEvent {
-                        logical_key,
-                        state: ElementState::Pressed,
-                        ..
-                    },
-                ..
-            } = event
-            else {
-                return EventResult::Propagate;
-            };
-            let Some(app) = weak.upgrade() else {
-                return EventResult::Propagate;
-            };
-            let close = match logical_key {
-                Key::Named(slint::winit_030::winit::keyboard::NamedKey::Escape) => true,
-                Key::Named(slint::winit_030::winit::keyboard::NamedKey::Space) => true,
-                _ => false,
-            };
-            if close {
-                app.borrow_mut().close_preview();
-            }
-            EventResult::Propagate
-        });
-}
-
 /// 原生探测磁盘介质类型：通过查询寻道惩罚（Seek Penalty）精准判定。
 /// SSD 无寻道惩罚，机械硬盘有寻道惩罚。
 /// 核心改进：先将卷映射为物理驱动器，穿透卷管理器；遇到底层驱动拒绝回答时，强制兜底为 HDD 保护。
@@ -8232,7 +8011,6 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     wire_callbacks(&app);
     setup_timers(&app);
     setup_keyboard(&app);
-    setup_preview_keys(&app);
 
     // 初始数据。
     {

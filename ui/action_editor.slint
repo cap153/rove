@@ -314,30 +314,44 @@ export component ActionEditorDialog inherits Rectangle {
                 }
             }
 
-            // 字段 5：层级归属（向上弹出上拉菜单，选项多时限高 140px 并支持滚动）
+            // 字段 5：层级归属（可输入新名称新建二级菜单；右侧箭头列出已有分组）
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "层级归属"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: "层级归属（留空 = 一级菜单，输入新名称可新建二级菜单）"; color: Theme.text-secondary; font-size: 12px; }
 
                 drop-box := Rectangle {
                     height: 32px;
                     border-radius: 6px;
                     background: Theme.bg-main;
                     border-width: 1px;
-                    border-color: root.dropdown-open ? Theme.accent : Theme.border;
+                    border-color: group-input.has-focus || root.dropdown-open ? Theme.accent : Theme.border;
 
-                    HorizontalLayout {
-                        padding-left: 10px;
-                        padding-right: 10px;
+                    group-input := SingleLineEdit {
+                        x: 10px;
+                        width: parent.width - 36px;
+                        height: parent.height;
+                        text <=> root.edit-group;
+                        font-size: 12.5px;
+                        text-color: Theme.text-primary;
+                    }
 
-                        Text {
-                            text: root.edit-group == "" ? "一级菜单" : root.edit-group;
-                            color: Theme.text-primary;
-                            font-size: 12.5px;
-                            vertical-alignment: center;
-                            horizontal-stretch: 1;
-                            overflow: elide;
-                        }
+                    if (root.edit-group == "" && !group-input.has-focus) : Text {
+                        x: 10px;
+                        width: parent.width - 36px;
+                        height: parent.height;
+                        text: "一级菜单";
+                        font-size: 12.5px;
+                        color: Theme.text-disabled;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+
+                    // 箭头：只负责列出已有分组，不抢输入框的焦点
+                    Rectangle {
+                        x: parent.width - 26px;
+                        width: 22px;
+                        height: 100%;
+                        background: transparent;
 
                         Text {
                             // 上拉菜单：展开时箭头朝上 ▲，收起时朝下 ▼
@@ -346,15 +360,17 @@ export component ActionEditorDialog inherits Rectangle {
                             font-size: 8px;
                             font-family: Theme.symbol-font-family;
                             vertical-alignment: center;
-                            horizontal-alignment: right;
+                            horizontal-alignment: center;
+                            width: 100%;
+                            height: 100%;
                         }
-                    }
 
-                    TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        clicked => {
-                            root.dropdown-open = !root.dropdown-open;
+                        TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.dropdown-open = !root.dropdown-open;
+                            }
                         }
                     }
 

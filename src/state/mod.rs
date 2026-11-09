@@ -13,7 +13,6 @@ pub enum SettingsSubpage {
     ContextMenu,
     Shortcuts,
     Duplicates,
-    QuickLook,
 }
 
 impl Default for SettingsSubpage {
@@ -364,7 +363,6 @@ impl TabState {
                 SettingsSubpage::ContextMenu => "本地右键菜单".to_string(),
                 SettingsSubpage::Shortcuts => "快捷键".to_string(),
                 SettingsSubpage::Duplicates => "重复文件".to_string(),
-                SettingsSubpage::QuickLook => "快速预览".to_string(),
             };
         }
         match &self.panes[self.active_pane].path {

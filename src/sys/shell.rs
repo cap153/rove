@@ -1,17 +1,14 @@
-//! Windows 原生 Shell 设施：属性对话框、原生文件操作（复制/移动/删除）。
+//! Windows 原生 Shell 设施：原生文件操作（复制/移动/删除）。
 
 #[cfg(windows)]
 mod imp {
-    use std::os::windows::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
-    use windows_sys::core::w;
     use windows_sys::Win32::Foundation::HWND;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use windows_sys::Win32::UI::Shell::{
-        ShellExecuteExW, SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FO_COPY, FO_DELETE,
-        FO_MOVE, SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, SHFILEOPSTRUCTW,
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FO_COPY, FO_DELETE, FO_MOVE,
+        SHFILEOPSTRUCTW,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOW;
 
     /// 主窗口 HWND（UI 线程写入，后台 Shell 操作线程读取）。
     /// 必须传给 SHFileOperationW：否则确认/进度对话框没有宿主窗口，
@@ -44,29 +41,6 @@ mod imp {
         }
         out.push(0); // 整体列表结尾 double-null
         out
-    }
-
-    /// 弹出 Windows 原生文件/文件夹属性对话框。
-    pub fn show_properties(paths: &[PathBuf], hwnd: isize) {
-        if paths.is_empty() {
-            return;
-        }
-        for path in paths {
-            let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-            wide.push(0);
-
-            let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
-            sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
-            sei.fMask = SEE_MASK_INVOKEIDLIST;
-            sei.hwnd = owner_hwnd(hwnd);
-            sei.lpVerb = w!("properties");
-            sei.lpFile = wide.as_ptr();
-            sei.nShow = SW_SHOW as i32;
-
-            unsafe {
-                ShellExecuteExW(&mut sei);
-            }
-        }
     }
 
     /// 调用 Windows 原生 Shell 执行文件操作（弹窗进度条、同名覆盖确认、UAC 提权、支持 Ctrl+Z）。
@@ -144,7 +118,6 @@ pub use imp::*;
 mod imp {
     use std::path::{Path, PathBuf};
 
-    pub fn show_properties(_paths: &[PathBuf], _hwnd: isize) {}
     pub fn set_owner_hwnd(_hwnd: isize) {}
     pub fn shell_copy(
         _from: &[PathBuf],
