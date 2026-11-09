@@ -121,6 +121,8 @@ export component MainWindow inherits Window {
     in-out property <[SettingsDriveItem]> search-drives: [];
     in-out property <[string]> search-builtin-exclusions: [];
     in-out property <[string]> search-custom-exclusions: [];
+    in-out property <[string]> menu-hide-keywords: [];
+    in-out property <string> menu-hide-input: "";
     in-out property <string> search-exclude-input: "";
     in-out property <bool> search-idle-enabled: true;
     in-out property <int> search-idle-minutes: 60;
@@ -131,6 +133,9 @@ export component MainWindow inherits Window {
     callback search_remove_exclusion_clicked(string); // path
     callback search_pick_folder_clicked();
     callback search_reset_exclusions_clicked();
+    callback menu_hide_add_clicked();
+    callback menu_hide_remove_clicked(string);
+    callback menu_hide_restore_clicked();
     callback search_idle_toggled(bool);
     callback search_idle_minutes_changed(int);
     callback search_max_results_changed(int);
@@ -1282,6 +1287,11 @@ out property <length> row-height-out: file-list.row-height-out;
                     search-builtin-exclusions: root.search-builtin-exclusions;
                     search-custom-exclusions: root.search-custom-exclusions;
                     exclude-input-text <=> root.search-exclude-input; // 核心修复：改为双向绑定
+                    menu-hide-keywords: root.menu-hide-keywords;
+                    hide-input-text <=> root.menu-hide-input;
+                    menu_hide_add_clicked() => { root.menu_hide_add_clicked(); }
+                    menu_hide_remove_clicked(k) => { root.menu_hide_remove_clicked(k); }
+                    menu_hide_restore_clicked() => { root.menu_hide_restore_clicked(); }
                     text_focus_changed(v) => { root.settings-text-focus = v; }
                     search-idle-enabled: root.search-idle-enabled;
                     search-idle-minutes: root.search-idle-minutes;

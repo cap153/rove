@@ -42,6 +42,8 @@ pub struct Config {
     pub search_excluded_drives: Vec<String>,
     /// 用户自定义排除的路径/通配符列表（如 `**/*.log`, `C:/Cache`）。
     pub search_excluded_paths: Vec<String>,
+    /// 要隐藏的系统右键菜单项关键词（包含即隐藏；`!` 开头表示精确匹配）。
+    pub context_menu_hide: Vec<String>,
     /// 空闲重新索引间隔（分钟，0 表示关闭）。
     pub search_idle_rescan_minutes: u32,
     /// 搜索最大展示结果数。
@@ -58,6 +60,28 @@ pub fn default_sidebar_order() -> Vec<String> {
         .iter()
         .map(|s| s.to_string())
         .collect()
+}
+
+/// 默认隐藏的系统菜单项。
+///
+/// 前四条（复制/剪切/粘贴/刷新）是系统菜单里的标准命令：Rove 自己有同名的项，
+/// 系统的这几项拿进来用不了（剪贴板内容读不出、刷新不清缓存），必须默认藏掉。
+/// 用 `!` 精确匹配，避免连带藏掉「复制到文件夹」这类变体。
+/// 中英两份都列：系统语言不同时靠另一份生效。
+pub fn default_context_menu_hide() -> Vec<String> {
+    [
+        "!Copy",
+        "!Cut",
+        "!Paste",
+        "!Refresh",
+        "!复制(C)",
+        "!剪切(T)",
+        "!粘贴(P)",
+        "!刷新(E)",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl Default for Config {
@@ -81,6 +105,7 @@ impl Default for Config {
             shortcuts: std::collections::HashMap::new(),
             search_excluded_drives: Vec::new(),
             search_excluded_paths: Vec::new(),
+            context_menu_hide: default_context_menu_hide(),
             search_idle_rescan_minutes: 60,
             search_max_results: 1000,
             is_first_run: true,
@@ -207,6 +232,12 @@ impl Config {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
         }
+        if let Some(arr) = json.get("context_menu_hide").and_then(|v| v.as_array()) {
+            config.context_menu_hide = arr
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+        }
         if let Some(m) = json.get("search_idle_rescan_minutes").and_then(|v| v.as_u64()) {
             config.search_idle_rescan_minutes = m as u32;
         }
@@ -260,6 +291,7 @@ impl Config {
             "shortcuts": self.shortcuts,
             "search_excluded_drives": self.search_excluded_drives,
             "search_excluded_paths": self.search_excluded_paths,
+            "context_menu_hide": self.context_menu_hide,
             "search_idle_rescan_minutes": self.search_idle_rescan_minutes,
             "search_max_results": self.search_max_results,
             "is_first_run": self.is_first_run,

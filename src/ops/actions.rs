@@ -36,42 +36,31 @@ pub struct ActionEntry {
     /// 适用扩展名（仅 target = file 时生效；空 = 全部）。
     pub extensions: Vec<String>,
     pub enabled: bool,
-    /// 二级菜单分组名（空 = 一级菜单或系统菜单）。
+    /// 二级菜单分组名（空 = 一级菜单）。
     pub group: String,
     /// 是否系统内置（true = 只许开关，不许改命令/删除）。
     pub builtin: bool,
 }
 
+/// 已废弃的内置动作 id。
+///
+/// 这些项全部由系统菜单提供，隐藏它们改用设置页的关键词过滤，
+/// 不再需要单独开关；启动时从 actions.toml 里清掉历史残留。
+pub const RETIRED_BUILTINS: &[&str] = &[
+    "builtin.open",
+    "builtin.open_with",
+    "builtin.sendto",
+    "builtin.rename",
+    "builtin.delete",
+    "builtin.properties",
+];
+
 /// 内置右键动作元数据（与 Rust 内建操作一一对应，由 actions.toml 开关控制显隐）。
+///
+/// 只列 Rove 自己追加的项：标准命令（打开 / 打开方式 / 发送到 / 重命名 /
+/// 删除 / 属性）由 Shell 菜单提供，要藏就用关键词，不在设置页留开关。
 pub fn builtin_actions() -> Vec<ActionEntry> {
     vec![
-        ActionEntry {
-            id: "builtin.open".into(),
-            label: "打开".into(),
-            tool: "".into(),
-            program: "".into(),
-            args: "".into(),
-            working_dir: "".into(),
-            target: "any".into(),
-            extensions: vec![],
-            enabled: true,
-            group: "".into(),
-            builtin: true,
-        },
-        ActionEntry {
-            id: "builtin.open_with".into(),
-            label: "打开方式".into(),
-            tool: "".into(),
-            program: "".into(),
-            args: "".into(),
-            working_dir: "".into(),
-            target: "any".into(),
-            extensions: vec![],
-            enabled: true,
-            // 一级菜单项：真正的子菜单由系统提供（设置页也就不能单独成组）。
-            group: "".into(),
-            builtin: true,
-        },
         ActionEntry {
             id: "builtin.copy".into(),
             label: "复制".into(),
@@ -99,19 +88,6 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             builtin: true,
         },
         ActionEntry {
-            id: "builtin.rename".into(),
-            label: "重命名".into(),
-            tool: "".into(),
-            program: "".into(),
-            args: "".into(),
-            working_dir: "".into(),
-            target: "any".into(),
-            extensions: vec![],
-            enabled: true,
-            group: "".into(),
-            builtin: true,
-        },
-        ActionEntry {
             id: "builtin.stage".into(),
             label: "添加到暂存盘".into(),
             tool: "".into(),
@@ -125,20 +101,6 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             builtin: true,
         },
         ActionEntry {
-            id: "builtin.sendto".into(),
-            label: "发送到".into(),
-            tool: "".into(),
-            program: "".into(),
-            args: "".into(),
-            working_dir: "".into(),
-            target: "any".into(),
-            extensions: vec![],
-            enabled: true,
-            // 同上：发送到也是系统提供的子菜单，这里只留开关。
-            group: "".into(),
-            builtin: true,
-        },
-        ActionEntry {
             id: "builtin.terminal".into(),
             label: "在此处打开终端".into(),
             tool: "".into(),
@@ -146,32 +108,6 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             args: "".into(),
             working_dir: "".into(),
             target: "dir".into(),
-            extensions: vec![],
-            enabled: true,
-            group: "".into(),
-            builtin: true,
-        },
-        ActionEntry {
-            id: "builtin.delete".into(),
-            label: "删除".into(),
-            tool: "".into(),
-            program: "".into(),
-            args: "".into(),
-            working_dir: "".into(),
-            target: "any".into(),
-            extensions: vec![],
-            enabled: true,
-            group: "".into(),
-            builtin: true,
-        },
-        ActionEntry {
-            id: "builtin.properties".into(),
-            label: "属性".into(),
-            tool: "".into(),
-            program: "".into(),
-            args: "".into(),
-            working_dir: "".into(),
-            target: "any".into(),
             extensions: vec![],
             enabled: true,
             group: "".into(),
@@ -226,7 +162,7 @@ fn generate_default() -> String {
          #   - 手动添加的注释与排版会被保留。\n\
          #\n\
          # 字段：target = any | file | dir；\n\
-         # group = 二级菜单分组名（空 = 一级菜单或系统菜单）；\n\
+         # group = 二级菜单分组名（空 = 一级菜单）；\n\
          # builtin = true 表示系统内置（仅允许开关）；\n\
          # extensions = 适用扩展名（仅 target = file）；\n\
          # 参数模板占位符：\n\
@@ -307,32 +243,16 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
         return Vec::new();
     };
 
-    // 一次性修复：早期版本把「无外部程序」的内置动作误判为命令缺失，
-    // 并写回 enabled=false，导致整批内置菜单项被禁用。特征：所有内置项
-    // （program 为空）同时处于禁用态——正常用户几乎不会这么做。
-    let is_builtin_row = |t: &toml_edit::Table| {
-        t.get("builtin").and_then(|v| v.as_bool()).unwrap_or(false)
-            && str_field(t, "program")
-                .or_else(|| str_field(t, "command"))
-                .unwrap_or_default()
-                .is_empty()
-    };
-    let (mut total, mut disabled) = (0usize, 0usize);
-    for t in items.iter() {
-        if !is_builtin_row(t) {
-            continue;
-        }
-        total += 1;
-        if !t.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true) {
-            disabled += 1;
-        }
-    }
-    if total >= 4 && disabled == total {
-        logln!("heal: 内置菜单项被历史版本批量禁用，恢复启用（{} 项）", total);
-        for t in items.iter_mut() {
-            if is_builtin_row(t) {
-                t["enabled"] = toml_edit::value(true);
-            }
+    // 清掉已废弃的内置动作（打开 / 打开方式 / 发送到 / 重命名 / 删除 / 属性）：
+    // 它们现在由系统菜单提供，隐藏改用关键词，不再需要开关。
+    for index in (0..items.len()).rev() {
+        let retired = items
+            .get(index)
+            .map(|t| str_field(t, "id").unwrap_or_default())
+            .map(|id| RETIRED_BUILTINS.contains(&id.as_str()))
+            .unwrap_or(false);
+        if retired {
+            items.remove(index);
         }
     }
 
@@ -601,8 +521,12 @@ mod tests {
         let arr = doc.get("action").unwrap().as_array_of_tables().unwrap();
         assert_eq!(arr.len(), builtin_actions().len());
         assert!(text.contains("# Rove 右键自定义动作配置"));
-        assert!(text.contains("id = \"builtin.open\""));
         assert!(text.contains("id = \"builtin.copy\""));
+        assert!(text.contains("id = \"builtin.terminal\""));
+        // 系统菜单提供的项不再生成开关。
+        for retired in RETIRED_BUILTINS {
+            assert!(!text.contains(&format!("id = \"{}\"", retired)));
+        }
     }
 
     #[test]

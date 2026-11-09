@@ -365,6 +365,13 @@ export component SettingsPage inherits Rectangle {
     callback search_pick_folder_clicked();
     callback search_reset_exclusions_clicked();
     in-out property <string> exclude-input-text: "";
+
+    // ---- 隐藏的系统右键菜单项（关键词）----
+    in property <[string]> menu-hide-keywords: [];
+    in-out property <string> hide-input-text: "";
+    callback menu_hide_add_clicked();
+    callback menu_hide_remove_clicked(string); // keyword
+    callback menu_hide_restore_clicked();
     /// 设置页内有文本输入框持有键盘焦点。
     /// 用回调上报给 MainWindow（嵌套在 if 内的元素 id 不能从外部访问，故用回调）。
     callback text_focus_changed(bool);
@@ -1310,14 +1317,257 @@ export component SettingsPage inherits Rectangle {
 
 
             // ---- 子页 2：本地右键菜单分组列表 ----
-            if (root.page-title == "本地右键菜单" && root.action-groups.length > 0) : SettingsScrollContainer {
+            if (root.page-title == "本地右键菜单") : SettingsScrollContainer {
                 content-height: max(root.content-height, groups-layout.preferred-height) + 28px;
+
+                // 点击本页空白处 → 释放关键词输入框焦点。
+                // 必须放在这个 if 块内：才能直接访问 hide-input-ta。
+                // 声明在内容之前（最底层）：内容区不消费指针事件，空白处点击会穿透到这里。
+                TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => {
+                        hide-input-ta.blur-input();
+                    }
+                }
 
                 groups-layout := VerticalLayout {
                     width: 100%;
                     padding-right: 24px;
                     spacing: 12px;
                     alignment: start;
+
+                    // 隐藏的系统菜单项（关键词）：包含即隐藏，`!` 开头为精确匹配。
+                    // 只作用于系统 / 第三方项，Rove 自己的菜单项不受影响。
+                    Rectangle {
+                        width: 100%;
+                        background: Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        // 12+20+12+28+12+30+12 = 126；出现横向滚动条时多留 12+6。
+                        height: hide-tags-flick.content-width > hide-tags-flick.width ? 144px : 126px;
+
+                        VerticalLayout {
+                            padding: 12px;
+                            spacing: 12px;
+
+                            HorizontalLayout {
+                                height: 20px;
+                                Text { text: "隐藏的系统菜单项"; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
+                            }
+
+                            // 输入框 + 添加 + 恢复
+                            HorizontalLayout {
+                                height: 28px;
+                                spacing: 8px;
+
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                    height: 100%;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: hide-input-ta.has-focus ? Theme.accent : Theme.border;
+                                    background: Theme.bg-main;
+
+                                    hide-input-ta := SingleLineEdit {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: 100%;
+                                        text <=> root.hide-input-text;
+                                        text-color: Theme.text-primary;
+                                        font-size: 11px;
+
+                                        // 回车 = 添加（与「添加」按钮同一回调）。
+                                        accepted(_t) => {
+                                            root.menu_hide_add_clicked();
+                                        }
+
+                                        // 上报聚焦态，供 Rust 放行按键（否则 Enter 被全局 keymap 吃掉）。
+                                        focus-changed(has) => {
+                                            root.text_focus_changed(has);
+                                        }
+                                    }
+
+                                    if (root.hide-input-text == "" && !hide-input-ta.has-focus) : Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: 100%;
+                                        text: "输入菜单上看到的文字(!开头为精确匹配)，回车添加";
+                                        color: Theme.text-disabled;
+                                        font-size: 11px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+
+                                // 添加按钮
+                                Rectangle {
+                                    width: 52px;
+                                    height: 100%;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: hide-add-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+
+                                    Text {
+                                        text: "添加";
+                                        color: Theme.accent;
+                                        font-size: 11px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+
+                                    hide-add-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => { root.menu_hide_add_clicked(); }
+                                    }
+                                }
+
+                                // 恢复默认按钮：把列表重置回默认那几条。
+                                Rectangle {
+                                    width: 52px;
+                                    height: 100%;
+                                    border-radius: 5px;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    background: hide-restore-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+
+                                    Text {
+                                        text: "恢复";
+                                        color: Theme.text-secondary;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                        width: 100%;
+                                        height: 100%;
+                                    }
+
+                                    hide-restore-ta := TouchArea {
+                                        width: 100%;
+                                        height: 100%;
+                                        clicked => { root.menu_hide_restore_clicked(); }
+                                    }
+                                }
+                            }
+
+                            // 已添加的关键词（悬停变红并变成「删除」，点击即删）
+                            hide-tags-flick := Flickable {
+                                height: 30px;
+                                content-width: max(hide-tags-layout.preferred-width, self.width);
+                                interactive: false;
+
+                                hide-tags-layout := HorizontalLayout {
+                                    x: 0px;
+                                    y: 2px;
+                                    height: 26px;
+                                    spacing: 8px;
+
+                                    // 新添加的（insert 0）排在最左侧。
+                                    for item in root.menu-hide-keywords : Rectangle {
+                                        height: 26px;
+                                        // 用隐藏的 ghost-text 测真实文本宽度：否则悬停变成「删除」时宽度会缩水闪烁。
+                                        width: min(max(hide-ghost-text.preferred-width + 24px, 64px), 200px);
+                                        border-radius: 5px;
+                                        background: hide-c-ta.has-hover ? #C0392B : Theme.bg-main;
+                                        border-width: 1px;
+                                        border-color: hide-c-ta.has-hover ? #C0392B : Theme.border;
+
+                                        hide-ghost-text := Text {
+                                            text: item;
+                                            visible: false;
+                                        }
+
+                                        hide-c-ta := TouchArea {
+                                            width: 100%;
+                                            height: 100%;
+                                            clicked => { root.menu_hide_remove_clicked(item); }
+                                        }
+
+                                        hide-c-txt := Text {
+                                            text: hide-c-ta.has-hover ? "删除" : item;
+                                            color: hide-c-ta.has-hover ? white : Theme.text-primary;
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                            width: 100%;
+                                            height: 100%;
+                                            overflow: elide;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // 横向滚动条（悬停加粗高亮 + 点击跳转 + 拖动滑块）
+                            if (hide-tags-flick.content-width > hide-tags-flick.width) : Rectangle {
+                                height: 6px;
+                                width: 100%;
+                                background: transparent;
+
+                                property <length> max-scroll: max(1px, hide-tags-flick.content-width - hide-tags-flick.width);
+                                property <length> thumb-w: max(32px, self.width * (hide-tags-flick.width / max(hide-tags-flick.content-width, 1px)));
+                                property <length> max-travel: max(0px, self.width - self.thumb-w);
+                                property <bool> active: hide-h-track-ta.has-hover || hide-h-track-ta.pressed;
+
+                                Rectangle {
+                                    y: (parent.height - self.height) / 2;
+                                    width: 100%;
+                                    height: parent.active ? 5px : 3px;
+                                    border-radius: self.height / 2;
+                                    background: parent.active ? Theme.bg-hover : Theme.bg-main;
+
+                                    animate height { duration: 120ms; }
+                                    animate background { duration: 120ms; }
+                                }
+
+                                hide-h-track-ta := TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+
+                                    property <length> drag-start-x: 0px;
+                                    property <length> drag-start-scroll: 0px;
+
+                                    pointer-event(event) => {
+                                        if (event.kind == PointerEventKind.down) {
+                                            let thumb-left = parent.max-travel * (-hide-tags-flick.content-x / parent.max-scroll);
+                                            if (self.mouse-x < thumb-left || self.mouse-x > thumb-left + parent.thumb-w) {
+                                                let click-ratio = (self.mouse-x - parent.thumb-w / 2) / max(1px, parent.max-travel);
+                                                hide-tags-flick.content-x = -max(0.0, min(1.0, click-ratio)) * parent.max-scroll;
+                                            }
+                                            self.drag-start-scroll = hide-tags-flick.content-x;
+                                            self.drag-start-x = self.mouse-x;
+                                        }
+                                    }
+
+                                    moved => {
+                                        if (self.pressed && parent.max-travel > 0px) {
+                                            let delta-x = self.mouse-x - self.drag-start-x;
+                                            let delta-scroll = (delta-x / parent.max-travel) * parent.max-scroll;
+                                            hide-tags-flick.content-x = max(-parent.max-scroll, min(0px, self.drag-start-scroll - delta-scroll));
+                                        }
+                                    }
+                                }
+
+                                Rectangle {
+                                    x: parent.max-travel * (-hide-tags-flick.content-x / parent.max-scroll);
+                                    y: (parent.height - self.height) / 2;
+                                    width: parent.thumb-w;
+                                    height: parent.active ? 5px : 3px;
+                                    border-radius: self.height / 2;
+                                    background: hide-h-track-ta.pressed ? Theme.accent : (hide-h-track-ta.has-hover ? Theme.text-secondary : Theme.border);
+                                    opacity: parent.active ? 0.9 : 0.6;
+
+                                    animate height { duration: 120ms; }
+                                    animate background { duration: 120ms; }
+                                    animate opacity { duration: 120ms; }
+                                }
+                            }
+                        }
+                    }
 
                     for group in root.action-groups : GroupCard {
                         width: 100%;

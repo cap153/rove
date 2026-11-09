@@ -66,24 +66,139 @@ pub enum MenuAction {
 
 pub type Sink = Arc<dyn Fn(MenuAction) + Send + Sync>;
 
+/// 菜单裁剪选项。
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// 要隐藏的菜单项关键词：菜单文字**包含**它就隐藏；`!` 开头表示**精确相等**。
+    /// 由设置页「隐藏的系统菜单项」决定（含默认藏掉的系统复制/剪切/粘贴/刷新）。
+    pub hide_keywords: Vec<String>,
+    /// Shift + 右键 = 扩展动词（「以管理员身份运行」这类）。
+    pub extended: bool,
+}
+
 /// 弹出原生菜单。`owner` 是主窗口 HWND（用于菜单关闭后归还前台权）；
-/// `hidden_verbs` 是要从 Shell 菜单里摘掉的命令（canonical verb，如 `copy` / `openas`），
-/// 由设置页的开关决定。菜单本身由内部专用线程的零面积窗口持有。
+/// 菜单本身由内部专用线程的零面积窗口持有。
 /// 返回 false 表示菜单线程不可用（调用方记日志并放弃本次菜单）。
 #[cfg(windows)]
 pub(crate) use imp::open;
 
 #[cfg(not(windows))]
-pub fn open(
-    _: Target,
-    _: Vec<MenuNode>,
-    _: Vec<String>,
-    _: bool,
-    _: isize,
-    _: Sink,
-) -> bool {
+pub fn open(_: Target, _: Vec<MenuNode>, _: Options, _: isize, _: Sink) -> bool {
     false
+}
+
+/// 菜单项文字归一化：去掉助记符 `&`、小写化、丢掉 `\t` 之后的热键说明、
+/// 全角标点转半角、去掉尾部 `.` / `…`。两边都走它，才能跨语言 / 跨输入法比较。
+pub(crate) fn normalize_label(label: &str) -> String {
+    let mut s = label.replace('&', "").to_lowercase();
+    if let Some(head) = s.split('\t').next() {
+        s = head.to_string();
+    }
+    let s: String = s
+        .chars()
+        .map(|c| match c {
+            '“' | '”' | '＂' => '"',
+            '‘' | '’' | '＇' => '\'',
+            '（' => '(',
+            '）' => ')',
+            '：' => ':',
+            '，' => ',',
+            _ => c,
+        })
+        .collect();
+    s.trim().trim_end_matches('.').trim_end_matches('…').trim().to_string()
+}
+
+/// 关键词是否命中菜单项。`label` 必须已经过 [`normalize_label`]。
+/// 普通关键词 = **包含**即命中；`!` 开头 = **精确相等**（`!` 本身不参与比较）。
+pub(crate) fn keyword_hit(label: &str, keywords: &[String]) -> bool {
+    if label.is_empty() {
+        return false;
+    }
+    keywords.iter().any(|keyword| {
+        let keyword = keyword.trim();
+        if keyword.is_empty() {
+            return false;
+        }
+        // 全角的「！」也当 `!` 用：中文输入法下很容易打出来。
+        match keyword.strip_prefix('!').or_else(|| keyword.strip_prefix('！')) {
+            Some(exact) => normalize_label(exact) == label,
+            None => label.contains(&normalize_label(keyword)),
+        }
+    })
 }
 
 #[cfg(windows)]
 mod imp;
+
+#[cfg(test)]
+mod tests {
+    use super::{keyword_hit, normalize_label};
+
+    fn hit(label: &str, keywords: &[&str]) -> bool {
+        let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
+        keyword_hit(&normalize_label(label), &keywords)
+    }
+
+    #[test]
+    fn normalize_strips_accel_and_ellipsis() {
+        assert_eq!(normalize_label("&Open"), "open");
+        assert_eq!(normalize_label("Scan with Microsoft Defender..."), "scan with microsoft defender");
+        assert_eq!(normalize_label("Scan with Microsoft Defender…"), "scan with microsoft defender");
+        assert_eq!(normalize_label("Open\tCtrl+O"), "open");
+    }
+
+    #[test]
+    fn normalize_folds_full_width_punctuation() {
+        assert_eq!(normalize_label("添加到 “重.rar”"), normalize_label("添加到 \"重.rar\""));
+        assert_eq!(normalize_label("打开（新窗口）"), "打开(新窗口)");
+    }
+
+    #[test]
+    fn substring_keyword_matches() {
+        assert!(hit("用手机打开", &["用手机打开"]));
+        assert!(hit("上传到百度网盘", &["百度"]));
+        assert!(hit("pin to quick access", &["Pin to Quick Access"]));
+        // 带文件名的动态项：填固定片段即可
+        assert!(hit("添加到 \"重.rar\"", &["添加到 \""]));
+        // 全角引号手打也能命中
+        assert!(hit("添加到 \"重.rar\"", &["添加到 “"]));
+    }
+
+    #[test]
+    fn bang_prefix_is_exact_match() {
+        assert!(hit("Open", &["!Open"]));
+        assert!(!hit("Open in new window", &["!Open"]));
+        assert!(!hit("Open", &["!open with"]));
+        // `!` 后的内容同样做归一化
+        assert!(hit("&Open", &["!open"]));
+        // 中文输入法打出的全角「！」同效
+        assert!(hit("Open", &["！Open"]));
+        assert!(!hit("Open in new window", &["！Open"]));
+    }
+
+    #[test]
+    fn blank_keywords_are_ignored() {
+        assert!(!hit("Open", &[""]));
+        assert!(!hit("Open", &["   "]));
+        assert!(!hit("Open", &[]));
+    }
+
+    #[test]
+    fn default_keywords_hide_only_the_standard_four() {
+        let kw = crate::config::default_context_menu_hide();
+        for label in ["Copy", "Cut", "Paste", "Refresh", "复制", "剪切", "粘贴", "刷新"] {
+            assert!(
+                keyword_hit(&normalize_label(label), &kw),
+                "默认项应当藏掉 {label}"
+            );
+        }
+        // 精确匹配：变体项不能跟着消失。
+        for label in ["Copy to folder", "复制到文件夹", "Paste shortcut", "刷新视图"] {
+            assert!(
+                !keyword_hit(&normalize_label(label), &kw),
+                "默认项不能误伤 {label}"
+            );
+        }
+    }
+}

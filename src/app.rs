@@ -3473,7 +3473,6 @@ impl App {
 
         match target {
             MenuScope::Selection(paths) => {
-                let single = paths.len() == 1;
                 let mut nodes: Vec<MenuNode> = Vec::new();
                 // 按 group 聚合："" 为一级项，其余按首次出现顺序输出为二级子菜单。
                 let mut groups: std::collections::BTreeMap<
@@ -3493,12 +3492,7 @@ impl App {
                 }
 
                 for a in groups.remove("").unwrap_or_default() {
-                    let mut enabled = true;
                     let mut label = a.label.clone();
-                    // 重命名在单选外置灰。
-                    if a.id == "builtin.rename" && !single {
-                        enabled = false;
-                    }
                     // 终端：非目录时改标签。
                     if a.id == "builtin.terminal" {
                         let first_is_dir = paths.first().map(|p| p.is_dir()).unwrap_or(false);
@@ -3512,7 +3506,7 @@ impl App {
                     nodes.push(MenuNode::Item {
                         key: format!("act:{}", a.id),
                         label,
-                        enabled,
+                        enabled: true,
                         checked: false,
                     });
                 }
@@ -3662,23 +3656,17 @@ impl App {
     }
 
 
-    /// 与 Shell 菜单重复的内置动作 / 分组（仅在挂了 Shell 项时跳过）。
+    /// 与 Shell 菜单重复的自定义动作（仅在挂了 Shell 项时跳过）。
+    ///
+    /// 内置动作已经不再包含标准命令；这里只是防止用户手写 actions.toml 时
+    /// 用旧 id 把「打开 / 属性」之类的项重复加一遍。
     ///
     /// 复制/剪切不在其中：系统的 copy 在我们这儿不可用（写进去的 CF_HDROP 读不到），
     /// 所以这两个始终用 Rove 自己的内置动作（还能给剪切态加变淡效果）。
     #[cfg(windows)]
     fn is_shell_duplicate(id: &str) -> bool {
-        matches!(
-            id,
-            "builtin.open"
-                | "builtin.open_with"
-                | "builtin.sendto"
-                | "builtin.rename"
-                | "builtin.delete"
-                | "builtin.properties"
-        )
+        crate::ops::actions::RETIRED_BUILTINS.contains(&id)
     }
-
 
     /// 弹出原生菜单。返回 false 表示原生菜单线程不可用（菜单线程起不来）。
     #[cfg(windows)]
@@ -3689,43 +3677,16 @@ impl App {
         extended: bool,
     ) -> bool {
         let owner = get_window_hwnd(&self.ui).unwrap_or(0);
-        let hidden = Self::hidden_shell_verbs(&self.actions);
+        let options = crate::sys::menu::Options {
+            hide_keywords: self.config.context_menu_hide.clone(),
+            extended,
+        };
         let sink: crate::sys::menu::Sink = std::sync::Arc::new(|action| {
             let _ = slint::invoke_from_event_loop(move || handle_native_menu_action(action));
         });
-        crate::sys::menu::open(target, nodes, hidden, extended, owner, sink)
+        crate::sys::menu::open(target, nodes, options, owner, sink)
     }
 
-    /// 设置页的内置动作开关 → 要从 Shell 菜单里摘掉的命令。
-    ///
-    /// 标准命令（打开/复制·剪切/重命名/删除/属性/打开方式/发送到）现在全部由
-    /// Shell 提供，所以开关不再控制「Rove 自己的那一项」，而是控制「Shell 的那一项」。
-    ///
-    /// 常驻例外（与开关无关）：
-    /// * `copy` / `cut`：系统的那两项拿到 Rove 里读不出剪贴板内容，始终用 Rove 的内置动作；
-    /// * `paste`：始终用 Rove 自己的粘贴（粘贴后自动滚动选中、回收站还原语义）；
-    /// * `refresh`：始终用 Rove 自己的刷新（它还会清空目录大小的缓存）。
-    #[cfg(windows)]
-    fn hidden_shell_verbs(actions: &[crate::ops::actions::ActionEntry]) -> Vec<String> {
-        let mut hidden: Vec<String> = vec![
-            "copy".to_string(),
-            "cut".to_string(),
-            "paste".to_string(),
-            "refresh".to_string(),
-        ];
-        for action in actions.iter().filter(|a| a.builtin && !a.enabled) {
-            match action.id.as_str() {
-                "builtin.open" => hidden.push("open".into()),
-                "builtin.rename" => hidden.push("rename".into()),
-                "builtin.delete" => hidden.push("delete".into()),
-                "builtin.properties" => hidden.push("properties".into()),
-                "builtin.open_with" => hidden.push("openas".into()),
-                "builtin.sendto" => hidden.push("sendto".into()),
-                _ => {}
-            }
-        }
-        hidden
-    }
 }
 
 /// 累加各分组卡片高度，得到内容总高（与 `GroupCard` 的 Slint 侧公式一致：
@@ -3954,7 +3915,7 @@ impl App {
             SettingsSubpage::SearchAndIndex => ("搜索与索引", "拼音检索、索引范围与缓存策略。", false),
             SettingsSubpage::ContextMenu => (
                 "本地右键菜单",
-                "开关控制菜单项显隐；内置动作仅允许开关，自定义动作可编辑或删除。",
+                "开关控制菜单项显隐，关键词隐藏系统菜单项；自定义动作可编辑或删除。",
                 true,
             ),
             SettingsSubpage::Shortcuts => (
@@ -3968,6 +3929,18 @@ impl App {
         self.ui.set_settings_page_title(title.into());
         self.ui.set_settings_page_desc(desc.into());
         self.ui.set_settings_show_add(show_add);
+
+        // 隐藏的系统右键菜单项关键词。
+        // 注意：不能放进 sync_search_stats —— 那个函数只在「搜索与索引」子页才跑，
+        // 而在「本地右键菜单」页添加关键词时模型就永远不会更新（列表始终为空）。
+        let hide_keywords: Vec<SharedString> = self
+            .config
+            .context_menu_hide
+            .iter()
+            .map(|k| k.clone().into())
+            .collect();
+        self.ui
+            .set_menu_hide_keywords(ModelRc::new(VecModel::from(hide_keywords)));
 
         if current == SettingsSubpage::SearchAndIndex {
             self.sync_search_stats(true);
@@ -4043,7 +4016,7 @@ impl App {
             .into_iter()
             .map(|g| {
                 let name = if g.is_empty() {
-                    "一级菜单或系统菜单".into()
+                    "一级菜单".into()
                 } else {
                     g.clone().into()
                 };
@@ -6771,6 +6744,53 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.config.save();
             reindex_if_active();
             app.sync_settings();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_menu_hide_add_clicked(move || {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let text = app.ui.get_menu_hide_input().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            if !app.config.context_menu_hide.contains(&text) {
+                // 头插：新加的排在最左侧
+                app.config.context_menu_hide.insert(0, text);
+                app.config.save();
+                app.sync_settings();
+            }
+            // 添加后清空输入框。
+            app.ui.set_menu_hide_input(SharedString::default());
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_menu_hide_remove_clicked(move |keyword| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let k = keyword.to_string();
+            let before = app.config.context_menu_hide.len();
+            app.config.context_menu_hide.retain(|x| x != &k);
+            if app.config.context_menu_hide.len() != before {
+                app.config.save();
+                app.sync_settings();
+            }
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_menu_hide_restore_clicked(move || {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            // 恢复为默认项（含用户自定义的全部清掉，与搜索页「恢复」语义一致）。
+            let defaults = crate::config::default_context_menu_hide();
+            if app.config.context_menu_hide != defaults {
+                app.config.context_menu_hide = defaults;
+                app.config.save();
+                app.sync_settings();
+            }
         });
     }
     {

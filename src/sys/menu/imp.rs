@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::{MenuAction, MenuNode, Sink, Target};
+use super::{MenuAction, MenuNode, Options, Sink, Target};
 
 use windows::core::{Interface, PCSTR, PCWSTR, PSTR, Result as WinResult};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -55,8 +55,7 @@ const WM_APP_OPEN_MENU: u32 = WM_APP + 0x51;
 struct Job {
     target: Target,
     nodes: Vec<MenuNode>,
-    hidden_verbs: Vec<String>,
-    extended: bool,
+    options: Options,
     owner: isize,
     sink: Sink,
 }
@@ -75,6 +74,9 @@ static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(
 thread_local! {
     /// 当前这个线程上正在 Track 的菜单：四条菜单消息要转发给它。
     static ACTIVE: RefCell<Option<IContextMenu>> = const { RefCell::new(None) };
+    /// 当前菜单的裁剪选项。子菜单是**展开那一刻**才被 Shell 填内容的，
+    /// 所以 `WM_INITMENUPOPUP` 里必须再裁一次。
+    static ACTIVE_OPTS: RefCell<Option<Options>> = const { RefCell::new(None) };
 }
 
 /// 弹出原生菜单。`owner` 是主窗口 HWND（用于菜单关闭后归还前台权）；
@@ -82,8 +84,7 @@ thread_local! {
 pub(crate) fn open(
     target: Target,
     nodes: Vec<MenuNode>,
-    hidden_verbs: Vec<String>,
-    extended: bool,
+    options: Options,
     owner: isize,
     sink: Sink,
 ) -> bool {
@@ -100,8 +101,7 @@ pub(crate) fn open(
     JOBS.lock().unwrap_or_else(|e| e.into_inner()).push(Job {
         target,
         nodes,
-        hidden_verbs,
-        extended,
+        options,
         owner,
         sink,
     });
@@ -122,18 +122,34 @@ fn forward_menu_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         return None;
     }
     let menu = ACTIVE.with(|active| active.borrow().clone())?;
+    let mut result = LRESULT(0);
+    let mut handled = false;
     if let Ok(menu3) = menu.cast::<IContextMenu3>() {
-        let mut result = LRESULT(0);
         if unsafe { menu3.HandleMenuMsg2(msg, wp, lp, Some(&mut result)) }.is_ok() {
-            return Some(result);
+            handled = true;
         }
     }
-    if let Ok(menu2) = menu.cast::<IContextMenu2>() {
-        if unsafe { menu2.HandleMenuMsg(msg, wp, lp) }.is_ok() {
-            return Some(LRESULT(0));
+    if !handled {
+        if let Ok(menu2) = menu.cast::<IContextMenu2>() {
+            if unsafe { menu2.HandleMenuMsg(msg, wp, lp) }.is_ok() {
+                handled = true;
+                result = LRESULT(0);
+            }
         }
     }
-    None
+    // 子菜单是**展开那一刻**才被 Shell 填内容的，所以这里必须再裁一次。
+    // 无论上面有没有人接这个消息都裁：接了就裁已填好的项，没接就是空菜单，
+    // 裁一遍也无害。
+    if msg == WM_INITMENUPOPUP {
+        if let Some(options) = ACTIVE_OPTS.with(|opts| opts.borrow().clone()) {
+            filter_hidden(HMENU(wp.0 as *mut _), &options);
+        }
+    }
+    if handled {
+        Some(result)
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -316,10 +332,13 @@ fn folder_context_menu(host: HWND, dir: &Path) -> Option<IContextMenu> {
     unsafe { folder.CreateViewObject::<IContextMenu>(host) }.ok()
 }
 
-/// 按用户开关删除 Shell 菜单项。
-/// Shell 项只有 `1..=0x6FFF` 的才有命令字符串，应用项（`0x7000+`）不动。
-fn filter_hidden(hmenu: HMENU, ctx: Option<&IContextMenu>, hidden: &[String]) {
-    if hidden.is_empty() {
+/// 按用户关键词删除 Shell 菜单项（`!` 开头 = 精确匹配，否则包含即隐藏）。
+///
+/// 只看菜单文字：不再为每一项发 `GetCommandString` 跨进程询问，
+/// 系统自带的复制/剪切/粘贴/刷新也靠默认关键词藏掉。
+/// 应用项（`0x7000+`）不动。
+fn filter_hidden(hmenu: HMENU, options: &Options) {
+    if options.hide_keywords.is_empty() {
         return;
     }
     let count = unsafe { GetMenuItemCount(Some(hmenu)) }.max(0);
@@ -328,15 +347,14 @@ fn filter_hidden(hmenu: HMENU, ctx: Option<&IContextMenu>, hidden: &[String]) {
         if id >= APP_FIRST && id != u32::MAX {
             continue;
         }
-        let label = menu_label(hmenu, index);
-        let verb = ctx.and_then(|c| canonical_verb(c, id));
-        if should_hide(verb.as_deref(), &label, hidden) {
+        let label = super::normalize_label(&menu_label(hmenu, index));
+        if !label.is_empty() && super::keyword_hit(&label, &options.hide_keywords) {
             let _ = unsafe { DeleteMenu(hmenu, index as u32, MF_BYPOSITION) };
             continue;
         }
         let sub = unsafe { GetSubMenu(hmenu, index) };
         if !sub.is_invalid() {
-            filter_hidden(sub, ctx, hidden);
+            filter_hidden(sub, options);
         }
     }
     trim_separators(hmenu);
@@ -347,42 +365,6 @@ fn menu_label(hmenu: HMENU, index: i32) -> String {
     let length = unsafe { GetMenuStringW(hmenu, index as u32, Some(&mut buffer), MF_BYPOSITION) };
     let length = length.max(0) as usize;
     String::from_utf16_lossy(&buffer[..length.min(buffer.len())])
-}
-
-fn should_hide(verb: Option<&str>, label: &str, hidden: &[String]) -> bool {
-    if let Some(verb) = verb {
-        let verb = verb.to_ascii_lowercase();
-        if hidden.iter().any(|h| *h == verb) {
-            return true;
-        }
-    }
-    // 子菜单（发送到 / 打开方式）取不到命令字符串，只能按标签兜底。
-    let label = normalize_label(label);
-    if label.is_empty() {
-        return false;
-    }
-    hidden
-        .iter()
-        .any(|h| label_aliases(h).iter().any(|alias| *alias == label))
-}
-
-/// 去掉助记符与省略号，小写化，便于跨语言比较。
-fn normalize_label(label: &str) -> String {
-    let mut s = label.replace('&', "").to_lowercase();
-    if let Some(head) = s.split('\t').next() {
-        s = head.to_string();
-    }
-    let s = s.trim().trim_end_matches('.').trim_end_matches('…').trim();
-    s.to_string()
-}
-
-/// 取不到命令字符串的项（子菜单）用它认人。
-fn label_aliases(verb: &str) -> &'static [&'static str] {
-    match verb {
-        "sendto" => &["send to", "发送到"],
-        "openas" => &["open with", "打开方式"],
-        _ => &[],
-    }
 }
 
 /// 菜单线程的 OLE 剪贴板延迟渲染落盘（仅当剪贴板属主是本线程）。
@@ -586,11 +568,11 @@ fn run_menu(host: HWND, job: Job) {
         if matches!(&job.target, Target::Items(p) if p.len() == 1) {
             flags |= CMF_CANRENAME;
         }
-        if job.extended {
+        if job.options.extended {
             flags |= CMF_EXTENDEDVERBS;
         }
         let _ = unsafe { active.QueryContextMenu(hmenu, 0, SHELL_FIRST, SHELL_LAST, flags) };
-        filter_hidden(hmenu, Some(active), &job.hidden_verbs);
+        filter_hidden(hmenu, &job.options);
     }
 
     // 3. 追加应用命令
@@ -618,15 +600,17 @@ fn run_menu(host: HWND, job: Job) {
         let _ = SetFocus(Some(host));
     }
     ACTIVE.with(|active| *active.borrow_mut() = menu.clone());
+    ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = Some(job.options.clone()));
     let flags = TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0;
     let chosen = unsafe { TrackPopupMenuEx(hmenu, flags, point.x, point.y, host, None) }.0 as u32;
+    ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = None);
     ACTIVE.with(|active| *active.borrow_mut() = None);
     crate::logv!(
-        "[menu] shell={} count={} app={} hidden={} chosen={}",
+        "[menu] shell={} count={} app={} keywords={} chosen={}",
         menu.is_some(),
         unsafe { GetMenuItemCount(Some(hmenu)) },
         map.len(),
-        job.hidden_verbs.join(","),
+        job.options.hide_keywords.len(),
         chosen
     );
 
