@@ -2439,7 +2439,7 @@ impl App {
                         detail: String::new().into(),
                         kind: "network".into(),
                         icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
-                        icon_text: "网".into(),
+                        icon_text: "N".into(),
                         usage: -1.0,
                         icon: slint::Image::default(),
                     });
@@ -2466,7 +2466,7 @@ impl App {
                         detail: String::new().into(),
                         kind: "network".into(),
                         icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
-                        icon_text: "网".into(),
+                        icon_text: "N".into(),
                         usage: -1.0,
                         icon: slint::Image::default(),
                     });

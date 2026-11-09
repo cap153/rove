@@ -69,7 +69,13 @@ pub struct NetworkLocation {
 
 /// 侧栏分区的默认顺序。
 pub fn default_sidebar_order() -> Vec<String> {
-    ["quick", "recent", "computer", "network", "explorer-net"]
+    [
+        "network",
+        "explorer-net",
+        "computer",
+        "quick",
+        "recent",
+    ]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -228,8 +234,9 @@ impl Config {
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
-            // 已知 key 按用户顺序保留，缺失的（如新增的 explorer-net）补到末尾，
-            // 未知 key 丢弃。这样升级后不会把用户的顺序重置成默认值。
+            // 已知 key 按用户顺序保留，缺失的（如升级新增的）补到末尾，
+            // 未知 key 丢弃。这样升级后不会把用户的顺序重置成默认值；
+            // 用户从未调整过时，加载的就是存盘的默认顺序，不受此合并影响。
             let known = default_sidebar_order();
             let mut merged: Vec<String> = Vec::new();
             for key in keys {
