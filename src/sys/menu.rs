@@ -178,6 +178,15 @@ mod tests {
     }
 
     #[test]
+    fn exact_match_is_literal() {
+        // `!` = 完全相等：带了热键尾巴就是带尾巴，不帮用户“猜”。
+        assert!(hit("复制(C)", &["!复制(C)"]));
+        assert!(!hit("复制(C)", &["!复制"]));
+        assert!(!hit("复制", &["!复制(C)"]));
+        assert!(!hit("Open (new window)", &["!Open"]));
+    }
+
+    #[test]
     fn blank_keywords_are_ignored() {
         assert!(!hit("Open", &[""]));
         assert!(!hit("Open", &["   "]));
@@ -187,7 +196,16 @@ mod tests {
     #[test]
     fn default_keywords_hide_only_the_standard_four() {
         let kw = crate::config::default_context_menu_hide();
-        for label in ["Copy", "Cut", "Paste", "Refresh", "复制", "剪切", "粘贴", "刷新"] {
+        for label in [
+            "Copy",
+            "Cut",
+            "Paste",
+            "Refresh",
+            "复制(C)",
+            "剪切(T)",
+            "粘贴(P)",
+            "刷新(E)",
+        ] {
             assert!(
                 keyword_hit(&normalize_label(label), &kw),
                 "默认项应当藏掉 {label}"

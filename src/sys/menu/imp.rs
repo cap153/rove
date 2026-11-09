@@ -476,7 +476,13 @@ fn canonical_verb(menu: &IContextMenu, id: u32) -> Option<String> {
     Some(String::from_utf16_lossy(&buffer[..end]))
 }
 
-fn invoke_shell(menu: &IContextMenu, owner: HWND, id: u32, point: POINT) -> WinResult<()> {
+fn invoke_shell(
+    menu: &IContextMenu,
+    owner: HWND,
+    id: u32,
+    point: POINT,
+    dir: Option<&Path>,
+) -> WinResult<()> {
     if !(SHELL_FIRST..=SHELL_LAST).contains(&id) {
         return Ok(());
     }
@@ -490,6 +496,11 @@ fn invoke_shell(menu: &IContextMenu, owner: HWND, id: u32, point: POINT) -> WinR
     if control {
         mask |= CMIC_MASK_CONTROL_DOWN;
     }
+    // 资源管理器会把“当前文件夹”一起传给处理程序（lpDirectoryW）。
+    // 有些扩展靠它拼相对路径 / 定位工作目录，缺了就会自己再猜一个（往往猜错）。
+    let dir_wide: Vec<u16> = dir
+        .map(|d| d.as_os_str().encode_wide().chain(Some(0)).collect())
+        .unwrap_or_default();
     let info = CMINVOKECOMMANDINFOEX {
         cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
         fMask: mask,
@@ -497,12 +508,26 @@ fn invoke_shell(menu: &IContextMenu, owner: HWND, id: u32, point: POINT) -> WinR
         lpVerb: PCSTR(offset as *const u8),
         nShow: 1, // SW_SHOWNORMAL
         lpVerbW: PCWSTR(offset as *const u16),
+        lpDirectoryW: if dir_wide.is_empty() {
+            PCWSTR::null()
+        } else {
+            PCWSTR(dir_wide.as_ptr())
+        },
         ptInvoke: point,
         ..Default::default()
     };
-    unsafe {
+    let result = unsafe {
         menu.InvokeCommand((&info as *const CMINVOKECOMMANDINFOEX).cast::<CMINVOKECOMMANDINFO>())
-    }
+    };
+    crate::logv!(
+        "[menu] invoke id={} offset={} verb={:?} dir={:?} hr={:?}",
+        id,
+        offset,
+        canonical_verb(menu, id),
+        dir.map(|d| d.display().to_string()),
+        result.as_ref().err().map(|e| e.code().0)
+    );
+    result
 }
 
 fn run_menu(host: HWND, job: Job) {
@@ -629,6 +654,19 @@ fn run_menu(host: HWND, job: Job) {
                 }
                 _ => None,
             };
+            // 交给 Shell 处理时的“当前文件夹”：背景菜单就是该目录，
+            // 选中项就是它所在的目录（与资源管理器一致）。
+            let shell_dir = match &job.target {
+                Target::Background(dir) => Some(dir.clone()),
+                Target::Items(paths) => paths.first().map(|p| {
+                    if p.is_dir() {
+                        p.clone()
+                    } else {
+                        p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.clone())
+                    }
+                }),
+                _ => None,
+            };
             match verb.as_deref() {
                 Some(v) if v.eq_ignore_ascii_case("rename") => (job.sink)(MenuAction::Rename),
                 Some(v)
@@ -639,7 +677,7 @@ fn run_menu(host: HWND, job: Job) {
                         Some(dir) => (job.sink)(MenuAction::Navigate(dir.clone())),
                         None => {
                             (job.sink)(MenuAction::ShellOpBegin);
-                            let _ = invoke_shell(active, host, chosen, point);
+                            let _ = invoke_shell(active, host, chosen, point, shell_dir.as_deref());
                             (job.sink)(MenuAction::ShellOpEnd);
                             (job.sink)(MenuAction::Refresh);
                         }
@@ -647,7 +685,7 @@ fn run_menu(host: HWND, job: Job) {
                 }
                 _ => {
                     (job.sink)(MenuAction::ShellOpBegin);
-                    let _ = invoke_shell(active, host, chosen, point);
+                    let _ = invoke_shell(active, host, chosen, point, shell_dir.as_deref());
                     (job.sink)(MenuAction::ShellOpEnd);
                     (job.sink)(MenuAction::Refresh);
                 }
