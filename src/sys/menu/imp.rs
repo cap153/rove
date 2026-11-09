@@ -19,10 +19,11 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Ole::OleInitialize;
 use windows::Win32::UI::Shell::Common::ITEMIDLIST;
 use windows::Win32::UI::Shell::{
-    IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, SHBindToParent,
+    IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView, SHBindToParent,
     SHCreateDefaultContextMenu, SHGetDesktopFolder, SHParseDisplayName, CMF_CANRENAME, CMF_EXPLORE,
     CMF_EXTENDEDVERBS, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE,
     CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, DEFCONTEXTMENU, GCS_VERBW,
+    SVGIO_BACKGROUND,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, AllowSetForegroundWindow, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -77,6 +78,15 @@ thread_local! {
     /// 当前菜单的裁剪选项。子菜单是**展开那一刻**才被 Shell 填内容的，
     /// 所以 `WM_INITMENUPOPUP` 里必须再裁一次。
     static ACTIVE_OPTS: RefCell<Option<Options>> = const { RefCell::new(None) };
+    /// 背景菜单取自视图时，视图对象必须活到菜单关掉为止。
+    static ACTIVE_VIEW: RefCell<Option<IShellView>> = const { RefCell::new(None) };
+    /// 根弹出菜单的句柄。它也会收到 `WM_INITMENUPOPUP`，但那个时刻 Rove
+    /// 自己的菜单项已经追加进去了；根菜单在构建阶段（那时还只有系统项）
+    /// 已经裁过一遍，所以补过滤要跳过它。
+    static ACTIVE_ROOT: RefCell<isize> = const { RefCell::new(0) };
+    /// Rove 自己建的子菜单句柄。关键词过滤只针对系统菜单项，
+    /// 这些子菜单连同里面的内容一律不碰。
+    static APP_POPUPS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
 }
 
 /// 弹出原生菜单。`owner` 是主窗口 HWND（用于菜单关闭后归还前台权）；
@@ -138,17 +148,213 @@ fn forward_menu_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         }
     }
     // 子菜单是**展开那一刻**才被 Shell 填内容的，所以这里必须再裁一次。
-    // 无论上面有没有人接这个消息都裁：接了就裁已填好的项，没接就是空菜单，
-    // 裁一遍也无害。
+    // 只处理子菜单：根弹出菜单在构建阶段已经裁过，那时里面还只有系统项。
     if msg == WM_INITMENUPOPUP {
+        let popup = HMENU(wp.0 as *mut _);
+        let root = ACTIVE_ROOT.with(|value| *value.borrow());
+        if root != 0 && wp.0 as isize == root {
+            return if handled { Some(result) } else { None };
+        }
+        // IContextMenu3 的聚合会跳过「只实现了 IContextMenu2」的子处理器
+        // （典型：授予访问权限 / 共享、部分网盘与同步类扩展）。
+        // 结果就是子菜单一直空着，但 `HandleMenuMsg2` 照样返回 S_OK。
+        // 发现还是空的就补一次 2 版本的调用。
+        if unsafe { GetMenuItemCount(Some(popup)) } <= 0 {
+            if let Ok(menu2) = menu.cast::<IContextMenu2>() {
+                let _ = unsafe { menu2.HandleMenuMsg(msg, wp, lp) };
+            }
+        }
         if let Some(options) = ACTIVE_OPTS.with(|opts| opts.borrow().clone()) {
-            filter_hidden(HMENU(wp.0 as *mut _), &options);
+            let filled = unsafe { GetMenuItemCount(Some(popup)) }.max(0);
+            filter_hidden(popup, &options);
+            let kept = unsafe { GetMenuItemCount(Some(popup)) }.max(0);
+            crate::logv!(
+                "[menu] popup handled={} filled={} kept={}",
+                handled,
+                filled,
+                kept
+            );
         }
     }
     if handled {
         Some(result)
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 菜单站点
+// ---------------------------------------------------------------------------
+
+/// 「授予访问权限」这类扩展不是从 `IShellExtInit` 的 pidl / 数据对象里拿目标的，
+/// 而是向菜单的 **site**（`IObjectWithSite`）要一个 `IFolderView`，
+/// 再调 `IFolderView::Items(SVGIO_SELECTION, IID_IShellItemArray)` 取当前目标。
+/// 不给 site 时它们不报错、也不填子菜单——就是我们现在遇到的现象。
+///
+/// 这里给一个只实现必要几项的最小 site：
+/// `IOleWindow::GetWindow` 给宿主窗口，`IFolderView::Items` 给文件夹自身的
+/// `IShellItemArray`，其余全部 `E_NOTIMPL`。
+#[cfg(windows)]
+mod site {
+    use std::cell::RefCell;
+    use std::ffi::c_void;
+    use std::path::Path;
+
+    use windows::core::{implement, GUID, IUnknown, Interface, Result as WinResult};
+    use windows::Win32::Foundation::{BOOL, E_NOTIMPL, E_NOINTERFACE, HWND, POINT};
+    use windows::Win32::System::Com::{IServiceProvider, IServiceProvider_Impl};
+    use windows::Win32::System::Ole::{IObjectWithSite, IOleWindow, IOleWindow_Impl};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        IFolderView, IFolderView_Impl, IShellItem, IShellItemArray, SHCreateItemFromIDList,
+        SHCreateShellItemArrayFromShellItem, _SVGIO,
+    };
+
+    thread_local! {
+        /// `QueryService` 要把自己 QI 成 `IFolderView`，但 `_Impl` 方法里
+        /// 只有 `&self`，拿不到外层 COM 指针，所以存一份自己。
+        static SELF_UNK: RefCell<Option<IUnknown>> = const { RefCell::new(None) };
+    }
+
+    #[implement(IServiceProvider, IOleWindow, IFolderView)]
+    struct MenuSite {
+        hwnd: HWND,
+        item: IShellItem,
+    }
+
+    impl IServiceProvider_Impl for MenuSite_Impl {
+        fn QueryService(
+            &self,
+            _guidservice: *const GUID,
+            riid: *const GUID,
+            ppvobject: *mut *mut c_void,
+        ) -> WinResult<()> {
+            let unknown = SELF_UNK.with(|slot| slot.borrow().clone());
+            let Some(unknown) = unknown else {
+                return Err(windows::core::Error::from_hresult(E_NOINTERFACE));
+            };
+            unsafe { unknown.query(riid, ppvobject) }.ok()
+        }
+    }
+
+    impl IOleWindow_Impl for MenuSite_Impl {
+        fn GetWindow(&self) -> WinResult<HWND> {
+            Ok(self.hwnd)
+        }
+        fn ContextSensitiveHelp(&self, _entermode: BOOL) -> WinResult<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+    }
+
+    impl IFolderView_Impl for MenuSite_Impl {
+        fn GetCurrentViewMode(&self) -> WinResult<u32> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn SetCurrentViewMode(&self, _viewmode: u32) -> WinResult<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn GetFolder(
+            &self,
+            _riid: *const GUID,
+            _ppv: *mut *mut c_void,
+        ) -> WinResult<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn Item(&self, _itemindex: i32) -> WinResult<*mut ITEMIDLIST> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn ItemCount(&self, _flags: &_SVGIO) -> WinResult<i32> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn Items(
+            &self,
+            _flags: &_SVGIO,
+            riid: *const GUID,
+            ppv: *mut *mut c_void,
+        ) -> WinResult<()> {
+            let array: IShellItemArray =
+                unsafe { SHCreateShellItemArrayFromShellItem(&self.item) }?;
+            unsafe { array.query(riid, ppv) }.ok()
+        }
+        fn GetSelectionMarkedItem(&self) -> WinResult<i32> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn GetFocusedItem(&self) -> WinResult<i32> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn GetItemPosition(&self, _pidl: *const ITEMIDLIST) -> WinResult<POINT> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn GetSpacing(&self, _ppt: *mut POINT) -> WinResult<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn GetDefaultSpacing(&self) -> WinResult<POINT> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn GetAutoArrange(&self) -> WinResult<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn SelectItem(&self, _item: i32, _flags: u32) -> WinResult<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+        fn SelectAndPositionItems(
+            &self,
+            _cidl: u32,
+            _apidl: *const *const ITEMIDLIST,
+            _apt: *const POINT,
+            _flags: u32,
+        ) -> WinResult<()> {
+            Err(windows::core::Error::from_hresult(E_NOTIMPL))
+        }
+    }
+
+    /// 挂上 site；菜单关掉后 `Drop` 会自动摘下来。
+    pub(super) struct SiteGuard {
+        shell_hook: IObjectWithSite,
+        _provider: IServiceProvider,
+    }
+
+    impl Drop for SiteGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { self.shell_hook.SetSite(None) };
+            SELF_UNK.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    pub(super) fn attach(menu: &windows::Win32::UI::Shell::IContextMenu, hwnd: HWND, dir: &Path) -> Option<SiteGuard> {
+        let pidl = super::path_pidl(dir).ok()?;
+        let guard = super::Pidls(vec![pidl]);
+        let item: IShellItem = unsafe { SHCreateItemFromIDList(guard.0[0]) }.ok()?;
+        let unknown: IUnknown = MenuSite {
+            hwnd,
+            item,
+        }
+        .into();
+        SELF_UNK.with(|slot| *slot.borrow_mut() = Some(unknown.clone()));
+        let provider: IServiceProvider = match unknown.cast() {
+            Ok(provider) => provider,
+            Err(_) => {
+                SELF_UNK.with(|slot| *slot.borrow_mut() = None);
+                return None;
+            }
+        };
+        let shell_hook: IObjectWithSite = match menu.cast() {
+            Ok(hook) => hook,
+            Err(_) => {
+                SELF_UNK.with(|slot| *slot.borrow_mut() = None);
+                return None;
+            }
+        };
+        if unsafe { shell_hook.SetSite(Some(&unknown)) }.is_err() {
+            SELF_UNK.with(|slot| *slot.borrow_mut() = None);
+            return None;
+        }
+        crate::logv!("[menu] site attached");
+        Some(SiteGuard {
+            shell_hook,
+            _provider: provider,
+        })
     }
 }
 
@@ -329,6 +535,19 @@ fn folder_context_menu(host: HWND, dir: &Path) -> Option<IContextMenu> {
     let pidls = Pidls(vec![pidl]);
     let desktop = unsafe { SHGetDesktopFolder() }.ok()?;
     let folder: IShellFolder = unsafe { desktop.BindToObject(pidls.0[0], None) }.ok()?;
+    // 「授予访问权限」这类子菜单是靠 Shell 扩展在展开那一刻填的。
+    // 文件夹自己的菜单对象（`CreateViewObject(IID_IContextMenu)`）虽然也会
+    // 画出那一条，但它转发不到扩展里，子菜单永远是空的。
+    // 视图的背景菜单对象才会转发，所以优先走视图（不需要真建窗口，
+    // 跟 zsdesk 借背景菜单的做法一致）。
+    if let Ok(view) = unsafe { folder.CreateViewObject::<IShellView>(host) } {
+        if let Ok(menu) = unsafe { view.GetItemObject::<IContextMenu>(SVGIO_BACKGROUND) } {
+            crate::logv!("[menu] background source=view");
+            ACTIVE_VIEW.with(|slot| *slot.borrow_mut() = Some(view));
+            return Some(menu);
+        }
+    }
+    crate::logv!("[menu] background source=folder-object");
     unsafe { folder.CreateViewObject::<IContextMenu>(host) }.ok()
 }
 
@@ -341,11 +560,23 @@ fn filter_hidden(hmenu: HMENU, options: &Options) {
     if options.hide_keywords.is_empty() {
         return;
     }
+    if APP_POPUPS.with(|list| list.borrow().iter().any(|h| *h == hmenu.0 as isize)) {
+        return;
+    }
     let count = unsafe { GetMenuItemCount(Some(hmenu)) }.max(0);
     for index in (0..count).rev() {
         let id = unsafe { GetMenuItemID(hmenu, index) };
         if id >= APP_FIRST && id != u32::MAX {
             continue;
+        }
+        // 子菜单项没有 id，只能看句柄归属。
+        if id == u32::MAX {
+            let sub = unsafe { GetSubMenu(hmenu, index) };
+            if !sub.is_invalid()
+                && APP_POPUPS.with(|list| list.borrow().iter().any(|h| *h == sub.0 as isize))
+            {
+                continue;
+            }
         }
         let label = super::normalize_label(&menu_label(hmenu, index));
         if !label.is_empty() && super::keyword_hit(&label, &options.hide_keywords) {
@@ -421,6 +652,7 @@ fn append_nodes(
                 children,
             } => {
                 let sub = unsafe { CreatePopupMenu()? };
+                APP_POPUPS.with(|list| list.borrow_mut().push(sub.0 as isize));
                 append_nodes(sub, children, next_id, map)?;
                 let mut flags = MF_POPUP | MF_STRING;
                 if !enabled {
@@ -552,6 +784,7 @@ fn run_menu(host: HWND, job: Job) {
 
     // 1. Shell 部分
     let mut menu: Option<IContextMenu> = None;
+    let mut site_guard: Option<site::SiteGuard> = None;
     match &job.target {
         Target::Items(paths) if !paths.is_empty() => {
             let mut pidls = Pidls(Vec::with_capacity(paths.len()));
@@ -583,6 +816,10 @@ fn run_menu(host: HWND, job: Job) {
         }
         Target::Background(dir) => {
             menu = folder_context_menu(host, dir);
+            // 背景菜单要挂 site，「授予访问权限」子菜单才会被填内容。
+            if let Some(active) = &menu {
+                site_guard = site::attach(active, host, dir);
+            }
         }
         _ => {}
     }
@@ -626,10 +863,15 @@ fn run_menu(host: HWND, job: Job) {
     }
     ACTIVE.with(|active| *active.borrow_mut() = menu.clone());
     ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = Some(job.options.clone()));
+    ACTIVE_ROOT.with(|root| *root.borrow_mut() = hmenu.0 as isize);
     let flags = TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0;
     let chosen = unsafe { TrackPopupMenuEx(hmenu, flags, point.x, point.y, host, None) }.0 as u32;
     ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = None);
     ACTIVE.with(|active| *active.borrow_mut() = None);
+    ACTIVE_VIEW.with(|slot| *slot.borrow_mut() = None);
+    ACTIVE_ROOT.with(|root| *root.borrow_mut() = 0);
+    APP_POPUPS.with(|list| list.borrow_mut().clear());
+    drop(site_guard.take());
     crate::logv!(
         "[menu] shell={} count={} app={} keywords={} chosen={}",
         menu.is_some(),

@@ -3671,8 +3671,16 @@ impl App {
         extended: bool,
     ) -> bool {
         let owner = get_window_hwnd(&self.ui).unwrap_or(0);
+        let mut hide_keywords = self.config.context_menu_hide.clone();
+        if matches!(target, crate::sys::menu::Target::Background(_)) {
+            hide_keywords.extend(
+                crate::sys::menu::VIEW_LEVEL_LABELS
+                    .iter()
+                    .map(|s| s.to_string()),
+            );
+        }
         let options = crate::sys::menu::Options {
-            hide_keywords: self.config.context_menu_hide.clone(),
+            hide_keywords,
             extended,
         };
         let sink: crate::sys::menu::Sink = std::sync::Arc::new(|action| {

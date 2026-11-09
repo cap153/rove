@@ -66,6 +66,35 @@ pub enum MenuAction {
 
 pub type Sink = Arc<dyn Fn(MenuAction) + Send + Sync>;
 
+/// 背景菜单取自视图对象时，会多出 Explorer 视图自己的一套菜单项。
+/// Rove 的列表不是原生视图，这些项点下去无效，而 Rove 自己已经有对应的
+/// 「视图 / 排序 / 粘贴」菜单，所以固定剔除。
+/// 与用户关键词同一个语法（`!` = 精确相等），不进入设置页。
+/// 只能写带加速键的系统原文：根弹出菜单也会再过滤一次，那时 Rove 自己的
+/// 菜单项已经在里面了（`排序方式` 正是它自己的子菜单标题）。
+pub(crate) const VIEW_LEVEL_LABELS: &[&str] = &[
+    "!查看(V)",
+    "!View",
+    "!排序方式(O)",
+    "!Sort by",
+    "!分组依据(P)",
+    "!Group by",
+    "!刷新(E)",
+    "!Refresh",
+    "!粘贴(P)",
+    "!Paste",
+    "!粘贴快捷方式(S)",
+    "!Paste shortcut",
+    "!撤消删除(U)",
+    "!撤消(U)",
+    "!Undo Delete",
+    "!Undo",
+    "!在终端中打开",
+    "!Open in Terminal",
+    "!自定义文件夹(F)…",
+    "!Customize this folder…",
+];
+
 /// 菜单裁剪选项。
 #[derive(Clone, Debug, Default)]
 pub struct Options {
