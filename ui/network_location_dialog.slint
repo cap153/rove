@@ -1,0 +1,235 @@
+// 「添加网络位置」弹窗：输入服务器地址（别名可留空，留空取地址尾段）。
+import { Theme, IconClose } from "common.slint";
+import { SingleLineEdit } from "single_line_edit.slint";
+
+component Field inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder: "";
+
+    callback accepted(text: string);
+    /// Esc
+    callback canceled();
+
+    public function focus-input() {
+        ti.focus-input();
+    }
+
+    height: 32px;
+    vertical-stretch: 0;
+    border-radius: 6px;
+    background: Theme.bg-main;
+    border-width: 1px;
+    border-color: ti.has-focus ? Theme.accent : Theme.border;
+
+    ti := SingleLineEdit {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text <=> root.text;
+        font-size: 12.5px;
+        text-color: Theme.text-primary;
+
+        accepted(t) => {
+            root.accepted(self.text);
+        }
+
+        key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.canceled();
+                return EventResult.accept;
+            }
+            return EventResult.reject;
+        }
+    }
+
+    if (root.text == "" && !ti.has-focus && root.placeholder != "") : Text {
+        x: 10px;
+        width: parent.width - 20px;
+        height: parent.height;
+        text: root.placeholder;
+        font-size: 12px;
+        color: Theme.text-disabled;
+        vertical-alignment: center;
+    }
+}
+
+export component NetworkLocationDialog inherits Rectangle {
+    in property <string> title: "添加网络位置";
+    in-out property <string> server;
+    in-out property <string> alias;
+    in-out property <string> error: "";
+
+    callback connect-clicked();
+    callback cancel-clicked();
+
+    public function focus-server() {
+        server-edit.focus-input();
+    }
+
+    width: 100%;
+    height: 100%;
+
+    // 遮罩：吸收点击，防止穿透到下面的列表（不关闭弹窗，避免误触丢输入）。
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        background: #000000;
+        opacity: 0.45;
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+        }
+    }
+
+    Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: max(16px, (parent.height - self.height) / 2);
+        width: 460px;
+        height: card-layout.preferred-height;
+        background: Theme.bg-input;
+        border-radius: 10px;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        card-layout := VerticalLayout {
+            padding-left: 24px;
+            padding-right: 24px;
+            padding-top: 20px;
+            padding-bottom: 20px;
+            spacing: 14px;
+            alignment: start;
+
+            HorizontalLayout {
+                height: 24px;
+
+                Text {
+                    text: root.title;
+                    color: Theme.text-primary;
+                    font-size: 16px;
+                    font-weight: 600;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+
+                Rectangle {
+                    width: 24px;
+                    height: 24px;
+                    border-radius: 4px;
+                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    IconClose {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        size: 9px;
+                        stroke-width: 1.1px;
+                        icon-color: Theme.text-secondary;
+                    }
+
+                    close-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.cancel-clicked();
+                        }
+                    }
+                }
+            }
+
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "服务器地址"; color: Theme.text-secondary; font-size: 12px; }
+                server-edit := Field {
+                    text <=> root.server;
+                    placeholder: "例如：\\\\192.168.1.5\\Video";
+                    accepted(t) => {
+                        root.connect-clicked();
+                    }
+                    canceled => {
+                        root.cancel-clicked();
+                    }
+                }
+            }
+
+            VerticalLayout {
+                spacing: 4px;
+                Text { text: "别名（可留空，留空取地址尾段）"; color: Theme.text-secondary; font-size: 12px; }
+                Field {
+                    text <=> root.alias;
+                    placeholder: "例如：Video";
+                    accepted(t) => {
+                        root.connect-clicked();
+                    }
+                    canceled => {
+                        root.cancel-clicked();
+                    }
+                }
+            }
+
+            if (root.error != "") : Text {
+                text: root.error;
+                color: #D93F3F;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            HorizontalLayout {
+                height: 34px;
+                spacing: 12px;
+                alignment: end;
+
+                Rectangle {
+                    width: 72px;
+                    height: parent.height;
+                    background: cancel-ta.has-hover ? Theme.bg-hover : transparent;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+
+                    Text {
+                        text: "取消";
+                        color: Theme.text-primary;
+                        font-size: 12.5px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    cancel-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.cancel-clicked();
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 72px;
+                    height: parent.height;
+                    background: connect-ta.has-hover ? Theme.accent-hover : Theme.accent;
+                    border-radius: 6px;
+
+                    Text {
+                        text: "连接";
+                        color: white;
+                        font-size: 12.5px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    connect-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.connect-clicked();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

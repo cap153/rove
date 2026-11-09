@@ -304,10 +304,29 @@ pub fn purge_recycle_entries(originals: &[std::path::PathBuf]) -> usize {
 /// 枚举已连接的网络位置（映射盘与 UNC 共享）。
 #[cfg(windows)]
 pub fn list_network_locations() -> Vec<String> {
+    use windows_sys::Win32::NetworkManagement::WNet::{RESOURCE_CONNECTED, RESOURCE_REMEMBERED};
+
+    let mut locations = enumerate_wnet(RESOURCE_CONNECTED);
+    // 断开但记住的映射（资源管理器里依然显示）也要列出来。
+    for remote in enumerate_wnet(RESOURCE_REMEMBERED) {
+        if !locations
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(&remote))
+        {
+            locations.push(remote);
+        }
+    }
+    if !locations.is_empty() {
+        crate::logv!("[net] wnet={:?}", locations);
+    }
+    locations
+}
+
+#[cfg(windows)]
+fn enumerate_wnet(scope: windows_sys::Win32::NetworkManagement::WNet::NET_RESOURCE_SCOPE) -> Vec<String> {
     use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::NetworkManagement::WNet::{
-        NETRESOURCEW, RESOURCETYPE_ANY, RESOURCE_CONNECTED, WNetCloseEnum, WNetEnumResourceW,
-        WNetOpenEnumW,
+        NETRESOURCEW, RESOURCETYPE_ANY, WNetCloseEnum, WNetEnumResourceW, WNetOpenEnumW,
     };
     use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 
@@ -315,7 +334,7 @@ pub fn list_network_locations() -> Vec<String> {
     let mut enum_handle: HANDLE = std::ptr::null_mut();
     let rc = unsafe {
         WNetOpenEnumW(
-            RESOURCE_CONNECTED,
+            scope,
             RESOURCETYPE_ANY,
             0,
             std::ptr::null(),
@@ -381,4 +400,420 @@ unsafe fn wide_len(ptr: *const u16) -> usize {
 #[cfg(not(windows))]
 pub fn list_network_locations() -> Vec<String> {
     Vec::new()
+}
+
+/// `%APPDATA%\Microsoft\Windows\Network Shortcuts`：资源管理器「添加一个
+/// 网络位置」向导把结果存成这里的 `.lnk` 快捷方式，**不会**建立网络连接。
+#[cfg(windows)]
+fn network_shortcuts_dir() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("APPDATA")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .map(|p| std::path::PathBuf::from(p).join("AppData/Roaming"))
+        })?;
+    Some(base.join("Microsoft").join("Windows").join("Network Shortcuts"))
+}
+
+/// 资源管理器里的「网络位置」条目。
+///
+/// 这些东西**不是网络连接**（`WNet` 枚举不到），只是
+/// `%APPDATA%\Microsoft\Windows\Network Shortcuts` 下的快捷方式文件。
+/// 这里直接读文件字节解 `LinkInfo`：纯本地、微秒级，不会像 shell 枚举那样
+/// 去探网络（`IShellFolder::EnumObjects` 在本机上卡过 28 秒）。
+#[cfg(windows)]
+pub fn list_network_places() -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let Some(dir) = network_shortcuts_dir() else {
+        crate::logln!("[net] shortcuts dir: APPDATA/USERPROFILE missing");
+        return out;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        crate::logln!("[net] shortcuts dir missing {}", dir.display());
+        return out;
+    };
+    let mut seen: Vec<String> = Vec::new();
+    let mut skipped: Vec<String> = Vec::new();
+    let mut dir_errors = 0usize;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            dir_errors += 1;
+            continue;
+        };
+        let path = entry.path();
+        // 向导生成的条目未必带 `.lnk` 扩展名，所以不能按扩展名筛；
+        // 也不能无条件用 `file_stem`：名字里带普通点（“Samba 4.22.4”）会被吃掉半截。
+        let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        // 条目类型写进日志：绕过 is_file / 扩展名两道猜测。
+        let kind = match entry.file_type() {
+            Ok(ft) => format!(
+                "{}{}{}",
+                if ft.is_file() { "file" } else { "-file" },
+                if ft.is_dir() { " dir" } else { "" },
+                if ft.is_symlink() { " symlink" } else { "" }
+            ),
+            Err(err) => format!("file_type err: {err}"),
+        };
+        let label = if path
+            .extension()
+            .map(|ext| ext.eq_ignore_ascii_case("lnk"))
+            .unwrap_or(false)
+        {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_else(|| name.clone())
+        } else {
+            name.clone()
+        };
+        if label.is_empty() {
+            continue;
+        }
+        seen.push(format!("{name} [{kind}]"));
+        let file_type = entry.file_type().ok();
+        // 情况一：重解析点/符号链接，目标是 UNC 就直接用。
+        if file_type.map(|ft| ft.is_symlink()).unwrap_or(false) {
+            match std::fs::read_link(&path) {
+                Ok(link) => {
+                    let raw = link.to_string_lossy().to_string();
+                    match normalize_network_path(&raw) {
+                        Some(target) => out.push((label, target)),
+                        None => skipped.push(format!("{label} -> {raw} (link, not unc)")),
+                    }
+                }
+                Err(err) => skipped.push(format!("{label} (read_link err: {err})")),
+            }
+            continue;
+        }
+        // 情况二：目录版的网络位置（资源管理器就是这么存的），进目录找 UNC。
+        if file_type.map(|ft| ft.is_dir()).unwrap_or(false) {
+            let children = dir_children(&path);
+            match dir_network_target(&path) {
+                Some(target) => out.push((label, target)),
+                None => skipped.push(format!("{label} (dir, no unc inside; children={children:?})")),
+            }
+            continue;
+        }
+        // 情况三：普通 `.lnk` 文件，解 LinkInfo。
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                skipped.push(format!("{label} (read err: {err})"));
+                continue;
+            }
+        };
+        match lnk_target_from_bytes(&bytes) {
+            Some(target) => match normalize_network_path(&target) {
+                Some(target) => out.push((label, target)),
+                None => skipped.push(format!("{label} -> {target} (not unc)")),
+            },
+            None => skipped.push(format!("{label} (no target, {} bytes)", bytes.len())),
+        }
+    }
+    crate::logv!(
+        "[net] shortcuts dir={} errors={} files={:?} places={:?} skipped={:?}",
+        dir.display(),
+        dir_errors,
+        seen,
+        out,
+        skipped
+    );
+    // 只有“看到了但没解析出”的才算异常，升级到常规日志。
+    if !skipped.is_empty() {
+        crate::logln!("[net] unparsed shortcuts: {skipped:?}");
+    }
+    out
+}
+
+/// 目录版「网络位置」：读目录里的每个文件（`desktop.ini` / `target.lnk` ...），
+/// 先试 `.lnk` 的 `LinkInfo`，再退到全字节搜 UNC 字串。
+fn dir_network_target(dir: &std::path::Path) -> Option<String> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut found: Option<String> = None;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(entry.path()) else {
+            continue;
+        };
+        if let Some(target) = lnk_target_from_bytes(&bytes).and_then(|t| normalize_network_path(&t)) {
+            return Some(target);
+        }
+        if let Some(target) = scan_bytes_for_unc(&bytes) {
+            found = found.or(Some(target));
+        }
+    }
+    found
+}
+
+/// 目录里的文件名（只用于日志排查）。
+fn dir_children(dir: &std::path::Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            format!("{} ({size}B)", entry.file_name().to_string_lossy())
+        })
+        .collect()
+}
+
+/// 在任意字节里找第一个 `\\host\share`：UTF-16LE 和 ANSI/UTF-8 两种写法都试。
+fn scan_bytes_for_unc(data: &[u8]) -> Option<String> {
+    let mut i = 0usize;
+    while i + 3 < data.len() {
+        // UTF-16LE: 5C 00 5C 00
+        if data[i] == b'\\' && data[i + 1] == 0 && data[i + 2] == b'\\' && data[i + 3] == 0 {
+            let mut units: Vec<u16> = Vec::new();
+            let mut j = i;
+            while j + 1 < data.len() {
+                let unit = u16::from_le_bytes([data[j], data[j + 1]]);
+                if unit == 0 || unit < 0x20 {
+                    break;
+                }
+                units.push(unit);
+                j += 2;
+            }
+            if let Some(target) = normalize_network_path(&String::from_utf16_lossy(&units)) {
+                return Some(target);
+            }
+        }
+        // ANSI / UTF-8: 5C 5C
+        if data[i] == b'\\' && data[i + 1] == b'\\' {
+            let mut bytes: Vec<u8> = Vec::new();
+            let mut j = i;
+            while j < data.len() {
+                let byte = data[j];
+                if byte < 0x20 {
+                    break;
+                }
+                bytes.push(byte);
+                j += 1;
+            }
+            if let Some(target) = normalize_network_path(&String::from_utf8_lossy(&bytes)) {
+                return Some(target);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 把各种写法归一成 `\\host\share`；不是 UNC 就返回 `None`。
+///
+/// 兼容 `\\?\UNC\host\share`、`\\?\host\share` 和正斜杠写法。
+fn normalize_network_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let slashed = trimmed.replace('/', "\\");
+    let body = if let Some(rest) = slashed.strip_prefix("\\\\?\\UNC\\") {
+        format!("\\\\{rest}")
+    } else if let Some(rest) = slashed.strip_prefix("\\\\?\\") {
+        rest.to_string()
+    } else {
+        slashed
+    };
+    let body = body.trim_end_matches('\\');
+    body.starts_with("\\\\").then(|| body.to_string())
+}
+
+/// 从 `.lnk` 字节里取目标路径。
+///
+/// 只看 `LinkInfo`（MS-SHLLINK 2.3）：其中的 `LocalBasePath` 就是
+/// `\\server\share`；Unicode 版本优先，因为 ANSI 版会被 MAX_PATH 截断。
+/// 最后再上一个彻底兜底：全文件搜第一个 UTF-16 的 `\\`。
+fn lnk_target_from_bytes(data: &[u8]) -> Option<String> {
+    if data.len() < 0x4C + 4 {
+        return None;
+    }
+    let u32_at = |off: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(data.get(off..off + 4)?.try_into().ok()?))
+    };
+    let u16_at = |off: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(data.get(off..off + 2)?.try_into().ok()?))
+    };
+    let wide_at = |off: usize| -> Option<String> {
+        let mut units: Vec<u16> = Vec::new();
+        let mut i = off;
+        while i + 1 < data.len() {
+            let unit = u16::from_le_bytes([data[i], data[i + 1]]);
+            if unit == 0 {
+                break;
+            }
+            units.push(unit);
+            i += 2;
+        }
+        (!units.is_empty()).then(|| String::from_utf16_lossy(&units))
+    };
+    let ansi_at = |off: usize| -> Option<String> {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut i = off;
+        while i < data.len() {
+            if data[i] == 0 {
+                break;
+            }
+            bytes.push(data[i]);
+            i += 1;
+        }
+        (!bytes.is_empty()).then(|| String::from_utf8_lossy(&bytes).into_owned())
+    };
+
+    // 头部 0x14 处的 LinkFlags：bit0 = 有 LinkTargetIDList，bit1 = 有 LinkInfo。
+    let flags = u32_at(0x14)?;
+    let mut off = 0x4Cusize;
+    if flags & 0x1 != 0 {
+        let size = u16_at(off)? as usize;
+        off += 2 + size;
+    }
+    let join = |mut base: String, suffix: Option<String>| -> String {
+        if let Some(suffix) = suffix {
+            if !suffix.is_empty() {
+                base.push_str(suffix.trim_start_matches('\\'));
+                return base;
+            }
+        }
+        base
+    };
+    if flags & 0x2 != 0 {
+        let li = off;
+        let li_size = u32_at(li)? as usize;
+        let header = u16_at(li + 4)? as usize;
+        let li_flags = u32_at(li + 8)?;
+        let suffix_a = u32_at(li + 24).unwrap_or(0) as usize;
+        let (local_u, suffix_u) = if header >= 0x24 {
+            (
+                u32_at(li + 28).unwrap_or(0) as usize,
+                u32_at(li + 32).unwrap_or(0) as usize,
+            )
+        } else {
+            (0, 0)
+        };
+        if li_size >= 0x1C && li_flags & 0x1 != 0 {
+            if local_u != 0 && local_u < li_size {
+                if let Some(base) = wide_at(li + local_u) {
+                    let suffix = (suffix_u != 0 && suffix_u < li_size)
+                        .then(|| wide_at(li + suffix_u))
+                        .flatten();
+                    let target = join(base, suffix);
+                    if !target.is_empty() {
+                        return Some(target);
+                    }
+                }
+            }
+            let local = u32_at(li + 16).unwrap_or(0) as usize;
+            if local != 0 && local < li_size {
+                if let Some(base) = ansi_at(li + local) {
+                    let suffix = (suffix_a != 0 && suffix_a < li_size)
+                        .then(|| ansi_at(li + suffix_a))
+                        .flatten();
+                    let target = join(base, suffix);
+                    if !target.is_empty() {
+                        return Some(target);
+                    }
+                }
+            }
+        }
+    }
+    // 兜底：全文件搜第一个 UNC 字串。
+    scan_bytes_for_unc(data)
+}
+
+#[cfg(not(windows))]
+pub fn list_network_places() -> Vec<(String, String)> {
+    Vec::new()
+}
+#[cfg(test)]
+mod tests {
+    use super::{lnk_target_from_bytes, normalize_network_path, scan_bytes_for_unc};
+
+    fn put_u32(buf: &mut [u8], at: usize, value: u32) {
+        buf[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_u16(buf: &mut [u8], at: usize, value: u16) {
+        buf[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn utf16(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    /// 最小可用的 `.lnk`：只有 LinkInfo，Unicode 版 LocalBasePath。
+    fn sample(with_idlist: bool, path: &str) -> Vec<u8> {
+        const LI_HEADER: usize = 0x24;
+        let mut buf = vec![0u8; 0x4C];
+        let mut flags = 0x2u32; // HasLinkInfo
+        let mut idlist: Vec<u8> = Vec::new();
+        if with_idlist {
+            flags |= 0x1; // HasLinkTargetIDList
+            idlist.extend_from_slice(&4u16.to_le_bytes());
+            idlist.extend_from_slice(&[0, 0, 0, 0]);
+        }
+        let mut link_info = vec![0u8; LI_HEADER];
+        link_info.extend_from_slice(&utf16(path));
+        link_info.extend_from_slice(&[0, 0]);
+        let size = link_info.len() as u32;
+        put_u32(&mut link_info, 0, size);
+        put_u16(&mut link_info, 4, LI_HEADER as u16);
+        put_u32(&mut link_info, 8, 0x1); // VolumeIDAndLocalBasePath
+        put_u32(&mut link_info, 12, 0x1C);
+        put_u32(&mut link_info, 28, LI_HEADER as u32); // 路径紧跟在头后面
+        buf.extend_from_slice(&idlist);
+        buf.extend_from_slice(&link_info);
+        put_u32(&mut buf, 0x14, flags);
+        buf
+    }
+
+    #[test]
+    fn lnk_parses_unicode_local_base_path() {
+        let bytes = sample(false, r"\\192.168.1.5\Video");
+        assert_eq!(
+            lnk_target_from_bytes(&bytes).as_deref(),
+            Some(r"\\192.168.1.5\Video")
+        );
+    }
+
+    #[test]
+    fn lnk_parses_with_idlist_prefix() {
+        let bytes = sample(true, r"\\nas\share");
+        assert_eq!(lnk_target_from_bytes(&bytes).as_deref(), Some(r"\\nas\share"));
+    }
+
+    #[test]
+    fn lnk_rejects_garbage() {
+        assert_eq!(lnk_target_from_bytes(b"not a link"), None);
+    }
+
+    #[test]
+    fn scans_unc_from_utf16_and_ansi() {
+        let utf16: Vec<u8> = r"\\192.168.1.5\Video"
+            .encode_utf16()
+            .flat_map(|u| u.to_le_bytes())
+            .collect();
+        let mut bytes = b"junk".to_vec();
+        bytes.extend_from_slice(&utf16);
+        assert_eq!(
+            scan_bytes_for_unc(&bytes).as_deref(),
+            Some(r"\\192.168.1.5\Video")
+        );
+
+        let ansi = b"NetworkLocation=\\\\nas\\share\r\n";
+        assert_eq!(scan_bytes_for_unc(ansi).as_deref(), Some(r"\\nas\share"));
+    }
+
+    #[test]
+    fn normalize_handles_extended_prefixes() {
+        assert_eq!(
+            normalize_network_path(r"\\?\UNC\192.168.1.5\Video\").as_deref(),
+            Some(r"\\192.168.1.5\Video")
+        );
+        assert_eq!(
+            normalize_network_path("//nas/share").as_deref(),
+            Some(r"\\nas\share")
+        );
+        assert_eq!(normalize_network_path("ftp://nas/share"), None);
+    }
 }

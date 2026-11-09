@@ -13,9 +13,12 @@ export component Sidebar inherits Rectangle {
 
     callback item_activated(id: string);
     callback background_clicked();
-    callback item_pointer_event(id: string, event: PointerEvent, x: length, y: length);
+    /// 右键按下（仅上报，由外层决定行为，例如「网络位置」标题弹出添加弹窗）。
+    callback item_right_clicked(id: string);
     // 分区标题拖拽排序：phase 0=按下 1=拖动 2=松开，y 为指针相对行内的偏移。
     callback header_drag(index: int, phase: int, y: length);
+    /// 网络位置条目拖拽排序，参数含义同 header_drag。
+    callback network_drag(index: int, phase: int, y: length);
     in property <bool> drop-visible: false;
     in property <length> drop-y: 0px;
     callback staging_item_removed(index: int);
@@ -98,6 +101,7 @@ export component Sidebar inherits Rectangle {
                     }
 
                     // 分区标题支持拖拽排序（按下/拖动/松开三阶段上报）。
+                    // 网络位置条目同样支持拖拽（只在用户添加的条目之间）。
                     pointer-event(event) => {
                         if (item.kind == "header") {
                             if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
@@ -106,8 +110,18 @@ export component Sidebar inherits Rectangle {
                                 root.header_drag(i, 2, self.mouse-y);
                             }
                         }
-                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
-                            root.item_pointer_event(item.id, event, self.mouse-x, self.mouse-y);
+                        if (item.kind == "network") {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.network_drag(i, 0, self.mouse-y);
+                            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                root.network_drag(i, 2, self.mouse-y);
+                            }
+                        }
+                        if (event.button == PointerEventButton.right) {
+                            // 右键菜单/弹窗等松开再弹（跟资源管理器一致）。
+                            if (event.kind == PointerEventKind.up) {
+                                root.item_right_clicked(item.id);
+                            }
                             return EventResult.accept;
                         }
                         return EventResult.reject;
@@ -115,6 +129,9 @@ export component Sidebar inherits Rectangle {
                     moved => {
                         if (item.kind == "header" && self.pressed) {
                             root.header_drag(i, 1, self.mouse-y);
+                        }
+                        if (item.kind == "network" && self.pressed) {
+                            root.network_drag(i, 1, self.mouse-y);
                         }
                     }
                 }
@@ -192,7 +209,7 @@ export component Sidebar inherits Rectangle {
 
                         Text {
                             text: item.label;
-                            color: (root.active-id == item.id) ? Theme.accent : Theme.text-primary;
+                            color: (item.kind == "hint") ? Theme.text-secondary : ((root.active-id == item.id) ? Theme.accent : Theme.text-primary);
                             font-size: 12.5px;
                             vertical-alignment: center;
                             overflow: elide;

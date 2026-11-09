@@ -26,7 +26,9 @@ pub struct Config {
     pub computer_expanded: bool,
     /// 「网络位置」是否展开（默认 true 展开）。
     pub network_expanded: bool,
-    /// 侧栏分区顺序（分区 key：quick / recent / computer / network）。
+    /// 资源管理器里已有的网络位置（自动检测）是否展开（默认 true）。
+    pub explorer_net_expanded: bool,
+    /// 侧栏分区顺序（分区 key：quick / recent / computer / network / explorer-net）。
     pub sidebar_order: Vec<String>,
     /// 视图模式：details | list | icons-small | icons-medium | icons-large | icons-xl。
     pub view_mode: String,
@@ -50,13 +52,24 @@ pub struct Config {
     pub search_max_results: usize,
     /// 是否首次启动（用于触发 SSD 检测与初始自动化配置）。
     pub is_first_run: bool,
+    /// 用户添加的网络位置（别名 + 地址）。
+    pub network_locations: Vec<NetworkLocation>,
     /// 是否已完成侧边栏宽度的历史数据修复（旧版 bug 会把被动挤压后的宽度落盘）。
     pub sidebar_width_repaired: bool,
 }
 
+/// 侧边栏「网络位置」里的一条用户自定义项。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct NetworkLocation {
+    /// 侧边栏显示的名字。
+    pub label: String,
+    /// `\\host\share` 形式的地址。
+    pub path: String,
+}
+
 /// 侧栏分区的默认顺序。
 pub fn default_sidebar_order() -> Vec<String> {
-    ["quick", "recent", "computer", "network"]
+    ["quick", "recent", "computer", "network", "explorer-net"]
         .iter()
         .map(|s| s.to_string())
         .collect()
@@ -97,6 +110,7 @@ impl Default for Config {
             quick_expanded: true,   // 默认展开
             computer_expanded: true,// 默认展开
             network_expanded: true, // 默认展开
+            explorer_net_expanded: true,
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
             sort_key: "name".to_string(),
@@ -109,9 +123,42 @@ impl Default for Config {
             search_idle_rescan_minutes: 60,
             search_max_results: 1000,
             is_first_run: true,
+            network_locations: Vec::new(),
             sidebar_width_repaired: false,
         }
     }
+}
+
+/// 把用户输入的服务器地址整理成 `\\host` 或 `\\host\share` 形式。
+/// 允许用 `/` 分隔，也允许不写开头的 `\\`（直接写 `192.168.1.5/Video` 也行）。
+/// 只写主机（`\\192.168.1.5` / `\\nas`）也是合法的：资源管理器能直接列出该主机的共享。
+pub fn normalize_network_path(input: &str) -> Option<String> {
+    let mut text = input.trim().replace('/', "\\");
+    while text.ends_with('\\') {
+        text.pop();
+    }
+    if text.is_empty() {
+        return None;
+    }
+    if !text.starts_with("\\\\") {
+        text.insert_str(0, if text.starts_with('\\') { "\\" } else { "\\\\" });
+    }
+    let host = text[2..].split('\\').next().unwrap_or("").trim();
+    if host.is_empty() {
+        return None;
+    }
+    Some(text)
+}
+
+/// 别名留空时取地址尾段：`\\192.168.1.5\Video` → `Video`，
+/// `\\192.168.1.5` / `\\nas` → `192.168.1.5` / `nas`。
+pub fn network_label_from_path(path: &str) -> String {
+    let trimmed = path.trim_end_matches('\\');
+    trimmed
+        .rsplit('\\')
+        .find(|segment| !segment.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 impl Config {
@@ -173,19 +220,29 @@ impl Config {
         if let Some(expanded) = json.get("network_expanded").and_then(|v| v.as_bool()) {
             config.network_expanded = expanded;
         }
+        if let Some(expanded) = json.get("explorer_net_expanded").and_then(|v| v.as_bool()) {
+            config.explorer_net_expanded = expanded;
+        }
         if let Some(order) = json.get("sidebar_order").and_then(|v| v.as_array()) {
             let keys: Vec<String> = order
                 .iter()
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
-            // 与默认 key 集合完全一致才采用，防止脏数据。
-            let mut sorted_keys = keys.clone();
-            sorted_keys.sort();
-            let mut sorted_default = default_sidebar_order();
-            sorted_default.sort();
-            if sorted_keys == sorted_default {
-                config.sidebar_order = keys;
+            // 已知 key 按用户顺序保留，缺失的（如新增的 explorer-net）补到末尾，
+            // 未知 key 丢弃。这样升级后不会把用户的顺序重置成默认值。
+            let known = default_sidebar_order();
+            let mut merged: Vec<String> = Vec::new();
+            for key in keys {
+                if known.contains(&key) && !merged.contains(&key) {
+                    merged.push(key);
+                }
             }
+            for key in known {
+                if !merged.contains(&key) {
+                    merged.push(key);
+                }
+            }
+            config.sidebar_order = merged;
         }
         if let Some(vm) = json.get("view_mode").and_then(|v| v.as_str()) {
             if matches!(
@@ -247,6 +304,26 @@ impl Config {
         if let Some(b) = json.get("is_first_run").and_then(|v| v.as_bool()) {
             config.is_first_run = b;
         }
+        if let Some(arr) = json.get("network_locations").and_then(|v| v.as_array()) {
+            config.network_locations = arr
+                .iter()
+                .filter_map(|v| {
+                    let label = v.get("label")?.as_str()?.trim().to_string();
+                    let path = v.get("path")?.as_str()?.trim().to_string();
+                    if path.is_empty() {
+                        return None;
+                    }
+                    Some(NetworkLocation {
+                        label: if label.is_empty() {
+                            network_label_from_path(&path)
+                        } else {
+                            label
+                        },
+                        path,
+                    })
+                })
+                .collect();
+        }
         config.sidebar_width_repaired = json
             .get("sidebar_width_repaired")
             .and_then(|v| v.as_bool())
@@ -283,6 +360,7 @@ impl Config {
             "quick_expanded": self.quick_expanded,
             "computer_expanded": self.computer_expanded,
             "network_expanded": self.network_expanded,
+            "explorer_net_expanded": self.explorer_net_expanded,
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
             "sort_key": self.sort_key,
@@ -295,9 +373,43 @@ impl Config {
             "search_idle_rescan_minutes": self.search_idle_rescan_minutes,
             "search_max_results": self.search_max_results,
             "is_first_run": self.is_first_run,
+            "network_locations": self
+                .network_locations
+                .iter()
+                .map(|n| serde_json::json!({ "label": n.label, "path": n.path }))
+                .collect::<Vec<_>>(),
             "sidebar_width_repaired": self.sidebar_width_repaired,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_adds_unc_prefix_and_normalizes_slashes() {
+        assert_eq!(
+            normalize_network_path("192.168.1.5/Video").as_deref(),
+            Some("\\\\192.168.1.5\\Video")
+        );
+        assert_eq!(
+            normalize_network_path("\\\\nas\\media\\").as_deref(),
+            Some("\\\\nas\\media")
+        );
+        assert_eq!(normalize_network_path("   ").as_deref(), None);
+        // 只有主机名（没有共享名）也合法：资源管理器能直接列出该主机的共享。
+        assert_eq!(normalize_network_path("\\\\nas").as_deref(), Some("\\\\nas"));
+        assert_eq!(normalize_network_path("\\\\").as_deref(), None);
+    }
+
+    #[test]
+    fn label_defaults_to_tail_segment() {
+        assert_eq!(network_label_from_path("\\\\192.168.1.5\\Video"), "Video");
+        assert_eq!(network_label_from_path("\\\\nas\\a\\b\\"), "b");
+        assert_eq!(network_label_from_path("\\\\192.168.1.5"), "192.168.1.5");
+        assert_eq!(network_label_from_path("\\\\nas"), "nas");
     }
 }

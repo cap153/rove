@@ -5,6 +5,7 @@ import { FileList } from "file_list.slint";
 import { StagingTray } from "staging_tray.slint";
 import { SettingsPage } from "settings_page.slint";
 import { ActionEditorDialog } from "action_editor.slint";
+import { NetworkLocationDialog } from "network_location_dialog.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
 // SettingsDriveItem 需从入口文件再导出，否则 Rust 侧拿到的是废弃的内部别名。
 export { SettingsDriveItem } from "common.slint";
@@ -149,6 +150,14 @@ export component MainWindow inherits Window {
     in-out property <string> settings-editor-args: "";
     // 编辑器「层级归属」可选分组（含内置的「一级菜单」）。
     in-out property <[string]> settings-editor-group-options: ["一级菜单"];
+    // 添加网络位置弹窗状态。
+    in-out property <bool> network-dialog-open: false;
+    in-out property <string> network-dialog-title: "添加网络位置";
+    in-out property <string> network-dialog-server: "";
+    in-out property <string> network-dialog-alias: "";
+    in-out property <string> network-dialog-error: "";
+    callback network_dialog_connect();
+    callback network_dialog_cancel();
     in-out property <[SidebarItem]> sidebar-items: [];
     in-out property <string> sidebar-active-id: "";
     in-out property <[FileRow]> file-rows: [];
@@ -328,8 +337,22 @@ out property <length> row-height-out: file-list.row-height-out;
     callback crumb_dbg(view_w: length, content_w: length, content_x: length, n: int);
     /// 诊断：地址栏空白处被点到（进入编辑态）。
     callback crumb_edit_clicked(x: length, content_x: length);
+
+    // 把面包屑的各段拼回完整路径。
+    // 磁盘路径各段自带前缀（`C:\`、`C:\Users`），直接取最后一段即可；
+    // UNC 路径的分段是 "\\\\服务器" 与 "\\\\服务器\\共享"，同样取最后一段；
+    // 关键是**不能**用 join 重拼（Slint 的 path 处理会吃掉前导反斜杠）。
+    pure function join-crumbs(segs: [BreadcrumbSegment]) -> string {
+        if (segs.length == 0) {
+            return "";
+        }
+        let last = segs[segs.length - 1];
+        return last.path == "" ? last.label : last.path;
+    }
     callback sidebar_header_drag(index: int, phase: int, y: length);
+    callback sidebar_network_drag(index: int, phase: int, y: length);
     callback sidebar_item_activated(id: string);
+    callback sidebar_item_right_clicked(id: string);
     /// 仅在用户拖拽结束时上报（落盘用）；窗口尺寸变化导致的被动收缩不上报。
     callback sidebar_width_changed(float);
     callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length);
@@ -663,9 +686,10 @@ out property <length> row-height-out: file-list.row-height-out;
                                 root.crumb_edit_clicked(self.mouse-x, crumbs-flick.content-x);
                                 if (root.breadcrumbs.length > 0) {
                                     let last = root.breadcrumbs[root.breadcrumbs.length - 1];
-                                    // 虚拟根（此电脑/回收站）的 path 为空，回退用标签作为初始文本，
-                                    // 避免进入编辑态后输入框一片空白。
-                                    root.path-edit-text = last.path == "" ? last.label : last.path;
+                                    // 网络路径（\\\\服务器\\共享）不是文件系统路径，
+                                    // 用 PathBuf::join / to_string_lossy 会把开头的反斜杠吃掉，
+                                    // 变成 `192.168.1.5`。这里把各段的原始 path 直接接起来。
+                                    root.path-edit-text = join-crumbs(root.breadcrumbs);
                                 }
                             }
                             // 竖向滚轮映射为横向滚动（地址栏只会在横向上溢出）
@@ -983,11 +1007,18 @@ out property <length> row-height-out: file-list.row-height-out;
                         root.clear-all-focus();
                         root.sidebar_item_activated(id);
                     }
+                    item_right_clicked(id) => {
+                        root.clear-all-focus();
+                        root.sidebar_item_right_clicked(id);
+                    }
                     background_clicked => {
                         root.clear-all-focus();
                     }
                     header_drag(index, phase, y) => {
                         root.sidebar_header_drag(index, phase, y);
+                    }
+                    network_drag(index, phase, y) => {
+                        root.sidebar_network_drag(index, phase, y);
                     }
                     staging_item_removed(index) => {
                         root.staging_item_removed(index);
@@ -1445,6 +1476,26 @@ out property <length> row-height-out: file-list.row-height-out;
         cancel => {
             root.settings_editor_cancel();
         }
+    }
+
+    // 添加网络位置弹窗。
+    network-dialog := NetworkLocationDialog {
+        visible: root.network-dialog-open;
+        title: root.network-dialog-title;
+        server <=> root.network-dialog-server;
+        alias <=> root.network-dialog-alias;
+        error <=> root.network-dialog-error;
+        connect-clicked => {
+            root.network_dialog_connect();
+        }
+        cancel-clicked => {
+            root.network_dialog_cancel();
+        }
+    }
+
+    /// 弹窗打开后把焦点交给地址输入框（Rust 侧等一帧再调）。
+    public function focus-network-dialog() {
+        network-dialog.focus-server();
     }
 
 }

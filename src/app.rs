@@ -24,7 +24,8 @@ use slint::{
 use crate::config::{Config, ThemeChoice};
 use crate::fs::{
     self, DriveInfo, FileEntry, SortKey, SortState, icon_color, icon_text_for, list_drives,
-    list_network_locations, quick_access_dirs, recycle_bin_stats, sort_entries,
+    list_network_locations, list_network_places, quick_access_dirs, recycle_bin_stats,
+    sort_entries,
 };
 use crate::ops::{
     self, clipboard, jobs::{JobKind, JobManager, JobSummary, status_text},
@@ -463,6 +464,12 @@ pub struct App {
     last_click: Option<(PathBuf, std::time::Instant)>,
     /// 侧栏分区拖拽：正在拖动的分区 header 行索引。
     sidebar_drag: Option<usize>,
+    /// 侧栏网络位置拖拽：(行索引, 按下时的指针 y, 是否已移动)。
+    network_drag: Option<(usize, f32, bool)>,
+    /// 拖拽结束后的那次 clicked 要丢弃（否则拖完会顺带导航）。带时间上限，不会误吐下一次点击。
+    suppress_sidebar_click: Option<std::time::Instant>,
+    /// 正在编辑的网络位置（旧地址）；None 表示“添加”。
+    network_edit_target: Option<String>,
     /// 外部拖入缓冲：winit 对一次投放逐文件发事件，聚合后统一处理。
     drop_buffer: Vec<PathBuf>,
     /// 任务 3（刷新）：各打开目录的 mtime 快照，轮询检测外部/内部变更。
@@ -613,6 +620,9 @@ impl App {
             menu_scope: None,
             last_click: None,
             sidebar_drag: None,
+            network_drag: None,
+            suppress_sidebar_click: None,
+            network_edit_target: None,
             drop_buffer: Vec::new(),
             dir_mtimes: HashMap::new(),
             drop_timer: Timer::default(),
@@ -1984,25 +1994,29 @@ impl App {
             // （\\服务器\共享）当成**一段**，直接用会把
             // `\\192.168.1.5\Video` 粘成一个不可分的新户，
             // 而服务器根与共享目录其实都是可浏览路径，必须拆成两段。
-            let mut cumulative = PathBuf::new();
+            // 路径字符串**全程用 String 拼**，不用 `PathBuf`。
+            // `PathBuf::new().to_string_lossy()` 在 "\\\\" 上得到空串（反斜杠被当成路径分隔符规范化掉），
+            // 于是服务器根的 path 丢了前导反斜杠，地址栏编辑时变成 `192.168.1.5`。
+            let mut cumulative = String::new();
             for comp in path.components() {
                 match comp {
                     std::path::Component::Prefix(prefix) => match prefix.kind() {
                         std::path::Prefix::UNC(server, share)
                         | std::path::Prefix::VerbatimUNC(server, share) => {
-                            let server_root =
-                                PathBuf::from(format!("\\\\{}", server.to_string_lossy()));
+                            let server = server.to_string_lossy().into_owned();
+                            let server_root = format!("\\\\{server}");
                             segments.push(BreadcrumbSegment {
-                                label: server.to_string_lossy().into_owned().into(),
-                                path: server_root.to_string_lossy().into_owned().into(),
+                                label: server.into(),
+                                path: server_root.clone().into(),
                             });
                             cumulative = if share.is_empty() {
                                 server_root
                             } else {
-                                let share_path = server_root.join(share);
+                                let share = share.to_string_lossy().into_owned();
+                                let share_path = format!("{server_root}\\{share}");
                                 segments.push(BreadcrumbSegment {
-                                    label: share.to_string_lossy().into_owned().into(),
-                                    path: share_path.to_string_lossy().into_owned().into(),
+                                    label: share.into(),
+                                    path: share_path.clone().into(),
                                 });
                                 share_path
                             };
@@ -2010,26 +2024,30 @@ impl App {
                         _ => {
                             let text = comp.as_os_str().to_string_lossy().into_owned();
                             // "C:" → 补上根
-                            cumulative = PathBuf::from(format!("{text}\\"));
+                            cumulative = format!("{text}\\");
                             let label = self
                                 .drives
                                 .iter()
                                 .find(|d| cumulative.starts_with(format!("{}:", d.letter).as_str()))
                                 .map(|d| d.display_label())
-                                .unwrap_or_else(|| format!("{text}\\"));
+                                .unwrap_or_else(|| cumulative.clone());
                             segments.push(BreadcrumbSegment {
                                 label: label.into(),
-                                path: cumulative.to_string_lossy().into_owned().into(),
+                                path: cumulative.clone().into(),
                             });
                         }
                     },
                     // 根分隔符已由前缀段覆盖，不单独出段。
                     std::path::Component::RootDir => {}
                     std::path::Component::Normal(name) => {
-                        cumulative = cumulative.join(name);
+                        let name = name.to_string_lossy().into_owned();
+                        if !cumulative.ends_with('\\') {
+                            cumulative.push('\\');
+                        }
+                        cumulative.push_str(&name);
                         segments.push(BreadcrumbSegment {
-                            label: name.to_string_lossy().into_owned().into(),
-                            path: cumulative.to_string_lossy().into_owned().into(),
+                            label: name.into(),
+                            path: cumulative.clone().into(),
                         });
                     }
                     _ => {}
@@ -2205,7 +2223,40 @@ impl App {
     fn sync_sidebar(&mut self) {
         self.drives = list_drives();
         let stats = recycle_bin_stats();
-        let network = list_network_locations();
+        // 用户自己添加的（`网络位置` 分区，显示别名）。
+        let network: Vec<(String, String)> = self
+            .config
+            .network_locations
+            .iter()
+            .map(|n| (n.label.clone(), n.path.clone()))
+            .collect();
+        // 资源管理器里本来就有、但用户没加到 Rove 的（独立 `网络位置(系统)` 分区）。
+        let mut detected: Vec<(String, String)> = Vec::new();
+        for remote in list_network_locations() {
+            if network
+                .iter()
+                .any(|(_, path)| path.eq_ignore_ascii_case(&remote))
+                || detected
+                    .iter()
+                    .any(|(_, path)| path.eq_ignore_ascii_case(&remote))
+            {
+                continue;
+            }
+            detected.push((remote.clone(), remote));
+        }
+        // 「添加网络位置」向导的产物只是快捷方式，没有网络连接，WNet 枚举不到。
+        for (label, target) in list_network_places() {
+            if network
+                .iter()
+                .any(|(_, path)| path.eq_ignore_ascii_case(&target))
+                || detected
+                    .iter()
+                    .any(|(_, path)| path.eq_ignore_ascii_case(&target))
+            {
+                continue;
+            }
+            detected.push((label, target));
+        }
 
         // 指纹：驱动器容量（按 MB 取整）+ 回收站条目数 + 网络位置集合。
         let mut fingerprint = 0u64;
@@ -2220,15 +2271,19 @@ impl App {
             .wrapping_mul(31)
             .wrapping_add(stats.items as u64)
             .wrapping_add(stats.bytes as u64 / (1024 * 1024));
-        for n in &network {
-            fingerprint = fingerprint.wrapping_mul(31).wrapping_add(n.len() as u64);
+        for n in network.iter().chain(detected.iter()) {
+            fingerprint = fingerprint
+                .wrapping_mul(31)
+                .wrapping_add(n.0.len() as u64)
+                .wrapping_add(n.1.len() as u64 * 3);
         }
-        // 纳入 4 个分区的展开状态（任一状态切换均触发侧栏重绘）
+        // 纳入 5 个分区的展开状态（任一状态切换均触发侧栏重绘）
         for exp in [
             self.config.quick_expanded,
             self.config.recent_expanded,
             self.config.computer_expanded,
             self.config.network_expanded,
+            self.config.explorer_net_expanded,
         ] {
             fingerprint = fingerprint.wrapping_mul(31).wrapping_add(exp as u64);
         }
@@ -2242,7 +2297,7 @@ impl App {
         // ---- 各分区内容 ----
         // key → 区块（header + 条目），按 config.sidebar_order 组装。
         let arrow_quick = if self.config.quick_expanded { "▼" } else { "▶" };
-        let mut h = header("快速访问");
+        let mut h = header("quick", "快速访问");
         h.icon_text = arrow_quick.into();
         let mut quick_items: Vec<SidebarItem> = vec![h];
 
@@ -2299,7 +2354,7 @@ impl App {
         if !self.state.recent.is_empty() {
             // 展开与收起箭头
             let arrow = if self.config.recent_expanded { "▼" } else { "▶" };
-            let mut h = header("最近使用");
+            let mut h = header("recent", "最近使用");
             h.icon_text = arrow.into();
             recent_items.push(h);
 
@@ -2309,7 +2364,7 @@ impl App {
                 // 又对 self 做可变借用（thumb_for），触发借用冲突。
                 let recent_paths: Vec<PathBuf> = self.state.recent.iter().take(8).cloned().collect();
                 for path in recent_paths {
-                    if !path.exists() {
+                    if !path.exists() && !crate::fs::dir::is_unc_server_root(&path) {
                         continue;
                     }
                     #[cfg(windows)]
@@ -2336,7 +2391,7 @@ impl App {
         }
 
         let arrow_computer = if self.config.computer_expanded { "▼" } else { "▶" };
-        let mut h = header("此电脑");
+        let mut h = header("computer", "此电脑");
         h.icon_text = arrow_computer.into();
         let mut computer_items: Vec<SidebarItem> = vec![h];
         if self.config.computer_expanded {
@@ -2361,26 +2416,53 @@ impl App {
         }
 
         let arrow_network = if self.config.network_expanded { "▼" } else { "▶" };
-        let mut h = header("网络位置");
+        let mut h = header("network", "网络位置");
         h.icon_text = arrow_network.into();
         let mut network_items: Vec<SidebarItem> = vec![h];
         if self.config.network_expanded {
             if network.is_empty() {
                 network_items.push(SidebarItem {
                     id: "net:none".into(),
-                    label: "暂无网络位置".into(),
+                    label: "暂无，右键标题添加".into(),
                     detail: String::new().into(),
-                    kind: "quick".into(),
+                    kind: "hint".into(),
                     icon_color: Color::from_rgb_u8(0x8A, 0x8F, 0x98),
                     icon_text: "网".into(),
                     usage: -1.0,
                     icon: slint::Image::default(),
                 });
             } else {
-                for remote in &network {
+                for (label, target) in &network {
                     network_items.push(SidebarItem {
-                        id: format!("net:{remote}").into(),
-                        label: remote.clone().into(),
+                        id: format!("net:{target}").into(),
+                        label: label.clone().into(),
+                        detail: String::new().into(),
+                        kind: "network".into(),
+                        icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
+                        icon_text: "网".into(),
+                        usage: -1.0,
+                        icon: slint::Image::default(),
+                    });
+                }
+            }
+        }
+
+        // 资源里已有的网络位置：整组只在**真的检测到**时才出现。
+        let arrow_explorer_net = if self.config.explorer_net_expanded {
+            "▼"
+        } else {
+            "▶"
+        };
+        let mut explorer_net_items: Vec<SidebarItem> = Vec::new();
+        if !detected.is_empty() {
+            let mut h = header("explorer-net", "网络位置(系统)");
+            h.icon_text = arrow_explorer_net.into();
+            explorer_net_items.push(h);
+            if self.config.explorer_net_expanded {
+                for (label, target) in &detected {
+                    explorer_net_items.push(SidebarItem {
+                        id: format!("net:{target}").into(),
+                        label: label.clone().into(),
                         detail: String::new().into(),
                         kind: "network".into(),
                         icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
@@ -2399,6 +2481,7 @@ impl App {
                 "recent" => &recent_items,
                 "computer" => &computer_items,
                 "network" => &network_items,
+                "explorer-net" => &explorer_net_items,
                 _ => continue,
             };
             items.extend(block.iter().cloned());
@@ -3301,9 +3384,9 @@ fn pane_view_range(
     (first, count)
 }
 
-fn header(label: &str) -> SidebarItem {
+fn header(key: &str, label: &str) -> SidebarItem {
     SidebarItem {
-        id: format!("header:{label}").into(),
+        id: format!("header:{key}").into(),
         label: label.into(),
         detail: String::new().into(),
         kind: "header".into(),
@@ -4108,38 +4191,42 @@ impl App {
         // 核心修复：使用 expand_path 展开环境变量和 ~
         let p = Self::expand_path(trimmed);
 
-        if !p.exists() {
+        // `\\host` 不是文件系统路径（GetFileAttributes 打不开），但能列出共享，
+        // 所以不能拿 exists() 卡它。
+        if !p.exists() && !crate::fs::dir::is_unc_server_root(&p) {
             self.set_status_job(format!("路径不存在：{trimmed}"));
             return;
         }
         self.navigate_active(Some(p));
     }
 
-    /// 侧栏各行的顶 y（内容坐标）。行高与 sidebar.slint 保持一致：
-    /// header 30 / drive 52 / 其余 32，行间距 2，顶部内边距 8。
-    fn sidebar_row_tops(&self) -> Vec<f32> {
+    /// 侧栏各行的 (顶 y, 行高)（内容坐标）。必须与 `ui/sidebar.slint` 完全一致：
+    /// header 30 / drive 46 / 其余 32，行间距 2，顶部内边距 8。
+    /// 两侧不同步时，拖拽指示线与落点判断会按驱动器数量累积偏差。
+    fn sidebar_row_metrics(&self) -> Vec<(f32, f32)> {
         let model = self.ui.get_sidebar_items();
         let n = model.row_count();
-        let mut tops = Vec::with_capacity(n);
+        let mut metrics = Vec::with_capacity(n);
         let mut y = 8.0_f32;
         for i in 0..n {
-            tops.push(y);
             let h = model
                 .row_data(i)
                 .map(|it| match it.kind.as_str() {
                     "header" => 30.0,
-                    "drive" => 52.0,
+                    "drive" => 46.0,
                     _ => 32.0,
                 })
                 .unwrap_or(32.0);
+            metrics.push((y, h));
             y += h + 2.0;
         }
-        tops
+        metrics
     }
 
     /// 侧栏分区拖拽排序（phase：0 按下 / 1 拖动 / 2 松开）。
     fn sidebar_header_drag(&mut self, index: usize, phase: i32, y_in_row: f32) {
-        let tops = self.sidebar_row_tops();
+        let metrics = self.sidebar_row_metrics();
+        let tops: Vec<f32> = metrics.iter().map(|(top, _)| *top).collect();
         let Some(&row_top) = tops.get(index) else { return };
         let pointer_y = row_top + y_in_row;
 
@@ -4152,14 +4239,8 @@ impl App {
             if it.kind != "header" {
                 continue;
             }
-            let key = match it.label.as_str() {
-                "快速访问" => "quick",
-                "最近使用" => "recent",
-                "此电脑" => "computer",
-                "网络位置" => "network",
-                _ => "",
-            };
-            if !key.is_empty() {
+            let key = it.id.strip_prefix("header:").unwrap_or("");
+            if matches!(key, "quick" | "recent" | "computer" | "network" | "explorer-net") {
                 headers.push((i, key.to_string()));
             }
         }
@@ -4175,32 +4256,13 @@ impl App {
                 if self.sidebar_drag != Some(index) {
                     return;
                 }
-                // 落点：非拖拽分区中，中点在指针上方的数量。
-                let drop_slot = headers
-                    .iter()
-                    .enumerate()
-                    .filter(|(s, _)| *s != drag_slot)
-                    .filter(|(_, (start, _))| {
-                        let next_start = headers
-                            .iter()
-                            .map(|(i, _)| *i)
-                            .find(|h| *h > *start)
-                            .unwrap_or(n);
-                        let mid = tops[*start] + (tops[next_start.min(n - 1)] - tops[*start]) / 2.0;
-                        mid < pointer_y
-                    })
-                    .count();
-                // 指示线 y：目标分区顶部（或末尾）。
-                let remaining: Vec<usize> = headers
-                    .iter()
-                    .enumerate()
-                    .filter(|(s, _)| *s != drag_slot)
-                    .map(|(_, (i, _))| *i)
-                    .collect();
-                let indicator_y = remaining
-                    .get(drop_slot)
-                    .map(|&row| tops[row])
-                    .unwrap_or_else(|| tops[n - 1] + 32.0 + 2.0);
+                let (_, indicator_y) = Self::header_drop_slot(
+                    &tops,
+                    &metrics,
+                    &headers,
+                    drag_slot,
+                    pointer_y,
+                );
                 self.ui.set_sidebar_drop_y(indicator_y);
                 self.ui.set_sidebar_drop_visible(true);
             }
@@ -4211,20 +4273,17 @@ impl App {
                     return;
                 }
                 self.sidebar_drag = None;
-                let drop_slot = headers
-                    .iter()
-                    .enumerate()
-                    .filter(|(s, _)| *s != drag_slot)
-                    .filter(|(_, (start, _))| {
-                        let next_start = headers
-                            .iter()
-                            .map(|(i, _)| *i)
-                            .find(|h| *h > *start)
-                            .unwrap_or(n);
-                        let mid = tops[*start] + (tops[next_start.min(n - 1)] - tops[*start]) / 2.0;
-                        mid < pointer_y
-                    })
-                    .count();
+                let (drop_slot, _) = Self::header_drop_slot(
+                    &tops,
+                    &metrics,
+                    &headers,
+                    drag_slot,
+                    pointer_y,
+                );
+                crate::logv!(
+                    "[sidebar] header drop index={index} slot={drop_slot} pointer_y={pointer_y:.1} headers={:?}",
+                    headers.iter().map(|(i, k)| (*i, tops[*i], k.as_str())).collect::<Vec<_>>()
+                );
                 let drag_key = headers[drag_slot].1.clone();
                 let mut order: Vec<String> = self
                     .config
@@ -4249,15 +4308,71 @@ impl App {
         }
     }
 
+    /// 分区拖拽落点：参照分区中「垂直中心在指针上方」的数量即插入槽位。
+    /// 分区中心按 分区顶端 → 分区末端（下一个分区顶端；最后一个分区则是
+    /// 列表最后一行的底部）计算。原实现拿「列表最后一行顶端」当末分区末端，
+    /// 中心会被推到很下面，导致必须把鼠标移得更低才能落到下一个分区。
+    fn header_drop_slot(
+        tops: &[f32],
+        metrics: &[(f32, f32)],
+        headers: &[(usize, String)],
+        drag_slot: usize,
+        pointer_y: f32,
+    ) -> (usize, f32) {
+        let list_end = metrics
+            .last()
+            .map(|(top, height)| top + height + 2.0)
+            .unwrap_or(0.0);
+        let section_end = |start: usize| -> f32 {
+            headers
+                .iter()
+                .map(|(i, _)| *i)
+                .find(|h| *h > start)
+                .map(|next| tops[next])
+                .unwrap_or(list_end)
+        };
+        let remaining: Vec<usize> = headers
+            .iter()
+            .enumerate()
+            .filter(|(s, _)| *s != drag_slot)
+            .map(|(_, (i, _))| *i)
+            .collect();
+        let slot = remaining
+            .iter()
+            .filter(|start| {
+                let top = tops[**start];
+                top + (section_end(**start) - top) / 2.0 < pointer_y
+            })
+            .count();
+        let indicator = match remaining.get(slot) {
+            Some(start) => tops[*start],
+            None => remaining
+                .last()
+                .map(|start| section_end(*start))
+                .unwrap_or(list_end),
+        };
+        (slot, indicator)
+    }
+
     /// 侧边栏项激活。
     fn sidebar_activated(&mut self, id: &str) {
+        // 拖拽排序结束后的那次 clicked 要丢弃，否则拖完会顺带导航。
+        if let Some(at) = self.suppress_sidebar_click.take() {
+            if at.elapsed() < std::time::Duration::from_millis(400) {
+                return;
+            }
+        }
         // 分区标题点击：切换展开/收起并持久化保存
-        if let Some(name) = id.strip_prefix("header:") {
-            let toggled = match name {
-                "快速访问" => { self.config.quick_expanded = !self.config.quick_expanded; true }
-                "最近使用" => { self.config.recent_expanded = !self.config.recent_expanded; true }
-                "此电脑" => { self.config.computer_expanded = !self.config.computer_expanded; true }
-                "网络位置" => { self.config.network_expanded = !self.config.network_expanded; true }
+        if let Some(key) = id.strip_prefix("header:") {
+            let toggled = match key {
+                "quick" => { self.config.quick_expanded = !self.config.quick_expanded; true }
+                "recent" => { self.config.recent_expanded = !self.config.recent_expanded; true }
+                "computer" => { self.config.computer_expanded = !self.config.computer_expanded; true }
+                "network" => { self.config.network_expanded = !self.config.network_expanded; true }
+                "explorer-net" => {
+                    self.config.explorer_net_expanded = !self.config.explorer_net_expanded;
+                    true
+                }
                 _ => false,
             };
             if toggled {
@@ -4295,6 +4410,288 @@ impl App {
         if let Some(rest) = id.strip_prefix("net:") {
             self.navigate_active(Some(PathBuf::from(rest)));
         }
+    }
+
+    /// 侧栏右键：分区标题「网络位置」弹添加框；已添加的网络位置弹编辑/删除菜单。
+    fn sidebar_right_clicked(&mut self, id: &str) {
+        if id == "header:network" {
+            self.open_network_dialog();
+            return;
+        }
+        let Some(path) = id.strip_prefix("net:") else {
+            return;
+        };
+        self.show_network_item_menu(path);
+    }
+
+    /// 已添加的网络位置右键菜单（编辑 / 删除）。系统检测出的映射盘不弹。
+    #[cfg(windows)]
+    fn show_network_item_menu(&mut self, path: &str) {
+        let Some(entry) = self
+            .config
+            .network_locations
+            .iter()
+            .find(|n| n.path.eq_ignore_ascii_case(path))
+        else {
+            return;
+        };
+        let item = |key: String, label: &str| crate::sys::menu::MenuNode::Item {
+            key,
+            label: label.to_string(),
+            enabled: true,
+            checked: false,
+        };
+        let nodes = vec![
+            item(format!("netloc:edit:{}", entry.path), "编辑"),
+            item(format!("netloc:unpin:{}", entry.path), "取消固定"),
+        ];
+        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false);
+    }
+
+    #[cfg(not(windows))]
+    fn show_network_item_menu(&mut self, _path: &str) {}
+
+    fn open_network_dialog(&mut self) {
+        self.network_edit_target = None;
+        self.ui.set_network_dialog_title("添加网络位置".into());
+        self.ui.set_network_dialog_server("".into());
+        self.ui.set_network_dialog_alias("".into());
+        self.ui.set_network_dialog_error("".into());
+        self.ui.set_network_dialog_open(true);
+        self.focus_network_dialog();
+    }
+
+    /// 编辑已添加的网络位置：标题不同，并把旧地址/别名填进去。
+    fn open_network_edit_dialog(&mut self, path: &str) {
+        let Some(entry) = self
+            .config
+            .network_locations
+            .iter()
+            .find(|n| n.path.eq_ignore_ascii_case(path))
+            .cloned()
+        else {
+            return;
+        };
+        self.network_edit_target = Some(entry.path.clone());
+        self.ui.set_network_dialog_title("编辑网络地址".into());
+        self.ui.set_network_dialog_server(entry.path.into());
+        self.ui.set_network_dialog_alias(entry.label.into());
+        self.ui.set_network_dialog_error("".into());
+        self.ui.set_network_dialog_open(true);
+        self.focus_network_dialog();
+    }
+
+    fn focus_network_dialog(&self) {
+        // 弹窗刚变可见时输入框还无法聚焦，等一帧。
+        let ui = self.ui.as_weak();
+        slint::Timer::single_shot(std::time::Duration::from_millis(16), move || {
+            if let Some(ui) = ui.upgrade() {
+                ui.invoke_focus_network_dialog();
+            }
+        });
+    }
+
+    fn close_network_dialog(&mut self) {
+        self.network_edit_target = None;
+        self.ui.set_network_dialog_open(false);
+        self.ui.set_network_dialog_error("".into());
+    }
+
+    /// 写入配置、刷新侧栏，并在新标签页打开。
+    fn connect_network_location(&mut self) -> bool {
+        let raw = self.ui.get_network_dialog_server().to_string();
+        let alias = self.ui.get_network_dialog_alias().trim().to_string();
+        let Some(path) = crate::config::normalize_network_path(&raw) else {
+            let message = if raw.trim().is_empty() {
+                "请输入服务器地址"
+            } else {
+                "地址应形如 \\\\服务器 或 \\\\服务器\\共享名"
+            };
+            self.ui.set_network_dialog_error(message.into());
+            return false;
+        };
+        let label = if alias.is_empty() {
+            crate::config::network_label_from_path(&path)
+        } else {
+            alias
+        };
+        let entry = crate::config::NetworkLocation {
+            label: label.clone(),
+            path: path.clone(),
+        };
+        // 编辑模式下地址可能改了：先拿掉旧那条，再把新的插回原位置。
+        let edit_target = self.network_edit_target.take();
+        let insert_at = edit_target.as_ref().and_then(|old| {
+            let index = self
+                .config
+                .network_locations
+                .iter()
+                .position(|n| n.path.eq_ignore_ascii_case(old))?;
+            self.config.network_locations.remove(index);
+            Some(index)
+        });
+        match self
+            .config
+            .network_locations
+            .iter_mut()
+            .find(|existing| existing.path.eq_ignore_ascii_case(&path))
+        {
+            Some(existing) => *existing = entry,
+            None => match insert_at {
+                Some(index) => self
+                    .config
+                    .network_locations
+                    .insert(index.min(self.config.network_locations.len()), entry),
+                None => self.config.network_locations.push(entry),
+            },
+        }
+        self.config.save();
+        self.close_network_dialog();
+        self.sidebar_fingerprint = 0;
+        self.sync_sidebar();
+
+        let sort = self.state.active().active().sort;
+        self.state.new_tab(Some(PathBuf::from(&path)), sort);
+        self.sync_active_tab();
+        self.reload_active();
+        self.ui.invoke_scroll_tabs_to_end();
+        logln!("[net] 添加网络位置 {path}（别名 {label}）");
+        true
+    }
+
+    /// 取消固定：只从侧边栏移除，不动磁盘上的共享。
+    fn unpin_network_location(&mut self, path: &str) {
+        let before = self.config.network_locations.len();
+        self.config
+            .network_locations
+            .retain(|n| !n.path.eq_ignore_ascii_case(path));
+        if self.config.network_locations.len() == before {
+            return;
+        }
+        self.config.save();
+        self.sidebar_fingerprint = 0;
+        self.sync_sidebar();
+        self.sync_sidebar_active();
+        logln!("[net] 取消固定网络位置 {path}");
+    }
+
+    /// 侧栏网络位置拖拽排序（phase：0 按下 / 1 拖动 / 2 松开）。
+    /// 只在**用户添加过的**条目之间重排，系统检测出的映射盘不参与。
+    fn sidebar_network_drag(&mut self, index: usize, phase: i32, y_in_row: f32) {
+        let metrics = self.sidebar_row_metrics();
+        let Some(&(row_top, _)) = metrics.get(index) else {
+            return;
+        };
+        let pointer_y = row_top + y_in_row;
+        let model = self.ui.get_sidebar_items();
+
+        // 参与排序的行（用户添加过的网络位置）及其 y 区间。
+        let rows: Vec<usize> = (0..model.row_count())
+            .filter(|i| {
+                model
+                    .row_data(*i)
+                    .map(|row| {
+                        row.kind == "network"
+                            && self
+                                .config
+                                .network_locations
+                                .iter()
+                                .any(|item| {
+                                    item.path.eq_ignore_ascii_case(
+                                        row.id.strip_prefix("net:").unwrap_or(""),
+                                    )
+                                })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        match phase {
+            0 => {
+                if rows.contains(&index) {
+                    self.network_drag = Some((index, pointer_y, false));
+                }
+            }
+            1 => {
+                let Some((from, start_y, moved)) = self.network_drag else {
+                    return;
+                };
+                if from != index {
+                    return;
+                }
+                let moved = moved || (pointer_y - start_y).abs() > 4.0;
+                self.network_drag = Some((from, start_y, moved));
+                if !moved {
+                    return;
+                }
+                // 一移动就置位：clicked 有可能比 up 事件先到。
+                self.suppress_sidebar_click = Some(std::time::Instant::now());
+                let (_, indicator_y) =
+                    Self::network_drop_slot(&metrics, &rows, from, pointer_y);
+                self.ui.set_sidebar_drop_y(indicator_y);
+                self.ui.set_sidebar_drop_visible(true);
+            }
+            2 => {
+                self.ui.set_sidebar_drop_visible(false);
+                let Some((from, _, moved)) = self.network_drag.take() else {
+                    return;
+                };
+                if from != index || !moved {
+                    return;
+                }
+                self.suppress_sidebar_click = Some(std::time::Instant::now());
+                let Some(row) = model.row_data(from) else { return };
+                let path = row.id.strip_prefix("net:").unwrap_or("");
+                let Some(from_slot) = self
+                    .config
+                    .network_locations
+                    .iter()
+                    .position(|item| item.path.eq_ignore_ascii_case(path))
+                else {
+                    return;
+                };
+                let (slot, _) = Self::network_drop_slot(&metrics, &rows, from, pointer_y);
+                crate::logv!(
+                    "[sidebar] net drop from={from} slot={slot} pointer_y={pointer_y:.1} rows={rows:?}"
+                );
+                let entry = self.config.network_locations.remove(from_slot);
+                self.config
+                    .network_locations
+                    .insert(slot.min(self.config.network_locations.len()), entry);
+                self.config.save();
+                self.sidebar_fingerprint = 0;
+                self.sync_sidebar();
+            }
+            _ => {}
+        }
+    }
+
+    /// 计算拖拽落点：参照项中「垂直中心在指针上方」的数量即插入槽位；
+    /// 返回 (槽位, 指示线 y)。落点的判据是**每一行自己的中心**，
+    /// 不再用「下一行顶部」推中点（那样最后一行会被撑到下个分区或列表末尾）。
+    fn network_drop_slot(
+        metrics: &[(f32, f32)],
+        rows: &[usize],
+        from: usize,
+        pointer_y: f32,
+    ) -> (usize, f32) {
+        let center = |i: usize| -> f32 {
+            metrics
+                .get(i)
+                .map(|(top, height)| top + height / 2.0)
+                .unwrap_or(pointer_y)
+        };
+        let others: Vec<usize> = rows.iter().copied().filter(|i| *i != from).collect();
+        let slot = others.iter().filter(|i| center(**i) < pointer_y).count();
+        let indicator = match others.get(slot) {
+            Some(i) => metrics.get(*i).map(|(top, _)| *top).unwrap_or(pointer_y),
+            None => others
+                .last()
+                .and_then(|i| metrics.get(*i))
+                .map(|(top, height)| top + height + 2.0)
+                .unwrap_or(pointer_y),
+        };
+        (slot, indicator)
     }
 
     /// 列头点击：切换排序键/方向。
@@ -4558,6 +4955,18 @@ impl App {
 impl App {
     /// 执行右键菜单动作。
     fn run_menu_action(&mut self, id: &str) {
+        // 0. 侧栏网络位置的编辑/删除（不依赖文件选择）
+        if let Some(rest) = id.strip_prefix("netloc:") {
+            if let Some(path) = rest.strip_prefix("edit:") {
+                let path = path.to_string();
+                self.open_network_edit_dialog(&path);
+            } else if let Some(path) = rest.strip_prefix("unpin:") {
+                let path = path.to_string();
+                self.unpin_network_location(&path);
+            }
+            return;
+        }
+
         // 1. 视图模式切换（优先执行！不依赖选中的文件 target，杜绝工具栏调用被拦截）
         if let Some(mode) = id.strip_prefix("view:") {
             self.set_view_mode(mode);
@@ -5892,6 +6301,7 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             || app.ui.get_path_editing()
             || app.ui.get_settings_text_focus()
             || app.ui.get_settings_editor_open()
+            || app.ui.get_network_dialog_open()
         {
             return EventResult::Propagate;
         }
@@ -6118,9 +6528,38 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        upgrade().on_sidebar_network_drag(move |index, phase, y| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut()
+                .sidebar_network_drag(index as usize, phase as i32, y);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
         upgrade().on_sidebar_item_activated(move |id| {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut().sidebar_activated(&id);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_sidebar_item_right_clicked(move |id| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().sidebar_right_clicked(&id);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_network_dialog_connect(move || {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().connect_network_location();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_network_dialog_cancel(move || {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().close_network_dialog();
         });
     }
 

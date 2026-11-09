@@ -38,9 +38,102 @@ impl Default for SortState {
     }
 }
 
+/// `\\host` / `\\host\` 形式：只有服务器名，没有共享名。
+/// 它不是普通文件系统路径（`GetFileAttributes` 打不开），需要枚举共享。
+pub fn is_unc_server_root(path: &Path) -> bool {
+    let text = path.to_string_lossy();
+    let Some(rest) = text.strip_prefix(r"\\") else {
+        return false;
+    };
+    !rest.is_empty() && !rest.trim_end_matches('\\').contains('\\')
+}
+
+/// 枚举服务器上的共享目录（等价于资源管理器打开 `\\host` 看到的东西）。
+#[cfg(windows)]
+fn list_unc_shares(host: &str) -> Vec<FileEntry> {
+    use windows::core::PWSTR;
+    use windows::Win32::Storage::FileSystem::{
+        NetShareEnum, SHARE_INFO_1, STYPE_DISKTREE, STYPE_MASK, STYPE_SPECIAL,
+    };
+    use windows::Win32::NetworkManagement::NetManagement::NetApiBufferFree;
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+    fn pwstr_to_string(text: PWSTR) -> String {
+        if text.is_null() {
+            return String::new();
+        }
+        let mut len = 0usize;
+        unsafe {
+            while *text.0.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(text.0, len))
+        }
+    }
+
+    let server = wide(host);
+    let mut buffer: *mut u8 = std::ptr::null_mut();
+    let mut read: u32 = 0;
+    let mut total: u32 = 0;
+    let mut resume: u32 = 0;
+    let status = unsafe {
+        NetShareEnum(
+            windows::core::PCWSTR(server.as_ptr()),
+            1,
+            &mut buffer,
+            u32::MAX,
+            &mut read,
+            &mut total,
+            Some(&mut resume),
+        )
+    };
+    // 0 = NERR_Success；234 = ERROR_MORE_DATA（还有下一页，先拿这一页）。
+    if status != 0 && status != 234 {
+        return Vec::new();
+    }
+    let mut entries = Vec::new();
+    if !buffer.is_null() {
+        let items = unsafe {
+            std::slice::from_raw_parts(buffer as *const SHARE_INFO_1, read as usize)
+        };
+        for item in items {
+            let name = pwstr_to_string(item.shi1_netname);
+            if name.is_empty() {
+                continue;
+            }
+            let kind = item.shi1_type.0;
+            // 只要磁盘目录，且不列管理共享（C$ / ADMIN$ / IPC$ 这类，资源管理器也不显示）。
+            if kind & STYPE_MASK.0 != STYPE_DISKTREE.0 {
+                continue;
+            }
+            if kind & STYPE_SPECIAL.0 != 0 || name.ends_with('$') {
+                continue;
+            }
+            let path = Path::new(host).join(&name);
+            entries.push(FileEntry::from_path(&path, true, 0, None, false));
+        }
+        unsafe {
+            let _ = NetApiBufferFree(Some(buffer as *const core::ffi::c_void));
+        }
+    }
+    entries
+}
+
+#[cfg(not(windows))]
+fn list_unc_shares(_host: &str) -> Vec<FileEntry> {
+    Vec::new()
+}
+
 /// 枚举目录内容（不递归）。读取失败（权限/不存在）时返回空表。
 /// 此函数运行在工作线程，可以放心阻塞。
 pub fn list_directory(path: &Path) -> Vec<FileEntry> {
+    // 服务器根不是文件系统路径：用共享枚举代替 read_dir。
+    if is_unc_server_root(path) {
+        let host = path.to_string_lossy().trim_end_matches('\\').to_string();
+        return list_unc_shares(&host);
+    }
     let Ok(read_dir) = std::fs::read_dir(path) else {
         return Vec::new();
     };
