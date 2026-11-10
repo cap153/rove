@@ -108,6 +108,60 @@ mod imp {
         }
         run_shell_op(FO_DELETE, from, None, flags, hwnd)
     }
+
+    /// 显示 Shell 条目的「属性」对话框。
+    ///
+    /// 回收站条目传入的是 `SIGDN_DESKTOPABSOLUTEPARSING`（Shell parsing name），
+    /// 不是磁盘上存在的文件路径：先 `SHParseDisplayName` 换成绝对 PIDL，再用
+    /// `SEE_MASK_INVOKEIDLIST` 调用 `properties` 动词。这样由回收站自己的 Shell
+    /// 扩展提供属性页（原位置 / 删除时间），而不是显示 `$R` 临时文件的属性。
+    pub fn show_properties(parsing_name: &Path) -> Result<(), String> {
+        use std::os::windows::ffi::OsStrExt;
+        // COM 用项目已启用 feature 的 `windows` crate；Shell 结构体用 `windows-sys`
+        // 的 POD 定义（windows-sys 未启用 Win32_System_Com）。
+        use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+        use windows_sys::Win32::UI::Shell::{
+            Common::ITEMIDLIST, ShellExecuteExW, SHParseDisplayName, SEE_MASK_INVOKEIDLIST,
+            SHELLEXECUTEINFOW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        unsafe {
+            // UI 线程可能已初始化 COM；重复调用返回 S_FALSE / RPC_E_CHANGED_MODE，
+            // 都不影响 ShellExecuteEx 按当前线程模型工作。
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        }
+        let mut name: Vec<u16> = parsing_name.as_os_str().encode_wide().collect();
+        name.push(0);
+        let verb: Vec<u16> = "properties".encode_utf16().chain([0]).collect();
+        let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+        let mut attrs: u32 = 0;
+        unsafe {
+            let hr = SHParseDisplayName(
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut pidl,
+                0,
+                &mut attrs,
+            );
+            if hr != 0 || pidl.is_null() {
+                return Err(format!("无法解析 Shell 条目（HRESULT 0x{:08X}）", hr as u32));
+            }
+            let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+            info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+            info.fMask = SEE_MASK_INVOKEIDLIST;
+            info.hwnd = owner_hwnd(0);
+            info.lpVerb = verb.as_ptr();
+            info.lpIDList = pidl.cast();
+            info.nShow = SW_SHOWNORMAL;
+            let ok = ShellExecuteExW(&mut info);
+            CoTaskMemFree(Some(pidl as *const std::ffi::c_void));
+            if ok == 0 {
+                return Err("Shell 未能打开属性对话框".to_string());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
@@ -140,4 +194,10 @@ mod imp {
     ) -> Result<bool, String> {
         Err("原生 Shell 操作仅在 Windows 支持".into())
     }
+    pub fn show_properties(_parsing_name: &Path) -> Result<(), String> {
+        Err("属性对话框仅在 Windows 支持".into())
+    }
 }
+
+#[cfg(not(windows))]
+pub use imp::*;

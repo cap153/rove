@@ -3735,20 +3735,35 @@ impl App {
         };
         let dup = |id: &str| shell_present && Self::is_shell_duplicate(id);
 
-        // 回收站视图：专用菜单（还原 / 彻底删除 / 清空）。
+        // 回收站视图：专用菜单（还原 / 剪切 / 彻底删除 / 属性 / 清空 / 视图 / 排序）。
         if self.state.active().active().path.as_deref()
             == Some(fs::drives::recycle_virtual_path().as_path())
         {
             return match target {
                 MenuScope::Selection(_) => vec![
                     item("recycle-restore", "还原到原位置", true),
+                    item("recycle-cut", "剪切", true),
                     MenuNode::Separator,
                     item("recycle-purge", "彻底删除", true),
+                    MenuNode::Separator,
+                    item("recycle-properties", "属性", true),
                 ],
                 MenuScope::Background => vec![
                     item("recycle-empty", "清空回收站", true),
                     MenuNode::Separator,
                     item(CMD_REFRESH, "刷新", true),
+                    // 视图 / 排序是全局状态，回收站条目走同一套 sort_entries 与
+                    // 行模型；`view:` / `sort:` 的分发也在 menu_scope 检查之前。
+                    MenuNode::Submenu {
+                        label: "视图".to_string(),
+                        enabled: true,
+                        children: self.view_menu_nodes(),
+                    },
+                    MenuNode::Submenu {
+                        label: "排序方式".to_string(),
+                        enabled: true,
+                        children: self.sort_menu_nodes(),
+                    },
                 ],
             };
         }
@@ -5274,6 +5289,9 @@ impl App {
                     self.sidebar_fingerprint = 0;
                 }
             }
+            // 与 Ctrl+X 同一条路径：写入 Rove 内部剪贴板并置半透明剪切态，
+            // 粘贴到普通目录时按唯一 Shell id 还原后再移动到目标目录。
+            "recycle-cut" => self.copy_selection(true),
             "recycle-purge" => {
                 if let MenuScope::Selection(paths) = &target {
                     let n = fs::drives::purge_recycle_entries(paths);
@@ -5294,6 +5312,16 @@ impl App {
                 }
                 self.reload_active();
                 self.sidebar_fingerprint = 0;
+            }
+            "recycle-properties" => {
+                if let MenuScope::Selection(paths) = &target {
+                    // Shell 的 properties 动词一次只处理一个条目，多选时显示第一项。
+                    if let Some(p) = paths.first() {
+                        if let Err(e) = crate::sys::shell::show_properties(p) {
+                            self.set_status_job(format!("无法显示属性：{e}"));
+                        }
+                    }
+                }
             }
             _ => {}
         }
