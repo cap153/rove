@@ -1024,9 +1024,9 @@ export component SettingsPage inherits Rectangle {
                                         // 核心防抖逻辑：用隐藏的 ghost-text 测量真实文本的宽度，防止悬停变成“删除”时宽度缩水闪烁
                                         width: min(max(ghost-text.preferred-width + 24px, 64px), 200px);
                                         border-radius: 5px;
-                                        background: c-ta.has-hover ? #C0392B : Theme.bg-main;
+                                        background: c-ta.has-hover ? Theme.close-hover : Theme.bg-main;
                                         border-width: 1px;
-                                        border-color: c-ta.has-hover ? #C0392B : Theme.border;
+                                        border-color: c-ta.has-hover ? Theme.close-hover : Theme.border;
 
                                         // 用于测宽度的幽灵元素，不渲染只计算
                                         ghost-text := Text {
@@ -1042,7 +1042,7 @@ export component SettingsPage inherits Rectangle {
 
                                         c-txt := Text {
                                             text: c-ta.has-hover ? "删除" : item;
-                                            color: c-ta.has-hover ? white : Theme.text-primary;
+                                            color: c-ta.has-hover ? #FFFFFF : Theme.text-primary;
                                             font-size: 11px;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
@@ -1464,9 +1464,9 @@ export component SettingsPage inherits Rectangle {
                                         // 用隐藏的 ghost-text 测真实文本宽度：否则悬停变成「删除」时宽度会缩水闪烁。
                                         width: min(max(hide-ghost-text.preferred-width + 24px, 64px), 200px);
                                         border-radius: 5px;
-                                        background: hide-c-ta.has-hover ? #C0392B : Theme.bg-main;
+                                        background: hide-c-ta.has-hover ? Theme.close-hover : Theme.bg-main;
                                         border-width: 1px;
-                                        border-color: hide-c-ta.has-hover ? #C0392B : Theme.border;
+                                        border-color: hide-c-ta.has-hover ? Theme.close-hover : Theme.border;
 
                                         hide-ghost-text := Text {
                                             text: item;
@@ -1481,7 +1481,7 @@ export component SettingsPage inherits Rectangle {
 
                                         hide-c-txt := Text {
                                             text: hide-c-ta.has-hover ? "删除" : item;
-                                            color: hide-c-ta.has-hover ? white : Theme.text-primary;
+                                            color: hide-c-ta.has-hover ? #FFFFFF : Theme.text-primary;
                                             font-size: 11px;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;

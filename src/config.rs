@@ -146,6 +146,8 @@ pub fn default_context_menu_hide() -> Vec<String> {
         "!刷新(E)",
         "!Pin to Quick access",
         "!固定到快速访问",
+        "!Folder",
+        "!文件夹(F)",
     ]
     .iter()
     .map(|s| s.to_string())

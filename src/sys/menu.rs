@@ -236,6 +236,8 @@ mod tests {
             "刷新(E)",
             "Pin to Quick access",
             "固定到快速访问",
+            "!Folder",
+            "!文件夹(F)",
         ] {
             assert!(
                 keyword_hit(&normalize_label(label), &kw),

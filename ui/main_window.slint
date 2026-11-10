@@ -175,6 +175,9 @@ export component MainWindow inherits Window {
     in-out property <string> sort-key: "name";
     in-out property <bool> sort-ascending: true;
     in-out property <string> rename-path: "";
+    /// 重命名发生在哪一栏（0 左 / 1 右）。不能用 active-pane：
+    /// 重命名期间点击别处会切换聚焦面板，输入框就会跳到另一栏。
+    in-out property <int> rename-pane: 0;
     /// 重命名输入框的当前文本（图标视图的浮层输入框双向绑定到它）。
     in-out property <string> rename-text: "";
     in-out property <[StagingItem]> staging-items: [];
@@ -1106,7 +1109,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     total-count: root.file-total;
                     sort-key: root.sort-key;
                     sort-ascending: root.sort-ascending;
-                    rename-path: root.rename-path;
+                    rename-path: root.rename-pane == 0 ? root.rename-path : "";
                     rename-text <=> root.rename-text;
                     loading: root.file-loading;
                     row_pointer_event(index, event, x, y) => {
@@ -1237,7 +1240,8 @@ out property <length> row-height-out: file-list.row-height-out;
                         sort-ascending: root.sort-ascending;
                         view-mode: root.view-mode;
                         show-path-column: root.show-path-column;
-                        rename-path: "";
+                        rename-path: root.rename-pane == 1 ? root.rename-path : "";
+                        rename-text <=> root.rename-text;
                         loading: root.file-loading-right;
                         row_pointer_event(index, event, x, y) => {
                             if (event.kind == PointerEventKind.down) {

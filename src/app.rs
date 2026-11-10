@@ -458,6 +458,8 @@ pub struct App {
     /// 必须重建；否则重命名期间列表会冻住在旧数据上（完全看不到目录刷新）。
     /// 必须包含 total：新建/删除条目即使可见窗口不变，内容已变。
     rows_sig: Option<(u64, usize, usize, usize)>,
+    /// 右分屏同名指纹：右栏重命名期间也要抑制无谓的行模型重建。
+    rows_sig_right: Option<(u64, usize, usize, usize)>,
     /// 当前右键菜单的作用范围（结果回投时用它决定作用于谁）。
     menu_scope: Option<MenuScope>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
@@ -638,6 +640,7 @@ impl App {
             sidebar_fingerprint: 0,
             visible_cache: None,
             rows_sig: None,
+            rows_sig_right: None,
             menu_scope: None,
             last_click: None,
             sidebar_drag: None,
@@ -3112,13 +3115,21 @@ impl App {
         // 40ms 轮询里的 thumb_needs_refresh 会频繁触发本函数，因此必须抑制这种无效重建。
         // 注：滚动会改变 (first0, count0) → 依然正常重建，不影响滚动。
         let sig = (
-            self.state.active().active().generation,
+            self.state
+                .active()
+                .panes
+                .first()
+                .map(|p| p.generation)
+                .unwrap_or(0),
             first0,
             count0,
             total0,
         );
         let renaming = !self.ui.get_rename_path().is_empty();
-        if renaming {
+        let rename_pane = self.ui.get_rename_pane();
+        // 左栏匹配诊断只对左栏重命名有意义；右栏重命名时 rows0 里本就找不到
+        // 目标路径，不做会刷出无意义的 "no visible row matches" 误报。
+        if renaming && rename_pane == 0 {
             // 只在异常时输出（重命名中却没有任何可见行匹配）——这是“输入框不出现 / 键盘全吞”的病灶。
             let rp = self.ui.get_rename_path();
             // 排查：重命名期间把影响滚动/虚拟窗口的关键几何一次性打出来。
@@ -3180,10 +3191,34 @@ impl App {
             let rows1 =
                 self.build_rows_for_pane(self.state.active_tab, 1, first1, count1, list_height);
             self.ui.set_file_total_right(total1 as i32);
-            self.ui.set_file_rows_right(ModelRc::new(VecModel::from(rows1)));
+            // 与左栏同理：右栏重命名期间，可见窗口没变就不要重建行模型，
+            // 否则 40ms 轮询会不断销毁行内 TextInput，右栏根本没法输入。
+            let sig_right = (
+                self.state
+                    .active()
+                    .panes
+                    .get(1)
+                    .map(|p| p.generation)
+                    .unwrap_or(0),
+                first1,
+                count1,
+                total1,
+            );
+            let reuse_right =
+                renaming && rename_pane == 1 && self.rows_sig_right == Some(sig_right);
+            if !reuse_right {
+                self.ui
+                    .set_file_rows_right(ModelRc::new(VecModel::from(rows1)));
+                self.rows_sig_right = Some(sig_right);
+                if renaming && rename_pane == 1 {
+                    self.arm_rename_scroll_guard();
+                }
+            }
         } else {
             self.ui.set_file_total_right(0);
-            self.ui.set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
+            self.ui
+                .set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
+            self.rows_sig_right = None;
         }
 
         self.sync_expand_targets();
@@ -3207,6 +3242,7 @@ impl App {
         }
 
         let rename = self.ui.get_rename_path().to_string();
+        let rename_pane = self.ui.get_rename_pane() as usize;
         let is_split = self.state.active().is_split;
         let mut targets: [(i32, String); 2] = [(-1, String::new()), (-1, String::new())];
         for pane in 0..2 {
@@ -3215,8 +3251,8 @@ impl App {
             }
             let tab = self.state.active();
             let Some(p) = tab.panes.get(pane) else { continue };
-            // 重命名只发生在左栏（右栏的 rename-path 恒为空）。
-            let target: Option<PathBuf> = if pane == 0 && !rename.is_empty() {
+            // 重命名发生在 rename-pane 指定的那一栏，左右分屏都要支持。
+            let target: Option<PathBuf> = if pane == rename_pane && !rename.is_empty() {
                 Some(PathBuf::from(&rename))
             } else if p.selection.len() == 1 {
                 p.selection.iter().next().cloned()
@@ -5423,6 +5459,10 @@ impl App {
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
+        // 三个入口（新建文件夹、F2、右键重命名）都作用于当前聚焦面板，
+        // 记下栏号，让只有该栏的 FileList 实例进入重命名态。
+        self.ui
+            .set_rename_pane(self.state.active().active_pane as i32);
         self.ui
             .set_rename_path(path.to_string_lossy().into_owned().into());
         self.ui.set_rename_text(name.as_str().into());
