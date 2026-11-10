@@ -2290,9 +2290,9 @@ impl App {
     }
 
     fn sync_status(&self) {
-        // 工具栏粘贴按钮可用性（系统剪贴板或内部缓存非空）。
-        let has_clipboard = !self.state.clipboard_paths.is_empty() || !clipboard::read_files().paths.is_empty();
-        self.ui.set_can_paste(has_clipboard);
+        // 工具栏粘贴按钮与右键菜单同源：实时读系统剪贴板。
+        let (paste_paths, _) = self.paste_state();
+        self.ui.set_can_paste(!paste_paths.is_empty());
         let tab = self.state.active();
         let (dirs, files, selected_size) = tab.active().stats();
         let total = tab.active().display.len();
@@ -3805,18 +3805,16 @@ impl App {
                 nodes
             }
             MenuScope::Background => {
+                // 实时读系统剪贴板：资源管理器等外部程序随时可能覆盖它，
+                // 不能用进程内的陈旧缓存判断文字与可用性。
+                let (paste_paths, paste_move) = self.paste_state();
                 // 「属性」不在这里：真实文件夹由系统菜单提供，
                 // 虚拟根（此电脑 / 回收站）本来也拿不到它。
                 vec![
                     MenuNode::Item {
                         key: CMD_PASTE.to_string(),
-                        label: if self.state.clipboard_operation == "move" {
-                            "粘贴（移动）"
-                        } else {
-                            "粘贴"
-                        }
-                        .to_string(),
-                        enabled: !self.state.clipboard_paths.is_empty(),
+                        label: if paste_move { "粘贴（移动）" } else { "粘贴" }.to_string(),
+                        enabled: !paste_paths.is_empty(),
                         checked: false,
                     },
                     item(CMD_NEW_FOLDER, "新建文件夹", true),
@@ -5356,6 +5354,26 @@ impl App {
         self.open_path(&entry.path);
     }
 
+    /// 当前可粘贴的剪贴板状态：`(路径列表, 是否为移动)`。
+    ///
+    /// 系统剪贴板是唯一权威：资源管理器等外部程序随时会覆盖它，进程内缓存
+    /// 只在「回收站内剪切」这类不写 CF_HDROP 的场景兜底。绝不能把系统值与
+    /// 陈旧的缓存值做 OR，否则外部复制会被误判成剪切（把源文件移走）。
+    fn paste_state(&self) -> (Vec<PathBuf>, bool) {
+        let files = clipboard::read_files();
+        if !files.paths.is_empty() {
+            return (files.paths, files.operation == "move");
+        }
+        if self.state.clipboard_from_recycle && !self.state.clipboard_paths.is_empty() {
+            return (
+                self.state.clipboard_paths.clone(),
+                self.state.clipboard_operation == "move",
+            );
+        }
+        // 系统里没有文件：常规缓存可能已被外部覆盖或清空，不能拿旧路径再粘一次。
+        (Vec::new(), false)
+    }
+
     /// 复制/剪切当前选择到系统剪贴板。
     fn copy_selection(&mut self, is_move: bool) {
         let paths = self.state.active().active().selected_paths();
@@ -5418,16 +5436,10 @@ impl App {
                 self.set_status_job("这些项目已在回收站中");
                 return;
             }
-            let files = clipboard::read_files();
-            let paths = if files.paths.is_empty() {
-                self.state.clipboard_paths.clone()
-            } else {
-                files.paths
-            };
+            let (paths, is_move) = self.paste_state();
             if paths.is_empty() {
                 return;
             }
-            let is_move = files.operation == "move" || self.state.clipboard_operation == "move";
             self.submit_job(JobKind::Delete { paths, to_trash: true });
             if is_move {
                 self.state.clipboard_paths.clear();
@@ -5478,17 +5490,11 @@ impl App {
             return;
         }
 
-        // 场景 3：常规目录之间粘贴。
-        let files = clipboard::read_files();
-        if files.paths.is_empty() && self.state.clipboard_paths.is_empty() {
+        // 场景 3：常规目录之间粘贴。copy / move 一律以系统剪贴板为准。
+        let (paths, is_move) = self.paste_state();
+        if paths.is_empty() {
             return;
         }
-        let paths = if files.paths.is_empty() {
-            self.state.clipboard_paths.clone()
-        } else {
-            files.paths
-        };
-        let is_move = files.operation == "move" || self.state.clipboard_operation == "move";
         self.state.clipboard_paths = paths.clone();
         self.state.clipboard_operation = if is_move { "move".into() } else { "copy".into() };
         self.expect_new_entries(&paths, &dest);
@@ -5583,8 +5589,14 @@ impl App {
             self.sync_status();
         }
 
-        // 移动操作会消耗剪贴板。
+        // 移动操作会消耗剪贴板：系统剪贴板里仍是「剪切」语义时一并清掉，
+        // 否则菜单会继续显示「粘贴（移动）」，再点就是移动已不存在的源文件。
+        // 内部拖拽移动不写剪切标记，不会误伤用户的剪贴板。
         if summary.message.starts_with("已移动") {
+            if clipboard::read_files().operation == "move" {
+                let _ = clipboard::clear();
+                self.sync_status();
+            }
             self.state.clipboard_paths.clear();
             self.state.cut_paths.clear();
             self.visible_cache = None;
