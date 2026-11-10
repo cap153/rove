@@ -37,6 +37,26 @@ pub fn is_thumbnail_candidate(path: &Path) -> bool {
     )
 }
 
+/// 是否为「慢格式」：解码开销明显大于普通图片（视频海报 / 这类媒体）。
+///
+/// 用于主池调度隔离：慢格式最多只占 `lanes-1` 条 worker，永远给普通图片
+/// 留 1 条空闲线程，避免滚到「图片+视频混排」文件夹时图片被视频卡死
+/// （抄 Pulse 的 `slow_cap = lanes-1` 思路）。纯视频文件夹本身解码就慢，
+/// 调度救不了（那是解码速度的物理上限），此隔离主要救混排场景。
+pub fn is_slow_thumbnail(path: &Path) -> bool {
+    if path.is_dir() {
+        return false; // 文件夹封面不按“慢”处理，保持原优先逻辑
+    }
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "m4v"
+    )
+}
+
 /// 每线程一次的 COM 初始化（CoInitializeEx 幂等：已初始化返回 S_FALSE 也算成功）。
 fn ensure_com() -> Result<(), String> {
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};

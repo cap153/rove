@@ -523,12 +523,21 @@ pub struct App {
     thumb_cache_bytes: usize,
     /// 已请求未完成的缩略图（防重复提交）。
     thumb_pending: HashSet<ThumbKey>,
+    /// 普通池请求的排队时间（按发出先后）。用于队列积压时把最早、
+    /// 已滑出可视区域的请求作废——否则滚过的每个位置都会往里塞请求，
+    /// 越滚越长，用户突然滚到中间时要排在一大堆已作废请求后面。
+    thumb_queued: Vec<ThumbKey>,
     /// 失败负缓存（本会话内不再重试）。
     thumb_failed: HashSet<ThumbKey>,
     /// 批量刷新标记：后台有缩略图到达时置位，由 poll_timer 统一刷新。
     thumb_needs_refresh: bool,
     #[allow(dead_code)]
     thumb_tx: Sender<ThumbKey>,
+    /// 优先通道：可见窗口内的缩略图请求。
+    /// 与 `thumb_tx` 分开，避免「先慢后快」渲染——轮转到的预览区把 4096 个文件
+    /// 全部占入 worker 队列后，用户突然滚到中间，新发出的请求会排在几千个
+    /// 已作废的请求后面。优先通道有自己的 worker（`PRIORITY_THREADS` 个）。
+    thumb_prio_tx: Sender<ThumbKey>,
     list_tx: Sender<ListRequest>,
     list_rx: Receiver<ListResult>,
     /// 深度搜索通道（文件夹视图子树搜索，独立线程执行）。
@@ -589,6 +598,7 @@ impl App {
         deep_tx: Sender<DeepRequest>,
         deep_rx: Receiver<DeepResult>,
         thumb_tx: Sender<ThumbKey>,
+        thumb_prio_tx: Sender<ThumbKey>,
         dir_size_tx: Sender<DirSizeRequest>,
         dir_size_rx: Receiver<DirSizeResult>,
         watch_tx: Sender<PathBuf>,
@@ -644,6 +654,7 @@ impl App {
             thumb_order: Vec::new(),
             thumb_cache_bytes: 0,
             thumb_pending: HashSet::new(),
+            thumb_queued: Vec::new(),
             thumb_failed: HashSet::new(),
             thumb_needs_refresh: false,
             syncing_tab: false,
@@ -656,6 +667,7 @@ impl App {
             shell_key_suppressed_logged: false,
             scroll_to_index: None,
             thumb_tx,
+            thumb_prio_tx,
             list_tx,
             list_rx,
             deep_tx,
@@ -1543,133 +1555,106 @@ fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>
 
 /// 缩略图工作线程：COM 初始化一次，循环取路径生成缩略图，
 /// 经事件循环回写缓存（线程安全：Image 可跨线程发送）。
+///
+/// 缩略图工作线程分发器。两个池：
+/// - 主池（`主池（自适应，见下）`）：当前目录的全量缩略图，轮询分发；
+/// - 优先池（`PRIORITY_THREADS`）：只装**当前可见窗口**的请求，
+///   抢在主池积压任务之前完成，解决“滚到中段却从顶部一个个加载”。
 #[cfg(windows)]
-/// 缩略图工作线程分发器。
-/// 核心修复：使用固定 4 线程并发池 + 轮询分发，彻底杜绝海量文件下的线程爆炸与 COM 崩溃。
-fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>) {
+fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>, prio_rx: mpsc::Receiver<ThumbKey>) {
     // 启动时初始化磁盘字节统计（仅计数，超预算才异步裁剪）。
     std::thread::spawn(init_thumb_disk_cache);
 
     std::thread::Builder::new()
         .name("rove-thumbs-dispatcher".into())
         .spawn(move || {
-            const NUM_THREADS: usize = 4;
-            let mut worker_txs = Vec::with_capacity(NUM_THREADS);
+            // 主池线程数随 CPU 核数自适应：留 2 核给 UI + 系统，
+            // 夹在 [2, 6] 之间。下限 2 = 至少 1 条图片专用 + 1 条视频；
+            // 上限 6 避免抢光多核机的算力。优先池固定 2 条，
+            // 故总线程 = num_threads + 2，范围 [4, 8]。
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4);
+            let num_threads = (cores.saturating_sub(2)).clamp(2, 6);
+            const PRIORITY_THREADS: usize = 2;
+            crate::logln!(
+                "[thumb] pool: cores={} main={} (1 fast + {} slow) prio={} total={}",
+                cores,
+                num_threads,
+                num_threads - 1,
+                PRIORITY_THREADS,
+                num_threads + PRIORITY_THREADS
+            );
+            let mut worker_txs = Vec::with_capacity(num_threads);
 
-            // 1. 启动固定数量的后台工作线程
-            for i in 0..NUM_THREADS {
+            // 0. 优先池：只服务当前可见窗口。独立线程，不抢主池队列。
+            {
+                let mut prio_txs = Vec::with_capacity(PRIORITY_THREADS);
+                for i in 0..PRIORITY_THREADS {
+                    let (tx, worker_rx) = mpsc::channel::<ThumbKey>();
+                    prio_txs.push(tx);
+                    let spawned = std::thread::Builder::new()
+                        .name(format!("rove-thumb-prio-{i}"))
+                        .spawn(move || {
+                            crate::logv!("[thumb] prio-{i} started");
+                            while let Ok(key) = worker_rx.recv() {
+                                thumb_decode_one("prio", i, key);
+                            }
+                            crate::logv!("[thumb] prio-{i} channel closed");
+                        });
+                    match spawned {
+                        Ok(_) => crate::logv!("[thumb] prio-{i} spawned"),
+                        Err(e) => crate::logln!("[thumb] prio-{i} SPAWN FAILED: {e}"),
+                    }
+                }
+                std::thread::Builder::new()
+                    .name("rove-thumbs-prio-dispatch".into())
+                    .spawn(move || {
+                        let n = prio_txs.len().max(1);
+                        let mut rr = 0usize;
+                        let mut logged = 0usize;
+                        while let Ok(req) = prio_rx.recv() {
+                            if logged < 64 {
+                                crate::logv!(
+                                    "[thumb] prio dispatch {} size={}",
+                                    req.path.display(),
+                                    req.px_size
+                                );
+                                logged += 1;
+                            }
+                            let lane = rr % n;
+                            if let Err(e) = prio_txs[lane].send(req) {
+                                crate::logln!("[thumb] !! prio lane={lane} send FAILED: {e}");
+                            }
+                            rr += 1;
+                        }
+                        crate::logv!("[thumb] prio dispatcher loop ended");
+                    })
+                    .ok();
+            }
+
+            // 1. 启动后台工作线程（数量自适应，见上方 num_threads 计算）。
+            // 慢格式隔离（抄 Pulse 的 slow_cap=lanes-1）：
+            //   lane 0 永远只接「快格式」（图片/文件夹），作为图片的专属通道；
+            //   lane 1..n 承接「慢格式」（视频海报等），且慢格式在途数上限
+            //   slow_cap = num_threads-1，永远给图片留 1 条空闲线程，
+            //   避免滚到「图片+视频混排」文件夹时图片被视频卡死。
+            const FAST_LANE: usize = 0;
+            let slow_cap = num_threads - 1; // 始终 ≥ 1
+            let (slow_done_tx, slow_done_rx) = mpsc::channel::<()>();
+            for i in 0..num_threads {
                 let (tx, worker_rx) = mpsc::channel::<ThumbKey>();
                 worker_txs.push(tx);
+                let slow_done_tx = slow_done_tx.clone();
                 let spawned = std::thread::Builder::new()
                     .name(format!("rove-thumb-worker-{i}"))
                     .spawn(move || {
                         crate::logv!("[thumb] worker-{i} started");
                         while let Ok(key) = worker_rx.recv() {
-                            crate::logv!(
-                                "[thumb] worker-{i} recv {} size={}",
-                                key.path.display(),
-                                key.px_size
-                            );
-                            // 每个工作线程只需在启动时初始化一次 COM (STA)
-                            #[cfg(windows)]
-                            unsafe {
-                                use windows::Win32::System::Com::{
-                                    CoInitializeEx, COINIT_APARTMENTTHREADED,
-                                };
-                                let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-                            }
-
-                            // 取图交给 thumbs 模块统一处理：
-                            // - 启动期 Shell 缩略图缓存未就绪会瞬时返回 E_PENDING(0x8000000A)，
-                            //   thumbs 内部做限次退避重试（盘符等最终仍取不到时返回 Err）；
-                            // - 降级系统图标尺寸过小时（如请求 264 返回 32）直接返回 Err，
-                            //   由 UI 的彩色方块兜底，避免白块。
-                            // 纯解码耗时（不含 E_PENDING 退避 sleep），用于判断是否值得落盘。
-                            let result = crate::ops::thumbs::get_thumbnail_timed(
-                                &key.path,
-                                key.px_size,
-                            );
-                            match result {
-                                Ok((w, h, rgba, pure_decode_ms)) => {
-                                    const MIN_DECODE_MS: u128 = 30;
-                                    let force_keep = is_always_kept(&key.path);
-
-                                    // 目录不落盘：解析仅 30–106ms，且图标几乎都是同一张“文件夹图形”；
-                                    // 落小图会在 icons-xl（显示 264px）下放大发糊，落原图又要 19.4KB/个。
-                                    // 文件：视频/RAW/PDF 等白名单无视耗时门槛，其他格式仍要求 >= 30ms。
-                                    // 且只写到本地固定盘（U 盘/光驱/网络盘不写）。
-                                    // Rove 自有数据文件（dir_sizes.json / index.bin）每次重写，一律排除。
-                                    if !key.path.is_dir()
-                                        && (pure_decode_ms >= MIN_DECODE_MS || force_keep)
-                                        && is_fixed_drive(&key.path)
-                                        && !is_rove_data_path(&key.path)
-                                    {
-                                        let disk_path = thumb_disk_path(&key);
-                                        if let Some(parent) = disk_path.parent() {
-                                            let _ = std::fs::create_dir_all(parent);
-                                        }
-                                        // WIC 编码：不透明→JPEG q90，带 alpha→PNG（原分辨率）。
-                                        if crate::ops::thumbs::encode_wic_to_file(
-                                            &disk_path, w, h, &rgba, None,
-                                        )
-                                        .is_ok()
-                                        {
-                                            if let Ok(meta) = std::fs::metadata(&disk_path) {
-                                                let total = THUMB_DISK_BYTES
-                                                    .fetch_add(
-                                                        meta.len(),
-                                                        std::sync::atomic::Ordering::Relaxed,
-                                                    )
-                                                    + meta.len();
-                                                if total > THUMB_DISK_MAX_BYTES {
-                                                    trigger_thumb_disk_trim();
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    // 2. 交还给主线程构建 Image 并写入内存 LRU。
-                                    let _ = slint::invoke_from_event_loop(move || {
-                                        let Some(img) = to_slint_image(w, h, &rgba) else {
-                                            // 静默丢弃会让 thumb_pending 永远留着该 key →
-                                            // 该行永久空白且不再重试。必须记日志。
-                                            crate::logln!(
-                                                "[thumb] !! to_slint_image FAILED {} {}x{} bytes={} (row stays blank)",
-                                                key.path.display(),
-                                                w,
-                                                h,
-                                                rgba.len()
-                                            );
-                                            if let Some(app) =
-                                                SESSION.with(|slot| slot.borrow().clone())
-                                            {
-                                                app.borrow_mut().fail_thumbnail(key);
-                                            }
-                                            return;
-                                        };
-                                        let Some(app) =
-                                            SESSION.with(|slot| slot.borrow().clone())
-                                        else {
-                                            crate::logln!(
-                                                "[thumb] !! SESSION None when storing {} (row stays blank)",
-                                                key.path.display()
-                                            );
-                                            return;
-                                        };
-                                        app.borrow_mut().store_thumbnail(key, img);
-                                    });
-                                }
-                                Err(_e) => {
-                                    crate::logln!("thumb failed {}: {}", key.path.display(), _e);
-                                    let _ = slint::invoke_from_event_loop(move || {
-                                        let Some(app) =
-                                            SESSION.with(|slot| slot.borrow().clone())
-                                        else {
-                                            return;
-                                        };
-                                        app.borrow_mut().fail_thumbnail(key);
-                                    });
-                                }
+                            let slow = crate::ops::thumbs::is_slow_thumbnail(&key.path);
+                            thumb_decode_one("worker", i, key);
+                            if slow {
+                                let _ = slow_done_tx.send(());
                             }
                         }
                         crate::logv!("[thumb] worker-{i} channel closed");
@@ -1680,24 +1665,137 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>) {
                 }
             }
 
-            // 2. 主分发循环：轮询（Round-Robin）将任务塞进这 4 个线程的通道中
+            // 2. 主分发循环：慢格式隔离 + 快格式优先 lane 0。
             let mut rr = 0;
-            while let Ok(req) = rx.recv() {
-                let lane = rr % NUM_THREADS;
-                crate::logv!(
-                    "[thumb] dispatch lane={} {} size={}",
-                    lane,
-                    req.path.display(),
-                    req.px_size
-                );
-                if let Err(e) = worker_txs[lane].send(req) {
-                    crate::logln!("[thumb] !! lane={} send FAILED: {e} (request LOST)", lane);
+            let mut slow_in_flight = 0usize;
+            // 慢格式在途已满时的暂存区（避免阻塞分发线程、饿死快格式）。
+            let mut slow_stash: std::collections::VecDeque<ThumbKey> = Default::default();
+            loop {
+                // 回收已完成的慢请求，腾出慢格式名额。
+                while let Ok(()) = slow_done_rx.try_recv() {
+                    slow_in_flight = slow_in_flight.saturating_sub(1);
                 }
-                rr += 1;
+                // 有空位就排空暂存。
+                while slow_in_flight < slow_cap {
+                    let Some(k) = slow_stash.pop_front() else { break };
+                    let lane = FAST_LANE + 1 + (rr % (num_threads - 1));
+                    rr += 1;
+                    let _ = worker_txs[lane].send(k);
+                    slow_in_flight += 1;
+                }
+                let req = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok(r) => r,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let slow = crate::ops::thumbs::is_slow_thumbnail(&req.path);
+                if slow {
+                    if slow_in_flight < slow_cap {
+                        let lane = FAST_LANE + 1 + (rr % (num_threads - 1));
+                        rr += 1;
+                        if let Err(e) = worker_txs[lane].send(req) {
+                            crate::logln!("[thumb] !! slow lane={lane} send FAILED: {e}");
+                        }
+                        slow_in_flight += 1;
+                    } else {
+                        slow_stash.push_back(req);
+                    }
+                } else {
+                    // 快格式：优先 lane 0（图片专属通道）。
+                    if let Err(e) = worker_txs[FAST_LANE].send(req) {
+                        crate::logln!("[thumb] !! fast lane send FAILED: {e}");
+                    }
+                }
             }
             crate::logv!("[thumb] dispatcher loop ended");
         })
         .ok();
+}
+
+/// 单个缩略图任务：解码 → （可选）落盘缓存 → 回主线程写内存 LRU。
+///
+/// `tag` / `idx` 只用于日志区分是主池还是优先池的哪个线程。
+#[cfg(windows)]
+fn thumb_decode_one(tag: &str, idx: usize, key: ThumbKey) {
+    // 每个工作线程只需在启动时初始化一次 COM (STA)，CoInitializeEx 是幂等的。
+    unsafe {
+        use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    }
+    crate::logv!(
+        "[thumb] {tag}-{idx} recv {} size={}",
+        key.path.display(),
+        key.px_size
+    );
+    match crate::ops::thumbs::get_thumbnail_timed(&key.path, key.px_size) {
+        Ok((w, h, rgba, pure_decode_ms)) => {
+            const MIN_DECODE_MS: u128 = 30;
+            let force_keep = is_always_kept(&key.path);
+
+            // 目录不落盘：解析仅 30–106ms，且图标几乎都是同一张“文件夹图形”；
+            // 落小图会在 icons-xl（显示 264px）下放大发糊，落原图又要 19.4KB/个。
+            // 文件：视频/RAW/PDF 等白名单无视耗时门槛，其他格式仍要求 >= 30ms。
+            // 且只写到本地固定盘（U 盘/光驱/网络盘不写）。
+            // Rove 自有数据文件（dir_sizes.json / index.bin）每次重写，一律排除。
+            if !key.path.is_dir()
+                && (pure_decode_ms >= MIN_DECODE_MS || force_keep)
+                && is_fixed_drive(&key.path)
+                && !is_rove_data_path(&key.path)
+            {
+                let disk_path = thumb_disk_path(&key);
+                if let Some(parent) = disk_path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                // WIC 编码：不透明→JPEG q90，带 alpha→PNG（原分辨率）。
+                if crate::ops::thumbs::encode_wic_to_file(&disk_path, w, h, &rgba, None).is_ok() {
+                    if let Ok(meta) = std::fs::metadata(&disk_path) {
+                        let total = THUMB_DISK_BYTES
+                            .fetch_add(meta.len(), std::sync::atomic::Ordering::Relaxed)
+                            + meta.len();
+                        if total > THUMB_DISK_MAX_BYTES {
+                            trigger_thumb_disk_trim();
+                        }
+                    }
+                }
+            }
+
+            // 2. 交还给主线程构建 Image 并写入内存 LRU。
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(img) = to_slint_image(w, h, &rgba) else {
+                    // 静默丢弃会让 thumb_pending 永远留着该 key →
+                    // 该行永久空白且不再重试。必须记日志。
+                    crate::logln!(
+                        "[thumb] !! to_slint_image FAILED {} {}x{} bytes={} (row stays blank)",
+                        key.path.display(),
+                        w,
+                        h,
+                        rgba.len()
+                    );
+                    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+                        app.borrow_mut().fail_thumbnail(key);
+                    }
+                    return;
+                };
+                let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+                    crate::logln!(
+                        "[thumb] !! SESSION None when storing {} (row stays blank)",
+                        key.path.display()
+                    );
+                    return;
+                };
+                app.borrow_mut().store_thumbnail(key, img);
+            });
+        }
+        Err(_e) => {
+            crate::logln!("[thumb] {tag}-{idx} failed {}: {_e}", key.path.display());
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+                    return;
+                };
+                app.borrow_mut().fail_thumbnail(key);
+            });
+        }
+    }
 }
 
 /// BGRA→RGBA 已由 thumbs 模块完成；这里包成 Slint 图像。
@@ -2312,9 +2410,9 @@ impl App {
                 // 回收站使用系统解析名，其余系统目录直接使用物理路径
                 #[cfg(windows)]
                 let icon_img = if label == "回收站" {
-                    self.thumb_for(Path::new("shell:RecycleBinFolder"), None, 0, SIDEBAR_ICON_PX)
+                    self.thumb_for(Path::new("shell:RecycleBinFolder"), None, 0, SIDEBAR_ICON_PX, true)
                 } else {
-                    self.thumb_for(&_dir, None, 0, SIDEBAR_ICON_PX)
+                    self.thumb_for(&_dir, None, 0, SIDEBAR_ICON_PX, false)
                 };
                 #[cfg(not(windows))]
                 let icon_img = slint::Image::default();
@@ -2368,7 +2466,7 @@ impl App {
                         continue;
                     }
                     #[cfg(windows)]
-                    let icon_img = self.thumb_for(&path, None, 0, SIDEBAR_ICON_PX);
+                    let icon_img = self.thumb_for(&path, None, 0, SIDEBAR_ICON_PX, false);
                     #[cfg(not(windows))]
                     let icon_img = slint::Image::default();
 
@@ -2605,6 +2703,7 @@ impl App {
         mtime: Option<SystemTime>,
         file_size: u64,
         size: u32,
+        priority: bool,
     ) -> slint::Image {
         let mtime_ms = mtime
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -2672,15 +2771,27 @@ impl App {
             }
 
             // 磁盘未命中，发送给后台去解码。
-            if self.thumb_tx.send(key.clone()).is_err() {
-                // 通道断开：不能把 key 永远留在 pending 里，否则该行永久空白。
-                crate::logln!(
-                    "[thumb] !! send to worker channel FAILED {} size={}",
-                    path.display(),
-                    size
-                );
-                self.thumb_pending.remove(&key);
-                self.thumb_failed.insert(key);
+            // `priority` = 该行在**当前可见窗口**内，走独立优先池，
+            // 不排在主池几千个“已滚走”的任务后面。
+            if priority {
+                if self.thumb_prio_tx.send(key.clone()).is_err() {
+                    self.thumb_pending.remove(&key);
+                    self.thumb_failed.insert(key);
+                    crate::logln!("[thumb] !! prio channel closed");
+                }
+            } else {
+                // 普通池：登记排队时间，队列过长时把最早的（已滑出屏幕的）作废。
+                self.thumb_queued.push(key.clone());
+                if self.thumb_tx.send(key.clone()).is_err() {
+                    // 通道断开：不能把 key 永远留在 pending 里，否则该行永久空白。
+                    crate::logln!(
+                        "[thumb] !! send to worker channel FAILED {} size={}",
+                        path.display(),
+                        size
+                    );
+                    self.thumb_pending.remove(&key);
+                    self.thumb_failed.insert(key);
+                }
             }
         }
         // 命中 pending 分支不记日志：此处在热路径上（每行每次刷新都会调用），
@@ -2723,6 +2834,7 @@ impl App {
         _mtime: Option<SystemTime>,
         _file_size: u64,
         _size: u32,
+        _priority: bool,
     ) -> slint::Image {
         slint::Image::default()
     }
@@ -2741,6 +2853,7 @@ impl App {
             key.px_size
         );
         self.thumb_pending.remove(&key);
+        self.thumb_queued.retain(|k| k != &key);
         self.thumb_failed.insert(key);
     }
 
@@ -2748,9 +2861,31 @@ impl App {
     #[allow(dead_code)]
     fn store_thumbnail(&mut self, key: ThumbKey, img: slint::Image) {
         self.thumb_pending.remove(&key);
+        self.thumb_queued.retain(|k| k != &key);
         self.insert_thumb_cache(key, img);
         // 核心修复：不再每次 store 都全量 refresh，只置位，由主线程 40ms 批量刷新。
         self.thumb_needs_refresh = true;
+    }
+
+    /// 丢弃普通池里排得太老的请求（从队首开始，即最早发出的）。
+    ///
+    /// 不丢的话，每滑过一个位置就塞 60 个新请求，队列只增不减；用户突然
+    /// 滑到中间时，他要的那一屏就排在上百个已经滑走的请求之后。
+    /// 最多保留 `keep` 个；被丢弃的不算失败，滑回去会重新请求。
+    ///
+    /// 返回实际丢弃的个数。
+    fn drop_stale_thumb_requests(&mut self, keep: usize) -> usize {
+        let mut dropped = 0;
+        while self.thumb_queued.len() > keep {
+            let key = self.thumb_queued.remove(0);
+            // 已经在解的（缓存里已有图）不能动，只删还没出图的。
+            if self.thumb_cache.contains_key(&key) {
+                continue;
+            }
+            self.thumb_pending.remove(&key);
+            dropped += 1;
+        }
+        dropped
     }
 
     /// 当前列表几何（用于检测布局落定 / 窗口尺寸变化）。
@@ -2885,8 +3020,21 @@ impl App {
 
         let (first0, count0) = pane_view_range(total0, cells_per_row, row_h, rows_visible, scroll0);
 
+        // 丢弃排队太久、可能已滑出屏幕的缩略图请求，避免队列无限增长：
+        // 每滑过一个位置就塞 60 个新请求，不丢的话越滑越多，用户突然滑到
+        // 中间时就只能排在上百个已滑走的请求之后（表现：依然从顶部慢慢出图）。
+        // 保留量 = 当前可视窗口的条目数（含 overscan）的 2 倍，留一屏余量。
+        let stale_dropped = self.drop_stale_thumb_requests(count0.max(60) * 2);
+        if stale_dropped > 0 {
+            crate::logv!(
+                "[thumb] dropped {stale_dropped} stale requests (queued={})",
+                self.thumb_queued.len()
+            );
+        }
+
         // 左栏始终绑定 pane 0
-        let rows0 = self.build_rows_for_pane(self.state.active_tab, 0, first0, count0);
+        let rows0 =
+            self.build_rows_for_pane(self.state.active_tab, 0, first0, count0, list_height);
         // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
         // 只在真的有空图时输出，正常滚动不吵。
         // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
@@ -2989,7 +3137,8 @@ impl App {
                 }
             };
             let (first1, count1) = pane_view_range(total1, cells_per_row, row_h, rows_visible, scroll1);
-            let rows1 = self.build_rows_for_pane(self.state.active_tab, 1, first1, count1);
+            let rows1 =
+                self.build_rows_for_pane(self.state.active_tab, 1, first1, count1, list_height);
             self.ui.set_file_total_right(total1 as i32);
             self.ui.set_file_rows_right(ModelRc::new(VecModel::from(rows1)));
         } else {
@@ -3059,6 +3208,7 @@ impl App {
         pane_index: usize,
         first: usize,
         count: usize,
+        list_height: f32,
     ) -> Vec<FileRow> {
         let (collected, computer_view) = {
             let tab = &self.state.tabs[tab_index];
@@ -3098,14 +3248,58 @@ impl App {
                     .collect();
             (collected, computer_view)
         };
-        collected
+        // 缩略图请求：**按“离视口中心的距离”从近到远发出**，两步解决“滚到中段
+        // 依然从顶部一个个慢慢加载”：
+        //
+        // 病灶：可视窗口 = 可视行 + 2*OVERSCAN（icons-xl 下 5 列，约 100 个条目）。
+        // 按索引顺序发时，先发的是窗口**顶部**那一批；而旧窗口已经往主池排过
+        // 成千上万个已滚走的任务，新请求只能排在它们后面，于是看起来像
+        // 从顶部线性加载。
+        //
+        // 1. 按“距视口中心”排序，中心先出图，观感是整屏同时出现；
+        // 2. 屏幕上正在显示的格子（不含 overscan）走独立优先池。
+        //
+        // 注意：可见区间必须用**条目下标**算，不能用 `scroll / row_h`。
+        // `scroll_y` 不是按行高换算的像素值（图标视图里两者不同步），
+        // 除出来会得到一个偏离真实位置的行号，结果优先池永远收不到任务。
+        // `first` 是本帧窗口的**首个条目下标**，但它包含了上方 OVERSCAN 行缓冲
+        // （见 pane_view_range：`first_row = scroll/row_h - OVERSCAN`），
+        // 所以 `first` 落在屏幕上方看不见的缓冲里。真实屏幕的首项要再跳过
+        // OVERSCAN 行，否则优先池会先从看不见的缓冲行开始做，观感就是“加载偏高”。
+        let row_h = if self.ui.get_row_height_out() > 0.0 {
+            self.ui.get_row_height_out()
+        } else {
+            ROW_HEIGHT
+        };
+        let cells_per_row = (self.ui.get_cells_per_row().max(1)) as usize;
+        let visible_rows = (list_height / row_h).ceil().max(1.0) as usize;
+        // 真实屏幕的条目下标区间（不含上下缓冲）。
+        let screen_first = (first + OVERSCAN * cells_per_row).min(first + count);
+        let screen_last = (screen_first + visible_rows * cells_per_row).min(first + count);
+        let core_first = screen_first;
+        let core_last = screen_last;
+        // 视口中心用真实屏幕首行表示，供“距中心排序”使用。
+        let first_row = first / cells_per_row;
+        let viewport_center_row =
+            (first_row + OVERSCAN) as f32 + visible_rows as f32 / 2.0;
+
+        let thumb_px = self.thumb_size_for_view();
+        let mut ordered = collected;
+        ordered.sort_by_key(|(index, _, _, _, _)| {
+            let row = (*index as usize) / cells_per_row;
+            let center = row as f32 + 0.5;
+            (center - viewport_center_row).abs() as i64
+        });
+        ordered
             .into_iter()
             .map(|(index, entry, selected, cut, name_parts)| {
+                let in_core = index >= core_first as i32 && (index as usize) < core_last;
                 let thumb = self.thumb_for(
                     &entry.path,
                     entry.modified,
                     entry.size,
-                    self.thumb_size_for_view(),
+                    thumb_px,
+                    in_core,
                 );
                 FileRow {
                     index,
@@ -8415,10 +8609,11 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
 
     // 缩略图 worker：路径 → 生成缩略图 → 回事件循环写缓存。
     let (thumb_tx, thumb_rx) = mpsc::channel::<ThumbKey>();
+    let (thumb_prio_tx, thumb_prio_rx) = mpsc::channel::<ThumbKey>();
     #[cfg(windows)]
-    spawn_thumb_worker(thumb_rx);
+    spawn_thumb_worker(thumb_rx, thumb_prio_rx);
     #[cfg(not(windows))]
-    drop(thumb_rx);
+    drop((thumb_rx, thumb_prio_rx));
 
     // 文件夹体积统计 worker：逐个递归计算目录大小，算完一个回传一个。
     let (dir_size_tx, dir_size_worker_rx) = mpsc::channel::<DirSizeRequest>();
@@ -8437,6 +8632,7 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         deep_tx,
         deep_rx,
         thumb_tx,
+        thumb_prio_tx,
         dir_size_tx,
         dir_size_rx,
         watch_tx,
