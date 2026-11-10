@@ -2006,6 +2006,60 @@ mod tests {
     fn drag_gesture_none_when_no_pending() {
         assert!(drag_gesture_paths(&None, 10.0, 10.0).is_none());
     }
+
+    /// 图标网格预切行：首行必须保留、最多 3 行、超长时末行带省略号。
+    /// 回归用例来自实测样本（文件名含 ❀ 会让 Slint 的 elide 吞掉首行）。
+    #[test]
+    fn grid_display_name_keeps_first_line_and_ellipsis() {
+        assert_eq!(grid_display_name("abc.mp4", 116.0, 3), "abc.mp4");
+
+        let name = "-菇菇哩--【竖屏】❀江南夜❀温婉旗袍，国风小调丨P2仙气汉元素不要错过(1)-气质温婉旗袍.mp4";
+        let out = grid_display_name(name, 116.0, 3);
+        let lines: Vec<&str> = out.split('\n').collect();
+        assert_eq!(lines.len(), 3, "应恰好 3 行: {out:?}");
+        assert!(lines[0].starts_with("-菇菇哩--"), "首行被吞: {out:?}");
+        assert!(lines[2].ends_with('…'), "末行应有省略号: {out:?}");
+
+        // 未超过 3 行时不加省略号
+        let fits = "文".repeat(24);
+        let out2 = grid_display_name(&fits, 116.0, 3);
+        assert!(!out2.contains('…'), "未超出行数不该有省略号: {out2:?}");
+    }
+
+    /// 英文按单词边界换行：单词不能被劈开，中文仍逐字断。
+    #[test]
+    fn grid_display_name_wraps_on_word_boundary() {
+        let out = grid_display_name("Quarterly Financial Report Summary.mp4", 116.0, 3);
+        for w in ["Quarterly", "Financial", "Report", "Summary.mp4"] {
+            assert!(
+                out.split('\n').any(|l| l.contains(w)),
+                "单词 {w} 被换行拆开: {out:?}"
+            );
+        }
+
+        // 单个超长单词放不下一行时只能硬断，但仍要压到 3 行且末行带省略号。
+        let long = format!("{}.mp4", "Supercalifragilistic".repeat(3));
+        let out2 = grid_display_name(&long, 116.0, 3);
+        let lines: Vec<&str> = out2.split('\n').collect();
+        assert_eq!(lines.len(), 3, "超长单词仍应压到 3 行: {out2:?}");
+        assert!(!lines[0].is_empty(), "首行不能为空: {out2:?}");
+        assert!(lines[2].ends_with('…'), "末行应有省略号: {out2:?}");
+    }
+
+    /// 连续装饰符号会回退到符号字体，按 14px 的保守值切行，
+    /// 否则多个符号累积超宽会让整行被水平裁掉。
+    #[test]
+    fn grid_display_name_budgets_fallback_symbols() {
+        let name = format!("{}.mp4", "❀".repeat(12));
+        let out = grid_display_name(&name, 116.0, 3);
+        // 预算 = 116 - 11.5 = 104.5；符号按 14px 估 → 一行最多 7 个。
+        let first = out.split('\n').next().unwrap();
+        assert_eq!(
+            first.chars().filter(|c| *c == '❀').count(),
+            7,
+            "按 11.5px 估会塞进 9 个而超宽: {out:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3376,6 +3430,8 @@ impl App {
             (first_row + OVERSCAN) as f32 + visible_rows as f32 / 2.0;
 
         let thumb_px = self.thumb_size_for_view();
+        // 网格名称的可换宽度 = cell-w - 16px（与 file_list.slint 内层文字宽一致）。
+        let grid_name_w = (self.ui.get_cell_w_out() as f32 - 16.0).max(24.0);
         let mut ordered = collected;
         ordered.sort_by_key(|(index, _, _, _, _)| {
             let row = (*index as usize) / cells_per_row;
@@ -3396,6 +3452,7 @@ impl App {
                 FileRow {
                     index,
                     name: entry.name.clone().into(),
+                    grid_name: grid_display_name(&entry.name, grid_name_w, 3).into(),
                     // 「路径」列显示删除前的原始路径，而不是内部唯一 Shell id。
                     path: entry
                         .original_path
@@ -3651,6 +3708,175 @@ fn clamp_units(s: &str, max: usize) -> &str {
         units += w;
     }
     s
+}
+
+/// 图标网格名称：按格宽预算预切成最多 `max_lines` 行，超出时末行以 `…` 收尾。
+///
+/// 返回用 `\n` 分行的文本，Slint 侧只逐行渲染、不再使用 `overflow:elide`。
+/// 背景：文件名里的 `❀` 等装饰符号会触发字体回退，让 Slint 的 `char-wrap`
+/// 多断一行；而多行 `Text` 在 elide 模式下按「完整文本高度」做垂直定位，
+/// 多出一行就把文本整体上移一整行，首行被整行裁掉（实测删掉该符号即恢复）。
+/// 由 Rust 预先定好行，首行与结尾省略号都不再受字体回退影响；文件名本身、
+/// 重命名输入框、展开浮层仍使用完整原名。
+/// CJK / 全角字符：11.5px 字号下 advance 基本等于 1em，与 11.5px 估值一致。
+/// 其余非 ASCII（`❀` `♡` `❤` `▶` 等装饰符号、emoji）会回退到符号字体，
+/// 实际宽度往往大于字号，由调用方按更大值估算。
+fn is_wide_cjk(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x115F       // 谚文字母
+            | 0x2E80..=0x303E // CJK 部首 / 标点（含全角空格）
+            | 0x3041..=0x33FF // 假名 / 注音 / CJK 兼容
+            | 0x3400..=0x4DBF // CJK 扩展 A
+            | 0x4E00..=0x9FFF // CJK 统一表意文字
+            | 0xA000..=0xA4CF // 彝文
+            | 0xAC00..=0xD7A3 // 谚文音节
+            | 0xF900..=0xFAFF // CJK 兼容表意
+            | 0xFE30..=0xFE4F // CJK 兼容形式
+            | 0xFF00..=0xFF60 // 全角 ASCII
+            | 0xFFE0..=0xFFE6 // 全角符号
+            | 0x20000..=0x3FFFD // CJK 扩展 B 及以后
+    )
+}
+
+fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
+    const ASCII_W: f32 = 6.0;
+    const WIDE_W: f32 = 11.5; // 与 file_list.slint 的 font-size 一致
+    // 符号/emoji 按更保守的 14px 估：连续多个装饰字符（❀♡❤▶）各自回退到
+    // 符号字体时，若仍按 11.5px 计就会累积超宽，整行被水平裁掉两端。
+    const SYMBOL_W: f32 = 14.0;
+    // 留整整一个宽字符余量：估算与真实 shaping 总有偏差，留一格缓冲。
+    let budget = (width_px - WIDE_W).max(WIDE_W * 2.0);
+    let width_of = |c: char| -> f32 {
+        if c.is_ascii() {
+            ASCII_W
+        } else if is_wide_cjk(c) {
+            WIDE_W
+        } else {
+            SYMBOL_W
+        }
+    };
+
+    // 可在该字符**之后**换行的位置：空白与常见分隔符；非 ASCII（CJK / 全角
+    // 符号）本身逐字可断，与资源管理器的中文换行一致。
+    // 刻意不含 '.'：避免把扩展名拆成单独一行（"xxx." / "mp4"）。
+    let breakable_after = |c: char| -> bool {
+        if c.is_ascii() {
+            matches!(
+                c,
+                ' ' | '\t'
+                    | '-'
+                    | '_'
+                    | '/'
+                    | '\\'
+                    | ','
+                    | ';'
+                    | ')'
+                    | ']'
+                    | '}'
+                    | '+'
+                    | '&'
+                    | '='
+                    | '~'
+                    | '|'
+            )
+        } else {
+            true
+        }
+    };
+
+    let chars: Vec<char> = name.chars().collect();
+    let mut lines: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let mut used = 0.0f32;
+        let mut j = 0usize;
+        // 行内最后一个可换行位置（相对行首的字符数）。
+        let mut last_break = 0usize;
+        while i + j < chars.len() {
+            let c = chars[i + j];
+            let cw = width_of(c);
+            if j > 0 && used + cw > budget {
+                break;
+            }
+            used += cw;
+            j += 1;
+            if breakable_after(c) {
+                last_break = j;
+            }
+        }
+        let rest_fits = i + j >= chars.len();
+        // 优先回退到最后一个可断点，避免把英文单词从中间劈开；
+        // 整行都没有可断点（单个超长单词）时才硬断。
+        let take = if rest_fits {
+            j
+        } else if last_break > 0 {
+            last_break
+        } else {
+            j.max(1)
+        };
+        let mut end = (i + take).min(chars.len());
+        while end > i && chars[end - 1].is_whitespace() {
+            end -= 1;
+        }
+        if end > i {
+            lines.push(chars[i..end].iter().collect());
+        }
+        i += take;
+        // 下一行不要以空白开头。
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    if lines.len() <= max_lines {
+        return lines.join("\n");
+    }
+
+    // 超出：保留前 max_lines 行，末行腾出省略号宽度后补 `…`。
+    lines.truncate(max_lines);
+    let last = lines.last_mut().unwrap();
+    let limit = (budget - WIDE_W).max(WIDE_W);
+    let mut w = 0.0f32;
+    let mut cut = last.len();
+    for (idx, ch) in last.char_indices() {
+        let cw = width_of(ch);
+        if w + cw > limit {
+            cut = idx;
+            break;
+        }
+        w += cw;
+    }
+    // 裁剪同理优先落在单词边界上（保留量不低于 60% 时才回退，
+    // 否则宁可硬断也别把最后一行弄得只剩一两个字符）。
+    let mut soft = 0usize;
+    let mut soft_w = 0.0f32;
+    let mut acc = 0.0f32;
+    for (idx, ch) in last.char_indices() {
+        if idx >= cut {
+            break;
+        }
+        acc += width_of(ch);
+        if breakable_after(ch) {
+            soft = idx + ch.len_utf8();
+            soft_w = acc;
+        }
+    }
+    if soft > 0 && soft_w >= limit * 0.6 {
+        cut = soft;
+    }
+    let mut end = cut.min(last.len());
+    while end > 0 && !last.is_char_boundary(end) {
+        end -= 1;
+    }
+    last.truncate(end);
+    while last.ends_with(' ') || last.ends_with('\t') {
+        last.pop();
+    }
+    last.push('…');
+    lines.join("\n")
 }
 
 fn cell_metrics(ui: &MainWindow) -> (f32, f32) {
@@ -6165,10 +6391,13 @@ struct RubberGeom {
     row_h: f32,
     cell_w: f32,
     cell_h: f32,
+    /// 图标网格均分后的间隙（与 file_list.slint 的 grid-gap 同源）。
+    grid_gap: f32,
 }
 
 impl RubberGeom {
-    fn read(ui: &MainWindow) -> Self {
+    /// right=true 时读右分屏的间隙：两栏宽度可能不同，gap 也各自不同。
+    fn read(ui: &MainWindow, right: bool) -> Self {
         let (cell_w, cell_h) = cell_metrics(ui);
         Self {
             is_icons: ui.get_is_icons_view_out(),
@@ -6176,18 +6405,25 @@ impl RubberGeom {
             row_h: ui.get_row_height_out(),
             cell_w,
             cell_h,
+            grid_gap: if right {
+                ui.get_grid_gap_right_out() as f32
+            } else {
+                ui.get_grid_gap_out() as f32
+            },
         }
     }
 
-    /// 第 di 个条目的 AABB（绝对内容坐标）。
+    /// 第 di 个条目的 AABB（绝对内容坐标）。x 与 file_list.slint 的
+    /// cell-x(col) = grid-gap + col*(item-w + grid-gap) 严格一致。
     fn rect(&self, di: usize) -> (f32, f32, f32, f32) {
         if self.is_icons {
             let col = di % self.cells_per_row;
             let row = di / self.cells_per_row;
+            let item_w = (self.cell_w - 8.0).max(1.0);
             (
-                col as f32 * self.cell_w + 4.0,
+                self.grid_gap + col as f32 * (item_w + self.grid_gap),
                 row as f32 * self.cell_h + 4.0,
-                self.cell_w - 8.0,
+                item_w,
                 self.cell_h - 8.0,
             )
         } else {
@@ -6595,7 +6831,7 @@ impl App {
         let top = y1.min(y2);
         let bottom = y1.max(y2);
 
-        let geom = RubberGeom::read(&self.ui);
+        let geom = RubberGeom::read(&self.ui, self.state.active().active_pane == 1);
         let tab = self.state.active().active();
         let mut hits = HashSet::new();
         for di in 0..tab.display.len() {
@@ -6613,7 +6849,7 @@ impl App {
     /// 从空白起手，此时以框内显示顺序最靠前的条目为焦点，不受拖拽方向影响。
     /// 例：框选 3/4/5 后 Shift 点 1，得到 1/2/3。
     fn rubber_band_anchor(&self, x1: f32, y1: f32, hits: &HashSet<PathBuf>) -> Option<PathBuf> {
-        let geom = RubberGeom::read(&self.ui);
+        let geom = RubberGeom::read(&self.ui, self.state.active().active_pane == 1);
         let tab = self.state.active().active();
         let mut first: Option<PathBuf> = None;
         for di in 0..tab.display.len() {
@@ -7460,7 +7696,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_file_name_debug(move |pane, info, name| {
             let Some(app) = app.upgrade() else { return };
-            let _app = app.borrow();
+            let app = app.borrow();
             let n = name.to_string();
             let total = n.chars().count();
             let head: String = n.chars().take(14).collect();
@@ -7468,13 +7704,31 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 let v: Vec<char> = n.chars().collect();
                 v[total.saturating_sub(14)..].iter().collect()
             };
+            // 关键：判断该行走「普通多行 Text」还是「搜索高亮 HighlightName」。
+            // HighlightName 是单行组件，若 name-parts 非空就能解释多行名字异常。
+            let rows = if pane == 1 {
+                app.ui.get_file_rows_right()
+            } else {
+                app.ui.get_file_rows()
+            };
+            let mut parts = -1i32; // -1 = 当前可见窗口里没找到该行
+            for i in 0..rows.row_count() {
+                if let Some(r) = rows.row_data(i) {
+                    if r.name.as_str() == n.as_str() {
+                        parts = r.name_parts.row_count() as i32;
+                        break;
+                    }
+                }
+            }
+            // 诊断信息留在详细级：ROVE_LOG=2 才会输出，常态 1 级日志保持干净。
             crate::logv!(
-                "[name] pane={} {} len={} head={:?} tail={:?}",
+                "[name] pane={} {} len={} head={:?} tail={:?} parts={}",
                 pane,
                 info,
                 total,
                 head,
-                tail
+                tail,
+                parts
             );
         });
     }

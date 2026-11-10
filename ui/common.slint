@@ -11,6 +11,10 @@ export struct FileRow {
     // 绝对行号（在完整排序后的列表中的下标），用于虚拟列表定位。
     index: int,
     name: string,
+    // 图标网格专用：Rust 按格宽预算切好的最多 3 行文本（超长时末行带 …）。
+    // 用 \n 分行交给 Slint，绕开多行 Text 的 overflow:elide —— 文件名里的
+    // ❀ 等装饰符号会触发字体回退，elide 的垂直布局会整行丢掉首行。
+    grid-name: string,
     path: string,
     is-dir: bool,
     is-hidden: bool,

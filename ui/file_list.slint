@@ -152,6 +152,9 @@ export component FileList inherits Rectangle {
     /// 行里有它就整行变高。取两者最大值，保证任何名字的 3 行都装得下。
     fm-name-3e := Text { visible: false; font-size: 11.5px; text: "国♡❤\n国♡❤\n国♡❤"; }
     fm-size-1 := Text { visible: false; font-size: 11px; font-family: Theme.mono-font-family; text: "0"; }
+    /// 单行实测行高（仅供 name-debug-info 诊断输出）。
+    fm-name-1 := Text { visible: false; font-size: 11.5px; text: "国"; }
+    fm-name-1e := Text { visible: false; font-size: 11.5px; text: "国♡❤"; }
     /// 名字固定展示 3 行的高度。
     /// **必须 +2px**：Slint 内部用 `floor(高度 / 行高)` 算“能放几行”，
     /// 当高度恰好等于 3×行高 时，浮点误差会算出 2.999… → floor 成 2 行，
@@ -171,15 +174,31 @@ export component FileList inherits Rectangle {
     private property <length> view-row-h: root.view-mode == "details" ? 30px
         : root.view-mode == "list" ? 24px
         : root.cell-h;
-    /// 每行单元格数：details/list = 1；icons = 网格列数。
-    // 列数计算保护：确保除数安全，严格根据视口实际宽度向下取整
+    /// 格子 AABB 宽度（可点击 / 高亮区），与下方 Repeater 的 width 一致。
+    private property <length> item-w: root.cell-w - 8px;
+    /// 图标间隙下限：原来格子之间只有 8px，鼠标很难从空白处起手框选。
+    private property <length> min-gap: 16px;
+    /// 每行单元格数：按「格子 + 最小间隙」取整，保证任一间隙都不小于 min-gap。
+    /// 仍由 Slint 单一数据源算出，Rust 的虚拟窗口只读这个值。
     out property <int> cells-per-row: root.view-mode == "details" || root.view-mode == "list"
         ? 1
-        : max(1, floor((flick.width - 8px) / max(40px, root.cell-w)));
+        : max(1, floor((flick.width - root.min-gap) / max(40px, root.item-w + root.min-gap)));
+    /// 放不下一个完整格子后剩下的宽度，均分成 N+1 份给
+    ///「最左 + N-1 个列间 + 最右」，两侧与列间完全相等（space-evenly）。
+    private property <length> grid-gap: root.is-icons-view
+        ? max(root.min-gap, (flick.width - root.cells-per-row * root.item-w) / (root.cells-per-row + 1))
+        : 0px;
+    /// 相邻格子原点的步进。
+    private property <length> cell-step: root.item-w + root.grid-gap;
+    pure function cell-x(col: int) -> length {
+        return root.grid-gap + col * root.cell-step;
+    }
     out property <length> row-height-out: root.view-row-h;
     /// 格子实际宽/高（Rust 卡选、拖放定位需要，不再在 Rust 里写一份固定数字）。
     out property <length> cell-w-out: root.cell-w;
     out property <length> cell-h-out: root.cell-h;
+    /// 均分后的间隙（Rust 框选命中需要同一套 x 几何；分屏两栏宽度可能不同）。
+    out property <length> grid-gap-out: root.grid-gap;
     /// 列表可视宽度（icons 网格列数计算用，供调试观测）。
     out property <length> view-width: flick.width;
     /// 当前视图是否为图标网格。
@@ -206,7 +225,7 @@ export component FileList inherits Rectangle {
         && (root.rename-path != "" || root.ex-needs);
     private property <int> ex-col: Math.mod(max(0, root.expand-index), max(1, root.cells-per-row));
     private property <int> ex-row: floor(max(0, root.expand-index) / max(1, root.cells-per-row));
-    private property <length> ex-item-x: ex-col * root.cell-w + 4px;
+    private property <length> ex-item-x: root.cell-x(root.ex-col);
     /// 框内文本：重命名中跟随输入，否则是完整文件名。
     private property <string> ex-text: root.rename-path != "" ? root.rename-text : root.expand-name;
     /// 框的最小宽度（= 格子的可见宽，左右各留 4px 边距）
@@ -268,17 +287,26 @@ export component FileList inherits Rectangle {
     /// 排查用：把“为什么截断 / 浮层为什么这样”的全部数字拼成一行。
     public function name-debug-info() -> string {
         return "mode=\{root.view-mode} cell=\{round(root.cell-w / 1px)}x\{round(root.cell-h / 1px)}"
-            + " thumb=\{round(root.cell-thumb / 1px)} name-h=\{round(root.name-h / 1px)}"
+            + " item-w=\{round(root.item-w / 1px)} gap=\{round(root.grid-gap / 1px)}"
+            + " thumb=\{round(root.cell-thumb / 1px)} name-y=\{round((root.cell-thumb + 3px) / 1px)}"
+            + " name-h=\{round(root.name-h / 1px)}"
+            + " line-h=\{round(fm-name-1.preferred-height / 1px)} line-he=\{round(fm-name-1e.preferred-height / 1px)}"
+            + " fit-lines=\{floor(root.name-h / max(1px, fm-name-1.preferred-height))}"
             + " size-h=\{round(root.size-line-h / 1px)} text-h=\{round(root.text-h / 1px)}"
             + " text-w=\{round(root.ex-cell-text-w / 1px)} m3=\{round(fm-name-3.preferred-height / 1px)}"
             + " m3e=\{round(fm-name-3e.preferred-height / 1px)} m1s=\{round(fm-size-1.preferred-height / 1px)}"
             + " idx=\{root.expand-index} renaming=\{root.ex-renaming}"
+            + " expand-active=\{root.expand-active ? 1 : 0}"
+            + " expanded=\{root.expand-index >= 0 ? (root.row-expanded(root.expand-index) ? 1 : 0) : 0}"
             + " need=\{root.ex-needs ? 1 : 0} wide=\{root.ex-wide ? 1 : 0}"
             + " m-cell=\{round(ex-measure-cell.preferred-height / 1px)}"
+            + " need-lines=\{floor(ex-measure-cell.preferred-height / max(1px, fm-name-1.preferred-height))}"
             + " box=\{round(root.ex-box-w / 1px)}x\{round(root.ex-box-h / 1px)}"
             + " m-box=\{round(ex-measure-box.preferred-height / 1px)}";
     }
     changed cell-h => { root.name-debug(root.name-debug-info(), root.expand-name); }
+    // 单选目标变化也打一条：点击同一个文件时 expand-name 不变，旧触发点会漏日志。
+    changed expand-index => { root.name-debug(root.name-debug-info(), root.expand-name); }
     changed expand-name => {
         if (root.expand-index >= 0) {
             root.name-debug(root.name-debug-info(), root.expand-name);
@@ -315,9 +343,14 @@ export component FileList inherits Rectangle {
             if (root.cell-w <= 0px || root.cell-h <= 0px || root.cells-per-row <= 0) {
                 return -1;
             }
-            let col = floor(rel-x / root.cell-w);
+            let col = floor((rel-x - root.grid-gap) / root.cell-step);
             let r = floor(rel-y / root.cell-h);
             if (col < 0 || col >= root.cells-per-row) {
+                return -1;
+            }
+            // 均分出来的间隙属于背景，不能归到相邻格子（否则拖放落点会偏）。
+            let cx = root.cell-x(col);
+            if (rel-x < cx || rel-x > cx + root.item-w) {
                 return -1;
             }
             let idx = r * root.cells-per-row + col;
@@ -337,9 +370,9 @@ export component FileList inherits Rectangle {
         if (root.is-icons-view) {
             let col = Math.mod(idx, root.cells-per-row);
             let r = floor(idx / root.cells-per-row);
-            let x = col * root.cell-w + 4px;
+            let x = root.cell-x(col);
             let y = header-h + r * root.cell-h + flick.content-y + 4px;
-            let w = root.cell-w - 8px;
+            let w = root.item-w;
             let h = root.cell-h - 8px;
             return [x, y, w, h];
         } else {
@@ -942,9 +975,9 @@ export component FileList inherits Rectangle {
             // ---- 图标网格（icons-* 视图）：单元格 = 缩略图 + 名称 ----
             for row[i] in root.rows : Rectangle {
                 visible: root.is-icons-view;
-                x: Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px;
+                x: root.cell-x(Math.mod(row.index, root.cells-per-row));
                 y: floor(row.index / root.cells-per-row) * root.cell-h + 4px;
-                width: root.cell-w - 8px;
+                width: root.item-w;
                 height: root.cell-h - 8px;
                 border-radius: 8px;
                 // 拖拽悬停到文件夹：显示醒目的选中色 + 强调色高亮边框；悬停到普通文件显示弱悬停底色
@@ -976,7 +1009,7 @@ export component FileList inherits Rectangle {
                         // 坐标换算为 FileList 内容坐标(列/行偏移 + 单元格内偏移),
                         // 供右键菜单在窗口中正确定位。
                         root.row-pointer-event(row.index, { kind: PointerEventKind.down, button: PointerEventButton.left },
-                            Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px + self.mouse-x,
+                            root.cell-x(Math.mod(row.index, root.cells-per-row)) + self.mouse-x,
                             floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y);
                     }
 
@@ -1008,7 +1041,7 @@ export component FileList inherits Rectangle {
                         let header-h = root.view-mode == "details" ? 30px : 0px;
                         let viewport_y = floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y + flick.content-y + header-h;
                         root.row-pointer-event(row.index, event,
-                            Math.mod(row.index, root.cells-per-row) * root.cell-w + 4px + self.mouse-x,
+                            root.cell-x(Math.mod(row.index, root.cells-per-row)) + self.mouse-x,
                             viewport_y);
                         return EventResult.accept;
                     }
@@ -1197,23 +1230,35 @@ export component FileList inherits Rectangle {
                         align-top: true;
                         horizontal-center: true;
                     }
-                    if (!root.row-expanded(row.index) && row.name-parts.length == 0) : Text {
+                    // 常态名称：直接渲染 Rust 预算好的「最多 3 行 + 末行 …」文本。
+                    // 不用 overflow:elide / max-lines：文件名里的 ❀ 等装饰符号会触发
+                    // 字体回退让 Slint 多断一行，elide 按完整文本高度垂直定位时就会把
+                    // 首行整行裁掉。行数和省略号都由 Rust 定好，这里只负责从顶部逐行画。
+                    // 外层再加固定 3 行高 + clip：万一行宽估算失准、Slint 又换出第 4 行，
+                    // 也只是纵向多出的那行被裁掉，首行和水平方向的内容都不会被切。
+                    if (!root.row-expanded(row.index) && row.name-parts.length == 0) : Rectangle {
                         x: 0px;
                         y: root.cell-thumb + 3px;
                         width: 100%;
                         height: root.name-h;
-                        text: row.name;
-                        color: Theme.text-primary;
-                        font-size: 11.5px;
-                        font-weight: row.is-dir ? 500 : 400;
-                        horizontal-alignment: center;
-                        vertical-alignment: top;
-                        // 中文按字换行（char-wrap）：英文按词换行会在
-                        // 中英混排的名字里留下大片空白。
-                        wrap: char-wrap;
-                        overflow: elide;
-                        // 常态固定 3 行名字
-                        max-lines: 3;
+                        clip: true;
+                        background: transparent;
+
+                        Text {
+                            x: 0px;
+                            y: 0px;
+                            width: 100%;
+                            height: self.preferred-height;
+                            text: row.grid-name;
+                            color: Theme.text-primary;
+                            font-size: 11.5px;
+                            font-weight: row.is-dir ? 500 : 400;
+                            horizontal-alignment: center;
+                            vertical-alignment: top;
+                            // 兜底：某行若真的比预算宽，宁可换行（多出的行由外层裁掉），
+                            // 也不要 no-wrap 那样把整行左右裁掉、连首行都缺字。
+                            wrap: char-wrap;
+                        }
                     }
 
                     // 容量行：紧跟在名字区下面（被浮层接管的那一行不画，避免漏底）。
@@ -1473,6 +1518,11 @@ export component FileList inherits Rectangle {
                 }
             }
         }
+        // 单独选中时的纯文字浮层。不能加 overflow:elide：它会按「完整文本高度」
+        // 触发多行行数限制，把 4 行文本在固定高度里从底部截断，吞掉第一行
+        //（重命名用的 TextInput 没有 overflow，所以同尺寸下能完整显示 4 行）。
+        // 浮层高度 ex-box-h 本就按 ex-measure-box 实测内容高 + 14px 算出，
+        // 这里逐行从顶部画完即可，不需要再省略。
         ex-display-text := Text {
             visible: root.rename-path == "";
             x: 4px;
@@ -1485,7 +1535,6 @@ export component FileList inherits Rectangle {
             horizontal-alignment: center;
             vertical-alignment: top;
             wrap: char-wrap;
-            overflow: elide;
         }
     }
 }

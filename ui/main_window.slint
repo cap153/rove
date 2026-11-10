@@ -229,6 +229,9 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 格子实际宽/高（Rust 卡选与拖放定位用；高度按真实字体行高算出来）
     out property <length> cell-w-out: file-list.cell-w-out;
     out property <length> cell-h-out: file-list.cell-h-out;
+    /// 图标网格均分后的间隙：左右栏宽度可能不同，各自导出供框选命中用。
+    out property <length> grid-gap-out: file-list.grid-gap-out;
+    out property <length> grid-gap-right-out: file-list-right.grid-gap-out;
     out property <bool> is-icons-view-out: file-list.is-icons-view;
     /// 过滤输入框是否持有焦点（焦点在内时不响应应用级快捷键）。
     in-out property <bool> filter-has-focus;
