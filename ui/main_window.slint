@@ -1,4 +1,4 @@
-import { Theme, FileRow, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup, SettingsDriveItem } from "common.slint";
+import { Theme, FileRow, GridLine, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup, SettingsDriveItem } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
@@ -166,12 +166,17 @@ export component MainWindow inherits Window {
     /// 图标视图“展开名称”目标（单个选中 / 重命名）：条目绝对索引与完整名称。
     in-out property <int> file-expand-index: -1;
     in-out property <string> file-expand-name: "";
+    /// 浮层名称的逐行高亮分段与框宽（Rust 与切行同源算出）。
+    in-out property <[GridLine]> file-expand-lines: [];
+    in-out property <length> file-expand-box-w: 0px;
     // 分屏右栏数据源（分屏关闭时不使用）。
     in-out property <[FileRow]> file-rows-right: [];
     in-out property <int> file-total-right: 0;
     in-out property <bool> file-loading-right: false;
     in-out property <int> file-expand-index-right: -1;
     in-out property <string> file-expand-name-right: "";
+    in-out property <[GridLine]> file-expand-lines-right: [];
+    in-out property <length> file-expand-box-w-right: 0px;
     in-out property <string> sort-key: "name";
     in-out property <bool> sort-ascending: true;
     in-out property <string> rename-path: "";
@@ -1111,6 +1116,8 @@ out property <length> row-height-out: file-list.row-height-out;
                         rows: root.file-rows;
                     expand-index: root.file-expand-index;
                     expand-name: root.file-expand-name;
+                    expand-lines: root.file-expand-lines;
+                    expand-box-w: root.file-expand-box-w;
                     total-count: root.file-total;
                     sort-key: root.sort-key;
                     sort-ascending: root.sort-ascending;
@@ -1241,6 +1248,8 @@ out property <length> row-height-out: file-list.row-height-out;
                         rows: root.file-rows-right;
                         expand-index: root.file-expand-index-right;
                         expand-name: root.file-expand-name-right;
+                        expand-lines: root.file-expand-lines-right;
+                        expand-box-w: root.file-expand-box-w-right;
                         total-count: root.file-total-right;
                         sort-key: root.sort-key;
                         sort-ascending: root.sort-ascending;

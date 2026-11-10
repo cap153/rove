@@ -7,14 +7,20 @@ export struct NamePart {
     hl: bool,
 }
 
+/// 图标视图的一行名称：由若干 (文本, 是否高亮) 片段组成。
+/// 多行 + 分段高亮必须按行拆开渲染，Slint 的 Text 不支持富文本。
+export struct GridLine {
+    parts: [NamePart],
+}
+
 export struct FileRow {
     // 绝对行号（在完整排序后的列表中的下标），用于虚拟列表定位。
     index: int,
     name: string,
-    // 图标网格专用：Rust 按格宽预算切好的最多 3 行文本（超长时末行带 …）。
-    // 用 \n 分行交给 Slint，绕开多行 Text 的 overflow:elide —— 文件名里的
-    // ❀ 等装饰符号会触发字体回退，elide 的垂直布局会整行丢掉首行。
-    grid-name: string,
+    // 图标网格专用：Rust 按格宽预算切好的最多 3 行（超长时末行带 …），
+    // 每行保留搜索命中的高亮片段。用显式分行绕开多行 Text 的 overflow:elide
+    // —— 文件名里的 ❀ 等装饰符号会触发字体回退，elide 会整行丢掉首行。
+    grid-lines: [GridLine],
     path: string,
     is-dir: bool,
     is-hidden: bool,

@@ -460,6 +460,9 @@ pub struct App {
     rows_sig: Option<(u64, usize, usize, usize)>,
     /// 右分屏同名指纹：右栏重命名期间也要抑制无谓的行模型重建。
     rows_sig_right: Option<(u64, usize, usize, usize)>,
+    /// 图标视图展开浮层的签名（索引 / 框宽 / 行内容哈希，左右各一份）。
+    /// 未变时跳过重建嵌套 ModelRc 与 set —— 本函数每帧都会走到。
+    expand_sig: Option<[(i32, u32, u64, u64); 2]>,
     /// 当前右键菜单的作用范围（结果回投时用它决定作用于谁）。
     menu_scope: Option<MenuScope>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
@@ -641,6 +644,7 @@ impl App {
             visible_cache: None,
             rows_sig: None,
             rows_sig_right: None,
+            expand_sig: None,
             menu_scope: None,
             last_click: None,
             sidebar_drag: None,
@@ -2046,6 +2050,26 @@ mod tests {
         assert!(lines[2].ends_with('…'), "末行应有省略号: {out2:?}");
     }
 
+    /// 切行要保留高亮分段：搜索命中片段跨行后仍带 hl 标记。
+    #[test]
+    fn grid_display_lines_keep_highlight_parts() {
+        let parts = vec![
+            ("Fire".to_string(), true),
+            ("foxSetupWithAVeryLongNameForWrapping.exe".to_string(), false),
+        ];
+        let lines = grid_display_lines(&parts, 116.0, 3);
+        let joined: String = lines
+            .iter()
+            .map(|l| l.iter().map(|(t, _)| t.as_str()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(joined.starts_with("Fire"), "命中段不在行首: {joined}");
+        assert!(
+            lines[0].iter().any(|(t, hl)| *hl && t.contains("Fire")),
+            "高亮标记丢了: {lines:?}"
+        );
+    }
+
     /// 连续装饰符号会回退到符号字体，按 14px 的保守值切行，
     /// 否则多个符号累积超宽会让整行被水平裁掉。
     #[test]
@@ -3306,15 +3330,27 @@ impl App {
         if !icons_big {
             self.ui.set_file_expand_index(-1);
             self.ui.set_file_expand_name(SharedString::default());
+            self.ui.set_file_expand_box_w(0.0);
+            self.ui
+                .set_file_expand_lines(ModelRc::new(VecModel::from(Vec::<GridLine>::new())));
             self.ui.set_file_expand_index_right(-1);
             self.ui.set_file_expand_name_right(SharedString::default());
+            self.ui.set_file_expand_box_w_right(0.0);
+            self.ui.set_file_expand_lines_right(ModelRc::new(VecModel::from(
+                Vec::<GridLine>::new(),
+            )));
+            // 切回图标视图时需要能重新下发，签名必须清空。
+            self.expand_sig = None;
             return;
         }
 
         let rename = self.ui.get_rename_path().to_string();
         let rename_pane = self.ui.get_rename_pane() as usize;
         let is_split = self.state.active().is_split;
-        let mut targets: [(i32, String); 2] = [(-1, String::new()), (-1, String::new())];
+        let mut targets: [(i32, String, Vec<(String, bool)>); 2] = [
+            (-1, String::new(), Vec::new()),
+            (-1, String::new(), Vec::new()),
+        ];
         for pane in 0..2 {
             if pane == 1 && !is_split {
                 break;
@@ -3334,14 +3370,121 @@ impl App {
                 let e = p.display_entry(di)?;
                 (e.path == target).then(|| (di as i32, e.name.clone()))
             });
-            if let Some(hit) = hit {
-                targets[pane] = hit;
+            if let Some((di, name)) = hit {
+                // 该条目的完整高亮分段：行模型里存的就是未截断的原始分段，
+                // 直接复用，避免在这里重跑一遍搜索命中计算。
+                let rows = if pane == 1 {
+                    self.ui.get_file_rows_right()
+                } else {
+                    self.ui.get_file_rows()
+                };
+                let key = p
+                    .display_entry(di as usize)
+                    .map(|e| e.path.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let mut parts: Vec<(String, bool)> = Vec::new();
+                for i in 0..rows.row_count() {
+                    let Some(r) = rows.row_data(i) else { continue };
+                    if r.path.as_str() == key {
+                        parts = (0..r.name_parts.row_count())
+                            .filter_map(|k| r.name_parts.row_data(k))
+                            .map(|x| (x.text.to_string(), x.hl))
+                            .collect();
+                        break;
+                    }
+                }
+                if parts.is_empty() {
+                    parts = vec![(name.clone(), false)];
+                }
+                targets[pane] = (di, name, parts);
             }
         }
-        self.ui.set_file_expand_index(targets[0].0);
-        self.ui.set_file_expand_name(targets[0].1.as_str().into());
-        self.ui.set_file_expand_index_right(targets[1].0);
-        self.ui.set_file_expand_name_right(targets[1].1.as_str().into());
+        // 是否需要浮层（名字超过 3 行）改在 Rust 侧判定：只有需要时才给
+        // expand-index，Slint 侧因此不再依赖文本测量决定弹不弹。
+        //
+        // 本函数每帧都会走到（滚动 / 几何变化 / 数据刷新），但选中项通常没变。
+        // 用「索引 + 框宽 + 行内容哈希」做签名，未变就整段跳过：不重建嵌套
+        // ModelRc，也不 set（set 会触发 Slint 侧重排）。
+        let hash_lines = |lines: &GridLines| -> u64 {
+            let mut h = lines.len() as u64;
+            for line in lines {
+                h = h.wrapping_mul(31).wrapping_add(line.len() as u64);
+                for (t, hl) in line {
+                    for ch in t.chars() {
+                        h = h.wrapping_mul(31).wrapping_add(ch as u64);
+                    }
+                    h = h.wrapping_mul(31).wrapping_add(*hl as u64);
+                }
+            }
+            h
+        };
+        let hash_str = |s: &str| -> u64 {
+            let mut h = 0u64;
+            for ch in s.chars() {
+                h = h.wrapping_mul(31).wrapping_add(ch as u64);
+            }
+            h
+        };
+
+        let mut sigs: [(i32, u32, u64, u64); 2] = [(-1, 0, 0, 0); 2];
+        let mut plans: [Option<(f32, GridLines, SharedString)>; 2] = [None, None];
+        for (pane, t) in targets.iter().enumerate() {
+            if t.0 < 0 {
+                continue;
+            }
+            // 重命名中输入框的实时文本才是浮层该显示的内容；否则每帧都会用
+            // 磁盘上的旧名字，把用户正在输入的行覆盖回去。
+            let renaming_here = rename_pane == pane && !rename.is_empty();
+            let parts: Vec<(String, bool)> = if renaming_here {
+                vec![(self.ui.get_rename_text().to_string(), false)]
+            } else {
+                t.2.clone()
+            };
+            let (needs, box_w, lines) = expand_layout(&self.ui, &parts);
+            // 重命名必须弹浮层（输入框就在浮层里），与「名字是否超过 3 行」无关：
+            // 超大图标视图格子宽，名字基本都在 3 行内，之前会因 needs=false
+            // 拿不到 expand-index，于是完全无法重命名。
+            let index = if needs || renaming_here { t.0 } else { -1 };
+            sigs[pane] = (index, box_w.to_bits(), hash_lines(&lines), hash_str(&t.1));
+            plans[pane] = Some((box_w, lines, t.1.as_str().into()));
+        }
+        if self.expand_sig.as_ref() == Some(&sigs) {
+            return;
+        }
+        self.expand_sig = Some(sigs);
+
+        for (pane, plan) in plans.into_iter().enumerate() {
+            let (index, box_w, lines, name) = match plan {
+                Some((box_w, lines, name)) => (sigs[pane].0, box_w, lines, name),
+                None => (-1, 0.0f32, Vec::new(), SharedString::default()),
+            };
+            let model = ModelRc::new(VecModel::from(
+                lines
+                    .into_iter()
+                    .map(|line| GridLine {
+                        parts: ModelRc::new(VecModel::from(
+                            line.into_iter()
+                                .map(|(text, hl)| NamePart {
+                                    text: text.into(),
+                                    hl,
+                                })
+                                .collect::<Vec<_>>(),
+                        )),
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            if pane == 0 {
+                self.ui.set_file_expand_index(index);
+                self.ui.set_file_expand_name(name);
+                self.ui.set_file_expand_box_w(box_w);
+                self.ui.set_file_expand_lines(model);
+            } else {
+                self.ui.set_file_expand_index_right(index);
+                self.ui.set_file_expand_name_right(name);
+                self.ui.set_file_expand_box_w_right(box_w);
+                self.ui.set_file_expand_lines_right(model);
+            }
+        }
     }
 
     /// 为指定面板构建可视窗口的行模型（左栏 pane 0 / 右栏 pane 1）。
@@ -3452,7 +3595,30 @@ impl App {
                 FileRow {
                     index,
                     name: entry.name.clone().into(),
-                    grid_name: grid_display_name(&entry.name, grid_name_w, 3).into(),
+                    grid_lines: {
+                        // 名称分成「高亮分段」两路输入：搜索态直接用命中分段，
+                        // 常态退化为单个不高亮段，渲染路径因此只有一条。
+                        let parts: Vec<(String, bool)> = if name_parts.is_empty() {
+                            vec![(entry.name.clone(), false)]
+                        } else {
+                            name_parts.clone()
+                        };
+                        ModelRc::new(VecModel::from(
+                            grid_display_lines(&parts, grid_name_w, 3)
+                                .into_iter()
+                                .map(|line| GridLine {
+                                    parts: ModelRc::new(VecModel::from(
+                                        line.into_iter()
+                                            .map(|(text, hl)| NamePart {
+                                                text: text.into(),
+                                                hl,
+                                            })
+                                            .collect::<Vec<_>>(),
+                                    )),
+                                })
+                                .collect::<Vec<_>>(),
+                        ))
+                    },
                     // 「路径」列显示删除前的原始路径，而不是内部唯一 Shell id。
                     path: entry
                         .original_path
@@ -3710,14 +3876,6 @@ fn clamp_units(s: &str, max: usize) -> &str {
     s
 }
 
-/// 图标网格名称：按格宽预算预切成最多 `max_lines` 行，超出时末行以 `…` 收尾。
-///
-/// 返回用 `\n` 分行的文本，Slint 侧只逐行渲染、不再使用 `overflow:elide`。
-/// 背景：文件名里的 `❀` 等装饰符号会触发字体回退，让 Slint 的 `char-wrap`
-/// 多断一行；而多行 `Text` 在 elide 模式下按「完整文本高度」做垂直定位，
-/// 多出一行就把文本整体上移一整行，首行被整行裁掉（实测删掉该符号即恢复）。
-/// 由 Rust 预先定好行，首行与结尾省略号都不再受字体回退影响；文件名本身、
-/// 重命名输入框、展开浮层仍使用完整原名。
 /// CJK / 全角字符：11.5px 字号下 advance 基本等于 1em，与 11.5px 估值一致。
 /// 其余非 ASCII（`❀` `♡` `❤` `▶` 等装饰符号、emoji）会回退到符号字体，
 /// 实际宽度往往大于字号，由调用方按更大值估算。
@@ -3739,17 +3897,36 @@ fn is_wide_cjk(c: char) -> bool {
     )
 }
 
-fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
-    const ASCII_W: f32 = 6.0;
+/// 名字切行结果：每行若干 `(文本, 是否高亮)` 片段。
+type GridLines = Vec<Vec<(String, bool)>>;
+
+/// 把「带高亮分段的名字」按可用宽度预切成最多 `max_lines` 行，超出时末行以
+/// `…` 收尾，返回逐行的片段列表。
+///
+/// 为什么按行拆成片段而不是交给 Slint：`Text` 不支持富文本，搜索命中高亮必须
+/// 拆成多个 `Text`；而多行 `Text` 用 `overflow:elide` 时，文件名里的 `❀` 等
+/// 装饰符号会触发字体回退多断一行，elide 按完整文本高度定位就会把首行整行
+/// 裁掉。行数由 Rust 定死后，多行、首行完整、末行省略号、命中高亮可以同时成立。
+fn grid_display_lines(parts: &[(String, bool)], width_px: f32, max_lines: usize) -> GridLines {
     const WIDE_W: f32 = 11.5; // 与 file_list.slint 的 font-size 一致
     // 符号/emoji 按更保守的 14px 估：连续多个装饰字符（❀♡❤▶）各自回退到
     // 符号字体时，若仍按 11.5px 计就会累积超宽，整行被水平裁掉两端。
     const SYMBOL_W: f32 = 14.0;
     // 留整整一个宽字符余量：估算与真实 shaping 总有偏差，留一格缓冲。
     let budget = (width_px - WIDE_W).max(WIDE_W * 2.0);
+    // ASCII 不能再统一按 6px 估：大写与数字明显更宽（「EXID-Up&Down.mp4」这类
+    // 名字会被低估，行宽超出容器后 HorizontalLayout 会压缩末段，把 `.mp4` 的
+    // 尾部裁掉）。这里按字宽细分，宁可估宽一点也不裁字。
     let width_of = |c: char| -> f32 {
         if c.is_ascii() {
-            ASCII_W
+            match c {
+                ' ' | '\t' => 3.6,
+                'a'..='z' => 5.9,
+                'A'..='Z' => 7.4,
+                '0'..='9' => 6.6,
+                '.' | ',' | ':' | ';' | '\'' | '|' | '!' => 3.6,
+                _ => 6.6,
+            }
         } else if is_wide_cjk(c) {
             WIDE_W
         } else {
@@ -3785,8 +3962,16 @@ fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
         }
     };
 
-    let chars: Vec<char> = name.chars().collect();
-    let mut lines: Vec<String> = Vec::new();
+    // 展开成「字符 + 是否高亮」，切行只依赖字符宽度，分组时再还原高亮段。
+    let chars: Vec<(char, bool)> = parts
+        .iter()
+        .flat_map(|(t, hl)| t.chars().map(move |c| (c, *hl)))
+        .collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut i = 0usize;
     while i < chars.len() {
         let mut used = 0.0f32;
@@ -3794,7 +3979,7 @@ fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
         // 行内最后一个可换行位置（相对行首的字符数）。
         let mut last_break = 0usize;
         while i + j < chars.len() {
-            let c = chars[i + j];
+            let c = chars[i + j].0;
             let cw = width_of(c);
             if j > 0 && used + cw > budget {
                 break;
@@ -3816,67 +4001,105 @@ fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
             j.max(1)
         };
         let mut end = (i + take).min(chars.len());
-        while end > i && chars[end - 1].is_whitespace() {
+        while end > i && chars[end - 1].0.is_whitespace() {
             end -= 1;
         }
         if end > i {
-            lines.push(chars[i..end].iter().collect());
+            ranges.push((i, end));
         }
         i += take;
         // 下一行不要以空白开头。
-        while i < chars.len() && chars[i].is_whitespace() {
+        while i < chars.len() && chars[i].0.is_whitespace() {
             i += 1;
         }
     }
+
+    let mut lines: GridLines = ranges
+        .into_iter()
+        .map(|(s, e)| group_parts(&chars[s..e]))
+        .collect();
     if lines.is_empty() {
-        return String::new();
+        return Vec::new();
     }
     if lines.len() <= max_lines {
-        return lines.join("\n");
+        return lines;
     }
 
-    // 超出：保留前 max_lines 行，末行腾出省略号宽度后补 `…`。
+    // 超出：保留前 max_lines 行，末行腾出省略号宽度后补 `…`（不继承高亮色）。
     lines.truncate(max_lines);
-    let last = lines.last_mut().unwrap();
     let limit = (budget - WIDE_W).max(WIDE_W);
+    let last = lines.last_mut().unwrap();
+    let mut kept: Vec<(String, bool)> = Vec::new();
     let mut w = 0.0f32;
-    let mut cut = last.len();
-    for (idx, ch) in last.char_indices() {
-        let cw = width_of(ch);
-        if w + cw > limit {
-            cut = idx;
+    let mut full = false;
+    for (text, hl) in last.iter() {
+        let mut cur = String::new();
+        for ch in text.chars() {
+            let cw = width_of(ch);
+            if w + cw > limit {
+                full = true;
+                break;
+            }
+            w += cw;
+            cur.push(ch);
+        }
+        if !cur.is_empty() {
+            kept.push((cur, *hl));
+        }
+        if full {
             break;
         }
-        w += cw;
     }
-    // 裁剪同理优先落在单词边界上（保留量不低于 60% 时才回退，
-    // 否则宁可硬断也别把最后一行弄得只剩一两个字符）。
-    let mut soft = 0usize;
-    let mut soft_w = 0.0f32;
-    let mut acc = 0.0f32;
-    for (idx, ch) in last.char_indices() {
-        if idx >= cut {
-            break;
-        }
-        acc += width_of(ch);
-        if breakable_after(ch) {
-            soft = idx + ch.len_utf8();
-            soft_w = acc;
+    // 去掉末段尾部空白，避免出现「字 …」的空隙。
+    if let Some((t, _)) = kept.last_mut() {
+        let len = t.trim_end().len();
+        t.truncate(len);
+        if t.is_empty() {
+            kept.pop();
         }
     }
-    if soft > 0 && soft_w >= limit * 0.6 {
-        cut = soft;
+    kept.push(("…".to_string(), false));
+    *last = kept;
+    lines
+}
+
+/// 把同高亮属性的相邻字符合并成一个片段。
+fn group_parts(chars: &[(char, bool)]) -> Vec<(String, bool)> {
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for &(c, hl) in chars {
+        match out.last_mut() {
+            Some((t, h)) if *h == hl => t.push(c),
+            _ => out.push((c.to_string(), hl)),
+        }
     }
-    let mut end = cut.min(last.len());
-    while end > 0 && !last.is_char_boundary(end) {
-        end -= 1;
-    }
-    last.truncate(end);
-    while last.ends_with(' ') || last.ends_with('\t') {
-        last.pop();
-    }
-    last.push('…');
-    lines.join("\n")
+    out
+}
+
+/// 浮层布局：先按格宽判断是否需要浮层（名字超过 3 行），需要时把框放宽到
+/// 1.4 倍尽量压到 4 行内，仍放不下就继续往下长。行分段与框宽由同一处算出，
+/// 保证高亮分段与真实换行位置一致。
+fn expand_layout(ui: &MainWindow, parts: &[(String, bool)]) -> (bool, f32, GridLines) {
+    let base_box = (ui.get_cell_w_out() as f32 - 8.0).max(24.0);
+    let cap = (ui.get_view_width() as f32 - 12.0).max(base_box);
+    let at_cell = grid_display_lines(parts, (base_box - 8.0).max(20.0), 64);
+    let needs = at_cell.len() > 3;
+    // 浮层固定 1.05 倍格宽，4 行放不下就继续往下长（不再逐级试探宽度，
+    // 否则宽度与切行容易对不上）。1.1 倍在超大图标视图下会被右侧滚动条挤到：
+    // 滚动条会吃掉末列右侧的 net gap，实际可用边距小于 min-gap。1.05 倍时
+    // 单侧只伸出 0.025 × item-w（xl 约 4.7px），滚动条占位也留得住。
+    let wide = (base_box * 1.05).min(cap);
+    let lines = grid_display_lines(parts, (wide - 8.0).max(20.0), 64);
+    (needs, wide, lines)
+}
+
+/// 纯文本版本（仅供单测断言用）。
+#[cfg(test)]
+fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
+    grid_display_lines(&[(name.to_string(), false)], width_px, max_lines)
+        .iter()
+        .map(|line| line.iter().map(|(t, _)| t.as_str()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn cell_metrics(ui: &MainWindow) -> (f32, f32) {
@@ -5541,6 +5764,9 @@ impl App {
         self.ui.invoke_set_drag_armed(false);
 
         // 超长名字直接截断到系统上限（截断后可能留下尾部空格，一并去掉）。
+        // 先把**原始输入**的码元数记下来：下面 new_name 会被重新绑定成截断后的
+        // 字符串，之后再拿它比较长度就永远相等，提示会永远不出现。
+        let raw_units = utf16_len(new_name.trim());
         let clamped = clamp_file_name(new_name.trim());
         let new_name = clamped.trim_end();
         if new_name.is_empty() {
@@ -5587,6 +5813,13 @@ impl App {
                     ));
                 }
                 self.reload_active();
+                // 名字被截到系统上限时明确告知用户：输入的名字与实际生效的不一致，
+                // 不说会让人以为改坏了。放在 reload 之后，避免被刷新的状态文案覆盖。
+                if raw_units > MAX_FILE_NAME_UNITS {
+                    self.set_status_job(format!(
+                        "名称超过 {MAX_FILE_NAME_UNITS} 个字符上限，已截断后重命名"
+                    ));
+                }
             }
             Err(e) => self.set_status_job(format!("重命名失败：{e}")),
         }
@@ -7696,7 +7929,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_file_name_debug(move |pane, info, name| {
             let Some(app) = app.upgrade() else { return };
-            let app = app.borrow();
+            // 纯诊断回调：重命名提交等路径会在持有可变借用时同步触发它，
+            // 拿不到借用就跳过（不能 borrow()，否则 RefCell 直接 panic）。
+            let Ok(app) = app.try_borrow() else { return };
             let n = name.to_string();
             let total = n.chars().count();
             let head: String = n.chars().take(14).collect();
@@ -7742,13 +7977,66 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
-        upgrade().on_file_rename_text_changed(move |_pane, text| {
+        upgrade().on_file_rename_text_changed(move |pane, text| {
             let Some(app) = app.upgrade() else { return };
+            // 输入达到系统上限（255 UTF-16 码元）时，直接按截断后的名字提交：
+            // 等效于「到上限即完成重命名」——既不回写文本（回写会让 TextInput
+            // 光标错位、把字插进扩展名内部），浮层也不会无限往下长。
+            if utf16_len(text.as_str()) > MAX_FILE_NAME_UNITS {
+                // 用块把共享借用限制在语句内：下面要 borrow_mut() 做提交，
+                // 直接写成一整行容易让人以为借用跨越了后续代码。
+                let path = {
+                    let shared = app.borrow();
+                    shared.ui.get_rename_path().to_string()
+                };
+                if path.is_empty() {
+                    return;
+                }
+                // 必须传**原始**超长文本：commit_rename 内部会调 clamp_file_name
+                // 截断，并把「截断前的码元数」用于状态栏提示。若在这里先截断再传，
+                // 那边的 raw_units 就永远 ≤ 上限，提示分支永远进不去。
+                // 同步提交：invoke_from_event_loop 要求 Send，而 App 是 Rc，用不了。
+                // 提交过程中会触发 name-debug 等只读诊断回调，它们已改成 try_borrow，
+                // 拿不到借用时直接跳过，不会与这里的可变借用冲突。
+                app.borrow_mut()
+                    .commit_rename(std::path::Path::new(&path), text.as_str());
+                return;
+            }
             let app = app.borrow();
-            let clamped = clamp_file_name(text.as_str());
-            if clamped.len() != text.len() {
-                app.ui.set_rename_text(clamped.as_str().into());
-                logv!("[rename] input clamped to {} units", MAX_FILE_NAME_UNITS);
+            // 不在输入过程中回写文本：Slint 的 TextInput 被外部改 text 后，
+            // 光标（按字符索引维护）会错位，用户继续输入就会插进扩展名内部，
+            // 表现为 `.mp4` 被插成 `.xmpx4`。TextInput 也没有 max-length 之类的
+            // 声明式限长属性，所以长度上限统一在提交时由 clamp_file_name()
+            // 处理（截断主名、保留扩展名），输入阶段不打断用户。
+            //
+            // 浮层行按输入框里的真实文本重算，保证与显示内容一致。
+            let width = app.ui.get_file_expand_box_w();
+            let box_w = if width > 1.0 {
+                width
+            } else {
+                (app.ui.get_cell_w_out() - 8.0).max(24.0)
+            };
+            let parts = vec![(text.to_string(), false)];
+            let lines = grid_display_lines(&parts, (box_w - 8.0).max(20.0), 64);
+            let model = ModelRc::new(VecModel::from(
+                lines
+                    .into_iter()
+                    .map(|line| GridLine {
+                        parts: ModelRc::new(VecModel::from(
+                            line.into_iter()
+                                .map(|(t, hl)| NamePart {
+                                    text: t.into(),
+                                    hl,
+                                })
+                                .collect::<Vec<_>>(),
+                        )),
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            if pane == 1 {
+                app.ui.set_file_expand_lines_right(model);
+            } else {
+                app.ui.set_file_expand_lines(model);
             }
         });
     }

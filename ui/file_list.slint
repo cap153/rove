@@ -1,4 +1,4 @@
-import { Theme, FileRow, HighlightName } from "common.slint";
+import { Theme, FileRow, GridLine, HighlightName } from "common.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
 
 // 可排序表头单元格（公共部分）。
@@ -215,74 +215,30 @@ export component FileList inherits Rectangle {
     in-out property <int> expand-index: -1;
     /// 该条目的完整名称（Slint 无法按索引读模型，由 Rust 直接给）。
     in-out property <string> expand-name: "";
+    /// 浮层名称的逐行高亮分段与框宽：都由 Rust 预算好，保证「高亮分段」与
+    /// 「实际换行位置」严格同源（Slint 侧测量无法与 Rust 的切行一致）。
+    in-out property <[GridLine]> expand-lines: [];
+    in-out property <length> expand-box-w: 0px;
 
     /// 只在中/大/超大图标视图生效；小图标视图（横排单行）保持原样。
-    /// 两个条件之一：正在重命名（必须有输入框），或常态下名字被截断（3 行装不下）。
-    /// 名字 3 行就能完整显示时，选中不弹浮层。
+    /// 是否需要浮层（名字超过 3 行）由 Rust 判定：只有那时才会给 expand-index。
     private property <bool> expand-active: root.is-icons-view
         && root.view-mode != "icons-small"
-        && root.expand-index >= 0
-        && (root.rename-path != "" || root.ex-needs);
+        && root.expand-index >= 0;
     private property <int> ex-col: Math.mod(max(0, root.expand-index), max(1, root.cells-per-row));
     private property <int> ex-row: floor(max(0, root.expand-index) / max(1, root.cells-per-row));
     private property <length> ex-item-x: root.cell-x(root.ex-col);
-    /// 框内文本：重命名中跟随输入，否则是完整文件名。
-    private property <string> ex-text: root.rename-path != "" ? root.rename-text : root.expand-name;
     /// 框的最小宽度（= 格子的可见宽，左右各留 4px 边距）
     private property <length> ex-cell-w: root.cell-w - 8px;
-    /// 格子内名字的真实文字宽度（行内边距左右各 4 + 布局左右各 4）
-    private property <length> ex-cell-text-w: max(20px, root.cell-w - 16px);
-    /// 先按**格子宽度**换行，量出需要多高
-    ex-measure-cell := Text {
-        visible: false;
-        text: root.ex-text;
-        font-size: 11.5px;
-        wrap: char-wrap;
-        width: root.ex-cell-text-w;
-    }
-    /// 常态下会不会被截断（超过 3 行才需要浮层）
-    private property <bool> ex-needs: ex-measure-cell.preferred-height > root.name-h + 1px;
-    /// 格子宽下 4 行（名字 3 行 + 容量 1 行）都装不下 → 才向外变宽
-    private property <bool> ex-wide: ex-measure-cell.preferred-height > root.text-h;
-
-    // 变宽候选宽度：按 **1.25 倍格宽**一级一级递增，取“刚好能装进 4 行”的最小宽度。
-    // 这样不会为了一个中等长的名字直接撑到整个窗格宽、变成孤零零的一行。
-    private property <length> ex-limit-w: max(root.ex-cell-w, root.width - 12px);
-    private property <length> ex-w1: min(root.ex-limit-w, root.ex-cell-w * 125 / 100);
-    private property <length> ex-w2: min(root.ex-limit-w, root.ex-cell-w * 150 / 100);
-    private property <length> ex-w3: min(root.ex-limit-w, root.ex-cell-w * 175 / 100);
-    private property <length> ex-w4: min(root.ex-limit-w, root.ex-cell-w * 200 / 100);
-    private property <length> ex-w5: min(root.ex-limit-w, root.ex-cell-w * 250 / 100);
-    ex-m-w1 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w1 - 8px; }
-    ex-m-w2 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w2 - 8px; }
-    ex-m-w3 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w3 - 8px; }
-    ex-m-w4 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w4 - 8px; }
-    ex-m-w5 := Text { visible: false; text: root.ex-text; font-size: 11.5px; wrap: char-wrap; width: root.ex-w5 - 8px; }
-
-    /// 宽度：默认就是格子宽；装不下才一级一级加宽。
-    private property <length> ex-box-w: !root.ex-wide ? root.ex-cell-w
-        : ex-m-w1.preferred-height <= root.text-h ? root.ex-w1
-        : ex-m-w2.preferred-height <= root.text-h ? root.ex-w2
-        : ex-m-w3.preferred-height <= root.text-h ? root.ex-w3
-        : ex-m-w4.preferred-height <= root.text-h ? root.ex-w4
-        : ex-m-w5.preferred-height <= root.text-h ? root.ex-w5
-        : root.ex-limit-w;
-    /// 按**最终框宽**重新量高：短名字就矮（不再固定 4 行），长名字继续往下长。
-    /// 框内文本宽 = 框宽 - 8（左右各 4px 内边距，与格子里文字同宽）。
-    ex-measure-box := Text {
-        visible: false;
-        text: root.ex-text;
-        font-size: 11.5px;
-        wrap: char-wrap;
-        width: root.ex-box-w - 8px;
-    }
-    /// 高度：变宽的浮层保持“四行块”的体型（不要变成孤零零的一行）；
-    /// 没变宽时按内容高，短名字就矮，内容超过四行则继续往下长。
+    /// 一行名称的高度（11.5px 字号实测），网格与浮层共用。
+    private property <length> line-h: fm-name-1.preferred-height;
+    /// 框宽由 Rust 与逐行分段一起算好：Slint 自己测量无法与 Rust 的切行对齐，
+    /// 对不上就会出现「高亮分段和实际换行位置错开」。
+    private property <length> ex-box-w: max(root.expand-box-w, 1px);
     /// 排查用：重命名中 = 1（字符串模板里不能嵌套引号比较，所以先算好）
     private property <int> ex-renaming: root.rename-path == "" ? 0 : 1;
-    private property <length> ex-box-h: root.ex-wide
-        ? max(root.text-h + 14px, ex-measure-box.preferred-height + 14px)
-        : max(ex-measure-box.preferred-height + 14px, 30px);
+    /// 高度按行数：短名字就矮，长名字继续往下长（至少 30px）。
+    private property <length> ex-box-h: max(root.expand-lines.length * root.line-h + 14px, 30px);
 
     /// 排查用：把“为什么截断 / 浮层为什么这样”的全部数字拼成一行。
     public function name-debug-info() -> string {
@@ -293,16 +249,12 @@ export component FileList inherits Rectangle {
             + " line-h=\{round(fm-name-1.preferred-height / 1px)} line-he=\{round(fm-name-1e.preferred-height / 1px)}"
             + " fit-lines=\{floor(root.name-h / max(1px, fm-name-1.preferred-height))}"
             + " size-h=\{round(root.size-line-h / 1px)} text-h=\{round(root.text-h / 1px)}"
-            + " text-w=\{round(root.ex-cell-text-w / 1px)} m3=\{round(fm-name-3.preferred-height / 1px)}"
+            + " m3=\{round(fm-name-3.preferred-height / 1px)}"
             + " m3e=\{round(fm-name-3e.preferred-height / 1px)} m1s=\{round(fm-size-1.preferred-height / 1px)}"
             + " idx=\{root.expand-index} renaming=\{root.ex-renaming}"
             + " expand-active=\{root.expand-active ? 1 : 0}"
-            + " expanded=\{root.expand-index >= 0 ? (root.row-expanded(root.expand-index) ? 1 : 0) : 0}"
-            + " need=\{root.ex-needs ? 1 : 0} wide=\{root.ex-wide ? 1 : 0}"
-            + " m-cell=\{round(ex-measure-cell.preferred-height / 1px)}"
-            + " need-lines=\{floor(ex-measure-cell.preferred-height / max(1px, fm-name-1.preferred-height))}"
-            + " box=\{round(root.ex-box-w / 1px)}x\{round(root.ex-box-h / 1px)}"
-            + " m-box=\{round(ex-measure-box.preferred-height / 1px)}";
+            + " expand-lines=\{root.expand-lines.length}"
+            + " box=\{round(root.ex-box-w / 1px)}x\{round(root.ex-box-h / 1px)}";
     }
     changed cell-h => { root.name-debug(root.name-debug-info(), root.expand-name); }
     // 单选目标变化也打一条：点击同一个文件时 expand-name 不变，旧触发点会漏日志。
@@ -313,12 +265,12 @@ export component FileList inherits Rectangle {
         }
     }
     changed rename-path => { root.name-debug(root.name-debug-info(), root.expand-name); }
-    /// 居中在格子上；最左列向右长，最右列向左长。
-    private property <length> ex-want-x: ex-col == 0
-        ? ex-item-x
-        : ex-col >= root.cells-per-row - 1
-            ? ex-item-x + root.cell-w - 8px - ex-box-w
-            : ex-item-x + (root.cell-w - 8px - ex-box-w) / 2;
+    /// 相对格子**居中**（含最左/最右列）。
+    /// 浮层宽 1.1 倍格宽，居中后每侧只向外伸出 0.05 × item-w；而网格的
+    /// min-gap 是 16px，三档视图 item-w 分别 88 / 124 / 188，伸出量最多
+    /// 9.4px < 16px，因此首末列也不会越界，无需再按列贴边。
+    private property <length> ex-want-x: ex-item-x + (root.item-w - ex-box-w) / 2;
+    /// 兜底夹取：窗口极窄（列数=1 且浮层比可视区还宽）时才生效。
     private property <length> ex-box-x: max(4px, min(ex-want-x, root.width - 4px - ex-box-w));
     private property <length> ex-box-y: flick.y + flick.content-y + ex-row * root.cell-h
         + 4px + root.cell-thumb + 3px;
@@ -1219,24 +1171,11 @@ export component FileList inherits Rectangle {
                     // 重命名不在这里渲染：中/大/超大图标的重命名输入框统一放到
                     // 列表最上层的“展开名称层”（见文件末尾），因为行内元素
                     // 无法盖到下一行上面，而需求是允许盖住邻居。
-                    if (!root.row-expanded(row.index) && row.name-parts.length > 0) : HighlightName {
-                        x: 0px;
-                        y: root.cell-thumb + 3px;
-                        width: 100%;
-                        height: root.name-h;
-                        parts: row.name-parts;
-                        font-size: 11.5px;
-                        is-dir: row.is-dir;
-                        align-top: true;
-                        horizontal-center: true;
-                    }
-                    // 常态名称：直接渲染 Rust 预算好的「最多 3 行 + 末行 …」文本。
-                    // 不用 overflow:elide / max-lines：文件名里的 ❀ 等装饰符号会触发
-                    // 字体回退让 Slint 多断一行，elide 按完整文本高度垂直定位时就会把
-                    // 首行整行裁掉。行数和省略号都由 Rust 定好，这里只负责从顶部逐行画。
-                    // 外层再加固定 3 行高 + clip：万一行宽估算失准、Slint 又换出第 4 行，
-                    // 也只是纵向多出的那行被裁掉，首行和水平方向的内容都不会被切。
-                    if (!root.row-expanded(row.index) && row.name-parts.length == 0) : Rectangle {
+                    // 名称区：Rust 已按格宽切好行、并保留搜索命中的高亮分段，
+                    // 这里逐行渲染即可（搜索态与常态共用同一条路径）。
+                    // 不用 Slint 的多行 Text / HighlightName：前者在 overflow:elide
+                    // 时会被 ❀ 等符号的字体回退弄丢首行，后者是单行组件。
+                    if (!root.row-expanded(row.index)) : Rectangle {
                         x: 0px;
                         y: root.cell-thumb + 3px;
                         width: 100%;
@@ -1244,20 +1183,23 @@ export component FileList inherits Rectangle {
                         clip: true;
                         background: transparent;
 
-                        Text {
+                        for line[i] in row.grid-lines : HorizontalLayout {
                             x: 0px;
-                            y: 0px;
+                            y: i * root.line-h;
                             width: 100%;
-                            height: self.preferred-height;
-                            text: row.grid-name;
-                            color: Theme.text-primary;
-                            font-size: 11.5px;
-                            font-weight: row.is-dir ? 500 : 400;
-                            horizontal-alignment: center;
-                            vertical-alignment: top;
-                            // 兜底：某行若真的比预算宽，宁可换行（多出的行由外层裁掉），
-                            // 也不要 no-wrap 那样把整行左右裁掉、连首行都缺字。
-                            wrap: char-wrap;
+                            height: root.line-h;
+                            spacing: 0px;
+                            alignment: center;
+
+                            for part in line.parts : Text {
+                                width: self.preferred-width;
+                                height: 100%;
+                                text: part.text;
+                                color: part.hl ? Theme.accent : Theme.text-primary;
+                                font-size: 11.5px;
+                                font-weight: row.is-dir ? 500 : 400;
+                                vertical-alignment: top;
+                            }
                         }
                     }
 
@@ -1518,23 +1460,34 @@ export component FileList inherits Rectangle {
                 }
             }
         }
-        // 单独选中时的纯文字浮层。不能加 overflow:elide：它会按「完整文本高度」
-        // 触发多行行数限制，把 4 行文本在固定高度里从底部截断，吞掉第一行
-        //（重命名用的 TextInput 没有 overflow，所以同尺寸下能完整显示 4 行）。
-        // 浮层高度 ex-box-h 本就按 ex-measure-box 实测内容高 + 14px 算出，
-        // 这里逐行从顶部画完即可，不需要再省略。
-        ex-display-text := Text {
-            visible: root.rename-path == "";
+        // 单独选中时的纯文字浮层：按 Rust 切好的行渲染，命中片段照常高亮。
+        // 不用单个 Text：富文本高亮必须拆成多个 Text，而多行 Text 在 elide
+        // 模式下会因 ❀ 等符号的字体回退把首行整行裁掉。
+        // `rename-path == ""` 与行无关，提到外层只判一次（原先每个行实例都判）。
+        if (root.rename-path == "") : Rectangle {
             x: 4px;
             y: 6px;
             width: parent.width - 8px;
             height: parent.height - 12px;
-            text: root.expand-name;
-            color: Theme.text-primary;
-            font-size: 11.5px;
-            horizontal-alignment: center;
-            vertical-alignment: top;
-            wrap: char-wrap;
+            background: transparent;
+
+            for line[i] in root.expand-lines : HorizontalLayout {
+                x: 0px;
+                y: i * root.line-h;
+                width: 100%;
+                height: root.line-h;
+                spacing: 0px;
+                alignment: center;
+
+                for part in line.parts : Text {
+                    width: self.preferred-width;
+                    height: 100%;
+                    text: part.text;
+                    color: part.hl ? Theme.accent : Theme.text-primary;
+                    font-size: 11.5px;
+                    vertical-alignment: top;
+                }
+            }
         }
     }
 }
