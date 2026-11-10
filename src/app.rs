@@ -478,6 +478,9 @@ pub struct App {
     drop_timer: Timer,
     /// 拖出待定手势：(按下时行局部 x, y, 待拖路径)。
     drag_pending: Option<(f32, f32, Vec<PathBuf>)>,
+    /// 框选基线：按下时若按住 Ctrl/Shift，记录当时的选择集作为累加底本；
+    /// None 表示普通替换式框选。预览与结束都基于它重算，矩形缩回时高亮也跟着缩回。
+    rubber_band_base: Option<HashSet<PathBuf>>,
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
     /// 切换标签时置位，屏蔽切换过程中 Slint 因内容高度变化自动 Clamp 而
@@ -637,6 +640,7 @@ impl App {
             dir_mtimes: HashMap::new(),
             drop_timer: Timer::default(),
             drag_pending: None,
+            rubber_band_base: None,
             size_sort_pending: false,
             list_geom: (-1.0, 0, -1.0, false),
             recording_shortcut: None,
@@ -5677,6 +5681,45 @@ impl App {
 // 选择与行交互
 // ---------------------------------------------------------------------------
 
+/// 框选命中计算用的列表几何：循环外读一次 UI 属性，避免每条目重复查询。
+struct RubberGeom {
+    is_icons: bool,
+    cells_per_row: usize,
+    row_h: f32,
+    cell_w: f32,
+    cell_h: f32,
+}
+
+impl RubberGeom {
+    fn read(ui: &MainWindow) -> Self {
+        let (cell_w, cell_h) = cell_metrics(ui);
+        Self {
+            is_icons: ui.get_is_icons_view_out(),
+            cells_per_row: ui.get_cells_per_row().max(1) as usize,
+            row_h: ui.get_row_height_out(),
+            cell_w,
+            cell_h,
+        }
+    }
+
+    /// 第 di 个条目的 AABB（绝对内容坐标）。
+    fn rect(&self, di: usize) -> (f32, f32, f32, f32) {
+        if self.is_icons {
+            let col = di % self.cells_per_row;
+            let row = di / self.cells_per_row;
+            (
+                col as f32 * self.cell_w + 4.0,
+                row as f32 * self.cell_h + 4.0,
+                self.cell_w - 8.0,
+                self.cell_h - 8.0,
+            )
+        } else {
+            // 列表视图横向全宽
+            (0.0, di as f32 * self.row_h, 5000.0, self.row_h)
+        }
+    }
+}
+
 #[cfg(windows)]
 fn key_down(vk: i32) -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState;
@@ -5753,6 +5796,14 @@ impl App {
                 let ctrl = key_down(VK_CONTROL);
                 let shift = key_down(VK_SHIFT);
                 let tab = self.state.active_mut().active_mut();
+                logv!(
+                    "[select] row down index={} ctrl={} shift={} anchor={:?} selected={}",
+                    index,
+                    ctrl,
+                    shift,
+                    tab.anchor.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()),
+                    tab.selection.len()
+                );
                 if ctrl {
                     if tab.selection.contains(&path) {
                         tab.selection.remove(&path);
@@ -5761,16 +5812,22 @@ impl App {
                     }
                     tab.anchor = Some(path);
                 } else if shift {
-                    if let Some(anchor) = tab.anchor.clone() {
-                        let anchor_pos = tab.display
+                    let anchor_pos = tab.anchor.clone().and_then(|anchor| {
+                        tab.display
                             .iter()
-                            .position(|&i| tab.entries.get(i).is_some_and(|e| e.path == anchor));
-                        if let Some(anchor_pos) = anchor_pos {
+                            .position(|&i| tab.entries.get(i).is_some_and(|e| e.path == anchor))
+                    });
+                    match anchor_pos {
+                        Some(anchor_pos) => {
                             let (lo, hi) = if anchor_pos <= index {
                                 (anchor_pos, index)
                             } else {
                                 (index, anchor_pos)
                             };
+                            logv!(
+                                "[select] shift range {}..={} (anchor={}, click={})",
+                                lo, hi, anchor_pos, index
+                            );
                             tab.selection.clear();
                             for di in lo..=hi {
                                 if let Some(e) = tab.display_entry(di) {
@@ -5778,10 +5835,14 @@ impl App {
                                 }
                             }
                         }
-                    } else {
-                        tab.selection.clear();
-                        tab.selection.insert(path.clone());
-                        tab.anchor = Some(path);
+                        None => {
+                            // 锚点已不在当前列表（换目录 / 排序变化 / 被过滤）：
+                            // 退化为单击并重设锚点，不能让 Shift 点击毫无反应。
+                            logv!("[select] shift without valid anchor, click={}", index);
+                            tab.selection.clear();
+                            tab.selection.insert(path.clone());
+                            tab.anchor = Some(path);
+                        }
                     }
                 } else {
                     tab.selection.clear();
@@ -6009,12 +6070,28 @@ impl App {
         }
         match event.button {
             PointerEventButton::Left => {
-                let tab = self.state.active_mut();
-                tab.active_mut().selection.clear();
-                tab.active_mut().anchor = None;
-                self.visible_cache = None;
-                self.refresh_visible_rows();
-                self.sync_status();
+                // 资源管理器语义：按住 Ctrl/Shift 起手时保留已有选择，
+                // 记下按下瞬间的选择集作为本轮框选的累加基线；
+                // 普通框选才清空（含单击空白取消选择）。
+                let additive = key_down(VK_CONTROL) || key_down(VK_SHIFT);
+                self.rubber_band_base = if additive {
+                    Some(self.state.active().active().selection.clone())
+                } else {
+                    None
+                };
+                logv!(
+                    "[select] rubber-band down additive={} base={}",
+                    additive,
+                    self.rubber_band_base.as_ref().map_or(0, |b| b.len())
+                );
+                if !additive {
+                    let tab = self.state.active_mut().active_mut();
+                    tab.selection.clear();
+                    tab.anchor = None;
+                    self.visible_cache = None;
+                    self.refresh_visible_rows();
+                    self.sync_status();
+                }
             }
             PointerEventButton::Right => {
                 let target = MenuScope::Background;
@@ -6025,115 +6102,122 @@ impl App {
         }
     }
 
-    /// 处理文件列表的框选。
-    fn handle_rubber_band_select(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
+    /// 矩形与条目的 AABB 命中集合（纯几何，是否成框由调用方判定）。
+    /// 背景 TouchArea 撑满 content-height，传来的 y 已是包含滚动偏移的绝对
+    /// 内容坐标（与单元格同一坐标系），无需再补 scroll_y。
+    fn rubber_band_hits(&self, x1: f32, y1: f32, x2: f32, y2: f32) -> HashSet<PathBuf> {
         let left = x1.min(x2);
         let right = x1.max(x2);
-
-        // 核心修复：背景 TouchArea 已撑满整个 content-height，传来的 y1/y2 已经是
-        // 包含滚动偏移的绝对内容坐标（与单元格 AABB 同一坐标系），无需再补 scroll_y，
-        // 否则越往下滚偏得越多（实测框选内容偏下）。
         let top = y1.min(y2);
         let bottom = y1.max(y2);
 
-        let is_icons = self.ui.get_is_icons_view_out();
-        let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
-        let row_h = self.ui.get_row_height_out();
-        let (cell_w, cell_h) = cell_metrics(&self.ui);
-
-        let tab = self.state.active_mut().active_mut();
-        let mut newly_selected = HashSet::new();
-
-        // 遍历当前的 display 列表（即视图中所有条目）
+        let geom = RubberGeom::read(&self.ui);
+        let tab = self.state.active().active();
+        let mut hits = HashSet::new();
         for di in 0..tab.display.len() {
-            let entry = match tab.display_entry(di) {
-                Some(e) => e,
-                None => continue,
-            };
-
-            // 计算单元格的绝对坐标 (y 包含滚动偏移，因为选框是在 flick 内部生成的)
-            let (ix, iy, iw, ih) = if is_icons {
-                let col = di % cells_per_row;
-                let row = di / cells_per_row;
-                let x = col as f32 * cell_w + 4.0;
-                let y = row as f32 * cell_h + 4.0;
-                (x, y, cell_w - 8.0, cell_h - 8.0)
-            } else {
-                let y = di as f32 * row_h;
-                (0.0, y, 5000.0, row_h) // 列表视图横向全宽
-            };
-
-            // AABB 碰撞检测 (AxisAlignment Bounding Box)
+            let Some(entry) = tab.display_entry(di) else { continue };
+            let (ix, iy, iw, ih) = geom.rect(di);
             if ix < right && ix + iw > left && iy < bottom && iy + ih > top {
-                newly_selected.insert(entry.path.clone());
+                hits.insert(entry.path.clone());
             }
         }
+        hits
+    }
 
-        tab.selection.extend(newly_selected);
-        tab.anchor = None; // 框选后取消按住锚点
-        self.visible_cache = None;
-        self.refresh_visible_rows();
-        self.sync_status();
+    /// 框选的「焦点项」，即后续 Shift 连续选择的锚点。
+    /// 起点落在条目上时用该条目（资源管理器把拖拽起点当焦点）；框选通常只能
+    /// 从空白起手，此时以框内显示顺序最靠前的条目为焦点，不受拖拽方向影响。
+    /// 例：框选 3/4/5 后 Shift 点 1，得到 1/2/3。
+    fn rubber_band_anchor(&self, x1: f32, y1: f32, hits: &HashSet<PathBuf>) -> Option<PathBuf> {
+        let geom = RubberGeom::read(&self.ui);
+        let tab = self.state.active().active();
+        let mut first: Option<PathBuf> = None;
+        for di in 0..tab.display.len() {
+            let Some(entry) = tab.display_entry(di) else { continue };
+            let (ix, iy, iw, ih) = geom.rect(di);
+            if ix <= x1 && x1 < ix + iw && iy <= y1 && y1 < iy + ih {
+                return Some(entry.path.clone());
+            }
+            if first.is_none() && hits.contains(&entry.path) {
+                first = Some(entry.path.clone());
+            }
+        }
+        first
+    }
+
+    /// 合并命中集与拖拽基线：Some(base) = 按住 Ctrl/Shift 的累加框选。
+    /// 始终以按下瞬间的选择为底，矩形缩回时预览高亮也会跟着缩回。
+    fn rubber_band_combine(&self, hits: &HashSet<PathBuf>) -> HashSet<PathBuf> {
+        match &self.rubber_band_base {
+            Some(base) => {
+                let mut s = base.clone();
+                s.extend(hits.iter().cloned());
+                s
+            }
+            None => hits.clone(),
+        }
+    }
+
+    /// 框选结束（每次抬手都会调用，包括误触与取消）。
+    fn handle_rubber_band_select(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
+        // 4px 以内视为点击 / 误触，或 UI 传零矩形表示 cancel：恢复按下前的选择。
+        let dragged = (x1 - x2).abs() > 4.0 || (y1 - y2).abs() > 4.0;
+        let hits = if dragged {
+            self.rubber_band_hits(x1, y1, x2, y2)
+        } else {
+            HashSet::new()
+        };
+        let new_selection = self.rubber_band_combine(&hits);
+        let anchor = if dragged {
+            self.rubber_band_anchor(x1, y1, &hits)
+        } else {
+            None
+        };
+        logv!(
+            "[select] rubber-band up dragged={} hits={} base={} anchor={:?}",
+            dragged,
+            hits.len(),
+            self.rubber_band_base.as_ref().map_or(0, |b| b.len()),
+            anchor.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string())
+        );
+        self.rubber_band_base = None;
+
+        let tab = self.state.active_mut().active_mut();
+        let changed = tab.selection != new_selection;
+        if changed {
+            tab.selection = new_selection;
+        }
+        if dragged {
+            // 成框后把焦点项留作 Shift 连续选择的锚点；框空时保留原锚点，
+            // 误触 / 取消则完全不动（Ctrl/Shift 基线会原样恢复）。
+            if let Some(anchor) = anchor {
+                tab.anchor = Some(anchor);
+            }
+        }
+        if changed {
+            self.visible_cache = None;
+            self.refresh_visible_rows();
+            self.sync_status();
+        }
     }
 
     /// 处理文件列表的实时框选（拖动过程中）。
     fn handle_rubber_band_move(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
         // 降级为 logv，避免高频刷屏
         logv!("[rubber-band] move x1={:.1}, y1={:.1}, x2={:.1}, y2={:.1}", x1, y1, x2, y2);
-
-        let left = x1.min(x2);
-        let right = x1.max(x2);
-
-        // 核心修复：同上，不再补偿 scroll_y，直接使用绝对内容坐标（避免框选偏下）。
-        let top = y1.min(y2);
-        let bottom = y1.max(y2);
-
-        let is_icons = self.ui.get_is_icons_view_out();
-        let cells_per_row = self.ui.get_cells_per_row().max(1) as usize;
-        let row_h = self.ui.get_row_height_out();
-        let (cell_w, cell_h) = cell_metrics(&self.ui);
-        let ctrl = key_down(VK_CONTROL);
-        let shift = key_down(VK_SHIFT);
-
-        let tab = self.state.active_mut().active_mut();
-        let mut newly_selected = HashSet::new();
-
-        for di in 0..tab.display.len() {
-            let entry = match tab.display_entry(di) {
-                Some(e) => e,
-                None => continue,
-            };
-
-            // 根据当前视图模式计算单元格的物理边界
-            let (ix, iy, iw, ih) = if is_icons {
-                let col = di % cells_per_row;
-                let row = di / cells_per_row;
-                let x = col as f32 * cell_w + 4.0;
-                let y = row as f32 * cell_h + 4.0;
-                (x, y, cell_w - 8.0, cell_h - 8.0)
-            } else {
-                let y = di as f32 * row_h;
-                (0.0, y, 5000.0, row_h)
-            };
-
-            // AABB 碰撞检测
-            if ix < right && ix + iw > left && iy < bottom && iy + ih > top {
-                newly_selected.insert(entry.path.clone());
-            }
-        }
-
-        // 计算最终的选择集
-        let new_selection = if ctrl || shift {
-            let mut s = tab.selection.clone();
-            s.extend(newly_selected);
-            s
+        let dragged = (x1 - x2).abs() > 4.0 || (y1 - y2).abs() > 4.0;
+        let hits = if dragged {
+            self.rubber_band_hits(x1, y1, x2, y2)
         } else {
-            newly_selected
+            HashSet::new()
         };
+        // 每次都基于按下瞬间的基线重算，而不是基于上一帧的选择集，
+        // 否则 Ctrl 框选会变成「涂抹」：曾经划过、后来缩回的项仍旧留着。
+        let new_selection = self.rubber_band_combine(&hits);
 
-        // 核心修复：仅当选择集发生变化时，才更新 UI。避免高频无效重绘导致卡顿
+        // 仅当选择集发生变化时才更新 UI，避免高频无效重绘导致卡顿。
+        let tab = self.state.active_mut().active_mut();
         if tab.selection != new_selection {
-            // 降级为 logv，避免高频刷屏
             logv!("[rubber-band] selection updated, count={}", new_selection.len());
             tab.selection = new_selection;
             self.visible_cache = None;

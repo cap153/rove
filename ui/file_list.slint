@@ -575,7 +575,7 @@ export component FileList inherits Rectangle {
                             root.sel-x2 = self.mouse-x;
                             root.sel-y2 = self.mouse-y;
                             root.is-selecting = true;
-                            // 让 Rust 清空旧选择
+                            // 让 Rust 记录 Ctrl/Shift 累加基线（普通框选则清空旧选择）
                             root.background-pointer-event(event, self.mouse-x, self.mouse-y);
                             return EventResult.accept;
                         } else if (event.button == PointerEventButton.right) {
@@ -598,9 +598,13 @@ export component FileList inherits Rectangle {
 
                     if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.is-selecting) {
                         root.is-selecting = false;
-                        // 仅在拖动了一定距离后才触发框选回调，避免误触
-                        if (abs(root.sel-x1 - root.sel-x2) > 4px || abs(root.sel-y1 - root.sel-y2) > 4px) {
+                        // 每次抬手都交给 Rust 收尾：由它按拖动距离判定是否成框，
+                        // 误触 / 取消时恢复按下前的选择（Ctrl/Shift 累加基线）。
+                        if (event.kind == PointerEventKind.up) {
                             root.rubber-band-selected(root.sel-x1, root.sel-y1, root.sel-x2, root.sel-y2);
+                        } else {
+                            // cancel：传零尺寸矩形，等价于撤销本轮框选。
+                            root.rubber-band-selected(root.sel-x1, root.sel-y1, root.sel-x1, root.sel-y1);
                         }
                         return EventResult.accept;
                     }
