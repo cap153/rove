@@ -21,7 +21,7 @@ use slint::{
     WindowSize,
 };
 
-use crate::config::{Config, ThemeChoice};
+use crate::config::{Config, QuickItem, ThemeChoice};
 use crate::fs::{
     self, DriveInfo, FileEntry, SortKey, SortState, icon_color, icon_text_for, list_drives,
     list_network_locations, list_network_places, quick_access_dirs, recycle_bin_stats,
@@ -466,6 +466,8 @@ pub struct App {
     sidebar_drag: Option<usize>,
     /// 侧栏网络位置拖拽：(行索引, 按下时的指针 y, 是否已移动)。
     network_drag: Option<(usize, f32, bool)>,
+    /// 侧栏「快速访问」拖拽，字段含义同 network_drag。
+    quick_drag: Option<(usize, f32, bool)>,
     /// 拖拽结束后的那次 clicked 要丢弃（否则拖完会顺带导航）。带时间上限，不会误吐下一次点击。
     suppress_sidebar_click: Option<std::time::Instant>,
     /// 正在编辑的网络位置（旧地址）；None 表示“添加”。
@@ -634,6 +636,7 @@ impl App {
             last_click: None,
             sidebar_drag: None,
             network_drag: None,
+            quick_drag: None,
             suppress_sidebar_click: None,
             network_edit_target: None,
             drop_buffer: Vec::new(),
@@ -2379,6 +2382,13 @@ impl App {
                 .wrapping_add(n.0.len() as u64)
                 .wrapping_add(n.1.len() as u64 * 3);
         }
+        // 快速访问的顺序本身就是要持久化的数据，纳入指纹避免重绘被短路。
+        for q in &self.config.quick_items {
+            fingerprint = fingerprint
+                .wrapping_mul(31)
+                .wrapping_add(q.id.bytes().map(|b| b as u64).sum::<u64>())
+                .wrapping_add(q.path.len() as u64);
+        }
         // 纳入 5 个分区的展开状态（任一状态切换均触发侧栏重绘）
         for exp in [
             self.config.quick_expanded,
@@ -2409,46 +2419,63 @@ impl App {
         const SIDEBAR_ICON_PX: u32 = 32;
 
         if self.config.quick_expanded {
-            for (label, id_suffix, dir) in quick_access_dirs() {
-                let Some(_dir) = dir else { continue };
-                // 回收站使用系统解析名，其余系统目录直接使用物理路径
+            // 顺序与条目全部来自持久化配置；系统项按 id 从 quick_access_dirs()
+            // 解析真实路径（含 OneDrive 回退），用户固定项直接用存下来的绝对路径。
+            let dirs = quick_access_dirs();
+            // 先克隆出局部列表：下面取图标的 thumb_for 需要 &mut self。
+            for q in self.config.quick_items.clone() {
+                let _path: PathBuf = if q.path.is_empty() {
+                    match dirs
+                        .iter()
+                        .find(|(_, key, _)| *key == q.id.as_str())
+                        .and_then(|(_, _, d)| d.clone())
+                    {
+                        Some(d) => d,
+                        // 系统目录不存在（或换了机器）：先不显示，但保留在配置里。
+                        None => continue,
+                    }
+                } else {
+                    PathBuf::from(&q.path)
+                };
+                let is_recycle = q.is_special();
                 #[cfg(windows)]
-                let icon_img = if label == "回收站" {
+                let icon_img = if is_recycle {
                     self.thumb_for(Path::new("shell:RecycleBinFolder"), None, 0, SIDEBAR_ICON_PX, true)
                 } else {
-                    self.thumb_for(&_dir, None, 0, SIDEBAR_ICON_PX, false)
+                    self.thumb_for(&_path, None, 0, SIDEBAR_ICON_PX, false)
                 };
                 #[cfg(not(windows))]
                 let icon_img = slint::Image::default();
 
-                let (color, icon) = match label {
-                    "桌面" => (Color::from_rgb_u8(0xE8, 0xB3, 0x3C), "桌"),
-                    "下载" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "下"),
-                    "图片" => (Color::from_rgb_u8(0x4C, 0x9F, 0x70), "图"),
-                    "文档" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "文"),
-                    "音乐" => (Color::from_rgb_u8(0xD9, 0x69, 0x4E), "乐"),
-                    "视频" => (Color::from_rgb_u8(0x8E, 0x6C, 0xC9), "视"),
-                _ => (Color::from_rgb_u8(0x8A, 0x8F, 0x98), "回"),
-            };
-            let detail = if label == "回收站" {
-                format!(
-                    "{} 项 · {}",
-                    stats.items,
-                    fs::format_size_bytes(stats.bytes.max(0) as u64)
-                )
-            } else {
-                String::new()
-            };
-            quick_items.push(SidebarItem {
-                id: format!("quick:{id_suffix}").into(),
-                label: label.into(),
-                detail: detail.into(),
-                kind: "quick".into(),
-                icon_color: color,
-                icon_text: icon.into(),
-                usage: -1.0,
-                icon: icon_img, // <-- 注入原生 Shell 图标
-            });
+                let (color, icon) = match q.id.as_str() {
+                    "desktop" => (Color::from_rgb_u8(0xE8, 0xB3, 0x3C), "桌"),
+                    "downloads" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "下"),
+                    "pictures" => (Color::from_rgb_u8(0x4C, 0x9F, 0x70), "图"),
+                    "documents" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "文"),
+                    "music" => (Color::from_rgb_u8(0xD9, 0x69, 0x4E), "乐"),
+                    "videos" => (Color::from_rgb_u8(0x8E, 0x6C, 0xC9), "视"),
+                    "recycle" => (Color::from_rgb_u8(0x8A, 0x8F, 0x98), "回"),
+                    _ => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "夹"),
+                };
+                let detail = if is_recycle {
+                    format!(
+                        "{} 项 · {}",
+                        stats.items,
+                        fs::format_size_bytes(stats.bytes.max(0) as u64)
+                    )
+                } else {
+                    String::new()
+                };
+                quick_items.push(SidebarItem {
+                    id: format!("quick:{}", q.id).into(),
+                    label: q.label.clone().into(),
+                    detail: detail.into(),
+                    kind: "quick".into(),
+                    icon_color: color,
+                    icon_text: icon.into(),
+                    usage: -1.0,
+                    icon: icon_img,
+                });
             }
         }
 
@@ -4609,9 +4636,24 @@ impl App {
             return;
         }
         if let Some(rest) = id.strip_prefix("quick:") {
-            if let Some((_, _, Some(dir))) =
-                quick_access_dirs().into_iter().find(|(_, key, _)| *key == rest)
-            {
+            let Some(q) = self
+                .config
+                .quick_items
+                .iter()
+                .find(|q| q.id == rest)
+                .cloned()
+            else {
+                return;
+            };
+            let dir = if !q.path.is_empty() {
+                Some(PathBuf::from(&q.path))
+            } else {
+                quick_access_dirs()
+                    .into_iter()
+                    .find(|(_, key, _)| *key == q.id.as_str())
+                    .and_then(|(_, _, d)| d)
+            };
+            if let Some(dir) = dir {
                 self.navigate_active(Some(dir));
             }
             return;
@@ -4630,10 +4672,15 @@ impl App {
         }
     }
 
-    /// 侧栏右键：分区标题「网络位置」弹添加框；已添加的网络位置弹编辑/删除菜单。
+    /// 侧栏右键：分区标题「网络位置」弹添加框；网络位置弹编辑/删除菜单；
+    /// 「快速访问」条目弹取消固定（特殊项置灰）。
     fn sidebar_right_clicked(&mut self, id: &str) {
         if id == "header:network" {
             self.open_network_dialog();
+            return;
+        }
+        if let Some(key) = id.strip_prefix("quick:") {
+            self.show_quick_item_menu(key);
             return;
         }
         let Some(path) = id.strip_prefix("net:") else {
@@ -4668,6 +4715,86 @@ impl App {
 
     #[cfg(not(windows))]
     fn show_network_item_menu(&mut self, _path: &str) {}
+
+    /// 「快速访问」条目右键菜单：取消固定。特殊项（回收站）置灰。
+    #[cfg(windows)]
+    fn show_quick_item_menu(&mut self, key: &str) {
+        let Some(entry) = self
+            .config
+            .quick_items
+            .iter()
+            .find(|q| q.id == key)
+            .cloned()
+        else {
+            return;
+        };
+        let nodes = vec![crate::sys::menu::MenuNode::Item {
+            key: format!("quick:unpin:{key}"),
+            label: "取消固定".to_string(),
+            enabled: !entry.is_special(),
+            checked: false,
+        }];
+        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false);
+    }
+
+    #[cfg(not(windows))]
+    fn show_quick_item_menu(&mut self, _key: &str) {}
+
+    /// 取消固定：只从侧栏移除，不动磁盘上的文件夹；特殊项不可移除。
+    fn unpin_quick_item(&mut self, key: &str) {
+        let before = self.config.quick_items.len();
+        self.config
+            .quick_items
+            .retain(|q| q.id != key || q.is_special());
+        if self.config.quick_items.len() == before {
+            return;
+        }
+        self.config.save();
+        self.sidebar_fingerprint = 0;
+        self.sync_sidebar();
+        self.set_status_job("已取消固定".to_string());
+    }
+
+    /// 把文件夹固定到侧栏「快速访问」；去重（含默认系统目录），返回新增条数。
+    fn pin_quick_folders(&mut self, paths: &[PathBuf]) -> usize {
+        let system_paths: Vec<String> = quick_access_dirs()
+            .into_iter()
+            .filter_map(|(_, _, d)| d)
+            .map(|d| d.to_string_lossy().into_owned())
+            .collect();
+        let mut added = 0;
+        for p in paths {
+            if !p.is_dir() || *p == fs::drives::recycle_virtual_path() {
+                continue;
+            }
+            let text = p.to_string_lossy().into_owned();
+            if system_paths.iter().any(|s| s.eq_ignore_ascii_case(&text))
+                || self
+                    .config
+                    .quick_items
+                    .iter()
+                    .any(|q| q.path.eq_ignore_ascii_case(&text))
+            {
+                continue;
+            }
+            let label = p
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| text.clone());
+            self.config.quick_items.push(QuickItem {
+                id: format!("pin:{text}"),
+                label,
+                path: text,
+            });
+            added += 1;
+        }
+        if added > 0 {
+            self.config.save();
+            self.sidebar_fingerprint = 0;
+            self.sync_sidebar();
+        }
+        added
+    }
 
     fn open_network_dialog(&mut self) {
         self.network_edit_target = None;
@@ -4876,6 +5003,106 @@ impl App {
                 self.config
                     .network_locations
                     .insert(slot.min(self.config.network_locations.len()), entry);
+                self.config.save();
+                self.sidebar_fingerprint = 0;
+                self.sync_sidebar();
+            }
+            _ => {}
+        }
+    }
+
+    /// 侧栏「快速访问」拖拽排序（含回收站；phase 与网络位置一致）。
+    /// 落点计算复用 `network_drop_slot`，顺序直接落到 `config.quick_items` 并保存。
+    fn sidebar_quick_drag(&mut self, index: usize, phase: i32, y_in_row: f32) {
+        let metrics = self.sidebar_row_metrics();
+        let Some(&(row_top, _)) = metrics.get(index) else {
+            return;
+        };
+        let pointer_y = row_top + y_in_row;
+        let model = self.ui.get_sidebar_items();
+        let rows: Vec<usize> = (0..model.row_count())
+            .filter(|i| {
+                model
+                    .row_data(*i)
+                    .map(|row| {
+                        row.kind == "quick"
+                            && self.config.quick_items.iter().any(|q| {
+                                q.id == row.id.strip_prefix("quick:").unwrap_or("")
+                            })
+                    })
+                    .unwrap_or(false)
+            })
+            .collect();
+
+        match phase {
+            0 => {
+                if rows.contains(&index) {
+                    self.quick_drag = Some((index, pointer_y, false));
+                }
+            }
+            1 => {
+                let Some((from, start_y, moved)) = self.quick_drag else {
+                    return;
+                };
+                if from != index {
+                    return;
+                }
+                let moved = moved || (pointer_y - start_y).abs() > 4.0;
+                self.quick_drag = Some((from, start_y, moved));
+                if !moved {
+                    return;
+                }
+                self.suppress_sidebar_click = Some(std::time::Instant::now());
+                let (_, indicator_y) = Self::network_drop_slot(&metrics, &rows, from, pointer_y);
+                self.ui.set_sidebar_drop_y(indicator_y);
+                self.ui.set_sidebar_drop_visible(true);
+            }
+            2 => {
+                self.ui.set_sidebar_drop_visible(false);
+                let Some((from, _, moved)) = self.quick_drag.take() else {
+                    return;
+                };
+                if from != index || !moved {
+                    return;
+                }
+                self.suppress_sidebar_click = Some(std::time::Instant::now());
+                let Some(row) = model.row_data(from) else { return };
+                let key = row.id.strip_prefix("quick:").unwrap_or("").to_string();
+                let Some(from_slot) = self.config.quick_items.iter().position(|q| q.id == key) else {
+                    return;
+                };
+                let (slot, _) = Self::network_drop_slot(&metrics, &rows, from, pointer_y);
+                // rows 只含当前显示的行；用落点对应的 id 反查配置里的插入位置，
+                // 避免某个系统目录因路径不存在被跳过时槽位错位。
+                let others: Vec<String> = rows
+                    .iter()
+                    .copied()
+                    .filter(|i| *i != from)
+                    .filter_map(|i| {
+                        model.row_data(i).map(|r| {
+                            r.id.strip_prefix("quick:").unwrap_or("").to_string()
+                        })
+                    })
+                    .collect();
+                let entry = self.config.quick_items.remove(from_slot);
+                let insert_at = if let Some(target) = others.get(slot) {
+                    self.config
+                        .quick_items
+                        .iter()
+                        .position(|q| &q.id == target)
+                        .unwrap_or(self.config.quick_items.len())
+                } else {
+                    others
+                        .last()
+                        .and_then(|last| {
+                            self.config.quick_items.iter().position(|q| &q.id == last)
+                        })
+                        .map(|p| p + 1)
+                        .unwrap_or(self.config.quick_items.len())
+                };
+                self.config
+                    .quick_items
+                    .insert(insert_at.min(self.config.quick_items.len()), entry);
                 self.config.save();
                 self.sidebar_fingerprint = 0;
                 self.sync_sidebar();
@@ -5185,6 +5412,13 @@ impl App {
             return;
         }
 
+        // 0.1 侧栏「快速访问」取消固定（不依赖文件选择）。
+        if let Some(key) = id.strip_prefix("quick:unpin:") {
+            let key = key.to_string();
+            self.unpin_quick_item(&key);
+            return;
+        }
+
         // 1. 视图模式切换（优先执行！不依赖选中的文件 target，杜绝工具栏调用被拦截）
         if let Some(mode) = id.strip_prefix("view:") {
             self.set_view_mode(mode);
@@ -5246,6 +5480,26 @@ impl App {
                             self.set_status_job(e);
                         }
                     }
+                    return;
+                }
+                "builtin.pin_quick" => {
+                    let dirs: Vec<PathBuf> = match &target {
+                        MenuScope::Selection(paths) => paths.clone(),
+                        MenuScope::Background => self
+                            .state
+                            .active()
+                            .active()
+                            .path
+                            .clone()
+                            .into_iter()
+                            .collect(),
+                    };
+                    let added = self.pin_quick_folders(&dirs);
+                    self.set_status_job(if added > 0 {
+                        format!("已固定 {added} 个文件夹到快速访问")
+                    } else {
+                        "文件夹已在快速访问中".to_string()
+                    });
                     return;
                 }
                 _ => {
@@ -6864,6 +7118,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut()
                 .sidebar_network_drag(index as usize, phase as i32, y);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_sidebar_quick_drag(move |index, phase, y| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut()
+                .sidebar_quick_drag(index as usize, phase as i32, y);
         });
     }
     {

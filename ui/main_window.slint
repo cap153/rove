@@ -351,6 +351,7 @@ out property <length> row-height-out: file-list.row-height-out;
     }
     callback sidebar_header_drag(index: int, phase: int, y: length);
     callback sidebar_network_drag(index: int, phase: int, y: length);
+    callback sidebar_quick_drag(index: int, phase: int, y: length);
     callback sidebar_item_activated(id: string);
     callback sidebar_item_right_clicked(id: string);
     /// 仅在用户拖拽结束时上报（落盘用）；窗口尺寸变化导致的被动收缩不上报。
@@ -1019,6 +1020,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                     network_drag(index, phase, y) => {
                         root.sidebar_network_drag(index, phase, y);
+                    }
+                    quick_drag(index, phase, y) => {
+                        root.sidebar_quick_drag(index, phase, y);
                     }
                     staging_item_removed(index) => {
                         root.staging_item_removed(index);

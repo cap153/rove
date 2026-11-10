@@ -56,6 +56,12 @@ pub struct Config {
     pub network_locations: Vec<NetworkLocation>,
     /// 是否已完成侧边栏宽度的历史数据修复（旧版 bug 会把被动挤压后的宽度落盘）。
     pub sidebar_width_repaired: bool,
+    /// 「快速访问」条目：**数组顺序就是显示顺序**，拖动排序、取消固定、固定新文件夹
+    /// 都直接改这个数组（与 `network_locations` 同一套持久化方式）。
+    pub quick_items: Vec<QuickItem>,
+    /// 是否已把新增的默认隐藏菜单项补进旧版 `context_menu_hide`。
+    /// 只补一次，之后用户在设置页删除这些项不会被启动逻辑强行加回来。
+    pub context_menu_hide_seeded: bool,
 }
 
 /// 侧边栏「网络位置」里的一条用户自定义项。
@@ -65,6 +71,45 @@ pub struct NetworkLocation {
     pub label: String,
     /// `\\host\share` 形式的地址。
     pub path: String,
+}
+
+/// 侧边栏「快速访问」里的一条。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct QuickItem {
+    /// 稳定标识：系统目录 "desktop"…"videos"、"recycle"；用户固定项 "pin:<路径>"。
+    pub id: String,
+    /// 侧边栏显示名。
+    pub label: String,
+    /// 空 = 系统项（含回收站，运行时由 `quick_access_dirs()` 解析路径）；
+    /// 非空 = 用户固定文件夹的绝对路径。
+    pub path: String,
+}
+
+impl QuickItem {
+    /// 特殊项：可拖动调位置，但不允许取消固定。
+    pub fn is_special(&self) -> bool {
+        self.id == "recycle"
+    }
+}
+
+/// 「快速访问」的默认条目与顺序（老配置没有 `quick_items` 字段时用这套）。
+pub fn default_quick_items() -> Vec<QuickItem> {
+    [
+        ("desktop", "桌面"),
+        ("downloads", "下载"),
+        ("pictures", "图片"),
+        ("documents", "文档"),
+        ("music", "音乐"),
+        ("videos", "视频"),
+        ("recycle", "回收站"),
+    ]
+    .iter()
+    .map(|(id, label)| QuickItem {
+        id: (*id).to_string(),
+        label: (*label).to_string(),
+        path: String::new(),
+    })
+    .collect()
 }
 
 /// 侧栏分区的默认顺序。
@@ -85,6 +130,8 @@ pub fn default_sidebar_order() -> Vec<String> {
 ///
 /// 前四条（复制/剪切/粘贴/刷新）是系统菜单里的标准命令：Rove 自己有同名的项，
 /// 系统的这几项拿进来用不了（剪贴板内容读不出、刷新不清缓存），必须默认藏掉。
+/// 「固定到快速访问」同理：系统那项固定到资源管理器，Rove 自己的动作固定到
+/// rove 侧边栏，两者语义不同，不能让用户误点。
 /// 用 `!` 精确匹配，避免连带藏掉「复制到文件夹」这类变体。
 /// 中英两份都列：系统语言不同时靠另一份生效。
 pub fn default_context_menu_hide() -> Vec<String> {
@@ -97,6 +144,8 @@ pub fn default_context_menu_hide() -> Vec<String> {
         "!剪切(T)",
         "!粘贴(P)",
         "!刷新(E)",
+        "!Pin to Quick access",
+        "!固定到快速访问",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -131,6 +180,8 @@ impl Default for Config {
             is_first_run: true,
             network_locations: Vec::new(),
             sidebar_width_repaired: false,
+            quick_items: default_quick_items(),
+            context_menu_hide_seeded: true,
         }
     }
 }
@@ -331,6 +382,55 @@ impl Config {
                 })
                 .collect();
         }
+        if let Some(arr) = json.get("quick_items").and_then(|v| v.as_array()) {
+            let mut unique: Vec<QuickItem> = Vec::new();
+            for v in arr {
+                let Some(id) = v.get("id").and_then(|s| s.as_str()).map(str::trim) else {
+                    continue;
+                };
+                if id.is_empty() {
+                    continue;
+                }
+                let path = v
+                    .get("path")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let label = v
+                    .get("label")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                let label = if label.is_empty() {
+                    // 用户固定项取路径末段，系统项退化为 id。
+                    path.rsplit(|c| c == '\\' || c == '/')
+                        .find(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| id.to_string())
+                } else {
+                    label
+                };
+                let item = QuickItem {
+                    id: id.to_string(),
+                    label,
+                    path,
+                };
+                if !unique.iter().any(|q| q.id == item.id) {
+                    unique.push(item);
+                }
+            }
+            // 特殊项（回收站）必须始终存在：可拖动排序，但不允许取消固定。
+            if !unique.iter().any(QuickItem::is_special) {
+                if let Some(recycle) = default_quick_items().into_iter().find(QuickItem::is_special) {
+                    unique.push(recycle);
+                }
+            }
+            if !unique.is_empty() {
+                config.quick_items = unique;
+            }
+        }
         config.sidebar_width_repaired = json
             .get("sidebar_width_repaired")
             .and_then(|v| v.as_bool())
@@ -342,6 +442,25 @@ impl Config {
             let mut fixed = config.clone();
             fixed.sidebar_width_repaired = true;
             fixed.save();
+        }
+        // 一次性升级：旧版 config 里的 `context_menu_hide` 会整体覆盖默认值，
+        // 新增的两条默认隐藏项对老安装不生效。只补一次，之后用户可自由增删。
+        config.context_menu_hide_seeded = json
+            .get("context_menu_hide_seeded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if !config.context_menu_hide_seeded {
+            for kw in ["!Pin to Quick access", "!固定到快速访问"] {
+                if !config
+                    .context_menu_hide
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(kw))
+                {
+                    config.context_menu_hide.push(kw.to_string());
+                }
+            }
+            config.context_menu_hide_seeded = true;
+            config.save();
         }
         config
     }
@@ -386,6 +505,12 @@ impl Config {
                 .map(|n| serde_json::json!({ "label": n.label, "path": n.path }))
                 .collect::<Vec<_>>(),
             "sidebar_width_repaired": self.sidebar_width_repaired,
+            "quick_items": self
+                .quick_items
+                .iter()
+                .map(|q| serde_json::json!({ "id": q.id, "label": q.label, "path": q.path }))
+                .collect::<Vec<_>>(),
+            "context_menu_hide_seeded": self.context_menu_hide_seeded,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);

@@ -19,6 +19,8 @@ export component Sidebar inherits Rectangle {
     callback header_drag(index: int, phase: int, y: length);
     /// 网络位置条目拖拽排序，参数含义同 header_drag。
     callback network_drag(index: int, phase: int, y: length);
+    /// 「快速访问」条目拖拽排序（含回收站），参数含义同 header_drag。
+    callback quick_drag(index: int, phase: int, y: length);
     in property <bool> drop-visible: false;
     in property <length> drop-y: 0px;
     callback staging_item_removed(index: int);
@@ -117,6 +119,13 @@ export component Sidebar inherits Rectangle {
                                 root.network_drag(i, 2, self.mouse-y);
                             }
                         }
+                        if (item.kind == "quick") {
+                            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                root.quick_drag(i, 0, self.mouse-y);
+                            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                root.quick_drag(i, 2, self.mouse-y);
+                            }
+                        }
                         if (event.button == PointerEventButton.right) {
                             // 右键菜单/弹窗等松开再弹（跟资源管理器一致）。
                             if (event.kind == PointerEventKind.up) {
@@ -132,6 +141,9 @@ export component Sidebar inherits Rectangle {
                         }
                         if (item.kind == "network" && self.pressed) {
                             root.network_drag(i, 1, self.mouse-y);
+                        }
+                        if (item.kind == "quick" && self.pressed) {
+                            root.quick_drag(i, 1, self.mouse-y);
                         }
                     }
                 }

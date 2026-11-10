@@ -234,6 +234,8 @@ mod tests {
             "剪切(T)",
             "粘贴(P)",
             "刷新(E)",
+            "Pin to Quick access",
+            "固定到快速访问",
         ] {
             assert!(
                 keyword_hit(&normalize_label(label), &kw),
@@ -241,7 +243,14 @@ mod tests {
             );
         }
         // 精确匹配：变体项不能跟着消失。
-        for label in ["Copy to folder", "复制到文件夹", "Paste shortcut", "刷新视图"] {
+        for label in [
+            "Copy to folder",
+            "复制到文件夹",
+            "Paste shortcut",
+            "刷新视图",
+            "Unpin from Quick access",
+            "取消固定到快速访问",
+        ] {
             assert!(
                 !keyword_hit(&normalize_label(label), &kw),
                 "默认项不能误伤 {label}"
