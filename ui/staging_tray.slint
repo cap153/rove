@@ -141,6 +141,14 @@ export component StagingTray inherits Rectangle {
                         border-radius: 4px;
                         background: item-ta.has-hover ? Theme.bg-hover : transparent;
 
+                        // 整行 TouchArea 必须先声明：Slint 里后声明的元素在上层，
+                        // 放到 HorizontalLayout 之后会把行内的 rm-ta 整个盖住，
+                        // 单项 × 就既收不到 clicked、has-hover 也恒为 false。
+                        item-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                        }
+
                         HorizontalLayout {
                             spacing: 6px;
                             padding-left: 4px;
@@ -180,12 +188,13 @@ export component StagingTray inherits Rectangle {
                                 height: 16px;
                                 y: (parent.height - 16px) / 2;
                                 border-radius: 4px;
-                                background: rm-ta.has-hover ? Theme.bg-hover : transparent;
+                                background: rm-ta.has-hover ? Theme.close-hover : transparent;
 
                                 IconClose {
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
                                     size: 8px;
+                                    icon-color: rm-ta.has-hover ? #FFFFFF : Theme.text-secondary;
                                 }
 
                                 rm-ta := TouchArea {
@@ -196,11 +205,6 @@ export component StagingTray inherits Rectangle {
                                     }
                                 }
                             }
-                        }
-
-                        item-ta := TouchArea {
-                            width: 100%;
-                            height: 100%;
                         }
                     }
                 }
@@ -299,10 +303,10 @@ export component StagingTray inherits Rectangle {
                     height: 28px;
                     y: (parent.height - self.height) / 2;
                     border-radius: 6px;
-                    background: (root.items.length > 0 && clear-ta.has-hover) ? Theme.bg-hover : transparent;
+                    background: (root.items.length > 0 && clear-ta.has-hover) ? Theme.close-hover : transparent;
                     Text {
                         text: "🗑";
-                        color: root.items.length > 0 ? Theme.text-secondary : Theme.text-disabled;
+                        color: root.items.length == 0 ? Theme.text-disabled : (clear-ta.has-hover ? #FFFFFF : Theme.text-secondary);
                         font-size: 12px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
@@ -377,10 +381,10 @@ export component StagingTray inherits Rectangle {
                     height: 28px;
                     width: 100%;
                     border-radius: 6px;
-                    background: (root.items.length > 0 && clear-ta-narrow.has-hover) ? Theme.bg-hover : transparent;
+                    background: (root.items.length > 0 && clear-ta-narrow.has-hover) ? Theme.close-hover : transparent;
                     Text {
                         text: "清空";
-                        color: root.items.length > 0 ? Theme.text-secondary : Theme.text-disabled;
+                        color: root.items.length == 0 ? Theme.text-disabled : (clear-ta-narrow.has-hover ? #FFFFFF : Theme.text-secondary);
                         font-size: 11.5px;
                         horizontal-alignment: center;
                         vertical-alignment: center;

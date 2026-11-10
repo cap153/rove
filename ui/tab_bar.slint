@@ -123,14 +123,17 @@ export component TabBar inherits Rectangle {
                                 height: 18px;
                                 y: (parent.height - 18px) / 2;
                                 border-radius: 4px;
-                                background: close-ta.has-hover ? Theme.bg-hover : transparent;
-                                opacity: (tab.active || ta.has-hover) ? 1.0 : 0.35;
+                                background: close-ta.has-hover ? Theme.close-hover : transparent;
+                                // 悬停关闭按钮时外层 ta.has-hover 未必成立，必须把
+                                // close-ta 也算进来，否则整个红底会被压到 35% 透明。
+                                opacity: (tab.active || ta.has-hover || close-ta.has-hover) ? 1.0 : 0.35;
 
                                 IconClose {
                                     x: (parent.width - self.width) / 2;
                                     y: (parent.height - self.height) / 2;
                                     size: 8px;
                                     stroke-width: 1.1px;
+                                    icon-color: close-ta.has-hover ? #FFFFFF : Theme.text-secondary;
                                 }
                             }
                         }
@@ -288,7 +291,7 @@ export component TabBar inherits Rectangle {
             Rectangle {
                 width: 46px;
                 height: parent.height;
-                background: close-win-ta.has-hover ? #E81123 : transparent;
+                background: close-win-ta.has-hover ? Theme.close-hover : transparent;
 
                 IconClose {
                     x: (parent.width - self.width) / 2;

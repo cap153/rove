@@ -179,6 +179,10 @@ export component MainWindow inherits Window {
     in-out property <string> rename-text: "";
     in-out property <[StagingItem]> staging-items: [];
     in-out property <bool> staging-expanded: true;
+    /// 展开/收起变化时上报给 Rust 落盘；启动时灌入同值会被 Rust 侧幂等挡掉。
+    changed staging-expanded => {
+        root.staging_expanded_changed(root.staging-expanded);
+    }
     in-out property <[BreadcrumbSegment]> breadcrumbs: [];
     in-out property <string> filter-text: "";
     in-out property <bool> can-go-back: false;
@@ -384,6 +388,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback staging_clear_requested();
     callback staging_copy_here_requested();
     callback staging_move_here_requested();
+    callback staging_expanded_changed(bool);
     callback filter_edited(text: string);
     callback new_folder_requested();
     callback refresh_requested();
@@ -490,6 +495,15 @@ out property <length> row-height-out: file-list.row-height-out;
     public function focus-search-box() {
         filter-input.focus-input();
         filter-input.select-all-text();
+    }
+
+    /// 进入地址栏编辑态（点击地址栏 / 「+」新建标签共用，Rust 可调）。
+    /// 必须先预填再置 true：if 块重建时输入框 init 会 focus + select-all，
+    /// 顺序反过来只会选中上一次编辑的残留文本。
+    public function begin-path-edit() {
+        // UNC 路径不能重拼（会吃掉前导反斜杠），直接取最后一段的原始 path。
+        root.path-edit-text = root.breadcrumbs.length > 0 ? join-crumbs(root.breadcrumbs) : "";
+        root.path-editing = true;
     }
 
     /// 拖拽悬停高亮：把命中的目标行索引暴露给 Rust（拖入/拖出悬停时设置）。
@@ -683,15 +697,8 @@ out property <length> row-height-out: file-list.row-height-out;
                             height: 100%;
                             mouse-cursor: text; // 悬停显示文本光标（与资源管理器一致）
                             clicked => {
-                                root.path-editing = true;
+                                root.begin-path-edit();
                                 root.crumb_edit_clicked(self.mouse-x, crumbs-flick.content-x);
-                                if (root.breadcrumbs.length > 0) {
-                                    let last = root.breadcrumbs[root.breadcrumbs.length - 1];
-                                    // 网络路径（\\\\服务器\\共享）不是文件系统路径，
-                                    // 用 PathBuf::join / to_string_lossy 会把开头的反斜杠吃掉，
-                                    // 变成 `192.168.1.5`。这里把各段的原始 path 直接接起来。
-                                    root.path-edit-text = join-crumbs(root.breadcrumbs);
-                                }
                             }
                             // 竖向滚轮映射为横向滚动（地址栏只会在横向上溢出）
                             scroll-event(event) => {
@@ -947,12 +954,13 @@ out property <length> row-height-out: file-list.row-height-out;
                             height: 16px;
                             y: (parent.height - 16px) / 2;
                             border-radius: 4px;
-                            background: filter-clear-ta.has-hover ? Theme.bg-hover : transparent;
+                            background: filter-clear-ta.has-hover ? Theme.close-hover : transparent;
 
                             IconClose {
                                 x: (parent.width - self.width) / 2;
                                 y: (parent.height - self.height) / 2;
                                 size: 8px;
+                                icon-color: filter-clear-ta.has-hover ? #FFFFFF : Theme.text-secondary;
                             }
 
                             filter-clear-ta := TouchArea {
@@ -1001,7 +1009,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     active-id: root.sidebar-active-id;
                     loading: root.file-loading;
                     staging-items: root.staging-items;
-                    staging-expanded: root.staging-expanded;
+                    // 双向绑定：托盘标题栏点击改的是内部 expanded，必须回流到
+                    // MainWindow 才能触发 changed 上报给 Rust 落盘。
+                    staging-expanded <=> root.staging-expanded;
                     drop-visible: root.sidebar-drop-visible;
                     drop-y: root.sidebar-drop-y;
                     item_activated(id) => {

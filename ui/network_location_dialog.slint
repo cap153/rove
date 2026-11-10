@@ -116,14 +116,14 @@ export component NetworkLocationDialog inherits Rectangle {
                     width: 24px;
                     height: 24px;
                     border-radius: 4px;
-                    background: close-ta.has-hover ? Theme.bg-hover : transparent;
+                    background: close-ta.has-hover ? Theme.close-hover : transparent;
 
                     IconClose {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
                         size: 9px;
                         stroke-width: 1.1px;
-                        icon-color: Theme.text-secondary;
+                        icon-color: close-ta.has-hover ? #FFFFFF : Theme.text-secondary;
                     }
 
                     close-ta := TouchArea {

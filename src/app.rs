@@ -511,6 +511,8 @@ pub struct App {
     shell_op_running: bool,
     /// 本轮操作里是否已经记过“按键被拦”的日志（避免长按回车刷屏）。
     shell_key_suppressed_logged: bool,
+    /// 回收站下暂存盘点「移动」：等删除任务成功后才清空暂存盘。
+    clear_staging_on_delete_success: bool,
     /// 待滚到可视区的条目索引（由 scroll_to_path 解析而来，在 refresh_visible_rows 里消费）。
     scroll_to_index: Option<usize>,
     /// 上次重建可见行时的列表几何 (list_height, cells_per_row, row_h, 图标视图)。
@@ -672,6 +674,7 @@ impl App {
             scroll_select: false,
             shell_op_running: false,
             shell_key_suppressed_logged: false,
+            clear_staging_on_delete_success: false,
             scroll_to_index: None,
             thumb_tx,
             thumb_prio_tx,
@@ -5265,6 +5268,24 @@ impl App {
             self.set_status_job("请先进入目标文件夹");
             return;
         };
+
+        // 回收站是虚拟目录，不能当普通目标目录交给 Shell（会得到错误码 123）。
+        // 复制没有语义，直接给友好提示；「移动」按资源管理器语义改为删除到回收站。
+        if dest == fs::drives::recycle_virtual_path() {
+            if !is_move {
+                self.set_status_job(
+                    "回收站不支持复制到此处；如需把这些文件放入回收站，请点「移动」",
+                );
+                return;
+            }
+            let paths: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
+            if self.submit_job(JobKind::Delete { paths, to_trash: true }) {
+                // 删除成功后才清空：用户取消确认框或删除失败时保留暂存盘内容以便重试。
+                self.clear_staging_on_delete_success = true;
+            }
+            return;
+        }
+
         let sources: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
         self.expect_new_entries(&sources, &dest);
         let kind = if is_move {
@@ -5841,12 +5862,15 @@ impl App {
         }
     }
 
-    fn submit_job(&mut self, kind: JobKind) {
+    /// 提交后台文件任务；返回是否真的提交成功（已有任务在进行时为 false）。
+    fn submit_job(&mut self, kind: JobKind) -> bool {
         self.shell_op_running = true;
         self.shell_key_suppressed_logged = false;
-        if !self.jobs.submit(kind) {
+        let ok = self.jobs.submit(kind);
+        if !ok {
             self.set_status_job("有任务正在进行，请稍候");
         }
+        ok
     }
 
     fn set_status_job(&self, message: impl Into<SharedString>) {
@@ -5896,6 +5920,14 @@ impl App {
             self.state.clipboard_paths.clear();
             self.state.cut_paths.clear();
             self.visible_cache = None;
+        }
+        // 回收站下暂存盘点「移动」：只有真正删除成功才清空暂存盘，
+        // 「删除已取消 / 删除失败」时保留内容，避免一次取消就丢掉整个暂存列表。
+        if self.clear_staging_on_delete_success {
+            self.clear_staging_on_delete_success = false;
+            if summary.failed == 0 && summary.message.starts_with("已删除") {
+                self.state.staging.clear();
+            }
         }
         self.sync_staging();
     }
@@ -7015,6 +7047,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.sync_active_tab();
             app.reload_active();
             app.ui.invoke_scroll_tabs_to_end();
+            // 「+」新建的标签默认进入地址栏编辑：sync_active_tab 会清编辑态，
+            // 所以必须放在整条链路最后。begin-path-edit 预填当前路径并自动聚焦全选。
+            app.ui.invoke_begin_path_edit();
         });
     }
     {
@@ -7447,6 +7482,20 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_staging_move_here_requested(move || {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut().staging_transfer(true);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        // 折叠/展开落到 config：启动时 set_staging_expanded 灌的是同值，
+        // 幂等判断会挡掉那次无谓的 save。
+        upgrade().on_staging_expanded_changed(move |expanded| {
+            let Some(app) = app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            if app.config.staging_expanded == expanded {
+                return;
+            }
+            app.config.staging_expanded = expanded;
+            app.config.save();
         });
     }
 
