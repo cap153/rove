@@ -2063,7 +2063,7 @@ impl App {
         self.ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
         // 标签数量/宽度变化会改变标题栏空白拖拽区，同步给命中测试钩子。
         #[cfg(windows)]
-        sync_drag_bounds(self);
+        sync_drag_bounds(self, "tabs");
         self.ui.set_active_tab(self.state.active_tab as i32);
         self.ui.set_tab_loading(self.state.active().active().loading);
         self.ui.set_settings_open(self.state.active().kind == crate::state::TabKind::Settings);
@@ -6568,9 +6568,12 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
             crate::sys::shell::set_owner_hwnd(hwnd);
             if !drag_hittest::is_installed(hwnd) {
                 drag_hittest::install(hwnd);
-                sync_drag_bounds(&app.borrow());
+                sync_drag_bounds(&app.borrow(), "install");
             }
         }
+        // 布局落定前 Slint 几何可能仍是 0；每 40ms 重取一次，
+        // 保证最终一定收敛到真实的 drag-spacer 边界（update 内部去重）。
+        sync_drag_bounds(&app.borrow(), "poll");
     }
 
     let mut app = app.borrow_mut();
@@ -6854,7 +6857,7 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd as _) != 0 };
                     app.ui.set_win_maximized(is_zoomed);
                 }
-                sync_drag_bounds(&app);
+                sync_drag_bounds(&app, "resize");
             }
             return EventResult::Propagate;
         }
@@ -7019,6 +7022,13 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_tab_activated(move |id| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
+            // 与 [nc-hit] 对照：有这行说明点击到了 Slint，没有则是被 HTCAPTION 吞了。
+            logv!(
+                "[tab] click id={} found={} active={}",
+                id,
+                app.state.tab_by_id(id as u32).is_some(),
+                app.state.active_tab
+            );
             if let Some(index) = app.state.tab_by_id(id as u32) {
                 app.state.active_tab = index;
                 app.sync_active_tab();
@@ -8322,7 +8332,7 @@ fn get_window_hwnd(ui: &MainWindow) -> Option<isize> {
 ///   链成自身而造成无限递归。
 #[cfg(windows)]
 mod drag_hittest {
-    use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
     /// 前一窗口过程（`SetWindowLongPtrW` 的返回值）。
     static PREV_WNDPROC: AtomicI64 = AtomicI64::new(0);
@@ -8339,23 +8349,53 @@ mod drag_hittest {
     static DRAG_SCALE: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
     /// 标签栏高度（逻辑像素）：仅纵向落在此范围内才可能是标题栏拖拽区。
     const TAB_BAR_H: f32 = 38.0;
+    /// 命中日志节流（毫秒）：鼠标移动时 WM_NCHITTEST 高频触发，别把日志刷爆。
+    static LAST_HIT_LOG_MS: AtomicU64 = AtomicU64::new(0);
 
     fn bits(v: &AtomicU32) -> f32 {
         f32::from_bits(v.load(Ordering::Relaxed))
     }
 
-    /// 更新拖拽区边界；值未变化则跳过写入（调用方可能在热路径上）。
-    pub fn update(x: f32, w: f32, scale: f32) {
+    /// 更新拖拽区边界；值未变化则跳过写入。返回本次是否真的改变，
+    /// 供调用方只在变化时打日志（poll_timer 每 40ms 都会来一次）。
+    pub fn update(x: f32, w: f32, scale: f32) -> bool {
         let (xb, wb, sb) = (x.to_bits(), w.to_bits(), scale.to_bits());
         if DRAG_X.load(Ordering::Relaxed) == xb
             && DRAG_W.load(Ordering::Relaxed) == wb
             && DRAG_SCALE.load(Ordering::Relaxed) == sb
         {
-            return;
+            return false;
         }
         DRAG_X.store(xb, Ordering::Relaxed);
         DRAG_W.store(wb, Ordering::Relaxed);
         DRAG_SCALE.store(sb, Ordering::Relaxed);
+        true
+    }
+
+    /// 标题栏命中诊断（ROVE_LOG=2）：标签被判成 HTCAPTION 时会直接留下坐标证据。
+    /// 高频逐次命中只在详细级输出，且距上一条 200ms 以上才写一行。
+    fn log_hit(
+        reason: &str,
+        lx: f32,
+        ly: f32,
+        scale: f32,
+        win_w: f32,
+        x: f32,
+        w: f32,
+        zoomed: bool,
+    ) {
+        if ly < 0.0 || ly > TAB_BAR_H || !crate::app::log_enabled(2) {
+            return;
+        }
+        let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
+        let last = LAST_HIT_LOG_MS.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < 200 {
+            return;
+        }
+        LAST_HIT_LOG_MS.store(now, Ordering::Relaxed);
+        logv!(
+            "[nc-hit] {reason} lx={lx:.1} ly={ly:.1} scale={scale:.2} win_w={win_w:.1} x={x:.1} w={w:.1} zoomed={zoomed}"
+        );
     }
 
     /// 窗口过程拦截。
@@ -8417,6 +8457,7 @@ mod drag_hittest {
             }
 
             let scale = bits(&DRAG_SCALE);
+            let (x, w) = (bits(&DRAG_X), bits(&DRAG_W));
             let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
             let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
             let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
@@ -8428,16 +8469,16 @@ mod drag_hittest {
             windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
             let win_w = (rect.right - rect.left) as f32 / scale;
             let win_h = (rect.bottom - rect.top) as f32 / scale;
+            let is_maximized = IsZoomed(hwnd as _) != 0;
 
             // 核心修复：右上角 172px（设置 36 + 最小化 44 + 最大化 44 + 关闭 46
             // = 170px + 2px 余量）为窗口控制按钮的绝对独占区。任何缩放或窗口
             // 尺寸下，只要落入此处 100% 回报 HTCLIENT，绝不允许被后面的标题栏
             // 拖拽判定吞成 HTCAPTION（窄窗口下按钮失灵的根因）。
             if (0.0..=TAB_BAR_H).contains(&ly) && lx >= win_w - 172.0 {
+                log_hit("CLIENT-controls", lx, ly, scale, win_w, x, w, is_maximized);
                 return HTCLIENT as isize;
             }
-
-            let is_maximized = IsZoomed(hwnd as _) != 0;
 
             if !is_maximized {
                 let border = 6.0;
@@ -8468,12 +8509,13 @@ mod drag_hittest {
             }
 
             // 非缩放边缘：判断是否在标题栏空白拖拽区（坐标已在上面转换好）。
-            let (x, w) = (bits(&DRAG_X), bits(&DRAG_W));
             if w > 0.0 {
                 if (0.0..=TAB_BAR_H).contains(&ly) && lx >= x && lx <= x + w {
+                    log_hit("CAPTION", lx, ly, scale, win_w, x, w, is_maximized);
                     return HTCAPTION as isize;
                 }
             }
+            log_hit("CLIENT", lx, ly, scale, win_w, x, w, is_maximized);
             return HTCLIENT as isize;
         }
         CallWindowProcW(prev, hwnd, msg, wparam, lparam)
@@ -8510,45 +8552,65 @@ mod drag_hittest {
     }
 }
 
-/// 估算单个标签的宽度（逻辑像素）。仅 Windows 的拖拽热区计算使用。
-///
 /// 把标题栏空白拖拽区边界同步给 Win32 命中测试钩子（仅 Windows）。
 ///
-/// 纯 Rust 计算，**不依赖 Slint 布局属性**：`drag-spacer` 的 `x`/`width`
-/// 由 `HorizontalLayout` 在布局期赋值，在窗口 realize 之前读出来恒为 0，
-/// 且读取时机与布局时序耦合，不可靠。这里按标签栏的真实结构反推，
-/// 并对两侧都留安全余量——宁可让热区晚几个像素开始，
-/// 也绝不能压到标签或窗口按钮上（那会把点击变成拖窗口）。
+/// 优先采用 Slint 布局算出的真实 `drag-spacer` 几何；旧版纯 Rust 估算只作
+/// 窗口未 realize 时的兜底。估算曾用 `window().size()/scale` 再 `.max(400.0)`，
+/// 而 `size()` 在 show() 刚返回或部分后端上为 0 → 窗口宽被当成 400 →
+/// 拖拽区起点落到第二个标签里，标签被回报为 HTCAPTION，点击全部失效。
+/// 现在窗口宽度改从 HWND 的 `GetClientRect` 取（物理像素，一定准确），
+/// 宽度为 0 时直接跳过本次更新，绝不再用假宽度覆盖上次的有效边界。
 #[cfg(windows)]
-fn sync_drag_bounds(app: &App) {
+fn sync_drag_bounds(app: &App, reason: &str) {
     let scale = app.ui.window().scale_factor() as f32;
-    // size() 是物理像素；窗口未 realize 时为 0，给个下限保证算式有意义。
-    let window_w = (app.ui.window().size().width as f32 / scale).max(400.0);
-
-    // 标签可视区宽度上限（与 tab_bar.slint 预留的 270px 严格对齐）
-    let max_tabs_w = (window_w - 270.0).max(0.0);
-    let mut tabs_w = 0.0f32;
-    for _ in &app.state.tabs {
-        tabs_w += 153.0; // 单标签 150px + 3px 间距
+    let mut physical_w = app.ui.window().size().width as f32;
+    if let Some(hwnd) = get_window_hwnd(&app.ui) {
+        let mut rect = windows_sys::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(
+                hwnd as windows_sys::Win32::Foundation::HWND,
+                &mut rect,
+            );
+        }
+        let w = (rect.right - rect.left) as f32;
+        if w > 0.0 {
+            physical_w = w;
+        }
     }
+    let window_w = physical_w / scale.max(0.01);
+    if window_w <= 0.0 {
+        logv!("[drag-bounds] skip ({reason}) window not realized yet, scale={scale:.2}");
+        return;
+    }
+
+    // 旧估算：仅作为 Slint 几何不可用时的兜底，并保留在日志中便于对比。
+    let max_tabs_w = (window_w - 270.0).max(0.0);
+    let tabs_w = app.state.tabs.len() as f32 * 153.0; // 单标签 150px + 3px 间距
     let actual_tabs_w = tabs_w.min(max_tabs_w);
+    let rust_x = 8.0 + actual_tabs_w + 3.0 + 28.0 + 4.0;
+    let rust_w = (window_w - 176.0 - rust_x).max(0.0);
 
-    // 拖拽起点 x = 8px 左边距 + 实际标签区宽度 + 3px 间隙 + 28px 新建按钮 + 4px 留白
-    let x = 8.0 + actual_tabs_w + 3.0 + 28.0 + 4.0;
-    let controls_start = window_w - 176.0;
-    let w = (controls_start - x).max(0.0);
+    // Slint 真实布局几何（`tab_bar.slint` 导出的 drag-x / drag-w）。
+    let slint_x = app.ui.get_drag_area_x() as f32;
+    let slint_w = app.ui.get_drag_area_w() as f32;
+    let (x, w, source) = if slint_w > 0.0 && slint_x > 0.0 {
+        (slint_x, slint_w, "slint")
+    } else {
+        (rust_x, rust_w, "rust-estimate")
+    };
 
-    // 诊断用（ROVE_LOG=2 才输出）：同时打印 Slint 侧取值，用于核实拖拽热区几何。
-    logv!(
-        "drag bounds: rust x={:.1} w={:.1} | slint x={:.1} w={:.1} | scale={:.2} win_w={:.1}",
-        x,
-        w,
-        app.ui.get_drag_area_x(),
-        app.ui.get_drag_area_w(),
-        scale,
-        window_w
-    );
-    drag_hittest::update(x, w, scale);
+    // 只在边界真的变化时输出（poll_timer 每 40ms 都会来一次），诊断细节放详细级。
+    if drag_hittest::update(x, w, scale) {
+        logv!(
+            "[drag-bounds] {reason} -> {source} x={x:.1} w={w:.1} | rust x={rust_x:.1} w={rust_w:.1} | slint x={slint_x:.1} w={slint_w:.1} | scale={scale:.2} physical_w={physical_w:.1} win_w={window_w:.1} tabs={}",
+            app.state.tabs.len()
+        );
+    }
 }
 
 /// 主显示器工作区（逻辑像素），用于把窗口尺寸钳制在屏幕内。
@@ -9100,7 +9162,7 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
             Some(_) => {}
             None => logv!("drag hittest: hwnd not ready after show(); will retry in poll_timer"),
         }
-        sync_drag_bounds(&app.borrow());
+        sync_drag_bounds(&app.borrow(), "show");
     }
 
     logln!("session created");
