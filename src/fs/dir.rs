@@ -281,6 +281,7 @@ pub fn test_entry(name: &str, is_dir: bool, size: u64) -> FileEntry {
     FileEntry {
         name: name.to_string(),
         path: Path::new(name).to_path_buf(),
+        original_path: None,
         is_dir,
         size,
         modified: None,

@@ -247,23 +247,46 @@ pub fn list_recycle_entries() -> Vec<super::entry::FileEntry> {
             .unwrap_or(0);
         // 原路径已不在磁盘上，目录/文件只能按扩展名推断。
         let is_dir = item.name.to_string_lossy().ends_with('/');
+        // from_path 只负责「显示值」：名称 / 扩展名 / 图标风格 / 类型文本。
         let mut entry = super::entry::FileEntry::from_path(&original, is_dir, size, modified, false);
         if is_dir {
             entry.name = name.trim_end_matches('/').to_string();
         }
+        // 身份键必须唯一：同一目录、不同时间删除的同名文件 original_path 完全
+        // 相同，拿它当 path 会让选择集 / 高亮 / 缩略图缓存把它们当成同一项。
+        // trash 的 id 是 Shell 条目的 desktop-absolute parsing name，逐条唯一。
+        // 原始路径保留下来供还原、彻底删除和「路径」列使用。
+        entry.original_path = Some(original);
+        entry.path = std::path::PathBuf::from(item.id.clone());
         entries.push(entry);
     }
     entries
 }
 
-/// 按原始路径还原回收站条目，成功返回还原数量。
-pub fn restore_recycle_entry(original: &std::path::Path) -> usize {
+/// 回收站条目的匹配键：唯一 Shell id 优先，也兼容仍传原始路径的调用
+/// （剪切→粘贴时剪贴板里保存的是原始路径）。
+fn trash_item_matches(item: &trash::TrashItem, key: &std::path::Path) -> bool {
+    std::path::Path::new(&item.id) == key || item.original_path().as_path() == key
+}
+
+/// 查回收站条目的删除前原始路径（还原前调用，用于判断是否还需要移到目标目录）。
+pub fn recycle_original_path(key: &std::path::Path) -> Option<std::path::PathBuf> {
+    trash::os_limited::list()
+        .ok()?
+        .iter()
+        .find(|it| trash_item_matches(it, key))
+        .map(|it| it.original_path())
+}
+
+/// 按唯一 id（或兼容的原始路径）还原回收站条目，成功返回还原数量。
+/// 按 id 命中只还原那一条，不会把同名条目一起还原。
+pub fn restore_recycle_entry(key: &std::path::Path) -> usize {
     let Ok(items) = trash::os_limited::list() else {
         return 0;
     };
     let targets: Vec<_> = items
         .into_iter()
-        .filter(|it| it.original_path() == original)
+        .filter(|it| trash_item_matches(it, key))
         .collect();
     let count = targets.len();
     if count > 0 && trash::os_limited::restore_all(targets).is_ok() {
@@ -281,14 +304,14 @@ pub fn empty_recycle_bin() -> bool {
     trash::os_limited::purge_all(items).is_ok()
 }
 
-/// 彻底删除回收站中指定原始路径的条目，返回成功数量。
-pub fn purge_recycle_entries(originals: &[std::path::PathBuf]) -> usize {
+/// 彻底删除回收站中指定的条目，返回成功数量。
+pub fn purge_recycle_entries(keys: &[std::path::PathBuf]) -> usize {
     let Ok(items) = trash::os_limited::list() else {
         return 0;
     };
     let targets: Vec<_> = items
         .into_iter()
-        .filter(|it| originals.iter().any(|p| p == &it.original_path()))
+        .filter(|it| keys.iter().any(|p| trash_item_matches(it, p.as_path())))
         .collect();
     if targets.is_empty() {
         return 0;

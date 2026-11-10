@@ -1027,6 +1027,26 @@ export component FileList inherits Rectangle {
                             source: row.thumb;
                             image-fit: contain;
                         }
+                        // 缩略图缺失（回收站 / 离线网络路径 / 系统图标过小）时，
+                        // 与详细视图一样退回彩色扩展名角标，避免空白格子。
+                        if (row.thumb.width <= 0) : Rectangle {
+                            width: 100%;
+                            height: 100%;
+                            border-radius: 6px;
+                            background: row.icon-color.transparentize(row.is-dir ? 0.82 : 0.84);
+
+                            Text {
+                                text: row.icon-text;
+                                color: row.icon-color;
+                                font-size: 11px;
+                                font-weight: 700;
+                                font-family: Theme.mono-font-family;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
+                        }
                     }
 
                     // 名称:搜索命中时高亮,否则普通 elide。
@@ -1126,6 +1146,29 @@ export component FileList inherits Rectangle {
                             height: 100%;
                             source: row.thumb;
                             image-fit: contain;
+                        }
+                        // 与详细/列表视图同一套兜底：拿不到缩略图时画居中的
+                        // 彩色扩展名角标。回收站条目原路径已不存在，系统图标
+                        // 降级又只有 32px，被尺寸门槛丢弃后就会走到这里。
+                        if (row.thumb.width <= 0) : Rectangle {
+                            x: (parent.width - min(72px, parent.width - 8px)) / 2;
+                            y: (parent.height - min(72px, parent.height - 8px)) / 2;
+                            width: min(72px, parent.width - 8px);
+                            height: min(72px, parent.height - 8px);
+                            border-radius: 10px;
+                            background: row.icon-color.transparentize(row.is-dir ? 0.82 : 0.84);
+
+                            Text {
+                                text: row.icon-text;
+                                color: row.icon-color;
+                                font-size: 18px;
+                                font-weight: 700;
+                                font-family: Theme.mono-font-family;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                                width: 100%;
+                                height: 100%;
+                            }
                         }
                     }
 

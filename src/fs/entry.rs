@@ -47,6 +47,10 @@ impl IconStyle {
 pub struct FileEntry {
     pub name: String,
     pub path: std::path::PathBuf,
+    /// 回收站条目的「删除前原始路径」，仅回收站条目有值。
+    /// `path` 是唯一身份键（Shell 条目 id），供选择集 / 高亮 / 缩略图缓存使用；
+    /// 这里只用于还原、彻底删除和「路径」列显示。
+    pub original_path: Option<std::path::PathBuf>,
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
@@ -99,6 +103,7 @@ impl FileEntry {
         Self {
             name,
             path: path.to_path_buf(),
+            original_path: None,
             is_dir,
             size,
             modified,
@@ -124,6 +129,7 @@ impl FileEntry {
         Self {
             name: format!("{label} ({}:)", drive.letter),
             path: std::path::PathBuf::from(format!("{}:\\", drive.letter)),
+            original_path: None,
             is_dir: true,
             size: drive.total_bytes,
             modified: None,
@@ -249,7 +255,14 @@ pub fn icon_text_for(entry: &FileEntry) -> String {
     } else {
         &entry.ext
     };
-    ext.chars().take(4).collect()
+    let text: String = ext.chars().take(4).collect();
+    // 名字里带括号/空格/多个点时 extension() 会把后半段误当扩展名，
+    // 这类乱码角标没有意义，留空只显示配色块。
+    if text.chars().all(|c| c.is_ascii_alphanumeric()) {
+        text
+    } else {
+        String::new()
+    }
 }
 
 /// 条目图标配色。

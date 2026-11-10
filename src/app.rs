@@ -3308,7 +3308,14 @@ impl App {
                 FileRow {
                     index,
                     name: entry.name.clone().into(),
-                    path: entry.path.to_string_lossy().into_owned().into(),
+                    // 「路径」列显示删除前的原始路径，而不是内部唯一 Shell id。
+                    path: entry
+                        .original_path
+                        .as_ref()
+                        .unwrap_or(&entry.path)
+                        .to_string_lossy()
+                        .into_owned()
+                        .into(),
                     is_dir: entry.is_dir,
                     is_hidden: entry.is_hidden,
                     size_text: if computer_view {
@@ -5384,8 +5391,10 @@ impl App {
         let is_recycle =
             self.state.active().active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path());
         if is_recycle {
-            // 回收站条目的物理文件在 $Recycle.Bin 下，原始路径在磁盘上不存在，
-            // 不向系统 CF_HDROP 写入死路径（避免 Shell 报错），由 Rove 内部接管。
+            // 回收站条目的 path 是唯一 Shell id，物理文件在 $Recycle.Bin 下，
+            // 不向系统 CF_HDROP 写入它（避免 Shell 报错），由 Rove 内部接管。
+            // 内部剪贴板同样存唯一 id：还原时按 id 精确命中，不会把同名
+            // 条目一起还原；需要原位置时再按需查询。
             self.state.clipboard_from_recycle = true;
             self.state.clipboard_paths = paths.clone();
             self.state.clipboard_operation = "move".into();
@@ -5458,8 +5467,12 @@ impl App {
 
             let mut restored = Vec::new();
             for p in &paths {
-                if fs::drives::restore_recycle_entry(p) > 0 {
-                    restored.push(p.clone());
+                // 先记下删除前的位置，再按唯一 id 精确还原这一条；
+                // 同名条目各有自己的 id，不会互相牵连。
+                if let Some(original) = fs::drives::recycle_original_path(p) {
+                    if fs::drives::restore_recycle_entry(p) > 0 {
+                        restored.push(original);
+                    }
                 }
             }
 
@@ -5469,6 +5482,7 @@ impl App {
             }
 
             // 还原位置与目标目录不一致的项目需要移动过去。
+            let restored_paths = restored.clone();
             let to_move: Vec<PathBuf> = restored
                 .into_iter()
                 .filter(|p| p.parent() != Some(dest.as_path()))
@@ -5482,7 +5496,7 @@ impl App {
                 });
             } else {
                 self.set_status_job(format!("已从回收站还原 {} 个项目到当前目录", paths.len()));
-                self.scroll_to_paths = paths.clone();
+                self.scroll_to_paths = restored_paths;
                 self.scroll_select = true;
                 self.reload_active();
             }
