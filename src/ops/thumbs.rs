@@ -255,7 +255,8 @@ pub fn get_system_icon(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
 fn get_system_icon_timed(path: &Path) -> (Option<(u32, u32, Vec<u8>)>, u128) {
     use windows::core::PCWSTR;
     use windows::Win32::Graphics::Gdi::{
-        DeleteObject, GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
+        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, DIB_RGB_COLORS,
     };
     use windows::Win32::UI::Shell::{
         SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
@@ -334,22 +335,36 @@ fn get_system_icon_timed(path: &Path) -> (Option<(u32, u32, Vec<u8>)>, u128) {
         }
 
         let hdc = GetDC(None);
+        // SHGFI_LARGEICON 返回的 HICON 颜色位图在高 DPI / 带大图标的 exe 上
+        // 未必是 32×32。硬按 32 调 GetDIBits 只会取到左上角一角，正是拖拽图
+        // 「缺一块」的来源；先查真实尺寸再按它读取。
+        let mut bmp = BITMAP::default();
+        let got = GetObjectW(
+            hbm.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut _ as *mut _),
+        );
+        let (bw, bh) = if got > 0 && bmp.bmWidth > 0 && bmp.bmHeight > 0 {
+            (bmp.bmWidth as u32, bmp.bmHeight as u32)
+        } else {
+            (size, size)
+        };
         let mut bmi = BITMAPINFO::default();
         bmi.bmiHeader = BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size as i32,
-            biHeight: -(size as i32),
+            biWidth: bw as i32,
+            biHeight: -(bh as i32),
             biPlanes: 1,
             biBitCount: 32,
             biCompression: 0,
             ..Default::default()
         };
-        let mut buf = vec![0u8; (size * size * 4) as usize];
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
         let lines = GetDIBits(
             hdc,
             hbm,
             0,
-            size,
+            bh,
             Some(buf.as_mut_ptr().cast()),
             &mut bmi,
             DIB_RGB_COLORS,
@@ -372,7 +387,7 @@ fn get_system_icon_timed(path: &Path) -> (Option<(u32, u32, Vec<u8>)>, u128) {
             px.swap(0, 2);
         }
         (
-            Some((size, size, buf)),
+            Some((bw, bh, buf)),
             pure_ms + tail_ms(),
         )
     }

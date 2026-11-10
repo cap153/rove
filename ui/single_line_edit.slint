@@ -53,6 +53,10 @@ export component SingleLineEdit inherits Rectangle {
     public function select-all-text() {
         input.select-all();
     }
+    /// 按 UTF-8 字节偏移选中一段文本（重命名时只选主名、不选扩展名）。
+    public function select-range(anchor: int, focus: int) {
+        input.set-selection-offsets(anchor, focus);
+    }
     public function clear-text-selection() {
         input.clear-selection();
     }

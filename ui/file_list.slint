@@ -80,6 +80,8 @@ export component FileList inherits Rectangle {
     /// 重命名输入框的当前文本（供“点击别处即提交”时取用）。
     /// Slint 无法从外部直接读取 for 循环内的 TextInput，所以由输入框自己同步到这里。
     in-out property <string> rename-text: "";
+    /// 重命名时主名的结束字节偏移；-1 表示全选（目录 / 无扩展名）。
+    in-out property <int> rename-select-end: -1;
     /// 目录读取中。
     in-out property <bool> loading: false;
     /// 拖拽悬停命中的行索引（-1 为无悬停）
@@ -778,7 +780,11 @@ export component FileList inherits Rectangle {
                                 // 必须先 focus 再 select-all：获得焦点会把光标重置到文末。
                                 let keep-y = flick.content-y;
                                 rename-input-details.focus-input();
-                                rename-input-details.select-all-text();
+                                if (root.rename-select-end > 0) {
+                                    rename-input-details.select-range(0, root.rename-select-end);
+                                } else {
+                                    rename-input-details.select-all-text();
+                                }
                                 // focus() 会触发 Slint 的自动 reveal 把滚动位置推走，
                                 // 这里立刻恢复，抵消那次自动滚动（同步，无闪烁）。
                                 flick.content-y = keep-y;
@@ -1076,7 +1082,11 @@ export component FileList inherits Rectangle {
                                 if (root.rename-path == row.path && root.view-mode == "icons-small") {
                                     let keep-y = flick.content-y;
                                     rename-input-icon-small.focus-input();
-                                    rename-input-icon-small.select-all-text();
+                                    if (root.rename-select-end > 0) {
+                                        rename-input-icon-small.select-range(0, root.rename-select-end);
+                                    } else {
+                                        rename-input-icon-small.select-all-text();
+                                    }
                                     flick.content-y = keep-y;
                                     root.rename-dbg("icon-timer", rename-input-icon-small.has-focus);
                                 }
@@ -1453,7 +1463,11 @@ export component FileList inherits Rectangle {
                     self.running = false;
                     if (root.rename-path != "") {
                         rename-input-expand.focus();
-                        rename-input-expand.select-all();
+                        if (root.rename-select-end > 0) {
+                            rename-input-expand.set-selection-offsets(0, root.rename-select-end);
+                        } else {
+                            rename-input-expand.select-all();
+                        }
                         root.rename-dbg("expand-timer", rename-input-expand.has-focus);
                     }
                 }

@@ -2739,6 +2739,22 @@ impl App {
         px
     }
 
+    /// OLE 拖拽图像的边长（物理像素）：与当前视图里图标的屏幕尺寸一致。
+    /// 与 `thumb_size_for_view` 的区别是 details/list —— 取图会超采样到 44，
+    /// 但列表里只显示 24 逻辑像素，拖拽图应跟显示尺寸而不是取图尺寸。
+    #[cfg(windows)]
+    fn drag_icon_px(&self) -> u32 {
+        let scale = self.ui.window().scale_factor() as f32;
+        let logical = match self.config.view_mode.as_str() {
+            "details" | "list" => 24.0,
+            "icons-xl" => 132.0,
+            "icons-large" => 88.0,
+            "icons-medium" => 60.0,
+            _ => crate::ops::thumbs::THUMB_SIZE as f32, // icons-small
+        };
+        (logical * scale).ceil() as u32
+    }
+
     #[cfg(windows)]
     fn thumb_for(
         &mut self,
@@ -5466,6 +5482,18 @@ impl App {
         self.ui
             .set_rename_path(path.to_string_lossy().into_owned().into());
         self.ui.set_rename_text(name.as_str().into());
+        // 只选主名，不选扩展名。-1 表示目录/无扩展名时全选。
+        // set-selection-offsets 用 UTF-8 字节偏移，rfind('.') 正是字节索引；
+        // 开头点（.gitignore）和末尾点都不算扩展名，与 clamp_file_name 同口径。
+        let stem_end = if path.is_dir() {
+            -1
+        } else {
+            match name.rfind('.') {
+                Some(i) if i > 0 && i + 1 < name.len() => i as i32,
+                _ => -1,
+            }
+        };
+        self.ui.set_rename_select_end(stem_end);
         self.arm_rename_scroll_guard();
         self.sync_expand_targets();
     }
@@ -6333,6 +6361,13 @@ impl App {
         let ui_weak = self.ui.as_weak();
         #[cfg(windows)]
         let scale = self.ui.window().scale_factor() as f32;
+        // 拖拽图像按当前视图图标的屏幕尺寸取图（dnd 模块不碰 Slint，尺寸由这里注入）。
+        #[cfg(windows)]
+        let icon_px = self.drag_icon_px();
+        // 非 Windows 上 ops::thumbs 整个模块被 cfg 掉，这里只给个占位值
+        //（dnd 的非 Windows 桩会忽略它）。
+        #[cfg(not(windows))]
+        let icon_px = 44u32;
 
         // 原生焦点框高亮（仅 Windows）：DrawFocusRect 对同一矩形二次绘制即为自擦除。
         #[cfg(windows)]
@@ -6358,7 +6393,7 @@ impl App {
         #[cfg(windows)]
         let last_idx: std::rc::Rc<std::cell::Cell<i32>> = std::rc::Rc::new(std::cell::Cell::new(-1));
 
-        let outcome = crate::sys::dnd::begin_drag_out(&paths, {
+        let outcome = crate::sys::dnd::begin_drag_out(&paths, icon_px, {
             #[cfg(windows)]
             let last_highlight_rect = last_highlight_rect.clone();
             #[cfg(windows)]
