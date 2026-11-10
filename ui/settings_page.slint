@@ -425,15 +425,6 @@ export component SettingsPage inherits Rectangle {
                         x: 16px;
                         width: parent.width - 32px;
                         height: parent.height;
-                        spacing: 10px;
-
-                        Text {
-                            text: nav.icon;
-                            color: nav.selected ? Theme.accent : Theme.text-secondary;
-                            font-size: 14px;
-                            vertical-alignment: center;
-                            width: 20px;
-                        }
 
                         Text {
                             text: nav.label;
@@ -1755,16 +1746,6 @@ export component SettingsPage inherits Rectangle {
                 }
             }
 
-            // ---- 其余未实现的子页占位提示 ----
-            if (root.page-title != "通用" && root.page-title != "搜索与索引" && root.page-title != "本地右键菜单" && root.page-title != "快捷键") : HorizontalLayout {
-                padding-right: 24px;
-                Text {
-                    text: "该设置页将在后续 Sprint 实现。";
-                    color: Theme.text-disabled;
-                    font-size: 12px;
-                    vertical-alignment: top;
-                }
-            }
         }
     }
 

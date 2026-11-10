@@ -7,9 +7,17 @@ export component TabBar inherits Rectangle {
     in-out property <int> active-tab: 0;
     in-out property <bool> loading: false;
 
+    // 标签拖动交换：拖动期间只更新这几个视觉状态，绝不重建 tabs 模型，
+    // 否则 Repeater 会销毁行实例、动画被中断。松手时由 Rust 一次性交换。
+    in property <int> drag-index: -1;  // 正在拖的标签（-1 = 无）
+    in property <int> drop-slot: -1;   // 目标位置（-1 = 无）
+    in property <bool> tab-drop-visible: false;
+
     callback tab_activated(id: int);
     callback tab_closed(id: int);
     callback new_tab_requested();
+    /// 拖动交换：phase 0 按下 / 1 拖动 / 2 松开，x 为行内局部横坐标。
+    callback tab_drag(index: int, phase: int, x: length);
 
     // 窗口控制（无边框标题栏整合，详见 main_window.slint 的 no-frame）。
     // 注意：窗口拖动不使用回调，改用下方原生 WindowMoveArea；
@@ -23,6 +31,18 @@ export component TabBar inherits Rectangle {
     public function scroll-to-end() {
         let total-w = root.tabs.length * 153px;
         tabs-flick.content-x = -max(0px, total-w - tabs-flick.width);
+    }
+
+    /// 把第 i 个标签滚进可视区（窄窗口打开/复用设置标签时用）。
+    public function scroll-to-index(i: int) {
+        let left = i * 153px;
+        let right = left + 150px;
+        let max-scroll = max(0px, root.tabs.length * 153px - tabs-flick.width);
+        if (left < -tabs-flick.content-x) {
+            tabs-flick.content-x = max(-max-scroll, min(0px, -left));
+        } else if (right > -tabs-flick.content-x + tabs-flick.width) {
+            tabs-flick.content-x = max(-max-scroll, min(0px, tabs-flick.width - right));
+        }
     }
 
     // 导出空白拖拽区的起止位置（供后端 WM_NCHITTEST 判定，见 app.rs drag_hittest）
@@ -66,7 +86,13 @@ export component TabBar inherits Rectangle {
                         height: 34px;
                         border-top-left-radius: 6px;
                         border-top-right-radius: 6px;
-                        background: tab.active ? Theme.bg-active-tab : (ta.has-hover ? Theme.bg-hover : transparent);
+                        background: tab.active ? Theme.bg-active-tab
+                            : (root.drop-slot == i && root.drag-index >= 0 ? Theme.bg-selected
+                            : (ta.has-hover ? Theme.bg-hover : transparent));
+                        animate background { duration: 120ms; easing: ease-out; }
+                        // 被拖起的标签淡出，配合落点竖线给出交换反馈。
+                        opacity: root.drag-index == i ? 0.55 : 1.0;
+                        animate opacity { duration: 120ms; easing: ease-out; }
 
                         Rectangle {
                             y: parent.height - 2px;
@@ -151,7 +177,18 @@ export component TabBar inherits Rectangle {
                                     root.tab_closed(tab.id);
                                     return EventResult.accept;
                                 }
+                                // 左键按下/松开上报拖动（与侧栏三阶段一致，中键关闭不受影响）。
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                    root.tab_drag(i, 0, self.mouse-x);
+                                } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                    root.tab_drag(i, 2, self.mouse-x);
+                                }
                                 return EventResult.reject;
+                            }
+                            moved => {
+                                if (self.pressed) {
+                                    root.tab_drag(i, 1, self.mouse-x);
+                                }
                             }
 
                             // 滚轮在标签上可直接左右平滑滚动
@@ -176,6 +213,17 @@ export component TabBar inherits Rectangle {
                             }
                         }
                     }
+                }
+                // 落点竖线：随目标标签平滑滑动，作为交换动画的视觉反馈。
+                if (root.tab-drop-visible) : Rectangle {
+                    x: root.drop-slot * 153px - 1.5px;
+                    y: 2px;
+                    width: 3px;
+                    height: parent.height - 4px;
+                    border-radius: 1.5px;
+                    background: Theme.accent;
+                    z: 10;
+                    animate x { duration: 120ms; easing: ease-out; }
                 }
             }
         }

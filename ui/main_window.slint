@@ -208,6 +208,10 @@ export component MainWindow inherits Window {
     /// 侧栏分区拖拽排序指示器（Rust 计算落点）。
     in-out property <bool> sidebar-drop-visible: false;
     in-out property <length> sidebar-drop-y: 0px;
+    /// 标签拖动交换的视觉状态（Rust 计算，透传给 TabBar）。
+    in-out property <int> tab-drag-index: -1;
+    in-out property <int> tab-drop-slot: -1;
+    in-out property <bool> tab-drop-visible: false;
     /// 文件列表可视高度（Rust 只读，用于虚拟窗口计算；由 FileList 绑定）。
     in-out property <length> list-height;
 /// 视图模式（Pulse 式视图切换）。直通 FileList。
@@ -326,6 +330,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback new_tab_requested();
     callback tab_activated(id: int);
     callback tab_closed(id: int);
+    callback tab_drag(index: int, phase: int, x: length);
 
     // 窗口控制（无边框标题栏）：由 TabBar 右侧按钮触发；
     // 窗口移动不使用回调，TabBar 内直接用原生 WindowMoveArea。
@@ -441,6 +446,10 @@ out property <length> row-height-out: file-list.row-height-out;
         tab-bar.scroll-to-end();
     }
 
+    public function scroll_tabs_to_index(i: int) {
+        tab-bar.scroll-to-index(i);
+    }
+
     /// 文件列表行命中测试（外部拖入定位目标文件夹，Rust 调用）。
     public function row-hit-test(wx: length, wy: length) -> int {
         file-list.row-hit-test(wx - file-list.absolute-position.x, wy - file-list.absolute-position.y);
@@ -529,6 +538,10 @@ out property <length> row-height-out: file-list.row-height-out;
             tabs: root.tabs;
             active-tab: root.active-tab;
             loading: root.tab-loading;
+            drag-index: root.tab-drag-index;
+            drop-slot: root.tab-drop-slot;
+            tab-drop-visible: root.tab-drop-visible;
+            tab_drag(index, phase, x) => { root.tab_drag(index, phase, x); }
             tab_activated(id) => {
                 root.clear-all-focus();
                 root.tab_activated(id);

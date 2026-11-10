@@ -12,7 +12,6 @@ pub enum SettingsSubpage {
     SearchAndIndex,
     ContextMenu,
     Shortcuts,
-    Duplicates,
 }
 
 impl Default for SettingsSubpage {
@@ -362,7 +361,6 @@ impl TabState {
                 SettingsSubpage::SearchAndIndex => "搜索与索引".to_string(),
                 SettingsSubpage::ContextMenu => "本地右键菜单".to_string(),
                 SettingsSubpage::Shortcuts => "快捷键".to_string(),
-                SettingsSubpage::Duplicates => "重复文件".to_string(),
             };
         }
         match &self.panes[self.active_pane].path {

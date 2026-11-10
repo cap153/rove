@@ -468,6 +468,10 @@ pub struct App {
     network_drag: Option<(usize, f32, bool)>,
     /// 侧栏「快速访问」拖拽，字段含义同 network_drag。
     quick_drag: Option<(usize, f32, bool)>,
+    /// 顶部标签拖动交换：(起始索引, 按下时的内容 x, 是否已移动)。
+    tab_drag: Option<(usize, f32, bool)>,
+    /// 标签拖动松手后那次补发的 clicked 要丢弃，避免误切标签。
+    suppress_tab_click: Option<std::time::Instant>,
     /// 拖拽结束后的那次 clicked 要丢弃（否则拖完会顺带导航）。带时间上限，不会误吐下一次点击。
     suppress_sidebar_click: Option<std::time::Instant>,
     /// 正在编辑的网络位置（旧地址）；None 表示“添加”。
@@ -639,6 +643,8 @@ impl App {
             sidebar_drag: None,
             network_drag: None,
             quick_drag: None,
+            tab_drag: None,
+            suppress_tab_click: None,
             suppress_sidebar_click: None,
             network_edit_target: None,
             drop_buffer: Vec::new(),
@@ -4053,6 +4059,10 @@ impl App {
         self.sync_file_list();
         self.sync_status();
         self.sync_settings();
+        // 窄窗口 + 多标签时，设置标签（新建在末尾或复用在中间）可能落在视口外；
+        // 按当前活动标签索引滚进可视区，而不是无条件滚到最右端。
+        self.ui
+            .invoke_scroll_tabs_to_index(self.state.active_tab as i32);
     }
 
     /// 保存当前 actions 并重新加载（合并内置动作、校验自定义命令）。
@@ -4204,39 +4214,29 @@ impl App {
             SettingsNavItem {
                 id: "general".into(),
                 label: "通用".into(),
-                icon: "⚙".into(),
                 selected: current == SettingsSubpage::General,
             },
             SettingsNavItem {
                 id: "search".into(),
                 label: "搜索与索引".into(),
-                icon: "⌕".into(),
                 selected: current == SettingsSubpage::SearchAndIndex,
             },
             SettingsNavItem {
                 id: "context".into(),
                 label: "本地右键菜单".into(),
-                icon: "☰".into(),
                 selected: current == SettingsSubpage::ContextMenu,
             },
             SettingsNavItem {
                 id: "shortcuts".into(),
                 label: "快捷键".into(),
-                icon: "⌨".into(),
                 selected: current == SettingsSubpage::Shortcuts,
-            },
-            SettingsNavItem {
-                id: "duplicates".into(),
-                label: "重复文件".into(),
-                icon: "◫".into(),
-                selected: current == SettingsSubpage::Duplicates,
             },
         ];
         self.ui.set_settings_nav_items(ModelRc::new(VecModel::from(nav_items)));
         // 向设置页「通用」开关灌入当前状态。
         self.ui.set_show_hidden(self.config.show_hidden);
 
-        // 子页标题 / 描述 / 新增入口（未实现子页显示占位提示）。
+        // 子页标题 / 描述 / 新增入口。
         let (title, desc, show_add) = match current {
             SettingsSubpage::General => ("通用", "应用启动、视图与行为偏好。", false),
             SettingsSubpage::SearchAndIndex => ("搜索与索引", "拼音检索、索引范围与缓存策略。", false),
@@ -4250,7 +4250,6 @@ impl App {
                 "点击按键芯片即可录制新快捷键；修改会自动保存，支持单项或全部恢复默认。",
                 false,
             ),
-            SettingsSubpage::Duplicates => ("重复文件", "重复项扫描规则与清理策略。", false),
         };
         self.ui.set_settings_page_title(title.into());
         self.ui.set_settings_page_desc(desc.into());
@@ -5109,6 +5108,76 @@ impl App {
                 self.config.save();
                 self.sidebar_fingerprint = 0;
                 self.sync_sidebar();
+            }
+            _ => {}
+        }
+    }
+
+    /// 顶部标签拖拽插入排序（phase：0 按下 / 1 拖动 / 2 松开，x 为行内局部横坐标）。
+    /// 拖动期间只更新 Slint 的视觉状态，不重建 tabs 模型，落点线的滑动、
+    /// 被拖标签淡出、目标标签高亮才能连续播放；松手才真正重排。
+    fn tab_drag(&mut self, index: usize, phase: i32, x_in_row: f32) {
+        let n = self.state.tabs.len();
+        if index >= n {
+            return;
+        }
+        // 标签宽 150px + 间距 3px。mouse-x 是相对行元素的局部坐标，
+        // 行本身不移动，所以无需补偿 Flickable 的 content-x。
+        let pointer_x = index as f32 * 153.0 + x_in_row;
+        let slot_of = |px: f32| -> usize {
+            ((px / 153.0).floor() as isize)
+                .clamp(0, n.saturating_sub(1) as isize) as usize
+        };
+
+        match phase {
+            0 => {
+                self.tab_drag = Some((index, pointer_x, false));
+            }
+            1 => {
+                let Some((from, start_x, moved)) = self.tab_drag else {
+                    return;
+                };
+                if from != index {
+                    return;
+                }
+                let moved = moved || (pointer_x - start_x).abs() > 4.0;
+                self.tab_drag = Some((from, start_x, moved));
+                if !moved {
+                    return;
+                }
+                // 松手补发的 clicked 有可能早于 up，一移动就置位。
+                self.suppress_tab_click = Some(std::time::Instant::now());
+                self.ui.set_tab_drag_index(from as i32);
+                self.ui.set_tab_drop_slot(slot_of(pointer_x) as i32);
+                self.ui.set_tab_drop_visible(true);
+            }
+            2 => {
+                let Some((from, _, moved)) = self.tab_drag.take() else {
+                    return;
+                };
+                self.ui.set_tab_drop_visible(false);
+                self.ui.set_tab_drag_index(-1);
+                self.ui.set_tab_drop_slot(-1);
+                if from != index || !moved {
+                    return;
+                }
+                self.suppress_tab_click = Some(std::time::Instant::now());
+                let to = slot_of(pointer_x);
+                if to == from || to >= self.state.tabs.len() {
+                    return;
+                }
+                // 拖拽插入：先摘出被拖标签，再插到目标槽位，其余标签依次顺移。
+                // 不是两两对调——[A,B,C,D] 把 A 拖到 C 的位置应得到 [B,C,A,D]。
+                let active_id = self.state.tabs[self.state.active_tab].id;
+                let entry = self.state.tabs.remove(from);
+                let at = to.min(self.state.tabs.len());
+                self.state.tabs.insert(at, entry);
+                // active_tab 是索引：记住稳定 id，重排后按 id 反查，避免指错标签。
+                self.state.active_tab = self
+                    .state
+                    .tab_by_id(active_id)
+                    .unwrap_or(self.state.active_tab);
+                self.sync_tabs();
             }
             _ => {}
         }
@@ -7057,6 +7126,12 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_tab_activated(move |id| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
+            // 拖动交换松手会补发一次 clicked，丢弃它（400ms 上限，不误伤下次点击）。
+            if let Some(at) = app.suppress_tab_click.take() {
+                if at.elapsed() < std::time::Duration::from_millis(400) {
+                    return;
+                }
+            }
             // 与 [nc-hit] 对照：有这行说明点击到了 Slint，没有则是被 HTCAPTION 吞了。
             logv!(
                 "[tab] click id={} found={} active={}",
@@ -7086,6 +7161,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 drop(app);
                 schedule_destroy();
             }
+        });
+    }
+
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_tab_drag(move |index, phase, x| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().tab_drag(index as usize, phase as i32, x);
         });
     }
 
@@ -7556,7 +7639,6 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 "search" => crate::state::SettingsSubpage::SearchAndIndex,
                 "context" => crate::state::SettingsSubpage::ContextMenu,
                 "shortcuts" => crate::state::SettingsSubpage::Shortcuts,
-                "duplicates" => crate::state::SettingsSubpage::Duplicates,
                 _ => crate::state::SettingsSubpage::General,
             };
             app.state.active_mut().settings_subpage = subpage;
