@@ -12,6 +12,27 @@ export component Sidebar inherits Rectangle {
     in-out property <bool> staging-expanded: true;
 
     callback item_activated(id: string);
+    /// 条目行的窗口逻辑几何（拖动落点判定用）。
+    /// Slint 的 public function 访问不到 `for` 里的元素 id，只能由行自己上报。
+    callback sidebar_rect(id: string, x: length, y: length, w: length, h: length);
+
+    /// 几何重发代次。只依赖 `absolute-position` 的派生属性在布局变化后不会
+    /// 重新求值，重排/展开/滚动后各行仍上报旧坐标；这里用一个显式自增属性做
+    /// 触发器，变化后每行的 `row-geom` 必然重算并重发一次。
+    in-out property <int> geom-epoch: 0;
+    private property <bool> geom-republish: true;
+    changed items => { root.geom-republish = true; }
+    changed width => { root.geom-republish = true; }
+    changed height => { root.geom-republish = true; }
+    // 0ms：等当前这批布局结算完再自增，拿到的是新坐标。
+    Timer {
+        interval: 0ms;
+        running: root.geom-republish;
+        triggered => {
+            root.geom-republish = false;
+            root.geom-epoch += 1;
+        }
+    }
     callback background_clicked();
     /// 右键按下（仅上报，由外层决定行为，例如「网络位置」标题弹出添加弹窗）。
     callback item_right_clicked(id: string);
@@ -41,6 +62,8 @@ export component Sidebar inherits Rectangle {
     min-height: 0px;
 
     flick := Flickable {
+        // 滚动同样会移动行的 absolute-position，一并触发几何重发。
+        changed content-y => { root.geom-republish = true; }
         x: 0px;
         y: 0px;
         width: parent.width;
@@ -84,6 +107,17 @@ export component Sidebar inherits Rectangle {
                 width: parent.width;
                 height: item.kind == "header" ? 30px : (item.kind == "drive" ? 46px : 32px);
                 background: (root.active-id == item.id) ? Theme.bg-selected : (item-ta.has-hover ? Theme.bg-hover : transparent);
+
+                // 拖动落点需要每行的窗口几何。`item-ta` 覆盖整行，几何等价于行矩形；
+                // 用字符串属性当触发器：滚动 / 展开 / 排序都会重发，天然纠正偏移。
+                private property <string> row-geom:
+                    "\{root.geom-epoch}|\{item.id}|\{round(item-ta.absolute-position.x / 1px)},\{round(item-ta.absolute-position.y / 1px)},"
+                    + "\{round(item-ta.width / 1px)},\{round(item-ta.height / 1px)}";
+                changed row-geom => {
+                    root.sidebar_rect(item.id, item-ta.absolute-position.x,
+                                      item-ta.absolute-position.y,
+                                      item-ta.width, item-ta.height);
+                }
 
                 // 选中态左侧主题色竖条。
                 Rectangle {

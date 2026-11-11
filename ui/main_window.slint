@@ -380,6 +380,8 @@ out property <length> row-height-out: file-list.row-height-out;
     callback sidebar_network_drag(index: int, phase: int, y: length);
     callback sidebar_quick_drag(index: int, phase: int, y: length);
     callback sidebar_item_activated(id: string);
+    /// 侧边栏条目行的窗口几何（拖动落点判定用）。
+    callback sidebar_rect(id: string, x: length, y: length, w: length, h: length);
     callback sidebar_item_right_clicked(id: string);
     /// 仅在用户拖拽结束时上报（落盘用）；窗口尺寸变化导致的被动收缩不上报。
     callback sidebar_width_changed(float);
@@ -1059,6 +1061,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     item_activated(id) => {
                         root.clear-all-focus();
                         root.sidebar_item_activated(id);
+                    }
+                    sidebar_rect(id, x, y, w, h) => {
+                        root.sidebar_rect(id, x, y, w, h);
                     }
                     item_right_clicked(id) => {
                         root.clear-all-focus();

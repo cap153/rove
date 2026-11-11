@@ -471,6 +471,12 @@ pub struct App {
     /// 会 RefCell panic。独立容器只借用自己，任何触发时机都安全，也不会丢几何。
     #[cfg(windows)]
     crumb_rects: std::rc::Rc<std::cell::RefCell<Vec<(f32, f32, f32, f32)>>>,
+    /// 侧边栏条目行的窗口逻辑矩形（key = `SidebarItem.id`）。
+    /// 用 id 而不是下标：分区顺序可配置重排、展开态会改变条目数量，索引不稳定。
+    #[cfg(windows)]
+    sidebar_rects: std::rc::Rc<
+        std::cell::RefCell<std::collections::HashMap<String, (f32, f32, f32, f32)>>,
+    >,
     /// 当前右键菜单的作用范围（结果回投时用它决定作用于谁）。
     menu_scope: Option<MenuScope>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
@@ -655,6 +661,10 @@ impl App {
             expand_sig: None,
             #[cfg(windows)]
             crumb_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+            #[cfg(windows)]
+            sidebar_rects: std::rc::Rc::new(std::cell::RefCell::new(
+                std::collections::HashMap::new(),
+            )),
             menu_scope: None,
             last_click: None,
             sidebar_drag: None,
@@ -4189,7 +4199,66 @@ fn drag_crumbs(app: &App) -> Vec<CrumbDrop> {
     out
 }
 
-/// 拖到面包屑松手：复用与内部拖放一致的移动管线。
+/// 侧边栏 id → 可落点目录。返回 `None` 的项（分区标题、网络占位、回收站、
+/// UNC 主机根、当前目录）既不高亮也不会落点。
+#[cfg(windows)]
+fn sidebar_id_to_dir(app: &App, id: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if id.starts_with("header:") || id == "net:none" || id == "quick:recycle" {
+        return None;
+    }
+    let dir = if let Some(rest) = id.strip_prefix("drive:") {
+        let letter = rest.chars().next()?;
+        PathBuf::from(format!("{letter}:\\"))
+    } else if let Some(rest) = id.strip_prefix("recent:") {
+        PathBuf::from(rest)
+    } else if let Some(rest) = id.strip_prefix("net:") {
+        PathBuf::from(rest)
+    } else if let Some(rest) = id.strip_prefix("quick:") {
+        let q = app.config.quick_items.iter().find(|q| q.id == rest)?;
+        if !q.path.is_empty() {
+            PathBuf::from(&q.path)
+        } else {
+            quick_access_dirs()
+                .into_iter()
+                .find(|(_, k, _)| *k == q.id.as_str())
+                .and_then(|(_, _, d)| d)?
+        }
+    } else {
+        return None;
+    };
+    // UNC 主机根（`\\server`）不是目录；当前所在目录也不作为落点。
+    if is_unc_host(&dir.to_string_lossy()) {
+        return None;
+    }
+    if app.state.active().active().path.as_deref() == Some(dir.as_path()) {
+        return None;
+    }
+    Some(dir)
+}
+
+/// 侧边栏可落点条目 + 几何（拖动前快照）。
+#[cfg(windows)]
+fn drag_sidebar_zones(app: &App) -> Vec<CrumbDrop> {
+    let items = app.ui.get_sidebar_items();
+    let n = items.row_count();
+    let rects = app.sidebar_rects.borrow();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(item) = items.row_data(i) else { continue };
+        let id = item.id.to_string();
+        let Some(target) = sidebar_id_to_dir(app, &id) else { continue };
+        let Some(rect) = rects.get(&id).copied() else { continue };
+        out.push(CrumbDrop {
+            rect,
+            target: Some(target),
+        });
+    }
+    out
+}
+
+/// 拖到面包屑 / 侧栏条目松手：复用与内部拖放一致的传输管线。
+/// 同盘用移动，跨盘（含网络路径）用复制。
 #[cfg(windows)]
 fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::path::Path) {
     if paths.iter().all(|p| p.parent() == Some(target)) {
@@ -4200,10 +4269,14 @@ fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::pa
         return;
     }
     app.expect_new_entries(paths, target);
-    app.submit_job(JobKind::Move {
-        sources: paths.to_vec(),
-        dest_dir: target.to_path_buf(),
-    });
+    let sources = paths.to_vec();
+    let dest_dir = target.to_path_buf();
+    let kind = if paths.iter().all(|p| same_volume(p, target)) {
+        JobKind::Move { sources, dest_dir }
+    } else {
+        JobKind::Copy { sources, dest_dir }
+    };
+    app.submit_job(kind);
 }
 
 /// 纯文本版本（仅供单测断言用）。
@@ -6973,7 +7046,13 @@ impl App {
         // 面包屑落点：几何与「是否可落点」在拖动前快照 —— DoDragDrop 期间不能再
         // 读 Slint（模态循环不跑事件循环），悬停高亮也只能靠 GDI 自绘。
         #[cfg(windows)]
-        let crumbs = std::rc::Rc::new(std::cell::RefCell::new(drag_crumbs(self)));
+        let crumbs = std::rc::Rc::new(std::cell::RefCell::new({
+            // 落点优先级：面包屑 → 侧栏条目 → 文件行。前两者的几何都在拖动前
+            // 快照，因为 DoDragDrop 的模态循环里不能再读 Slint。
+            let mut zones = drag_crumbs(self);
+            zones.extend(drag_sidebar_zones(self));
+            zones
+        }));
         #[cfg(windows)]
         let last_crumb: std::rc::Rc<std::cell::Cell<i32>> =
             std::rc::Rc::new(std::cell::Cell::new(-1));
@@ -8103,6 +8182,17 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                     store.resize(i + 1, (0.0, 0.0, 0.0, 0.0));
                 }
                 store[i] = (x, y, w, h);
+            });
+        }
+
+        #[cfg(windows)]
+        if let Some(app_rc) = app.upgrade() {
+            // 同理：侧栏几何只借用独立容器，不碰 App 的 RefCell。
+            let sidebar_rects = app_rc.borrow().sidebar_rects.clone();
+            upgrade().on_sidebar_rect(move |id, x, y, w, h| {
+                sidebar_rects
+                    .borrow_mut()
+                    .insert(id.to_string(), (x, y, w, h));
             });
         }
 
