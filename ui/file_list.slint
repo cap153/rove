@@ -60,6 +60,26 @@ export component FileList inherits Rectangle {
     private property <length> sel-x2: 0px;
     private property <length> sel-y2: 0px;
 
+    // 框选边缘自动滚：指针停在视口上下边缘时按 16ms 步进继续滚动，
+    // 不用先松手、滚一下、再重新框（资源管理器同款行为）。
+    private property <length> sel-vp-y: 0px;  // 指针在视口内的 y（不含表头）
+    private property <float> sel-edge: 0;     // -1 上边缘 / 0 无 / 1 下边缘
+    Timer {
+        interval: 16ms;
+        running: root.is-selecting && root.sel-edge != 0;
+        triggered => {
+            let want = flick.content-y - root.sel-edge * 16px;
+            let next = min(root.max-content-y, max(root.min-content-y, want));
+            if (next != flick.content-y) {
+                flick.content-y = next;
+                // 指针没动、内容滚了 → 指针的内容坐标按滚动量反算回去。
+                root.sel-y2 = root.sel-vp-y - next;
+                root.rubber-band-move(root.sel-x1, root.sel-y1, root.sel-x2, root.sel-y2);
+                root.scroll-changed(-next);
+            }
+        }
+    }
+
     // 供 Rust 调用的回调
     callback rubber-band-selected(x1: length, y1: length, x2: length, y2: length);
     callback rubber-band-move(x1: length, y1: length, x2: length, y2: length);
@@ -351,9 +371,27 @@ export component FileList inherits Rectangle {
         ? root.effective-total
         : ceil(root.effective-total / max(root.cells-per-row, 1));
     private property <length> w-icon: 40px;
-    private property <length> w-modified: 150px;
-    private property <length> w-type: 116px;
-    private property <length> w-size: 96px;
+    // 列宽为固定值（资源管理器风格）：窗口变宽时右侧留白，变窄时出横向滚动条，
+    // 不再按剩余空间自动分配 —— 用户手动调过的宽度不会被窗口缩放覆盖。
+    in-out property <length> w-name: 320px;
+    in-out property <length> w-modified: 150px;
+    /// 此电脑视图：整个「修改时间」列不显示，「大小」列表头改成「剩余」，
+    /// 单元格只显示剩余容量。
+    in-out property <bool> is-computer-view: false;
+    in-out property <length> w-type: 116px;
+    in-out property <length> w-size: 96px;
+    /// 双击列边界时用的估算宽度（Rust 按最长内容字符数估算后下发），
+    /// 顺序：名称 / 修改时间 / 类型 / 大小 / 路径。
+    in property <[length]> autofit-widths: [];
+    /// 用户拖动列边界结束（或双击自适应）后上报，由 Rust 按当前目录落盘。
+    callback col_resized(index: int, width: length);
+    // 列宽拖动状态：记录按下时的指针绝对 x 与列宽，rs-col 是正在拖的列号
+    // （-1 = 没在拖，用来给分隔符上高亮色）。
+    private property <length> rs-start-px: 0px;
+    private property <length> rs-start-w: 0px;
+    private property <int> rs-col: -1;
+    /// 最右侧留白：方便在空白处拖拽框选文件。
+    private property <length> right-pad: 96px;
     /// 滚动条轨道宽（含内边距）。
     private property <length> sb-width: 12px;
     /// 滚动条按下时记录的滑块 y，用于计算拖拽增量。
@@ -366,24 +404,38 @@ export component FileList inherits Rectangle {
     private property <length> max-content-y: 0px;
     // 横向：所有列的最小总宽（窄窗口时出现横向滚动）。「路径」列隐藏时
     // 其 240px 基宽不计入，避免窄窗口出现无意义的横向滚动。
-    private property <length> min-list-width: 8px + root.w-icon + 140px + root.w-modified + root.w-type + root.w-size + root.path-w-base + 10px;
+    // 横向滚动的判定基准：列表视图单列铺满；详细信息以「最后一列右边分隔符」
+    // 为准 —— 分隔符右侧的留白不算内容宽度，否则留白会把滚动条顶出来。
+    private property <length> min-list-width: root.view-mode == "list"
+        ? 8px + root.w-icon + 140px
+        : root.col-end + 8px;
     private property <length> min-content-x: min(0px, flick.width - flick.content-width);
     private property <length> max-content-x: 0px;
-    // 「路径」列基宽：隐藏时为 0，列宽分配随之全部让给名称列。
+    // 「路径」列基宽：隐藏时为 0。
     private property <length> path-w-base: root.show-path-column ? 240px : 0px;
     // 列几何（表头与行共用，保证像素级对齐）。
     private property <length> col-icon-x: 8px;
     private property <length> col-name-x: 8px + root.w-icon;
-    private property <length> col-avail: max(root.min-list-width, flick.width) - (8px + root.w-icon + root.w-modified + root.w-type + root.w-size + 10px);
-    private property <length> col-extra: max(0px, root.col-avail - 140px - root.path-w-base);
     private property <length> col-name-w: root.view-mode == "list"
         ? max(140px, flick.width - root.col-name-x - 10px)
-        : 140px + root.col-extra * (root.show-path-column ? 5 : 8) / 8;
-    private property <length> col-path-w: root.path-w-base + root.col-extra * (root.show-path-column ? 3 : 0) / 8;
+        : root.w-name;
+    private property <length> col-path-w: root.path-w-base;
+    /// 最后一列的右边界（= 「大小」列右边那条分隔符的位置，显示路径列时顺延）。
+    /// 三个用途：行点击区的右界、表头最后一条分隔线、横向滚动条的判定基准。
+    private property <length> col-end: root.col-path-x + root.col-path-w;
     private property <length> col-modified-x: root.col-name-x + root.col-name-w;
     private property <length> col-type-x: root.col-modified-x + root.w-modified;
     private property <length> col-size-x: root.col-type-x + root.w-type;
     private property <length> col-path-x: root.col-size-x + root.w-size;
+
+    /// 外部（Rust）按目录下发列宽。不用双向绑定：两个分屏各持一套宽度，
+    /// 绑定会互相覆盖，函数式下发更直接。
+    public function set-col-widths(n: length, m: length, t: length, s: length) {
+        root.w-name = n;
+        root.w-modified = m;
+        root.w-type = t;
+        root.w-size = s;
+    }
 
     // 供 Rust 切换标签时，强制重置滚动条（直接操作底层 Flickable）
     public function set-scroll-y(v: length) {
@@ -482,7 +534,7 @@ export component FileList inherits Rectangle {
                     x: root.col-size-x;
                     width: root.w-size;
                     key: "size";
-                    label: "大小";
+                    label: root.is-computer-view ? "剩余" : "大小";
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -501,6 +553,153 @@ export component FileList inherits Rectangle {
                         root.header-clicked(k);
                     }
                 }
+            }
+
+            // 列宽拖拽手柄：后声明 → 叠在表头之上，只占 6px 条带，不影响点击
+            // 标题排序。拖动结束（up）或双击自适应后上报，由 Rust 按目录落盘。
+            h-name := TouchArea {
+                x: root.col-modified-x - 3px;
+                width: 6px;
+                height: parent.height - 1px;
+                mouse-cursor: col-resize;
+                // 可见分隔符：默认 1px 细线，悬停或正在拖动时变强调色。
+                Rectangle {
+                    x: 2.5px;
+                    y: (parent.height - 16px) / 2;
+                    width: 1px;
+                    height: 16px;
+                    background: root.rs-col == 0 || h-name.has-hover ? Theme.accent : Theme.text-secondary;
+                }
+                moved => {
+                    if (self.pressed) {
+                        let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
+                        root.w-name = max(120px, root.rs-start-w + d);
+                    }
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.rs-col = 0;
+                        root.rs-start-px = self.absolute-position.x + self.mouse-x;
+                        root.rs-start-w = root.w-name;
+                    }
+                    if (e.kind == PointerEventKind.up) {
+                        root.rs-col = -1;
+                        root.col_resized(0, root.w-name);
+                    }
+                }
+                // 双击 = 自适应：宽度传 -1 表示「按内容估算」，由 Rust 现算。
+                double-clicked => {
+                    root.col_resized(0, -1px);
+                }
+            }
+            h-mod := TouchArea {
+                x: root.col-type-x - 3px;
+                width: 6px;
+                height: parent.height - 1px;
+                mouse-cursor: col-resize;
+                Rectangle {
+                    x: 2.5px;
+                    y: (parent.height - 16px) / 2;
+                    width: 1px;
+                    height: 16px;
+                    background: root.rs-col == 1 || h-mod.has-hover ? Theme.accent : Theme.text-secondary;
+                }
+                moved => {
+                    if (self.pressed) {
+                        let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
+                        root.w-modified = max(70px, root.rs-start-w + d);
+                    }
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.rs-col = 1;
+                        root.rs-start-px = self.absolute-position.x + self.mouse-x;
+                        root.rs-start-w = root.w-modified;
+                    }
+                    if (e.kind == PointerEventKind.up) {
+                        root.rs-col = -1;
+                        root.col_resized(1, root.w-modified);
+                    }
+                }
+                double-clicked => {
+                    root.col_resized(1, -1px);
+                }
+            }
+            h-type := TouchArea {
+                x: root.col-size-x - 3px;
+                width: 6px;
+                height: parent.height - 1px;
+                mouse-cursor: col-resize;
+                Rectangle {
+                    x: 2.5px;
+                    y: (parent.height - 16px) / 2;
+                    width: 1px;
+                    height: 16px;
+                    background: root.rs-col == 2 || h-type.has-hover ? Theme.accent : Theme.text-secondary;
+                }
+                moved => {
+                    if (self.pressed) {
+                        let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
+                        root.w-type = max(60px, root.rs-start-w + d);
+                    }
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.rs-col = 2;
+                        root.rs-start-px = self.absolute-position.x + self.mouse-x;
+                        root.rs-start-w = root.w-type;
+                    }
+                    if (e.kind == PointerEventKind.up) {
+                        root.rs-col = -1;
+                        root.col_resized(2, root.w-type);
+                    }
+                }
+                double-clicked => {
+                    root.col_resized(2, -1px);
+                }
+            }
+            h-size := TouchArea {
+                x: root.col-path-x - 3px;
+                width: 6px;
+                height: parent.height - 1px;
+                mouse-cursor: col-resize;
+                Rectangle {
+                    x: 2.5px;
+                    y: (parent.height - 16px) / 2;
+                    width: 1px;
+                    height: 16px;
+                    background: root.rs-col == 3 || h-size.has-hover ? Theme.accent : Theme.text-secondary;
+                }
+                moved => {
+                    if (self.pressed) {
+                        let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
+                        root.w-size = max(60px, root.rs-start-w + d);
+                    }
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.rs-col = 3;
+                        root.rs-start-px = self.absolute-position.x + self.mouse-x;
+                        root.rs-start-w = root.w-size;
+                    }
+                    if (e.kind == PointerEventKind.up) {
+                        root.rs-col = -1;
+                        root.col_resized(3, root.w-size);
+                    }
+                }
+                double-clicked => {
+                    root.col_resized(3, -1px);
+                }
+            }
+
+            // 「大小」列右边（显示路径列时是路径列右边）的分隔符：
+            // 它界定行点击区与横向滚动的边界，右侧留白从这里往后算。
+            if (root.show-path-column) : Rectangle {
+                x: root.col-end - 0.5px;
+                y: (parent.height - 16px) / 2;
+                width: 1px;
+                height: 16px;
+                background: Theme.text-secondary;
             }
 
             // 底部分隔线。
@@ -532,7 +731,8 @@ export component FileList inherits Rectangle {
             TouchArea {
                 x: 0px;
                 y: 0px;
-                width: parent.width;
+                // 横向也要撑满内容宽度：横向滚动后，视口右侧不会再漏出不响应的空白。
+                width: max(parent.width, parent.content-width);
                 // 核心修复：撑满整个滚动内容区域，而非仅视口高度。
                 // Flickable 会按 content-height 裁剪子元素，背景 TouchArea 默认只有
                 // parent.height（视口高）——滚动后下方内容在视口外，空白处点不到，
@@ -578,6 +778,14 @@ export component FileList inherits Rectangle {
                     if (event.kind == PointerEventKind.move && root.is-selecting) {
                         root.sel-x2 = self.mouse-x;
                         root.sel-y2 = self.mouse-y;
+                        // 视口内 y = 内容 y + 滚动偏移（content-y 向下滚为负）。
+                        let vp_y = self.mouse-y + flick.content-y;
+                        root.sel-vp-y = vp_y;
+                        // 表头在 flick 之外，flick.height 本身就是不含表头的视口高，
+                        // 不能再减一次 header-h，否则底部触发区会平白上移 30px。
+                        let vp_h = flick.height;
+                        // 距上下边缘 26px 内进入自动滚，越靠近边缘越快由定时器步进决定。
+                        root.sel-edge = vp_y < 26px ? -1 : (vp_y > vp_h - 26px ? 1 : 0);
                         // 核心：在背景 TouchArea 中直接触发移动回调
                         root.rubber-band-move(root.sel-x1, root.sel-y1, root.sel-x2, root.sel-y2);
                         return EventResult.accept;
@@ -585,6 +793,7 @@ export component FileList inherits Rectangle {
 
                     if ((event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) && root.is-selecting) {
                         root.is-selecting = false;
+                        root.sel-edge = 0;
                         // 每次抬手都交给 Rust 收尾：由它按拖动距离判定是否成框，
                         // 误触 / 取消时恢复按下前的选择（Ctrl/Shift 累加基线）。
                         if (event.kind == PointerEventKind.up) {
@@ -604,7 +813,9 @@ export component FileList inherits Rectangle {
                 visible: !root.is-icons-view;
                 y: row.index * root.row-h;
                 x: 0px;
-                width: flick.content-width;
+                // 行元素（含点击区）只铺到最后一列右边界：右侧留白里不存在行，
+                // 点它等于点空白、从那里起手就是框选。列表视图仍整行铺满。
+                width: root.view-mode == "list" ? flick.content-width : root.col-end;
                 height: root.row-h;
                 background: (row.index == root.drop-hover-index && row.is-dir) || row.selected
                     ? Theme.bg-selected
@@ -614,6 +825,8 @@ export component FileList inherits Rectangle {
                 border-radius: 4px;
 
                 ta := TouchArea {
+                    // 行容器本身已截止到最后一列边界，这里铺满行即可；
+                    // 用整行的 100% 保证列内任何位置（含图标、名称、类型、大小）都能点。
                     width: 100%;
                     height: 100%;
 

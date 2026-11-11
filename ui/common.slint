@@ -182,8 +182,13 @@ export component HighlightName inherits Rectangle {
         // 核心修复：根据外部传入的开关，决定是居中拼装还是靠左拼装
         alignment: root.horizontal-center ? center : start;
 
-        for part in root.parts : Text {
-            width: self.preferred-width;
+        for part[i] in root.parts : Text {
+            // 前几段宽 = preferred（min/max 钉死，不可压缩）；最后一段允许
+            // 压到 0 并在放不下时出省略号 —— 否则整串超宽会被外层 clip 硬裁
+            // 掉半个字（搜索命中在详细信息 / 列表 / 小图标视图都会出现）。
+            min-width: i == root.parts.length - 1 ? 0px : self.preferred-width;
+            max-width: self.preferred-width;
+            overflow: elide;
             height: 100%;
             text: part.text;
             color: part.hl ? Theme.accent : Theme.text-primary;

@@ -506,6 +506,12 @@ pub struct App {
     /// 框选基线：按下时若按住 Ctrl/Shift，记录当时的选择集作为累加底本；
     /// None 表示普通替换式框选。预览与结束都基于它重算，矩形缩回时高亮也跟着缩回。
     rubber_band_base: Option<HashSet<PathBuf>>,
+    /// 已经做过「列宽自适应」的目录键。每个目录只在打开时算一次，
+    /// 避免滚动 / 刷新时反复重算导致列宽跳动。
+    autofit_key: Option<String>,
+    /// 界面上当前实际生效的四列宽度（名称/修改时间/类型/大小）。
+    /// 拖动某列时以它为基准，避免把没动过的列弹回默认值。
+    cur_col_widths: [f32; 4],
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
     /// 切换标签时置位，屏蔽切换过程中 Slint 因内容高度变化自动 Clamp 而
@@ -679,6 +685,13 @@ impl App {
             drop_timer: Timer::default(),
             drag_pending: None,
             rubber_band_base: None,
+            autofit_key: None,
+            cur_col_widths: [
+                crate::config::DEFAULT_COLUMN_WIDTHS[0],
+                crate::config::DEFAULT_COLUMN_WIDTHS[1],
+                crate::config::DEFAULT_COLUMN_WIDTHS[2],
+                crate::config::DEFAULT_COLUMN_WIDTHS[3],
+            ],
             size_sort_pending: false,
             list_geom: (-1.0, 0, -1.0, false),
             recording_shortcut: None,
@@ -3082,6 +3095,11 @@ impl App {
         };
         let rows_visible = (list_height / row_h).ceil() as usize + OVERSCAN * 2;
 
+        // 「此电脑」视图（pane 没有路径）：详细信息要隐藏修改时间列，
+        // 大小列改为只显示剩余容量、表头文字改成「剩余」。
+        self.ui
+            .set_file_is_computer_view(self.state.active().active().path.is_none());
+
         // 核心修复：若是切换视图触发的刷新，且拿到了待恢复的条目索引，则换算成
         // 新的像素位置。必须放在下方的 clamp 块“之前”——否则残留的旧像素大偏移
         // 会先被 clamp 到内容底部，再恢复就已经晚了。
@@ -3346,6 +3364,10 @@ impl App {
                 .set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
             self.rows_sig_right = None;
         }
+
+        // 行已经就绪：没有手动列宽记录的目录，这里按最长条目自适应一次。
+        #[cfg(windows)]
+        autofit_column_widths_if_needed(self);
 
         self.sync_expand_targets();
     }
@@ -3661,8 +3683,15 @@ impl App {
                         .into(),
                     is_dir: entry.is_dir,
                     is_hidden: entry.is_hidden,
+                    // 此电脑视图：extra 形如「77.5 GB / 851 GB」，只留剩余容量。
                     size_text: if computer_view {
-                        entry.extra.clone()
+                        entry
+                            .extra
+                            .split('/')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string()
                     } else {
                         fs::format_size(&entry)
                     }
@@ -3844,6 +3873,9 @@ impl App {
             }
         };
         self.ui.set_sidebar_active_id(active_id);
+        // 切目录后按该目录记录还原列宽（含双击自适应所需的估算宽度）。
+        #[cfg(windows)]
+        apply_column_widths(self);
     }
 }
 
@@ -4277,6 +4309,168 @@ fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::pa
         JobKind::Copy { sources, dest_dir }
     };
     app.submit_job(kind);
+}
+
+/// 列宽的存储键：当前活动目录的路径字符串，虚拟目录用固定前缀。
+#[cfg(windows)]
+fn column_layout_key(app: &App) -> String {
+    match app.state.active().active().path.as_ref() {
+        Some(p) => p.to_string_lossy().into_owned(),
+        None => "::root".to_string(),
+    }
+}
+
+/// 按当前目录的**全部条目**估算各列「刚好放下最长内容」的宽度。
+/// Slint 不暴露文本测量接口，只能按字符类型估：CJK 约一个字号宽，其余约 0.55 个。
+/// 直接读数据而不是读已渲染的行，避免受虚拟滚动窗口影响。
+#[cfg(windows)]
+fn autofit_widths_for_pane(app: &App) -> [f32; 5] {
+    fn text_w(s: &str) -> f32 {
+        s.chars()
+            .map(|c| if (c as u32) < 0x2E80 { 7.0 } else { 13.0 })
+            .sum()
+    }
+    let tab = app.state.active().active();
+    let computer = tab.path.is_none();
+    let mut max = [0f32; 5];
+    let mut seen = 0usize;
+    for di in 0..tab.display.len() {
+        // 超大目录只采样前若干条：估算够用，打开不必为它卡一下。
+        if seen >= 4000 {
+            break;
+        }
+        let Some(e) = tab.display_entry(di) else { continue };
+        seen += 1;
+        max[0] = max[0].max(text_w(&e.name));
+        // 「此电脑」驱动器条目没有修改时间：format_time(None) 自然返回空串。
+        // 按用户意图不再做任何特判；下面的宽度下限保证这一列仍展示、只是数据留空。
+        max[1] = max[1].max(text_w(&crate::fs::format_time(e.modified)));
+        max[2] = max[2].max(text_w(&e.type_text));
+        // 此电脑视图的「剩余」列只显示 extra 的前半段。
+        let size_text = if computer {
+            e.extra.split('/').next().unwrap_or("").trim().to_string()
+        } else {
+            crate::fs::format_size(e)
+        };
+        max[3] = max[3].max(text_w(&size_text));
+    }
+    [
+        (max[0] + 60.0).clamp(160.0, 900.0),
+        // 下限 110px：此电脑整列没有具体时间，但仍保留列宽和表头，数据留空。
+        (max[1] + 24.0).clamp(110.0, 320.0),
+        (max[2] + 24.0).clamp(70.0, 260.0),
+        (max[3] + 24.0).clamp(70.0, 200.0),
+        // 第 5 项对应「路径」列：它是固定 240px，不参与自适应下发，
+        // 保留占位只为与 Config 的 [f32; 5] 结构对齐。
+        crate::config::DEFAULT_COLUMN_WIDTHS[4],
+    ]
+}
+
+/// 统一下发列宽。
+///
+/// 用户明确要求：「此电脑」的「修改时间」列**始终没有具体时间，但这一列照常展示**，
+/// 因为四种排序状态是全局统一的 —— 在别的文件夹按「修改时间」排序后，若此处隐藏
+/// 该列，排序就指向了一个不存在的列，很奇怪。所以此电脑只把该列的**数据留空**，
+/// 表头、列宽、排序入口都保留。
+///
+/// 据此这里不做「有没有时间值」的后台扫描或特判（每次下发都遍历几千条目纯属
+/// 浪费算力，而且此电脑的结论恒定为空）；空数据由 `format_time(None)` 自然产生，
+/// 列宽走正常路径（含 110px 下限，保证空列也展示得出来）。
+#[cfg(windows)]
+fn push_col_widths(app: &mut App, w: [f32; 5]) {
+    app.cur_col_widths = [w[0], w[1], w[2], w[3]];
+    app.ui.invoke_apply_col_widths(w[0], w[1], w[2], w[3]);
+}
+
+/// 切目录时先按手动记录还原一次（即时反馈），并重置自适应标记；
+/// 数据真正到位后 `autofit_column_widths_if_needed` 会再校准一次。
+#[cfg(windows)]
+fn apply_column_widths(app: &mut App) {
+    let key = column_layout_key(app);
+    app.autofit_key = None;
+    if let Some(w) = app
+        .config
+        .column_layouts
+        .iter()
+        .find(|c| c.dir == key)
+        .map(|c| c.widths)
+    {
+        push_col_widths(app, w);
+    }
+}
+
+/// 数据就绪后按目录下发列宽，每个目录只做一次：
+/// 有手动记录 → 用记录；没有 → 按最长条目自适应（结果不落盘）。
+#[cfg(windows)]
+fn autofit_column_widths_if_needed(app: &mut App) {
+    let key = column_layout_key(app);
+    // 导航时 display 仍是上一个目录的数据（项目特意保留旧内容避免白屏），
+    // loading 期间不能拿它估算新目录的列宽，也不能就此打上「已自适应」标记。
+    if app.state.active().active().loading {
+        return;
+    }
+    if app.autofit_key.as_deref() == Some(key.as_str()) {
+        return;
+    }
+    if app.state.active().active().display.is_empty() {
+        return;
+    }
+    app.autofit_key = Some(key.clone());
+    let w = if let Some(saved) = app
+        .config
+        .column_layouts
+        .iter()
+        .find(|c| c.dir == key)
+        .map(|c| c.widths)
+    {
+        saved
+    } else {
+        autofit_widths_for_pane(app)
+    };
+    push_col_widths(app, w);
+}
+
+/// 记录用户拖动后的列宽：就地更新当前目录的记录并落盘。
+#[cfg(windows)]
+fn record_col_width(app: &mut App, index: i32, width: f32) {
+    let idx = index.clamp(0, 4) as usize;
+    let key = column_layout_key(app);
+    // 基准用界面上当前的宽度：没动过的列保持原样，不会被默认值顶掉。
+    let path_w = app
+        .config
+        .column_layouts
+        .iter()
+        .find(|c| c.dir == key)
+        .map(|c| c.widths[4])
+        .unwrap_or(crate::config::DEFAULT_COLUMN_WIDTHS[4]);
+    let mut w = [
+        app.cur_col_widths[0],
+        app.cur_col_widths[1],
+        app.cur_col_widths[2],
+        app.cur_col_widths[3],
+        path_w,
+    ];
+    if width < 0.0 {
+        // 双击列边界（-1）：按当前目录内容现算「刚好放下最长内容」的宽度。
+        let fit = autofit_widths_for_pane(app);
+        w[idx] = fit[idx];
+    } else {
+        w[idx] = width.clamp(crate::config::MIN_COLUMN_W, crate::config::MAX_COLUMN_W);
+    }
+    match app.config.column_layouts.iter_mut().find(|c| c.dir == key) {
+        Some(c) => c.widths = w,
+        None => {
+            app.config
+                .column_layouts
+                .push(crate::config::ColumnLayout { dir: key, widths: w });
+            if app.config.column_layouts.len() > crate::config::MAX_COLUMN_LAYOUTS {
+                app.config.column_layouts.remove(0);
+            }
+        }
+    }
+    // 双击时 Slint 自己算不出宽度，必须由这里回写；拖动时也顺手同步一次。
+    push_col_widths(app, w);
+    app.config.save();
 }
 
 /// 纯文本版本（仅供单测断言用）。
@@ -8193,6 +8387,17 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 sidebar_rects
                     .borrow_mut()
                     .insert(id.to_string(), (x, y, w, h));
+            });
+        }
+
+        {
+            // 列宽拖动/双击结束后回传，按当前目录存进配置并落盘。
+            let app = app.clone();
+            upgrade().on_file_col_resized(move |index, width| {
+                let Some(app) = app.upgrade() else { return };
+                let mut app = app.borrow_mut();
+                #[cfg(windows)]
+                record_col_width(&mut app, index, width);
             });
         }
 

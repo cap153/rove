@@ -161,6 +161,8 @@ export component MainWindow inherits Window {
     in-out property <[SidebarItem]> sidebar-items: [];
     in-out property <string> sidebar-active-id: "";
     in-out property <[FileRow]> file-rows: [];
+    /// 当前是否「此电脑」视图：详细信息里要隐藏修改时间列、大小列改显示剩余容量。
+    in-out property <bool> file-is-computer-view: false;
     in-out property <int> file-total: 0;
     in-out property <bool> file-loading: false;
     /// 图标视图“展开名称”目标（单个选中 / 重命名）：条目绝对索引与完整名称。
@@ -249,6 +251,15 @@ out property <length> row-height-out: file-list.row-height-out;
     // ---- 分屏（步骤 1：UI 搭建，核心逻辑待后续） ----
     in-out property <bool> is-split: false;
     in-out property <int> active-pane: 0;
+
+    /// 按目录下发列宽到当前活动分屏（Rust 切目录时调用）。
+    public function apply-col-widths(n: length, m: length, t: length, s: length) {
+        if (root.active-pane == 1) {
+            file-list-right.set-col-widths(n, m, t, s);
+        } else {
+            file-list.set-col-widths(n, m, t, s);
+        }
+    }
     in-out property <float> split-ratio: 0.5; // 左右分屏**显示**比例（受限后）
     // 分屏**期望**比例：用户拖出来的值（Rust 存 tab.split_ratio 并回推这个），
     // 窗口变窄时只降级 split-ratio，窗口变宽后可自动回到 want。
@@ -388,6 +399,15 @@ out property <length> row-height-out: file-list.row-height-out;
     callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length);
     callback file_row_double_clicked(index: int);
     callback file_header_clicked(key: string);
+    /// 详细信息列宽：由 Rust 按目录下发，用户拖动后经回调回传落盘。
+    /// 用双向绑定让子组件里的拖动结果同步到这里的真源属性上。
+    in-out property <length> col-w-name: 320px;
+    in-out property <length> col-w-modified: 150px;
+    in-out property <length> col-w-type: 116px;
+    in-out property <length> col-w-size: 96px;
+    /// 双击列边界时的估算宽度（名称/修改时间/类型/大小），由 Rust 计算下发。
+    in property <[length]> col-autofit-widths: [];
+    callback file_col_resized(index: int, width: length);
     callback file_scroll_changed(offset: length);
     /// 排查用：滚动位置变化时连同几何一并上报（Rust 仅在重命名期间落日志）。
     callback file_scroll_dbg(pane: int, offset: length, content-h: length, view-h: length, min-y: length, content-y: length);
@@ -1156,6 +1176,11 @@ out property <length> row-height-out: file-list.row-height-out;
                     row_double_clicked(index) => {
                         root.file_row_double_clicked(index);
                     }
+                    autofit-widths: root.col-autofit-widths;
+                    is-computer-view: root.file-is-computer-view;
+                    col_resized(index, width) => {
+                        root.file_col_resized(index, width);
+                    }
                     header_clicked(key) => {
                         root.pane_focused(0);
                         root.file_header_clicked(key);
@@ -1293,6 +1318,11 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                         row_double_clicked(index) => {
                             root.file_row_double_clicked(index);
+                        }
+                        autofit-widths: root.col-autofit-widths;
+                        is-computer-view: root.file-is-computer-view;
+                        col_resized(index, width) => {
+                            root.file_col_resized(index, width);
                         }
                         header_clicked(key) => {
                             root.pane_focused(1);

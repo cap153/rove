@@ -9,6 +9,21 @@ pub enum ThemeChoice {
     Dark,
 }
 
+/// 列宽默认值（逻辑像素）。顺序：名称 / 修改时间 / 类型 / 大小 / 路径。
+pub const DEFAULT_COLUMN_WIDTHS: [f32; 5] = [320.0, 150.0, 116.0, 96.0, 240.0];
+/// 单列最小 / 最大宽度，防止拖到不可用或撑爆。
+pub const MIN_COLUMN_W: f32 = 60.0;
+pub const MAX_COLUMN_W: f32 = 2000.0;
+/// 最多记住多少个目录的列宽，超出淘汰最早的。
+pub const MAX_COLUMN_LAYOUTS: usize = 200;
+
+/// 单个目录的详细信息列宽（逻辑像素）：[名称, 修改时间, 类型, 大小, 路径]。
+#[derive(Clone, Debug)]
+pub struct ColumnLayout {
+    pub dir: String,
+    pub widths: [f32; 5],
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub theme: ThemeChoice,
@@ -36,6 +51,9 @@ pub struct Config {
     pub sort_key: String,
     /// 全局排序方向：true 递增 / false 递减。
     pub sort_ascending: bool,
+    /// 每个目录一套详细信息列宽。只记录用户手动调过的目录，
+    /// 顺序即写入顺序，超出上限时淘汰最早的记录。
+    pub column_layouts: Vec<ColumnLayout>,
     /// 是否显示隐藏文件/文件夹/驱动器（默认 false，即过滤掉）。
     pub show_hidden: bool,
     /// 用户自定义快捷键映射: ActionId -> [Chord1, Chord2]（空字符串代表已取消绑定）。
@@ -172,6 +190,7 @@ impl Default for Config {
             view_mode: "details".to_string(),
             sort_key: "name".to_string(),
             sort_ascending: true,
+            column_layouts: Vec::new(),
             show_hidden: false,
             shortcuts: std::collections::HashMap::new(),
             search_excluded_drives: Vec::new(),
@@ -319,6 +338,35 @@ impl Config {
         }
         if let Some(sa) = json.get("sort_ascending").and_then(|v| v.as_bool()) {
             config.sort_ascending = sa;
+        }
+        // 每目录列宽：数组项 { "dir": "...", "w": [名称, 修改时间, 类型, 大小, 路径] }。
+        if let Some(arr) = json.get("column_layouts").and_then(|v| v.as_array()) {
+            let mut seen = std::collections::HashSet::new();
+            for item in arr {
+                let Some(dir) = item.get("dir").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if dir.is_empty() || !seen.insert(dir.to_string()) {
+                    continue;
+                }
+                let mut widths = crate::config::DEFAULT_COLUMN_WIDTHS;
+                if let Some(ws) = item.get("w").and_then(|v| v.as_array()) {
+                    for (i, v) in ws.iter().take(5).enumerate() {
+                        if let Some(n) = v.as_f64() {
+                            widths[i] = (n as f32).clamp(MIN_COLUMN_W, MAX_COLUMN_W);
+                        }
+                    }
+                }
+                config.column_layouts.push(ColumnLayout {
+                    dir: dir.to_string(),
+                    widths,
+                });
+            }
+            // 上限 200 个目录，丢掉最早的。
+            if config.column_layouts.len() > MAX_COLUMN_LAYOUTS {
+                let extra = config.column_layouts.len() - MAX_COLUMN_LAYOUTS;
+                config.column_layouts.drain(0..extra);
+            }
         }
         if let Some(sh) = json.get("show_hidden").and_then(|v| v.as_bool()) {
             config.show_hidden = sh;
@@ -493,6 +541,14 @@ impl Config {
             "view_mode": self.view_mode,
             "sort_key": self.sort_key,
             "sort_ascending": self.sort_ascending,
+            "column_layouts": self
+                .column_layouts
+                .iter()
+                .map(|c| serde_json::json!({
+                    "dir": c.dir,
+                    "w": c.widths.iter().map(|w| *w as f64).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
             "show_hidden": self.show_hidden,
             "shortcuts": self.shortcuts,
             "search_excluded_drives": self.search_excluded_drives,
