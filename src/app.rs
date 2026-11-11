@@ -463,6 +463,14 @@ pub struct App {
     /// 图标视图展开浮层的签名（索引 / 框宽 / 行内容哈希，左右各一份）。
     /// 未变时跳过重建嵌套 ModelRc 与 set —— 本函数每帧都会走到。
     expand_sig: Option<[(i32, u32, u64, u64); 2]>,
+    /// 面包屑各段的窗口逻辑矩形（由 Slint 上报，拖动落点判定用）。
+    ///
+    /// 用独立的 `Rc<RefCell<_>>` 而不是普通字段：几何是在 Slint 的 `changed`
+    /// 回调里同步上报的，可能落在「App 已被可变借用」的路径上（例如
+    /// `sync_breadcrumbs` 在 `&mut self` 里重建模型后布局求值），直接写字段
+    /// 会 RefCell panic。独立容器只借用自己，任何触发时机都安全，也不会丢几何。
+    #[cfg(windows)]
+    crumb_rects: std::rc::Rc<std::cell::RefCell<Vec<(f32, f32, f32, f32)>>>,
     /// 当前右键菜单的作用范围（结果回投时用它决定作用于谁）。
     menu_scope: Option<MenuScope>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
@@ -645,6 +653,8 @@ impl App {
             rows_sig: None,
             rows_sig_right: None,
             expand_sig: None,
+            #[cfg(windows)]
+            crumb_rects: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
             menu_scope: None,
             last_click: None,
             sidebar_drag: None,
@@ -4121,6 +4131,81 @@ fn status_is_danger(text: &str) -> bool {
     MARKERS.iter().any(|m| text.contains(m))
 }
 
+/// 一个可落点的面包屑段：窗口逻辑矩形 + 目标目录（`None` = 不可落点）。
+#[cfg(windows)]
+#[derive(Clone)]
+struct CrumbDrop {
+    rect: (f32, f32, f32, f32),
+    target: Option<std::path::PathBuf>,
+}
+
+/// UNC 主机段（`\\server`）：只是 IP / 域名，不是可用目录，不能作为落点。
+#[cfg(windows)]
+fn is_unc_host(path: &str) -> bool {
+    path.strip_prefix(r"\\")
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains('\\'))
+}
+
+/// 命中的可落点面包屑段索引（-1 = 没命中或不可落点）。
+#[cfg(windows)]
+fn crumb_hit(list: &[CrumbDrop], x: f32, y: f32) -> i32 {
+    list.iter()
+        .position(|c| {
+            c.target.is_some()
+                && x >= c.rect.0
+                && x <= c.rect.0 + c.rect.2
+                && y >= c.rect.1
+                && y <= c.rect.1 + c.rect.3
+        })
+        .map_or(-1, |i| i as i32)
+}
+
+/// 面包屑各段 + 可落点判定。拖动前快照：模态循环里不能再读 Slint。
+#[cfg(windows)]
+fn drag_crumbs(app: &App) -> Vec<CrumbDrop> {
+    let crumbs = app.ui.get_breadcrumbs();
+    let n = crumbs.row_count();
+    let current = app.state.active().active().path.clone();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let Some(seg) = crumbs.row_data(i) else { continue };
+        let path = seg.path.to_string();
+        let rect = app
+            .crumb_rects
+            .borrow()
+            .get(i)
+            .copied()
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        // 排除：此电脑（path 为空）、当前目录（最后一段）、UNC 主机段。
+        let eligible = !path.is_empty()
+            && i + 1 != n
+            && !is_unc_host(&path)
+            && current.as_deref() != Some(std::path::Path::new(&path));
+        out.push(CrumbDrop {
+            rect,
+            target: eligible.then(|| std::path::PathBuf::from(&path)),
+        });
+    }
+    out
+}
+
+/// 拖到面包屑松手：复用与内部拖放一致的移动管线。
+#[cfg(windows)]
+fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::path::Path) {
+    if paths.iter().all(|p| p.parent() == Some(target)) {
+        return;
+    }
+    if paths.iter().any(|p| p == target || target.starts_with(p)) {
+        app.set_status_job("无法将文件夹移动到自身或其子文件夹中");
+        return;
+    }
+    app.expect_new_entries(paths, target);
+    app.submit_job(JobKind::Move {
+        sources: paths.to_vec(),
+        dest_dir: target.to_path_buf(),
+    });
+}
+
 /// 纯文本版本（仅供单测断言用）。
 #[cfg(test)]
 fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
@@ -6885,6 +6970,14 @@ impl App {
         #[cfg(windows)]
         let last_idx: std::rc::Rc<std::cell::Cell<i32>> = std::rc::Rc::new(std::cell::Cell::new(-1));
 
+        // 面包屑落点：几何与「是否可落点」在拖动前快照 —— DoDragDrop 期间不能再
+        // 读 Slint（模态循环不跑事件循环），悬停高亮也只能靠 GDI 自绘。
+        #[cfg(windows)]
+        let crumbs = std::rc::Rc::new(std::cell::RefCell::new(drag_crumbs(self)));
+        #[cfg(windows)]
+        let last_crumb: std::rc::Rc<std::cell::Cell<i32>> =
+            std::rc::Rc::new(std::cell::Cell::new(-1));
+
         let outcome = crate::sys::dnd::begin_drag_out(&paths, icon_px, {
             #[cfg(windows)]
             let last_highlight_rect = last_highlight_rect.clone();
@@ -6892,16 +6985,45 @@ impl App {
             let last_pane = last_pane.clone();
             #[cfg(windows)]
             let last_idx = last_idx.clone();
+            #[cfg(windows)]
+            let last_crumb = last_crumb.clone();
+            #[cfg(windows)]
+            let crumbs = crumbs.clone();
             move || {
                 #[cfg(windows)]
                 if let Some(ui) = ui_weak.upgrade() {
                     #[cfg(windows)]
                     if let Some((lx, ly)) = cursor_window_logical(&ui, scale) {
+                        // 0. 面包屑优先：命中可落点段就只高亮它，并跳过文件行高亮。
+                        let crumb = crumb_hit(&crumbs.borrow(), lx, ly);
+                        if crumb != last_crumb.get() {
+                            last_crumb.set(crumb);
+                            if let Some(old_rect) = last_highlight_rect.borrow_mut().take() {
+                                if hwnd != 0 {
+                                    unsafe { draw_focus(hwnd, &old_rect) };
+                                }
+                            }
+                            // 目标切换后，重新进入列表区域要重新判定并重绘。
+                            last_pane.set(-1);
+                            last_idx.set(-1);
+                            if crumb >= 0 && hwnd != 0 {
+                                let r = crumbs.borrow()[crumb as usize].rect;
+                                let new_rect = windows_sys::Win32::Foundation::RECT {
+                                    left: (r.0 * scale) as i32,
+                                    top: (r.1 * scale) as i32,
+                                    right: ((r.0 + r.2) * scale) as i32,
+                                    bottom: ((r.1 + r.3) * scale) as i32,
+                                };
+                                unsafe { draw_focus(hwnd, &new_rect) };
+                                *last_highlight_rect.borrow_mut() = Some(new_rect);
+                            }
+                        }
+
                         let res = ui.invoke_get_drop_target(lx, ly);
                         let pane = if res.row_count() == 2 { res.row_data(0).unwrap_or(0) as i32 } else { 0 };
                         let idx = if res.row_count() == 2 { res.row_data(1).unwrap_or(-1) as i32 } else { -1 };
 
-                        if pane != last_pane.get() || idx != last_idx.get() {
+                        if crumb < 0 && (pane != last_pane.get() || idx != last_idx.get()) {
                             last_pane.set(pane);
                             last_idx.set(idx);
 
@@ -6942,6 +7064,22 @@ impl App {
         if let Some(old_rect) = last_highlight_rect.borrow_mut().take() {
             if hwnd != 0 {
                 unsafe { draw_focus(hwnd, &old_rect) };
+            }
+        }
+
+        // 拖到面包屑松手：无 IDropTarget 的区域只会返回 CANCEL，用「松手结束」
+        // 标志 + 拖动前快照的几何判断落点，命中就直接移动。
+        #[cfg(windows)]
+        {
+            let hit = last_crumb.get();
+            if hit >= 0 && crate::sys::dnd::drag_released() {
+                let target = crumbs
+                    .borrow()
+                    .get(hit as usize)
+                    .and_then(|c| c.target.clone());
+                if let Some(dir) = target {
+                    drop_into_crumb(self, &paths, &dir);
+                }
             }
         }
 
@@ -7952,6 +8090,22 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        #[cfg(windows)]
+        if let Some(app_rc) = app.upgrade() {
+            // 只把几何容器 clone 进回调：回调不再触碰 App 的 RefCell，因此即使
+            // 触发点落在「App 正被可变借用」的路径上也不会 panic。
+            let crumb_rects = app_rc.borrow().crumb_rects.clone();
+            // 面包屑各段自己上报窗口几何（Slint 函数访问不到 for 里的 id）。
+            upgrade().on_crumb_rect(move |index, x, y, w, h| {
+                let i = index.max(0) as usize;
+                let mut store = crumb_rects.borrow_mut();
+                if store.len() <= i {
+                    store.resize(i + 1, (0.0, 0.0, 0.0, 0.0));
+                }
+                store[i] = (x, y, w, h);
+            });
+        }
+
         upgrade().on_file_name_debug(move |pane, info, name| {
             let Some(app) = app.upgrade() else { return };
             // 纯诊断回调：重命名提交等路径会在持有可变借用时同步触发它，

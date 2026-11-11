@@ -359,6 +359,9 @@ out property <length> row-height-out: file-list.row-height-out;
     callback path_edit_committed(path: string);
     /// 诊断：地址栏面包屑流量几何（视口 / 内容 / 偏移 / 段数）。
     callback crumb_dbg(view_w: length, content_w: length, content_x: length, n: int);
+    /// 面包屑每段的窗口逻辑几何（拖动落点判定用）。
+    /// Slint 的 public function 访问不到 `for` 循环里的元素 id，只能由段自己上报。
+    callback crumb_rect(index: int, x: length, y: length, w: length, h: length);
     /// 诊断：地址栏空白处被点到（进入编辑态）。
     callback crumb_edit_clicked(x: length, content_x: length);
 
@@ -750,6 +753,17 @@ out property <length> row-height-out: file-list.row-height-out;
                             for seg[i] in root.breadcrumbs : Rectangle {
                                 height: parent.height;
                                 width: crumb-text.preferred-width + (i == 0 ? 12px : 24px);
+
+                                // 拖动落点需要每段的窗口几何。`absolute-position` 已含 Flickable 的滚动
+                                // 偏移，导航 / 窗口 resize / 地址栏横滚都会改变它，从而触发上报。
+                                // Slint 的 public function 访问不到 for 里的 id，只能由元素自己上报。
+                                private property <string> seg-geom:
+                                    "\{round(crumb-ta.absolute-position.x / 1px)},\{round(crumb-ta.absolute-position.y / 1px)},"
+                                    + "\{round(crumb-ta.width / 1px)},\{round(crumb-ta.height / 1px)}";
+                                changed seg-geom => {
+                                    root.crumb_rect(i, crumb-ta.absolute-position.x, crumb-ta.absolute-position.y,
+                                                    crumb-ta.width, crumb-ta.height);
+                                }
 
                                 // 分隔箭头 "›"
                                 if (i > 0) : Text {

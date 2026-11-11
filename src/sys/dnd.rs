@@ -24,6 +24,27 @@ pub const DRAG_THRESHOLD: f32 = 4.0;
 #[allow(dead_code)]
 pub static IS_DRAGGING: AtomicBool = AtomicBool::new(false);
 
+/// 本次拖放是否由「松开左键」结束（而不是 Esc 取消）。
+///
+/// 拖到没有注册 `IDropTarget` 的区域（例如 rove 自己的面包屑）时，`DoDragDrop`
+/// 返回 `DRAGDROP_S_CANCEL`，和用户按 Esc 完全一样，只能靠 `QueryContinueDrag`
+/// 里记下这个标志来区分「用户松手了」。
+#[allow(dead_code)]
+pub static DRAG_RELEASED: AtomicBool = AtomicBool::new(false);
+
+/// 最近一次拖放是否是「松手」结束的。
+#[cfg(windows)]
+#[allow(dead_code)]
+pub fn drag_released() -> bool {
+    DRAG_RELEASED.load(Ordering::SeqCst)
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub fn drag_released() -> bool {
+    false
+}
+
 /// 拖出结果。
 #[allow(dead_code)]
 pub enum DragOutOutcome {
@@ -53,6 +74,7 @@ pub fn begin_drag_out<F: Fn() + 'static>(
     if paths.is_empty() {
         return DragOutOutcome::Cancelled;
     }
+    DRAG_RELEASED.store(false, Ordering::SeqCst);
     IS_DRAGGING.store(true, Ordering::SeqCst);
     let res = drag_out_impl(paths, icon_px, Box::new(on_feedback));
     IS_DRAGGING.store(false, Ordering::SeqCst);
@@ -121,6 +143,9 @@ fn drag_out_impl(paths: &[PathBuf], icon_px: u32, on_feedback: Box<dyn Fn()>) ->
             }
             // 左键已松开 → 触发放置
             if key_state & MK_LBUTTON == MODIFIERKEYS_FLAGS(0) {
+                // 记下来：拖到 rove 自己的面包屑这类「无 IDropTarget」的区域，
+                // DoDragDrop 返回值与 Esc 取消无法区分，只能靠这个标志判断。
+                DRAG_RELEASED.store(true, Ordering::SeqCst);
                 return DRAGDROP_S_DROP;
             }
             windows::core::HRESULT(0) // S_OK: 继续拖拽
