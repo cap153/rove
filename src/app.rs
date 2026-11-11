@@ -2070,6 +2070,18 @@ mod tests {
         );
     }
 
+    /// 状态栏危险提示的判定：失败/超限/删除类应为红色，普通提示不是。
+    #[test]
+    fn status_danger_markers() {
+        assert!(status_is_danger("操作失败：Shell 操作失败，错误代码: 123"));
+        assert!(status_is_danger("名称超过 255 个字符上限，已退出重命名"));
+        assert!(status_is_danger("已删除 3 个项目到回收站"));
+        assert!(status_is_danger("删除已取消"));
+        assert!(!status_is_danger("已复制 3 个项目"));
+        assert!(!status_is_danger("已重命名"));
+        assert!(!status_is_danger(""));
+    }
+
     /// 连续装饰符号会回退到符号字体，按 14px 的保守值切行，
     /// 否则多个符号累积超宽会让整行被水平裁掉。
     #[test]
@@ -4092,6 +4104,23 @@ fn expand_layout(ui: &MainWindow, parts: &[(String, bool)]) -> (bool, f32, GridL
     (needs, wide, lines)
 }
 
+/// 状态栏文案是否属于「危险 / 强提醒」：这类提示用红色，普通提示保持主题色。
+/// 按关键词判定，避免每个调用点都要额外传一个标记。
+fn status_is_danger(text: &str) -> bool {
+    const MARKERS: [&str; 9] = [
+        "失败",
+        "错误",
+        "超过",
+        "上限",
+        "非法",
+        "无法",
+        "不支持",
+        "拒绝",
+        "删除",
+    ];
+    MARKERS.iter().any(|m| text.contains(m))
+}
+
 /// 纯文本版本（仅供单测断言用）。
 #[cfg(test)]
 fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
@@ -5763,10 +5792,8 @@ impl App {
         self.drag_pending = None;
         self.ui.invoke_set_drag_armed(false);
 
-        // 超长名字直接截断到系统上限（截断后可能留下尾部空格，一并去掉）。
-        // 先把**原始输入**的码元数记下来：下面 new_name 会被重新绑定成截断后的
-        // 字符串，之后再拿它比较长度就永远相等，提示会永远不出现。
-        let raw_units = utf16_len(new_name.trim());
+        // 超长名字截断到系统上限（截断后可能留下尾部空格，一并去掉）。
+        // 正常交互不会再传超长文本——输入超限会直接退出重命名，这里只是兜底。
         let clamped = clamp_file_name(new_name.trim());
         let new_name = clamped.trim_end();
         if new_name.is_empty() {
@@ -5813,13 +5840,6 @@ impl App {
                     ));
                 }
                 self.reload_active();
-                // 名字被截到系统上限时明确告知用户：输入的名字与实际生效的不一致，
-                // 不说会让人以为改坏了。放在 reload 之后，避免被刷新的状态文案覆盖。
-                if raw_units > MAX_FILE_NAME_UNITS {
-                    self.set_status_job(format!(
-                        "名称超过 {MAX_FILE_NAME_UNITS} 个字符上限，已截断后重命名"
-                    ));
-                }
             }
             Err(e) => self.set_status_job(format!("重命名失败：{e}")),
         }
@@ -6470,7 +6490,10 @@ impl App {
     }
 
     fn set_status_job(&self, message: impl Into<SharedString>) {
-        self.ui.set_status_job(message.into());
+        let message = message.into();
+        // 危险提示用红色：失败、名称超限、删除（含删除取消）等需要一眼看到。
+        self.ui.set_status_danger(status_is_danger(message.as_str()));
+        self.ui.set_status_job(message);
     }
 
     /// 任务完成后的处理：刷新受影响目录。
@@ -7427,7 +7450,9 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 let Some(status) = status else { return };
                 let running_text = status_text(&status);
                 if app.ui.get_status_job().is_empty() || !running_text.is_empty() {
-                    app.ui.set_status_job(running_text.clone().into());
+                    // 走统一入口：这里必须顺手把危险标记复位，否则上一条
+                    // 红色提示（如「操作失败…」）会让进度文案也变红。
+                    app.set_status_job(running_text.clone());
                 }
                 if let Some(summary) = status.finished.as_ref().cloned() {
                     drop(status);
@@ -7979,27 +8004,19 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_file_rename_text_changed(move |pane, text| {
             let Some(app) = app.upgrade() else { return };
-            // 输入达到系统上限（255 UTF-16 码元）时，直接按截断后的名字提交：
-            // 等效于「到上限即完成重命名」——既不回写文本（回写会让 TextInput
-            // 光标错位、把字插进扩展名内部），浮层也不会无限往下长。
+            // 输入达到系统上限（255 UTF-16 码元）时**直接退出重命名**：
+            // 不回写文本（回写会让 TextInput 光标错位、把字插进扩展名内部），
+            // 也不提交截断后的名字（用户输入与实际生效不一致更糟），
+            // 浮层同时不会无限往下长。退出动作与 Esc 取消完全一致。
             if utf16_len(text.as_str()) > MAX_FILE_NAME_UNITS {
-                // 用块把共享借用限制在语句内：下面要 borrow_mut() 做提交，
-                // 直接写成一整行容易让人以为借用跨越了后续代码。
-                let path = {
-                    let shared = app.borrow();
-                    shared.ui.get_rename_path().to_string()
-                };
-                if path.is_empty() {
-                    return;
-                }
-                // 必须传**原始**超长文本：commit_rename 内部会调 clamp_file_name
-                // 截断，并把「截断前的码元数」用于状态栏提示。若在这里先截断再传，
-                // 那边的 raw_units 就永远 ≤ 上限，提示分支永远进不去。
-                // 同步提交：invoke_from_event_loop 要求 Send，而 App 是 Rc，用不了。
-                // 提交过程中会触发 name-debug 等只读诊断回调，它们已改成 try_borrow，
-                // 拿不到借用时直接跳过，不会与这里的可变借用冲突。
-                app.borrow_mut()
-                    .commit_rename(std::path::Path::new(&path), text.as_str());
+                let mut guard = app.borrow_mut();
+                guard.ui.set_rename_path(SharedString::default());
+                guard.sync_expand_targets();
+                guard.drag_pending = None;
+                guard.ui.invoke_set_drag_armed(false);
+                guard.set_status_job(format!(
+                    "名称超过 {MAX_FILE_NAME_UNITS} 个字符上限，已退出重命名"
+                ));
                 return;
             }
             let app = app.borrow();

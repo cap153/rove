@@ -201,6 +201,8 @@ export component MainWindow inherits Window {
     in-out property <string> status-left: "";
     in-out property <string> status-right: "";
     in-out property <string> status-job: "";
+    /// 状态栏文案是否为危险提示（失败 / 超限 / 删除等），红色高亮由 Rust 判定。
+    in-out property <bool> status-danger: false;
     /// 面包屑路径编辑态（点击地址栏空白处进入，Enter 确认 / Esc 取消）。
     in-out property <bool> path-editing: false;
     /// 本次地址栏编辑中，输入框是否确实获得过焦点。
@@ -1478,7 +1480,8 @@ out property <length> row-height-out: file-list.row-height-out;
 
                 if (root.status-job != "") : Text {
                     text: root.status-job;
-                    color: Theme.accent;
+                    // 失败 / 名称超限 / 删除等强提醒用红色，普通提示保持主题色。
+                    color: root.status-danger ? Theme.danger : Theme.accent;
                     font-size: 11.5px;
                     vertical-alignment: center;
                 }
