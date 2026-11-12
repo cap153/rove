@@ -10669,7 +10669,6 @@ fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
             }
         };
         if need_redraw {
-            logv!("[geom] HWND not ready, retry redraw ({})", app.borrow().geom_retries);
             app.borrow().ui.window().request_redraw();
         } else if give_up {
             logln!("[geom] HWND never ready after 120 retries, give up centering");
