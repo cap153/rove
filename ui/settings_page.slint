@@ -1,3 +1,4 @@
+import { I18n } from "i18n.slint";
 // 设置页面（独立标签页）。
 // 目前实现：左侧子导航 + 右侧「本地右键菜单」分组管理。
 
@@ -103,7 +104,7 @@ component SettingRow inherits Rectangle {
             background: edit-ta.has-hover ? Theme.bg-hover : transparent;
 
             Text {
-                text: "编辑";
+                text: I18n.strings[72];
                 color: Theme.text-secondary;
                 font-size: 11px;
                 horizontal-alignment: center;
@@ -133,7 +134,7 @@ component SettingRow inherits Rectangle {
             background: del-ta.has-hover ? Theme.bg-hover : transparent;
 
             Text {
-                text: "删除";
+                text: I18n.strings[23];
                 color: #C0392B;
                 font-size: 11px;
                 horizontal-alignment: center;
@@ -314,6 +315,115 @@ component SettingsScrollContainer inherits Rectangle {
     }
 }
 
+// 通用设置里的下拉行：标题 + 当前值 + 展开的选项列表。
+component ComboRow inherits Rectangle {
+    in property <string> label: "";
+    in property <[string]> options: [];
+    in-out property <int> selected: 0;
+    callback selection_changed(int);
+    in-out property <bool> open: false;
+
+    height: 58px;
+    background: Theme.bg-input;
+    border-radius: 8px;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    Text {
+        x: 16px;
+        y: 0px;
+        width: parent.width - 240px;
+        height: parent.height;
+        text: root.label;
+        color: Theme.text-primary;
+        font-size: 13px;
+        font-weight: 500;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+
+    Rectangle {
+        x: parent.width - 210px;
+        y: 11px;
+        width: 194px;
+        height: 36px;
+        background: Theme.bg-main;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.border;
+
+        Text {
+            x: 10px;
+            y: 0px;
+            width: parent.width - 34px;
+            height: parent.height;
+            text: root.options[root.selected];
+            color: Theme.text-primary;
+            font-size: 12px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        Text {
+            x: parent.width - 20px;
+            y: 0px;
+            width: 16px;
+            height: parent.height;
+            text: root.open ? "▲" : "▼";
+            color: Theme.text-secondary;
+            font-size: 8px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => { root.open = !root.open; }
+        }
+    }
+
+    if (root.open) : Rectangle {
+        x: parent.width - 210px;
+        y: 48px;
+        width: 194px;
+        height: min(140px, root.options.length * 30px + 8px);
+        background: Theme.bg-input;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.border;
+        z: 100;
+
+        for opt[i] in root.options : Rectangle {
+            x: 4px;
+            y: 4px + i * 30px;
+            width: parent.width - 8px;
+            height: 30px;
+            border-radius: 4px;
+            background: i == root.selected ? Theme.bg-selected : (opt-ta.has-hover ? Theme.bg-hover : transparent);
+
+            Text {
+                x: 8px;
+                y: 0px;
+                width: parent.width - 16px;
+                height: parent.height;
+                text: opt;
+                color: Theme.text-primary;
+                font-size: 12px;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+            opt-ta := TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => {
+                    root.selected = i;
+                    root.open = false;
+                    root.selection_changed(i);
+                }
+            }
+        }
+    }
+}
+
 export component SettingsPage inherits Rectangle {
     in property <[SettingsNavItem]> nav-items: [];
     in property <[SettingsActionGroup]> action-groups: [];
@@ -336,21 +446,27 @@ export component SettingsPage inherits Rectangle {
     callback shortcut_remove_alternate_clicked(string, int); // id, slot
     callback shortcut_reset_all_clicked();
     // 当前子页的标题 / 描述 / 是否显示「新增动作」入口。
-    in property <string> page-title: "本地右键菜单";
-    in property <string> page-desc: "开关控制菜单项显隐；内置动作仅允许开关，自定义动作可编辑或删除。";
+    in property <string> page-title: I18n.strings[59];
+    in property <string> page-desc: I18n.strings[44];
     in property <bool> show-add: true;
     /// 是否显示隐藏文件（由 MainWindow 透传自 config）。
     in-out property <bool> show-hidden: false;
     /// 开关「显示隐藏项目」时触发（bool = 新的开关态）。
     callback show_hidden_toggled(bool);
+    /// 显示语言：0 跟随系统 / 1 简体中文 / 2 English。
+    in-out property <int> language-index: 0;
+    callback language_changed(int);
+    /// 启动时打开：0 上次的标签页(包括分屏) / 1 电脑选项。
+    in-out property <int> startup-index: 0;
+    callback startup_changed(int);
 
     // ---- 搜索与索引数据与回调 ----
     in property <bool> search-ready: true;
-    in property <string> search-status-text: "索引未构建";
+    in property <string> search-status-text: I18n.strings[71];
     in property <string> search-items-count: "0";
     in property <string> search-size-text: "0 MB";
     in property <int> search-drives-count: 0;
-    in property <string> search-last-scan-time: "未记录";
+    in property <string> search-last-scan-time: I18n.strings[58];
     in property <[SettingsDriveItem]> search-drives: [];
     in property <[string]> search-builtin-exclusions: [];
     in property <[string]> search-custom-exclusions: [];
@@ -483,7 +599,7 @@ export component SettingsPage inherits Rectangle {
                         border-radius: 6px;
 
                         Text {
-                            text: "+ 新增动作";
+                            text: I18n.strings[4];
                             color: white;
                             font-size: 12px;
                             horizontal-alignment: center;
@@ -502,7 +618,7 @@ export component SettingsPage inherits Rectangle {
                     }
 
                     // 快捷键页面的「全部恢复默认」按钮
-                    if (root.page-title == "快捷键") : Rectangle {
+                    if (root.page-title == I18n.strings[45]) : Rectangle {
                         width: 104px;
                         height: 30px;
                         border-radius: 6px;
@@ -511,7 +627,7 @@ export component SettingsPage inherits Rectangle {
                         background: reset-all-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
 
                         Text {
-                            text: "全部恢复默认";
+                            text: I18n.strings[20];
                             color: Theme.text-secondary;
                             font-size: 12px;
                             horizontal-alignment: center;
@@ -540,7 +656,7 @@ export component SettingsPage inherits Rectangle {
             }
 
             // ---- 子页 1：通用设置面板 ----
-            if (root.page-title == "通用") : SettingsScrollContainer {
+            if (root.page-title == I18n.strings[79]) : SettingsScrollContainer {
                 content-height: gen-layout.preferred-height + 28px;
 
                 gen-layout := VerticalLayout {
@@ -577,14 +693,14 @@ export component SettingsPage inherits Rectangle {
                                 horizontal-stretch: 1;
 
                                 Text {
-                                    text: "显示隐藏的文件、文件夹和驱动器";
+                                    text: I18n.strings[53];
                                     color: Theme.text-primary;
                                     font-size: 13px;
                                     font-weight: 500;
                                     overflow: elide;
                                 }
                                 Text {
-                                    text: "关闭时自动过滤具有隐藏属性的文件；开启时以半透明效果显示";
+                                    text: I18n.strings[21];
                                     color: Theme.text-secondary;
                                     font-size: 11px;
                                     overflow: elide;
@@ -601,11 +717,34 @@ export component SettingsPage inherits Rectangle {
                             }
                         }
                     }
+
+                    ComboRow {
+                        // 展开时抬高层级：否则下拉列表会被布局里更靠后的行盖住。
+                        z: self.open ? 10 : 0;
+                        label: I18n.strings[85];
+                        options: [I18n.strings[86], I18n.strings[87], I18n.strings[88]];
+                        selected: root.language-index;
+                        selection_changed(i) => {
+                            root.language-index = i;
+                            root.language_changed(i);
+                        }
+                    }
+
+                    ComboRow {
+                        z: self.open ? 10 : 0;
+                        label: I18n.strings[89];
+                        options: [I18n.strings[90], I18n.strings[91]];
+                        selected: root.startup-index;
+                        selection_changed(i) => {
+                            root.startup-index = i;
+                            root.startup_changed(i);
+                        }
+                    }
                 }
             }
 
             // ---- 子页：搜索与索引 ----
-            if (root.page-title == "搜索与索引") : SettingsScrollContainer {
+            if (root.page-title == I18n.strings[50]) : SettingsScrollContainer {
                 content-height: search-layout.preferred-height + 28px;
 
                 // 点击本页空白处：释放文本框焦点。
@@ -682,7 +821,7 @@ export component SettingsPage inherits Rectangle {
                                         IconRefresh { size: 12px; icon-color: Theme.text-secondary; y: (parent.height - self.height) / 2; }
 
                                         Text {
-                                            text: "重新扫描驱动器";
+                                            text: I18n.strings[80];
                                             color: Theme.text-primary;
                                             font-size: 11.5px;
                                             vertical-alignment: center;
@@ -712,7 +851,7 @@ export component SettingsPage inherits Rectangle {
                                         alignment: center;
                                         spacing: 2px;
                                         Text { text: root.search-items-count; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
-                                        Text { text: "已索引项目"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                        Text { text: I18n.strings[41]; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
                                     }
                                 }
 
@@ -726,7 +865,7 @@ export component SettingsPage inherits Rectangle {
                                         alignment: center;
                                         spacing: 2px;
                                         Text { text: root.search-size-text; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
-                                        Text { text: "内存/缓存大小"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                        Text { text: I18n.strings[22]; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
                                     }
                                 }
 
@@ -740,7 +879,7 @@ export component SettingsPage inherits Rectangle {
                                         alignment: center;
                                         spacing: 2px;
                                         Text { text: root.search-drives-count; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
-                                        Text { text: "已纳管驱动器"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                        Text { text: I18n.strings[42]; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
                                     }
                                 }
 
@@ -754,7 +893,7 @@ export component SettingsPage inherits Rectangle {
                                         alignment: center;
                                         spacing: 2px;
                                         Text { text: root.search-last-scan-time; font-size: 15px; font-weight: 600; color: Theme.text-primary; horizontal-alignment: center; }
-                                        Text { text: "上次同步"; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
+                                        Text { text: I18n.strings[6]; font-size: 10.5px; color: Theme.text-secondary; horizontal-alignment: center; }
                                     }
                                 }
                             }
@@ -779,7 +918,7 @@ export component SettingsPage inherits Rectangle {
 
                             Text {
                                 height: 24px;
-                                text: "驱动器检索范围";
+                                text: I18n.strings[84];
                                 color: Theme.text-secondary;
                                 font-size: 12px;
                                 font-weight: 600;
@@ -835,7 +974,7 @@ export component SettingsPage inherits Rectangle {
                                         border-radius: 4px;
                                         background: drive.indexed ? Theme.accent.transparentize(0.85) : Theme.bg-badge;
                                         Text {
-                                            text: drive.indexed ? "已索引" : "未索引";
+                                            text: drive.indexed ? I18n.strings[40] : I18n.strings[57];
                                             color: drive.indexed ? Theme.accent : Theme.text-disabled;
                                             font-size: 10.5px;
                                             horizontal-alignment: center;
@@ -872,7 +1011,7 @@ export component SettingsPage inherits Rectangle {
                             HorizontalLayout {
                                 height: 20px;
                                 spacing: 8px;
-                                Text { text: "忽略与剪枝路径 (支持通配符)"; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
+                                Text { text: I18n.strings[46]; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
                             }
 
                             // 操作栏：选择 + 输入框 + 添加 + 恢复
@@ -890,7 +1029,7 @@ export component SettingsPage inherits Rectangle {
                                     background: pick-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
 
                                     Text {
-                                        text: "选择";
+                                        text: I18n.strings[78];
                                         color: Theme.text-primary;
                                         font-size: 11px;
                                         horizontal-alignment: center;
@@ -944,7 +1083,7 @@ export component SettingsPage inherits Rectangle {
                                         x: 8px;
                                         width: parent.width - 16px;
                                         height: 100%;
-                                        text: "手动输入路径或通配符 (如 **/*.log)";
+                                        text: I18n.strings[48];
                                         color: Theme.text-disabled;
                                         font-size: 11px;
                                         vertical-alignment: center;
@@ -962,7 +1101,7 @@ export component SettingsPage inherits Rectangle {
                                     background: add-ex-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
 
                                     Text {
-                                        text: "添加";
+                                        text: I18n.strings[63];
                                         color: Theme.accent;
                                         font-size: 11px;
                                         font-weight: 600;
@@ -989,7 +1128,7 @@ export component SettingsPage inherits Rectangle {
                                     background: reset-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
 
                                     Text {
-                                        text: "恢复";
+                                        text: I18n.strings[47];
                                         color: Theme.text-secondary;
                                         font-size: 11px;
                                         horizontal-alignment: center;
@@ -1041,7 +1180,7 @@ export component SettingsPage inherits Rectangle {
                                         }
 
                                         c-txt := Text {
-                                            text: c-ta.has-hover ? "删除" : item;
+                                            text: c-ta.has-hover ? I18n.strings[23] : item;
                                             color: c-ta.has-hover ? #FFFFFF : Theme.text-primary;
                                             font-size: 11px;
                                             horizontal-alignment: center;
@@ -1170,8 +1309,8 @@ export component SettingsPage inherits Rectangle {
                                     alignment: center;
                                     horizontal-stretch: 1;
                                     spacing: 1px;
-                                    Text { text: "空闲时自动同步索引"; font-size: 13px; font-weight: 500; color: Theme.text-primary; }
-                                    Text { text: "应用进入空闲且距离上次构建超过指定时间后，在后台静默增量同步"; font-size: 11px; color: Theme.text-secondary; overflow: elide; }
+                                    Text { text: I18n.strings[69]; font-size: 13px; font-weight: 500; color: Theme.text-primary; }
+                                    Text { text: I18n.strings[43]; font-size: 11px; color: Theme.text-secondary; overflow: elide; }
                                 }
 
                                 Toggle {
@@ -1210,7 +1349,7 @@ export component SettingsPage inherits Rectangle {
                                             }
                                         }
                                         Text {
-                                            text: root.search-idle-minutes + " 分钟";
+                                            text: root.search-idle-minutes + I18n.strings[0];
                                             font-size: 11px;
                                             color: Theme.text-primary;
                                             font-weight: 500;
@@ -1245,8 +1384,8 @@ export component SettingsPage inherits Rectangle {
                                     alignment: center;
                                     horizontal-stretch: 1;
                                     spacing: 1px;
-                                    Text { text: "全局搜索结果展示上限"; font-size: 13px; font-weight: 500; color: Theme.text-primary; }
-                                    Text { text: "限制此电脑全盘秒搜返回的最佳匹配条目上限，保证虚拟列表丝滑滚动"; font-size: 11px; color: Theme.text-secondary; overflow: elide; }
+                                    Text { text: I18n.strings[18]; font-size: 13px; font-weight: 500; color: Theme.text-primary; }
+                                    Text { text: I18n.strings[82]; font-size: 11px; color: Theme.text-secondary; overflow: elide; }
                                 }
 
                                 // 步进器
@@ -1275,7 +1414,7 @@ export component SettingsPage inherits Rectangle {
                                             }
                                         }
                                         Text {
-                                            text: root.search-max-results + " 项";
+                                            text: root.search-max-results + I18n.strings[1];
                                             font-size: 11px;
                                             color: Theme.text-primary;
                                             font-weight: 500;
@@ -1308,7 +1447,7 @@ export component SettingsPage inherits Rectangle {
 
 
             // ---- 子页 2：本地右键菜单分组列表 ----
-            if (root.page-title == "本地右键菜单") : SettingsScrollContainer {
+            if (root.page-title == I18n.strings[59]) : SettingsScrollContainer {
                 content-height: max(root.content-height, groups-layout.preferred-height) + 28px;
 
                 // 点击本页空白处 → 释放关键词输入框焦点。
@@ -1345,7 +1484,7 @@ export component SettingsPage inherits Rectangle {
 
                             HorizontalLayout {
                                 height: 20px;
-                                Text { text: "隐藏的系统菜单项"; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
+                                Text { text: I18n.strings[83]; font-size: 12px; font-weight: 600; color: Theme.text-secondary; }
                             }
 
                             // 输入框 + 添加 + 恢复
@@ -1384,7 +1523,7 @@ export component SettingsPage inherits Rectangle {
                                         x: 8px;
                                         width: parent.width - 16px;
                                         height: 100%;
-                                        text: "输入菜单上看到的文字(!开头为精确匹配)，回车添加";
+                                        text: I18n.strings[75];
                                         color: Theme.text-disabled;
                                         font-size: 11px;
                                         vertical-alignment: center;
@@ -1402,7 +1541,7 @@ export component SettingsPage inherits Rectangle {
                                     background: hide-add-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
 
                                     Text {
-                                        text: "添加";
+                                        text: I18n.strings[63];
                                         color: Theme.accent;
                                         font-size: 11px;
                                         font-weight: 600;
@@ -1429,7 +1568,7 @@ export component SettingsPage inherits Rectangle {
                                     background: hide-restore-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
 
                                     Text {
-                                        text: "恢复";
+                                        text: I18n.strings[47];
                                         color: Theme.text-secondary;
                                         font-size: 11px;
                                         horizontal-alignment: center;
@@ -1480,7 +1619,7 @@ export component SettingsPage inherits Rectangle {
                                         }
 
                                         hide-c-txt := Text {
-                                            text: hide-c-ta.has-hover ? "删除" : item;
+                                            text: hide-c-ta.has-hover ? I18n.strings[23] : item;
                                             color: hide-c-ta.has-hover ? #FFFFFF : Theme.text-primary;
                                             font-size: 11px;
                                             horizontal-alignment: center;
@@ -1572,7 +1711,7 @@ export component SettingsPage inherits Rectangle {
             }
 
             // ---- 子页：快捷键 ----
-            if (root.page-title == "快捷键") : SettingsScrollContainer {
+            if (root.page-title == I18n.strings[45]) : SettingsScrollContainer {
                 content-height: keys-layout.preferred-height + 28px;
 
                 keys-layout := VerticalLayout {
@@ -1655,13 +1794,13 @@ export component SettingsPage inherits Rectangle {
                                             vertical-alignment: center;
                                         }
                                         if (item.slot-index > 0) : Text {
-                                            text: "(备用)";
+                                            text: I18n.strings[2];
                                             color: Theme.text-disabled;
                                             font-size: 11px;
                                             vertical-alignment: center;
                                         }
                                         if (item.is-readonly) : Text {
-                                            text: "(锁定)";
+                                            text: I18n.strings[3];
                                             color: Theme.text-disabled;
                                             font-size: 11px;
                                             vertical-alignment: center;
@@ -1684,7 +1823,7 @@ export component SettingsPage inherits Rectangle {
 
                                         key-txt := Text {
                                             text: root.recording-item-key == item.item-key
-                                                ? "请按键..."
+                                                ? I18n.strings[73]
                                                 : (item.chord == "" ? "—" : item.chord);
                                             color: root.recording-item-key == item.item-key
                                                 ? Theme.accent
@@ -1776,7 +1915,7 @@ export component SettingsPage inherits Rectangle {
 
                 Text {
                     x: 10px;
-                    text: "重置快捷键";
+                    text: I18n.strings[81];
                     color: Theme.text-primary;
                     font-size: 12px;
                     vertical-alignment: center;
@@ -1800,7 +1939,7 @@ export component SettingsPage inherits Rectangle {
 
                 Text {
                     x: 10px;
-                    text: "取消绑定";
+                    text: I18n.strings[28];
                     color: Theme.text-primary;
                     font-size: 12px;
                     vertical-alignment: center;
@@ -1824,7 +1963,7 @@ export component SettingsPage inherits Rectangle {
 
                 Text {
                     x: 10px;
-                    text: "添加备用绑定";
+                    text: I18n.strings[64];
                     color: Theme.text-primary;
                     font-size: 12px;
                     vertical-alignment: center;
@@ -1847,7 +1986,7 @@ export component SettingsPage inherits Rectangle {
 
                 Text {
                     x: 10px;
-                    text: "移除备用快捷键绑定";
+                    text: I18n.strings[68];
                     color: #C0392B;
                     font-size: 12px;
                     vertical-alignment: center;

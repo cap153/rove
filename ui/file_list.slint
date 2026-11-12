@@ -1,3 +1,4 @@
+import { I18n } from "i18n.slint";
 import { Theme, FileRow, GridLine, HighlightName } from "common.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
 
@@ -107,7 +108,18 @@ export component FileList inherits Rectangle {
     /// 拖拽悬停命中的行索引（-1 为无悬停）
     in-out property <int> drop-hover-index: -1;
 
-    callback row-pointer-event(index: int, event: PointerEvent, x: length, y: length);
+    callback row-pointer-event(index: int, event: PointerEvent, x: length, y: length, on-name: bool);
+    /// 单选后再次点击文件名才进入重命名：判断点击是否落在「名称」列。
+    /// 图标视图的名称浮层另有 name-overlay-clicked，这里返回 false。
+    public function name-hit(x: length) -> bool {
+        if (root.view-mode == "details" || root.view-mode == "list") {
+            return x >= root.col-name-x && x <= root.col-name-x + root.col-name-w;
+        }
+        return false;
+    }
+    callback name-overlay-clicked();
+    /// Ctrl+滚轮切视图：返回 true 表示事件已被消费，列表不再滚动。
+    callback wheel-view(delta-y: length) -> bool;
     callback row-double-clicked(index: int);
     callback header-clicked(key: string);
     callback scroll-changed(offset: length);
@@ -167,14 +179,14 @@ export component FileList inherits Rectangle {
     /// 用的是同一套字体回退和行高，所以不多不少刚好装 3 行。
     /// （不能用拉丁字 "M\nM" 量：中文字体行高比拉丁字体大，量小了就会
     /// 把第 3 行挤掉。）
-    fm-name-3 := Text { visible: false; font-size: 11.5px; text: "国\n国\n国"; }
+    fm-name-3 := Text { visible: false; font-size: 11.5px; text: I18n.strings[32]; }
     /// 同上，但带符号字（♡/❤）：表情/符号字体往往行高更高，
     /// 行里有它就整行变高。取两者最大值，保证任何名字的 3 行都装得下。
-    fm-name-3e := Text { visible: false; font-size: 11.5px; text: "国♡❤\n国♡❤\n国♡❤"; }
+    fm-name-3e := Text { visible: false; font-size: 11.5px; text: I18n.strings[34]; }
     fm-size-1 := Text { visible: false; font-size: 11px; font-family: Theme.mono-font-family; text: "0"; }
     /// 单行实测行高（仅供 name-debug-info 诊断输出）。
-    fm-name-1 := Text { visible: false; font-size: 11.5px; text: "国"; }
-    fm-name-1e := Text { visible: false; font-size: 11.5px; text: "国♡❤"; }
+    fm-name-1 := Text { visible: false; font-size: 11.5px; text: I18n.strings[31]; }
+    fm-name-1e := Text { visible: false; font-size: 11.5px; text: I18n.strings[33]; }
     /// 名字固定展示 3 行的高度。
     /// **必须 +2px**：Slint 内部用 `floor(高度 / 行高)` 算“能放几行”，
     /// 当高度恰好等于 3×行高 时，浮点误差会算出 2.999… → floor 成 2 行，
@@ -501,7 +513,7 @@ export component FileList inherits Rectangle {
                     x: root.col-name-x;
                     width: root.col-name-w;
                     key: "name";
-                    label: "名称";
+                    label: I18n.strings[30];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -512,7 +524,7 @@ export component FileList inherits Rectangle {
                     x: root.col-modified-x;
                     width: root.w-modified;
                     key: "modified";
-                    label: "修改时间";
+                    label: I18n.strings[17];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -523,7 +535,7 @@ export component FileList inherits Rectangle {
                     x: root.col-type-x;
                     width: root.w-type;
                     key: "type";
-                    label: "类型";
+                    label: I18n.strings[70];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -534,7 +546,7 @@ export component FileList inherits Rectangle {
                     x: root.col-size-x;
                     width: root.w-size;
                     key: "size";
-                    label: root.is-computer-view ? "剩余" : "大小";
+                    label: root.is-computer-view ? I18n.strings[25] : I18n.strings[38];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -546,7 +558,7 @@ export component FileList inherits Rectangle {
                     x: root.col-path-x;
                     width: root.col-path-w;
                     key: "path";
-                    label: "路径";
+                    label: I18n.strings[74];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -740,6 +752,8 @@ export component FileList inherits Rectangle {
                 height: max(parent.height, parent.content-height);
 
                 scroll-event(event) => {
+                    // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
+                    if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
                     if (event.delta-y != 0px) {
                         root.scroll-user-input();
                         flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
@@ -855,7 +869,7 @@ export component FileList inherits Rectangle {
                             // flick.content-y 是负值（向下滚动为负），加它等于减去滚动偏移。
                             let header-h = root.view-mode == "details" ? 30px : 0px;
                             let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
-                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y);
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x));
                             return EventResult.accept;
                         }
                         // 拖拽手势：move/up 继续转发给按下时捕获的行 TouchArea。
@@ -866,7 +880,7 @@ export component FileList inherits Rectangle {
                             || event.kind == PointerEventKind.cancel) {
                             let header-h = root.view-mode == "details" ? 30px : 0px;
                             let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
-                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y);
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x));
                             return EventResult.accept;
                         }
                         return EventResult.reject;
@@ -879,6 +893,8 @@ export component FileList inherits Rectangle {
                     }
 
                     scroll-event(event) => {
+                    // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
+                    if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
                         if (event.delta-y != 0px) {
                             root.scroll-user-input();
                             flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
@@ -1157,6 +1173,8 @@ export component FileList inherits Rectangle {
                     height: 100%;
 
                     scroll-event(event) => {
+                    // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
+                    if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
                         if (event.delta-y != 0px) {
                             root.scroll-user-input();
                             flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
@@ -1164,18 +1182,6 @@ export component FileList inherits Rectangle {
                             return EventResult.accept;
                         }
                         return EventResult.reject;
-                    }
-
-                    clicked => {
-                        // 核心修复：图标视图也支持内联重命名，重命名时点击不应改选区。
-                        if (root.rename-path == row.path) {
-                            return;
-                        }
-                        // 坐标换算为 FileList 内容坐标(列/行偏移 + 单元格内偏移),
-                        // 供右键菜单在窗口中正确定位。
-                        root.row-pointer-event(row.index, { kind: PointerEventKind.down, button: PointerEventButton.left },
-                            root.cell-x(Math.mod(row.index, root.cells-per-row)) + self.mouse-x,
-                            floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y);
                     }
 
                     double-clicked => {
@@ -1205,9 +1211,16 @@ export component FileList inherits Rectangle {
                         // flick.content-y 是负值（向下滚动为负），加它即把内容坐标折算回视口坐标。
                         let header-h = root.view-mode == "details" ? 30px : 0px;
                         let viewport_y = floor(row.index / root.cells-per-row) * root.cell-h + 4px + self.mouse-y + flick.content-y + header-h;
+                        // 「单选后再点文件名重命名」在图标视图也生效：按落点判定是否点在名称区
+                        // —— 中/大/超大图标竖排（缩略图在上、名在下）：y 越过缩略图高度即名称区；
+                        // 小图标横排（图标左、名右）：x 越过 50px 即名称区。
+                        // 注意：不能像详情视图那样再发一次 clicked，否则一次点击会触发两次 down，
+                        // 后一次被 Rust 当成双击直接打开文件。
+                        let is_small = root.view-mode == "icons-small";
+                        let on_name = is_small ? self.mouse-x >= 50px : self.mouse-y >= root.cell-thumb;
                         root.row-pointer-event(row.index, event,
                             root.cell-x(Math.mod(row.index, root.cells-per-row)) + self.mouse-x,
-                            viewport_y);
+                            viewport_y, on_name);
                         return EventResult.accept;
                     }
                 }
@@ -1550,6 +1563,8 @@ export component FileList inherits Rectangle {
             }
 
             scroll-event(event) => {
+                    // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
+                    if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
                 if (event.delta-y != 0px) {
                     root.scroll-user-input();
                     flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
@@ -1570,7 +1585,7 @@ export component FileList inherits Rectangle {
         background: Theme.bg-list;
 
         Text {
-            text: "正在读取…";
+            text: I18n.strings[60];
             color: Theme.text-secondary;
             font-size: 13px;
             horizontal-alignment: center;
@@ -1592,7 +1607,7 @@ export component FileList inherits Rectangle {
             width: 100%;
 
             Text {
-                text: "此文件夹为空";
+                text: I18n.strings[61];
                 color: Theme.text-secondary;
                 font-size: 14px;
                 horizontal-alignment: center;
@@ -1700,6 +1715,13 @@ export component FileList inherits Rectangle {
                     font-size: 11.5px;
                     vertical-alignment: top;
                 }
+            }
+
+            // 单选后再次点击这个文件名浮层 → 进入重命名（Rust 侧复核仍为单选）。
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => { root.name-overlay-clicked(); }
             }
         }
     }

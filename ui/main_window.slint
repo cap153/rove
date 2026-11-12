@@ -1,3 +1,6 @@
+import { I18n } from "i18n.slint";
+// 让根组件把全局导出给 Rust（否则 include_modules! 不会生成公开类型）。
+export { I18n } from "i18n.slint";
 import { Theme, FileRow, GridLine, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup, SettingsDriveItem } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
@@ -68,7 +71,9 @@ component nav-btn inherits Rectangle {
 //   │ 状态栏                                    │
 //   └──────────────────────────────────────────┘
 export component MainWindow inherits Window {
-    title: "Rove";
+    /// 窗口标题实时跟随当前聚焦的标签（由 Rust 的 sync_tabs 推送）。
+    in property <string> window-title: "Rove";
+    title: root.window-title;
     no-frame: true; // 移除 Windows 原生黑色标题栏与边框，改由 TabBar 右侧自绘控制按钮
     // 废弃 Winit 内置缩放：全部交由 app.rs 的 WM_NCHITTEST 钩子接管，
     // 否则 Winit 会在客户区内部私自接管光标并触发缩放（导致右上角按钮区域出现调整大小箭头）。
@@ -102,21 +107,26 @@ export component MainWindow inherits Window {
     callback settings_shortcut_remove_alternate(string, int);
     callback settings_shortcut_reset_all();
     // 设置页子页标题 / 描述 / 新增入口 / 内容高度。
-    in-out property <string> settings-page-title: "本地右键菜单";
+    in-out property <string> settings-page-title: I18n.strings[59];
     in-out property <string> settings-page-desc: "";
     in-out property <bool> settings-show-add: true;
     in-out property <length> settings-content-height: 0px;
     // 是否显示隐藏文件（来自 config.show_hidden，驱动设置页「通用」开关）。
     in-out property <bool> show-hidden: false;
     callback show_hidden_toggled(bool);
+    /// 通用设置：显示语言 / 启动时打开（下标由 Rust 按配置下发）。
+    in-out property <int> language-index: 0;
+    in-out property <int> startup-index: 0;
+    callback language_changed(int);
+    callback startup_changed(int);
 
     // ---- 搜索与索引看板（Rust 驱动） ----
     in-out property <bool> search-ready: true;
-    in-out property <string> search-status-text: "索引未构建";
+    in-out property <string> search-status-text: I18n.strings[71];
     in-out property <string> search-items-count: "0";
     in-out property <string> search-size-text: "0 MB";
     in-out property <int> search-drives-count: 0;
-    in-out property <string> search-last-scan-time: "未记录";
+    in-out property <string> search-last-scan-time: I18n.strings[58];
     in-out property <[SettingsDriveItem]> search-drives: [];
     in-out property <[string]> search-builtin-exclusions: [];
     in-out property <[string]> search-custom-exclusions: [];
@@ -149,10 +159,10 @@ export component MainWindow inherits Window {
     in-out property <string> settings-editor-program: "";
     in-out property <string> settings-editor-args: "";
     // 编辑器「层级归属」可选分组（含内置的「一级菜单」）。
-    in-out property <[string]> settings-editor-group-options: ["一级菜单"];
+    in-out property <[string]> settings-editor-group-options: [I18n.strings[5]];
     // 添加网络位置弹窗状态。
     in-out property <bool> network-dialog-open: false;
-    in-out property <string> network-dialog-title: "添加网络位置";
+    in-out property <string> network-dialog-title: I18n.strings[65];
     in-out property <string> network-dialog-server: "";
     in-out property <string> network-dialog-alias: "";
     in-out property <string> network-dialog-error: "";
@@ -396,7 +406,10 @@ out property <length> row-height-out: file-list.row-height-out;
     callback sidebar_item_right_clicked(id: string);
     /// 仅在用户拖拽结束时上报（落盘用）；窗口尺寸变化导致的被动收缩不上报。
     callback sidebar_width_changed(float);
-    callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length);
+    callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length, on_name: bool);
+    callback file_name_overlay_clicked();
+    /// Ctrl+滚轮切换视图；返回 true 表示已消费滚轮事件。
+    callback file_wheel_view(delta_y: length) -> bool;
     callback file_row_double_clicked(index: int);
     callback file_header_clicked(key: string);
     /// 详细信息列宽：由 Rust 按目录下发，用户拖动后经回调回传落盘。
@@ -1044,7 +1057,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         x: 26px;
                         width: parent.width - 32px;
                         height: parent.height;
-                        text: "搜索当前文件夹";
+                        text: I18n.strings[51];
                         color: Theme.text-disabled;
                         font-size: 12px;
                         vertical-alignment: center;
@@ -1166,13 +1179,14 @@ out property <length> row-height-out: file-list.row-height-out;
                     rename-text <=> root.rename-text;
                     rename-select-end: root.rename-select-end;
                     loading: root.file-loading;
-                    row_pointer_event(index, event, x, y) => {
+                    row_pointer_event(index, event, x, y, on_name) => {
                         if (event.kind == PointerEventKind.down) {
                             root.clear-all-focus();
                             root.pane_focused(0);
                         }
-                        root.file_row_pointer_event(index, event, x, y);
+                        root.file_row_pointer_event(index, event, x, y, on_name);
                     }
+                    name_overlay_clicked() => { root.file_name_overlay_clicked(); }
                     row_double_clicked(index) => {
                         root.file_row_double_clicked(index);
                     }
@@ -1194,6 +1208,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     scroll_user_input() => {
                         root.file_scroll_user_input(0);
                     }
+                    wheel_view(d) => { return root.file_wheel_view(d); }
                     rename_dbg(kind, hf) => {
                         root.file_rename_dbg(0, kind, hf);
                     }
@@ -1305,17 +1320,18 @@ out property <length> row-height-out: file-list.row-height-out;
                         rename-text <=> root.rename-text;
                         rename-select-end: root.rename-select-end;
                         loading: root.file-loading-right;
-                        row_pointer_event(index, event, x, y) => {
+                        row_pointer_event(index, event, x, y, on_name) => {
                             if (event.kind == PointerEventKind.down) {
                                 root.clear-all-focus();
                                 root.pane_focused(1);
                             }
                             if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
-                                root.file_row_pointer_event(index, event, x + left-pane.width + 5px, y);
+                                root.file_row_pointer_event(index, event, x + left-pane.width + 5px, y, on_name);
                             } else {
-                                root.file_row_pointer_event(index, event, x, y);
+                                root.file_row_pointer_event(index, event, x, y, on_name);
                             }
                         }
+                        name_overlay_clicked() => { root.file_name_overlay_clicked(); }
                         row_double_clicked(index) => {
                             root.file_row_double_clicked(index);
                         }
@@ -1337,6 +1353,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         scroll_user_input() => {
                             root.file_scroll_user_input(1);
                         }
+                        wheel_view(d) => { return root.file_wheel_view(d); }
                         rename_dbg(kind, hf) => {
                             root.file_rename_dbg(1, kind, hf);
                         }
@@ -1404,6 +1421,10 @@ out property <length> row-height-out: file-list.row-height-out;
                     content-height: root.settings-content-height;
                     show-hidden: root.show-hidden;
                     show_hidden_toggled(v) => { root.show_hidden_toggled(v); }
+                    language-index: root.language-index;
+                    startup-index: root.startup-index;
+                    language_changed(i) => { root.language_changed(i); }
+                    startup_changed(i) => { root.startup_changed(i); }
                     search-ready: root.search-ready;
                     search-status-text: root.search-status-text;
                     search-items-count: root.search-items-count;

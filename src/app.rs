@@ -1,3 +1,4 @@
+//! src/app.rs
 //! 应用装配：状态机 + UI 回调 + 后台任务。
 //!
 //! 线程模型：
@@ -10,15 +11,15 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use slint::language::{PointerEvent, PointerEventButton, PointerEventKind};
 use slint::{
-    Color, ComponentHandle, LogicalSize, Model, ModelRc, SharedString, Timer, TimerMode, VecModel,
-    WindowSize,
+    Color, ComponentHandle, LogicalPosition, LogicalSize, Model, ModelRc, SharedString, Timer,
+    TimerMode, VecModel, WindowPosition, WindowSize,
 };
 
 use crate::config::{Config, QuickItem, ThemeChoice};
@@ -33,6 +34,8 @@ use crate::ops::{
 use crate::state::AppState;
 
 slint::include_modules!();
+#[path = "i18n.rs"]
+mod i18n;
 
 /// 日志等级判定：`ROVE_LOG` 存在即启用普通级；`ROVE_LOG=2|verbose|debug` 才启用详细级。
 pub(crate) fn log_enabled(level: u8) -> bool {
@@ -84,16 +87,25 @@ pub(crate) fn log_stamp() -> String {
 }
 
 /// 相对时间文案：索引构建完成时刻 -> "刚刚 / N 分钟前 / N 小时前 / N 天前"。
-fn format_ago(t: SystemTime) -> String {
+fn format_ago(t: SystemTime, en: bool) -> String {
     let secs = SystemTime::now()
         .duration_since(t)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    match secs {
-        0..=59 => "刚刚".to_string(),
-        60..=3599 => format!("{} 分钟前", secs / 60),
-        3600..=86399 => format!("{} 小时前", secs / 3600),
-        _ => format!("{} 天前", secs / 86400),
+    if en {
+        match secs {
+            0..=59 => "just now".to_string(),
+            60..=3599 => format!("{} min ago", secs / 60),
+            3600..=86399 => format!("{} h ago", secs / 3600),
+            _ => format!("{} d ago", secs / 86400),
+        }
+    } else {
+        match secs {
+            0..=59 => "刚刚".to_string(),
+            60..=3599 => format!("{} 分钟前", secs / 60),
+            3600..=86399 => format!("{} 小时前", secs / 3600),
+            _ => format!("{} 天前", secs / 86400),
+        }
     }
 }
 
@@ -215,6 +227,10 @@ const CMD_NEW_FOLDER: &str = "new_folder";
 const CMD_REFRESH: &str = "refresh";
 const CMD_SELECT_ALL: &str = "select_all";
 const CMD_MANAGE_ACTIONS: &str = "manage_actions";
+/// 搜索结果里右键打开路径：在 Rove 内跳到所在目录，或交给资源管理器定位。
+const CMD_OPEN_LOCATION: &str = "open_location";
+#[cfg(windows)]
+const CMD_REVEAL_EXPLORER: &str = "reveal_explorer";
 
 /// 右键菜单作用范围（决定挂哪些项、以及结果要作用于谁）。
 #[derive(Clone, Debug)]
@@ -517,6 +533,13 @@ pub struct App {
     /// 切换标签时置位，屏蔽切换过程中 Slint 因内容高度变化自动 Clamp 而
     /// 产生的残留 scroll-changed 事件污染新标签数据（否则表现为切标签白屏）。
     syncing_tab: bool,
+    /// 首次启动的 75% 居中：show() 后 scale_factor() 仍可能是 1.0（窗口尚未真正
+    /// 落到显示器），必须等到首帧 RedrawRequested 窗口已 realize、scale 正确时再居中，
+    /// 否则尺寸会按物理像素当逻辑像素计算而偏大、偏离中心。
+    first_run_pending: bool,
+    /// 首帧居中重试计数：HWND 未就绪时每次 redraw 重试一次，超过上限就放弃居中
+    /// （避免极端情况下 HWND 永远取不到导致每帧 request_redraw 死循环、CPU 打满）。
+    geom_retries: u32,
     /// 切换视图时，暂存待恢复的“逻辑条目索引”，等布局更新后再换算成像素。
     /// （视图切换会改变 cell 布局，旧像素偏移无法直接复用，必须先换回条目序号。）
     pending_scroll_index: Option<usize>,
@@ -618,6 +641,11 @@ pub struct App {
     /// 文件对话框吸附轮询定时器（仅 Windows 生效，见 wire_callbacks）。
     /// 必须挂在 App 字段上：局部 Timer 会在函数返回时停止。
     jump_poll_timer: Timer,
+    /// 单击文件名重命名的延迟定时器：按下先不起重命名，留出双击窗口；
+    /// 窗口内再来一次按下即判定为双击打开（取消本定时器），否则到点才重命名。
+    rename_defer_timer: Timer,
+    /// 自身弱引用：供 rename_defer_timer 等定时器回调里升级回 App。
+    self_weak: Option<Weak<RefCell<App>>>,
     }
 
 // ---------------------------------------------------------------------------
@@ -713,6 +741,8 @@ impl App {
             thumb_failed: HashSet::new(),
             thumb_needs_refresh: false,
             syncing_tab: false,
+            first_run_pending: false,
+            geom_retries: 0,
             pending_scroll_index: None,
             rename_scroll_guard: None,
             rename_pin: None,
@@ -737,6 +767,8 @@ impl App {
             #[cfg(windows)]
             jump_geom: None,
             jump_poll_timer: Timer::default(),
+            rename_defer_timer: Timer::default(),
+            self_weak: None,
         }
     }
 
@@ -1120,15 +1152,17 @@ impl App {
     fn apply_search_query(&mut self, text: &str) {
         logv!("search query: {text:?}");
         let is_root = self.state.active().active().path.is_none();
+        // 记录搜索页面（可前进/后退）以及搜索前的滚动位置。
+        self.state
+            .active_mut()
+            .active_mut()
+            .set_filter_from_search(text);
+        let clearing = text.trim().is_empty();
         // 「此电脑」视图：搜索框 = 全局拼音秒搜（Phase 5 索引）。
         if is_root {
             let query = text.trim().to_string();
             self.run_global_search(&query);
         } else {
-            {
-                let tab = self.state.active_mut();
-                tab.active_mut().filter = text.to_string();
-            }
             // 深度搜索（子树递归）：异步执行，结果经 poll timer 合并。
             self.start_deep_search();
             self.state.active_mut().active_mut().rebuild_display();
@@ -1136,7 +1170,20 @@ impl App {
         self.visible_cache = None;
         self.sync_file_list();
         self.sync_status();
-        self.ui.invoke_scroll_list_to_top();
+        // 搜索会改动历史（set_filter_from_search 压入/弹出搜索页），必须同步前进/后退
+        // 按钮状态；否则刚搜出来的页面在 UI 上仍是「不可后退」（与分屏/切换面板时
+        // 搜索状态串台是同一类「搜索框 ↔ 活动面板导航态」一致性问题）。
+        self.sync_nav();
+        if clearing {
+            // 清空搜索框：回到开始搜索前的滚动位置，而不是强制滚回顶部。
+            let (pane_index, scroll) = {
+                let tab = self.state.active();
+                (tab.active_pane, tab.active().scroll_y)
+            };
+            push_scroll(&self.ui, pane_index, scroll);
+        } else {
+            self.ui.invoke_scroll_list_to_top();
+        }
     }
 
     /// 启动/重置当前标签的深度搜索（filter 变化时调用）。
@@ -2162,6 +2209,40 @@ pub(crate) fn on_index_ready() {
 }
 
 impl App {
+    /// Rust 侧生成的界面文案也走同一份字典。
+    fn tr(&self, zh: &str) -> SharedString {
+        i18n::text(&self.config.language, zh)
+    }
+
+    /// 带 `{}` 占位符的文案：按顺序替换（中英共用同一模板）。
+    fn trf(&self, zh: &str, args: &[String]) -> String {
+        let mut s = self.tr(zh).to_string();
+        for a in args {
+            s = s.replace("{}", a);
+        }
+        s
+    }
+
+    /// 类型徽标文案：字典没有的「XXX 文件」兜底成英文 "XXX file"。
+    fn tr_type(&self, text: &str) -> SharedString {
+        let t = i18n::text(&self.config.language, text);
+        if t.as_str() != text || !text.ends_with(" 文件") {
+            return t;
+        }
+        SharedString::from(format!("{} file", text.trim_end_matches(" 文件")))
+    }
+
+    /// 驱动器显示名（「本地磁盘 (C:)」）：类型标签部分走字典，卷标保持原样。
+    fn tr_drive_label(&self, s: &str) -> SharedString {
+        if let Some(pos) = s.rfind(" (") {
+            let tail = &s[pos..];
+            if tail.len() == 5 && tail.starts_with(" (") && tail.ends_with(":)") {
+                return SharedString::from(format!("{}{}", self.tr_type(&s[..pos]), tail));
+            }
+        }
+        SharedString::from(s)
+    }
+
     fn sync_tabs(&self) {
         let tabs: Vec<TabInfo> = self
             .state
@@ -2174,8 +2255,8 @@ impl App {
                     "⚙".to_string()
                 } else {
                     match &t.active().path {
-                        None => "此".to_string(),
-                        Some(p) if *p == fs::drives::recycle_virtual_path() => "回".to_string(),
+                        None => self.tr("此").to_string(),
+                        Some(p) if *p == fs::drives::recycle_virtual_path() => self.tr("回").to_string(),
                         Some(p) => p
                             .components()
                             .next()
@@ -2188,7 +2269,7 @@ impl App {
                 };
                 TabInfo {
                     id: t.id as i32,
-                    title: t.title().into(),
+                    title: i18n::text(&self.config.language, &t.title()),
                     active: t.id == self.state.active().id,
                     is_settings: t.kind == crate::state::TabKind::Settings,
                     icon_text: icon_text.into(),
@@ -2202,6 +2283,12 @@ impl App {
         self.ui.set_active_tab(self.state.active_tab as i32);
         self.ui.set_tab_loading(self.state.active().active().loading);
         self.ui.set_settings_open(self.state.active().kind == crate::state::TabKind::Settings);
+        // 标题栏实时显示当前聚焦标签的名称（切换标签、导航、设置子页都会走这里）。
+        let window_title = format!(
+            "{} - Rove",
+            i18n::text(&self.config.language, &self.state.active().title())
+        );
+        self.ui.set_window_title(window_title.into());
     }
 
     fn sync_nav(&self) {
@@ -2215,14 +2302,14 @@ impl App {
         let tab = self.state.active();
         let mut segments: Vec<BreadcrumbSegment> = Vec::new();
         segments.push(BreadcrumbSegment {
-            label: "此电脑".into(),
+            label: self.tr("此电脑"),
             path: SharedString::default(),
         });
         if let Some(path) = &tab.active().path {
             if *path == fs::drives::recycle_virtual_path() {
                 // 回收站视图：单个虚拟段。
                 segments.push(BreadcrumbSegment {
-                    label: "回收站".into(),
+                    label: self.tr("回收站"),
                     path: fs::drives::recycle_virtual_path().to_string_lossy().into_owned().into(),
                 });
                 self.ui.set_breadcrumbs(ModelRc::new(VecModel::from(segments)));
@@ -2269,7 +2356,7 @@ impl App {
                                 .drives
                                 .iter()
                                 .find(|d| cumulative.starts_with(format!("{}:", d.letter).as_str()))
-                                .map(|d| d.display_label())
+                                .map(|d| self.tr_drive_label(&d.display_label()).to_string())
                                 .unwrap_or_else(|| cumulative.clone());
                             segments.push(BreadcrumbSegment {
                                 label: label.into(),
@@ -2298,6 +2385,30 @@ impl App {
     }
 
     /// 切换视图模式并持久化。
+    /// Ctrl+滚轮切换视图。向上依次：详细信息 → 列表 → 小图标 → 中等图标
+    /// → 大图标 → 超大图标；向下反过来；到达两端停住，不循环。
+    fn cycle_view_mode(&mut self, up: bool) {
+        const ORDER: [&str; 6] = [
+            "details",
+            "list",
+            "icons-small",
+            "icons-medium",
+            "icons-large",
+            "icons-xl",
+        ];
+        let Some(cur) = ORDER.iter().position(|m| *m == self.config.view_mode) else {
+            return;
+        };
+        let next = if up {
+            (cur + 1).min(ORDER.len() - 1)
+        } else {
+            cur.saturating_sub(1)
+        };
+        if next != cur {
+            self.set_view_mode(ORDER[next]);
+        }
+    }
+
     fn set_view_mode(&mut self, mode: &str) {
         if self.config.view_mode == mode {
             return;
@@ -2434,28 +2545,41 @@ impl App {
         let tab = self.state.active();
         let (dirs, files, selected_size) = tab.active().stats();
         let total = tab.active().display.len();
-        let mut left = format!("{total} 个项目（{dirs} 个文件夹，{files} 个文件）");
+        let en = !i18n::is_chinese(&self.config.language);
+        let mut left = if en {
+            format!("{total} items ({dirs} folders, {files} files)")
+        } else {
+            format!("{total} 个项目（{dirs} 个文件夹，{files} 个文件）")
+        };
         // 全盘索引构建中：此电脑视图的全局搜索结果可能只是已扫完那部分磁盘的
         // 未完成结果（会随构建推进而增多），必须显式告知，否则用户会以为搜漏了。
         // 判定绑定真实构建状态：仅「已启动但未就绪」才提示，索引未启动不误报。
         if tab.active().path.is_none() && matches!(Self::index_build_state(), Some(false)) {
-            left.push_str(" · 全盘索引构建中...");
+            left.push_str(if en { " · Building global index..." } else { " · 全盘索引构建中..." });
         }
         // 全局索引搜索命中数超过展示上限：明确告知结果被截断。
         if let Some(found) = tab.active().search_total.filter(|&n| total < n) {
-            left.push_str(&format!(" · 已展示前 {total} 项（共找到 {found} 项）"));
+            left.push_str(&if en {
+                format!(" · Showing top {total} of {found} matches")
+            } else {
+                format!(" · 已展示前 {total} 项（共找到 {found} 项）")
+            });
         }
         if tab.active().deep_searching {
-            left.push_str(" · 正在搜索子文件夹…");
+            left.push_str(if en { " · Searching subfolders…" } else { " · 正在搜索子文件夹…" });
         }
         self.ui.set_status_left(left.into());
         let selected = tab.active().selection_count();
         let right = if selected == 0 {
             String::new()
         } else if selected_size > 0 {
-            format!("已选 {selected} 项 · {}", fs::format_size_bytes(selected_size))
+            if en {
+                format!("{selected} selected · {}", fs::format_size_bytes(selected_size))
+            } else {
+                format!("已选 {selected} 项 · {}", fs::format_size_bytes(selected_size))
+            }
         } else {
-            format!("已选 {selected} 项")
+            if en { format!("{selected} selected") } else { format!("已选 {selected} 项") }
         };
         self.ui.set_status_right(right.into());
     }
@@ -2544,7 +2668,7 @@ impl App {
         // ---- 各分区内容 ----
         // key → 区块（header + 条目），按 config.sidebar_order 组装。
         let arrow_quick = if self.config.quick_expanded { "▼" } else { "▶" };
-        let mut h = header("quick", "快速访问");
+        let mut h = header("quick", self.tr("快速访问").as_str());
         h.icon_text = arrow_quick.into();
         let mut quick_items: Vec<SidebarItem> = vec![h];
 
@@ -2583,27 +2707,35 @@ impl App {
                 let icon_img = slint::Image::default();
 
                 let (color, icon) = match q.id.as_str() {
-                    "desktop" => (Color::from_rgb_u8(0xE8, 0xB3, 0x3C), "桌"),
-                    "downloads" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "下"),
-                    "pictures" => (Color::from_rgb_u8(0x4C, 0x9F, 0x70), "图"),
-                    "documents" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "文"),
-                    "music" => (Color::from_rgb_u8(0xD9, 0x69, 0x4E), "乐"),
-                    "videos" => (Color::from_rgb_u8(0x8E, 0x6C, 0xC9), "视"),
-                    "recycle" => (Color::from_rgb_u8(0x8A, 0x8F, 0x98), "回"),
-                    _ => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), "夹"),
+                    "desktop" => (Color::from_rgb_u8(0xE8, 0xB3, 0x3C), self.tr("桌")),
+                    "downloads" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), self.tr("下")),
+                    "pictures" => (Color::from_rgb_u8(0x4C, 0x9F, 0x70), self.tr("图")),
+                    "documents" => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), self.tr("文")),
+                    "music" => (Color::from_rgb_u8(0xD9, 0x69, 0x4E), self.tr("乐")),
+                    "videos" => (Color::from_rgb_u8(0x8E, 0x6C, 0xC9), self.tr("视")),
+                    "recycle" => (Color::from_rgb_u8(0x8A, 0x8F, 0x98), self.tr("回")),
+                    _ => (Color::from_rgb_u8(0x3E, 0x7B, 0xC4), self.tr("夹")),
                 };
                 let detail = if is_recycle {
-                    format!(
-                        "{} 项 · {}",
-                        stats.items,
-                        fs::format_size_bytes(stats.bytes.max(0) as u64)
-                    )
+                    if !i18n::is_chinese(&self.config.language) {
+                        format!(
+                            "{} items · {}",
+                            stats.items,
+                            fs::format_size_bytes(stats.bytes.max(0) as u64)
+                        )
+                    } else {
+                        format!(
+                            "{} 项 · {}",
+                            stats.items,
+                            fs::format_size_bytes(stats.bytes.max(0) as u64)
+                        )
+                    }
                 } else {
                     String::new()
                 };
                 quick_items.push(SidebarItem {
                     id: format!("quick:{}", q.id).into(),
-                    label: q.label.clone().into(),
+                    label: self.tr(&q.label).into(),
                     detail: detail.into(),
                     kind: "quick".into(),
                     icon_color: color,
@@ -2618,7 +2750,7 @@ impl App {
         if !self.state.recent.is_empty() {
             // 展开与收起箭头
             let arrow = if self.config.recent_expanded { "▼" } else { "▶" };
-            let mut h = header("recent", "最近使用");
+            let mut h = header("recent", self.tr("最近使用").as_str());
             h.icon_text = arrow.into();
             recent_items.push(h);
 
@@ -2655,7 +2787,7 @@ impl App {
         }
 
         let arrow_computer = if self.config.computer_expanded { "▼" } else { "▶" };
-        let mut h = header("computer", "此电脑");
+        let mut h = header("computer", self.tr("此电脑").as_str());
         h.icon_text = arrow_computer.into();
         let mut computer_items: Vec<SidebarItem> = vec![h];
         if self.config.computer_expanded {
@@ -2663,7 +2795,7 @@ impl App {
                 // 紧凑格式改为：剩余容量 / 总容量（如 "32G / 100G"）
                 computer_items.push(SidebarItem {
                     id: format!("drive:{}", drive.letter).into(),
-                    label: drive.display_label().into(),
+                    label: self.tr_drive_label(&drive.display_label()).into(),
                     detail: format!(
                         "{} / {}",
                         format_pulse_size(drive.free_bytes),
@@ -2680,18 +2812,18 @@ impl App {
         }
 
         let arrow_network = if self.config.network_expanded { "▼" } else { "▶" };
-        let mut h = header("network", "网络位置");
+        let mut h = header("network", self.tr("网络位置").as_str());
         h.icon_text = arrow_network.into();
         let mut network_items: Vec<SidebarItem> = vec![h];
         if self.config.network_expanded {
             if network.is_empty() {
                 network_items.push(SidebarItem {
                     id: "net:none".into(),
-                    label: "暂无，右键标题添加".into(),
+                    label: self.tr("暂无，右键标题添加").into(),
                     detail: String::new().into(),
                     kind: "hint".into(),
                     icon_color: Color::from_rgb_u8(0x8A, 0x8F, 0x98),
-                    icon_text: "网".into(),
+                    icon_text: self.tr("网").into(),
                     usage: -1.0,
                     icon: slint::Image::default(),
                 });
@@ -2719,7 +2851,7 @@ impl App {
         };
         let mut explorer_net_items: Vec<SidebarItem> = Vec::new();
         if !detected.is_empty() {
-            let mut h = header("explorer-net", "网络位置(系统)");
+            let mut h = header("explorer-net", self.tr("网络位置(系统)").as_str());
             h.icon_text = arrow_explorer_net.into();
             explorer_net_items.push(h);
             if self.config.explorer_net_expanded {
@@ -3646,14 +3778,22 @@ impl App {
                     thumb_px,
                     in_core,
                 );
+                // 此电脑视图的驱动器条目：显示名里的类型标签（"本地磁盘"）走字典翻译，
+                // 卷标保持原样——与侧边栏 / 面包屑的 tr_drive_label 行为一致。
+                // 只改显示名；排序、打开、重命名等仍用 entry.name / entry.path。
+                let display_name = if computer_view {
+                    self.tr_drive_label(&entry.name).to_string()
+                } else {
+                    entry.name.clone()
+                };
                 FileRow {
                     index,
-                    name: entry.name.clone().into(),
+                    name: display_name.clone().into(),
                     grid_lines: {
                         // 名称分成「高亮分段」两路输入：搜索态直接用命中分段，
                         // 常态退化为单个不高亮段，渲染路径因此只有一条。
                         let parts: Vec<(String, bool)> = if name_parts.is_empty() {
-                            vec![(entry.name.clone(), false)]
+                            vec![(display_name, false)]
                         } else {
                             name_parts.clone()
                         };
@@ -3697,7 +3837,7 @@ impl App {
                     }
                     .into(),
                     modified_text: fs::format_time(entry.modified).into(),
-                    type_text: entry.type_text.clone().into(),
+                    type_text: self.tr_type(&entry.type_text).into(),
                     icon_color: icon_color(&entry),
                     icon_text: icon_text_for(&entry).into(),
                     selected,
@@ -3721,9 +3861,16 @@ impl App {
         // 写进新标签的 scroll_y（否则表现为切标签白屏）。
         self.syncing_tab = true;
 
+        // 切换标签时取消挂起的延迟重命名：否则切走再切回原标签，原标签选择集可能
+        // 仍满足「唯一选中该路径」，导致 400ms 后跨标签冒出重命名输入框。
+        self.cancel_rename_defer();
+
         // 切换标签后退出地址栏编辑态。
         self.ui.set_path_editing(false);
         self.sync_tabs();
+        // 每个标签/分屏各有一份搜索词，切换后搜索框显示新页面的内容。
+        let pane_filter = self.state.active().active().filter.clone();
+        self.ui.set_filter_text(pane_filter.into());
         self.sync_nav();
         self.sync_breadcrumbs();
         self.sync_status();
@@ -3755,6 +3902,12 @@ impl App {
 
         // 关闭保护伞
         self.syncing_tab = false;
+
+        // 设置标签的导航/标题/分组由 sync_settings 下发：从快照恢复或切标签
+        // 回来时也必须补一次，否则左侧子导航是空的。
+        if self.state.active().kind == crate::state::TabKind::Settings {
+            self.sync_settings();
+        }
     }
 
     /// 切换当前标签的分屏状态。
@@ -3771,9 +3924,9 @@ impl App {
             }
             if !tab.is_split {
                 let src = tab.active();
+                // 右栏从干净状态新建：同路径 + 同排序，但不继承左栏的搜索词与历史，
+                // 否则左栏正在进行的搜索会随分屏混入右栏（含前进/后退导航里的历史搜索词）。
                 let mut pane = crate::state::PaneState::new(src.path.clone(), src.sort);
-                pane.history = src.history.clone();
-                pane.history_index = src.history_index;
                 pane.loading = true;
                 tab.panes.push(pane);
                 tab.is_split = true;
@@ -3795,6 +3948,8 @@ impl App {
         if let Some((id, pane, generation, path, sort)) = request {
             self.request_listing(id, pane, generation, path, sort);
         }
+        // 分屏后焦点切到新面板：搜索框同步为当前聚焦面板（右栏干净、应为空）。
+        self.ui.set_filter_text(self.state.active().active().filter.clone().into());
         let ratio = self.state.active().split_ratio;
         self.visible_cache = None;
         self.sync_split_state();
@@ -3842,6 +3997,9 @@ impl App {
         self.sync_breadcrumbs();
         self.sync_status();
         self.sync_file_list();
+        // 每个分屏各有一份搜索词：切换焦点时把搜索框换成新面板的内容。
+        let pane_filter = self.state.active().active().filter.clone();
+        self.ui.set_filter_text(pane_filter.into());
         // 同步标签栏标题、图标和 loading：标签作用于当前聚焦面板。
         self.sync_tabs();
     }
@@ -4159,18 +4317,15 @@ fn expand_layout(ui: &MainWindow, parts: &[(String, bool)]) -> (bool, f32, GridL
 /// 状态栏文案是否属于「危险 / 强提醒」：这类提示用红色，普通提示保持主题色。
 /// 按关键词判定，避免每个调用点都要额外传一个标记。
 fn status_is_danger(text: &str) -> bool {
-    const MARKERS: [&str; 9] = [
-        "失败",
-        "错误",
-        "超过",
-        "上限",
-        "非法",
-        "无法",
-        "不支持",
-        "拒绝",
-        "删除",
+    // 注意：「删除」不能当危险标记——"已删除 N 个项目到回收站"（成功）、
+    // "删除已取消"（取消）都会被它误判成红色。删除失败本来就含「失败」，
+    // 删除出错含「错误」，故移除裸「删除」后不会漏报真正的失败。
+    const MARKERS: [&str; 11] = [
+        "失败", "错误", "超过", "上限", "非法", "无法", "不支持", "拒绝", "failed", "cannot",
+        "denied",
     ];
-    MARKERS.iter().any(|m| text.contains(m))
+    let lower = text.to_lowercase();
+    MARKERS.iter().any(|m| lower.contains(m))
 }
 
 /// 一个可落点的面包屑段：窗口逻辑矩形 + 目标目录（`None` = 不可落点）。
@@ -4297,7 +4452,7 @@ fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::pa
         return;
     }
     if paths.iter().any(|p| p == target || target.starts_with(p)) {
-        app.set_status_job("无法将文件夹移动到自身或其子文件夹中");
+        app.set_status_job(app.tr("无法将文件夹移动到自身或其子文件夹中"));
         return;
     }
     app.expect_new_entries(paths, target);
@@ -4345,7 +4500,7 @@ fn autofit_widths_for_pane(app: &App) -> [f32; 5] {
         // 「此电脑」驱动器条目没有修改时间：format_time(None) 自然返回空串。
         // 按用户意图不再做任何特判；下面的宽度下限保证这一列仍展示、只是数据留空。
         max[1] = max[1].max(text_w(&crate::fs::format_time(e.modified)));
-        max[2] = max[2].max(text_w(&e.type_text));
+        max[2] = max[2].max(text_w(&app.tr_type(&e.type_text)));
         // 此电脑视图的「剩余」列只显示 extra 的前半段。
         let size_text = if computer {
             e.extra.split('/').next().unwrap_or("").trim().to_string()
@@ -4621,8 +4776,10 @@ fn apply_theme(ui: &MainWindow, choice: ThemeChoice) {
 // ---------------------------------------------------------------------------
 
 /// 编辑器「层级归属」候选：已有二级分组（去空去重）+ 内置的「一级菜单」。
-fn group_options(actions: &[crate::ops::actions::ActionEntry]) -> Vec<SharedString> {
-    let mut opts: Vec<SharedString> = vec!["一级菜单".into()];
+/// `top_label` 是「一级菜单」的当前语言文案：下拉直接展示它，且必须与
+/// Slint 侧识别哨兵用的 I18n.strings[5] 一致（否则英文界面会显示中文原文）。
+fn group_options(actions: &[crate::ops::actions::ActionEntry], top_label: &str) -> Vec<SharedString> {
+    let mut opts: Vec<SharedString> = vec![top_label.into()];
     for a in actions {
         let g = a.group.trim();
         if !g.is_empty() && !opts.iter().any(|o| o == g) {
@@ -4659,26 +4816,26 @@ impl App {
         {
             return match target {
                 MenuScope::Selection(_) => vec![
-                    item("recycle-restore", "还原到原位置", true),
-                    item("recycle-cut", "剪切", true),
+                    item("recycle-restore", self.tr("还原到原位置").as_str(), true),
+                    item("recycle-cut", self.tr("剪切").as_str(), true),
                     MenuNode::Separator,
-                    item("recycle-purge", "彻底删除", true),
+                    item("recycle-purge", self.tr("彻底删除").as_str(), true),
                     MenuNode::Separator,
-                    item("recycle-properties", "属性", true),
+                    item("recycle-properties", self.tr("属性").as_str(), true),
                 ],
                 MenuScope::Background => vec![
-                    item("recycle-empty", "清空回收站", true),
+                    item("recycle-empty", self.tr("清空回收站").as_str(), true),
                     MenuNode::Separator,
-                    item(CMD_REFRESH, "刷新", true),
+                    item(CMD_REFRESH, self.tr("刷新").as_str(), true),
                     // 视图 / 排序是全局状态，回收站条目走同一套 sort_entries 与
                     // 行模型；`view:` / `sort:` 的分发也在 menu_scope 检查之前。
                     MenuNode::Submenu {
-                        label: "视图".to_string(),
+                        label: self.tr("视图").to_string(),
                         enabled: true,
                         children: self.view_menu_nodes(),
                     },
                     MenuNode::Submenu {
-                        label: "排序方式".to_string(),
+                        label: self.tr("排序方式").to_string(),
                         enabled: true,
                         children: self.sort_menu_nodes(),
                     },
@@ -4689,6 +4846,12 @@ impl App {
         match target {
             MenuScope::Selection(paths) => {
                 let mut nodes: Vec<MenuNode> = Vec::new();
+                // 搜索结果里的条目来自任意目录，先给出「打开路径」入口：
+                // 可以跳到文件所在目录，也可以直接在资源管理器中定位它。
+                nodes.push(item(CMD_OPEN_LOCATION, self.tr("打开文件所在位置").as_str(), true));
+                #[cfg(windows)]
+                nodes.push(item(CMD_REVEAL_EXPLORER, self.tr("在资源管理器中显示").as_str(), true));
+                nodes.push(MenuNode::Separator);
                 // 按 group 聚合："" 为一级项，其余按首次出现顺序输出为二级子菜单。
                 let mut groups: std::collections::BTreeMap<
                     String,
@@ -4707,14 +4870,14 @@ impl App {
                 }
 
                 for a in groups.remove("").unwrap_or_default() {
-                    let mut label = a.label.clone();
+                    let mut label = self.tr(&a.label).to_string();
                     // 终端：非目录时改标签。
                     if a.id == "builtin.terminal" {
                         let first_is_dir = paths.first().map(|p| p.is_dir()).unwrap_or(false);
                         label = if first_is_dir {
-                            "在此处打开终端"
+                            self.tr("在此处打开终端")
                         } else {
-                            "在终端中打开"
+                            self.tr("在终端中打开")
                         }
                         .to_string();
                     }
@@ -4735,7 +4898,7 @@ impl App {
                             .into_iter()
                             .map(|a| MenuNode::Item {
                                 key: format!("act:{}", a.id),
-                                label: a.label.clone(),
+                                label: self.tr(&a.label).to_string(),
                                 enabled: true,
                                 checked: false,
                             })
@@ -4753,23 +4916,28 @@ impl App {
                 vec![
                     MenuNode::Item {
                         key: CMD_PASTE.to_string(),
-                        label: if paste_move { "粘贴（移动）" } else { "粘贴" }.to_string(),
+                        label: if paste_move {
+                            self.tr("粘贴（移动）")
+                        } else {
+                            self.tr("粘贴")
+                        }
+                        .to_string(),
                         enabled: !paste_paths.is_empty(),
                         checked: false,
                     },
-                    item(CMD_NEW_FOLDER, "新建文件夹", true),
+                    item(CMD_NEW_FOLDER, self.tr("新建文件夹").as_str(), true),
                     MenuNode::Separator,
-                    item(CMD_TERMINAL, "在此处打开终端", true),
-                    item(CMD_REFRESH, "刷新", true),
-                    item(CMD_SELECT_ALL, "全选", true),
-                    item(CMD_MANAGE_ACTIONS, "管理右键动作...", true),
+                    item(CMD_TERMINAL, self.tr("在此处打开终端").as_str(), true),
+                    item(CMD_REFRESH, self.tr("刷新").as_str(), true),
+                    item(CMD_SELECT_ALL, self.tr("全选").as_str(), true),
+                    item(CMD_MANAGE_ACTIONS, self.tr("管理右键动作...").as_str(), true),
                     MenuNode::Submenu {
-                        label: "视图".to_string(),
+                        label: self.tr("视图").to_string(),
                         enabled: true,
                         children: self.view_menu_nodes(),
                     },
                     MenuNode::Submenu {
-                        label: "排序方式".to_string(),
+                        label: self.tr("排序方式").to_string(),
                         enabled: true,
                         children: self.sort_menu_nodes(),
                     },
@@ -4795,7 +4963,7 @@ impl App {
         .iter()
         .map(|(id, label)| MenuNode::Item {
             key: format!("view:{id}"),
-            label: label.to_string(),
+            label: self.tr(label).to_string(),
             enabled: true,
             checked: current == *id,
         })
@@ -4809,7 +4977,7 @@ impl App {
         use crate::sys::menu::MenuNode;
         let item = |key: &str, label: &str, checked: bool| MenuNode::Item {
             key: format!("sort:{key}"),
-            label: label.to_string(),
+            label: self.tr(label).to_string(),
             enabled: true,
             checked,
         };
@@ -4970,25 +5138,26 @@ impl App {
 
         self.ui.set_search_ready(is_ready);
         let status_text = if is_ready {
-            "索引已就绪"
+            self.tr("索引已就绪")
         } else if snapshot.is_some() {
-            "正在构建索引..."
+            self.tr("正在构建索引...")
         } else {
-            "索引未构建"
+            self.tr("索引未构建")
         };
-        self.ui.set_search_status_text(status_text.into());
+        self.ui.set_search_status_text(status_text);
         self.ui.set_search_items_count(format!("{entry_count}").into());
         let real_bytes = crate::search::index::cache_file_size()
             .unwrap_or_else(|| (entry_count * INDEX_ENTRY_BYTES) as u64);
         self.ui.set_search_size_text(fs::format_size_bytes(real_bytes).into());
+        let en = !i18n::is_chinese(&self.config.language);
         let last_scan = if is_ready {
             built_at
-                .map(format_ago)
-                .unwrap_or_else(|| "刚刚".to_string())
+                .map(|t| format_ago(t, en))
+                .unwrap_or_else(|| self.tr("刚刚").to_string())
         } else if snapshot.is_some() {
-            "正在扫描...".to_string()
+            self.tr("正在扫描...").to_string()
         } else {
-            "未记录".to_string()
+            self.tr("未记录").to_string()
         };
         self.ui.set_search_last_scan_time(last_scan.into());
 
@@ -5012,7 +5181,12 @@ impl App {
             drive_items.push(SettingsDriveItem {
                 letter: letter.into(),
                 label: d.label.into(),
-                total_space: format!("总容量 {}", fs::format_size_bytes(d.total_bytes)).into(),
+                total_space: if en {
+                    format!("Total {}", fs::format_size_bytes(d.total_bytes))
+                } else {
+                    format!("总容量 {}", fs::format_size_bytes(d.total_bytes))
+                }
+                .into(),
                 indexed: is_indexed,
                 is_ssd,
             });
@@ -5092,25 +5266,26 @@ impl App {
             SettingsSubpage::General
         };
 
+        let tr = |key: &str| i18n::text(&self.config.language, key);
         let nav_items = vec![
             SettingsNavItem {
                 id: "general".into(),
-                label: "通用".into(),
+                label: tr("通用"),
                 selected: current == SettingsSubpage::General,
             },
             SettingsNavItem {
                 id: "search".into(),
-                label: "搜索与索引".into(),
+                label: tr("搜索与索引"),
                 selected: current == SettingsSubpage::SearchAndIndex,
             },
             SettingsNavItem {
                 id: "context".into(),
-                label: "本地右键菜单".into(),
+                label: tr("本地右键菜单"),
                 selected: current == SettingsSubpage::ContextMenu,
             },
             SettingsNavItem {
                 id: "shortcuts".into(),
-                label: "快捷键".into(),
+                label: tr("快捷键"),
                 selected: current == SettingsSubpage::Shortcuts,
             },
         ];
@@ -5133,8 +5308,9 @@ impl App {
                 false,
             ),
         };
-        self.ui.set_settings_page_title(title.into());
-        self.ui.set_settings_page_desc(desc.into());
+        // 标题与导航文案走同一份字典，保证与 Slint 里 I18n.strings 的比较一致。
+        self.ui.set_settings_page_title(tr(title));
+        self.ui.set_settings_page_desc(tr(desc));
         self.ui.set_settings_show_add(show_add);
 
         // 隐藏的系统右键菜单项关键词。
@@ -5171,8 +5347,8 @@ impl App {
                         id: meta.id.into(),
                         slot_index: slot as i32,
                         item_key: format!("{}:{}", meta.id, slot).into(),
-                        name: meta.name.into(),
-                        group: meta.group.into(),
+                        name: self.tr(meta.name),
+                        group: self.tr(meta.group),
                         chord: chord.into(),
                         default_chord: meta.default_chord.into(),
                         is_customized: is_custom,
@@ -5185,7 +5361,7 @@ impl App {
                 .into_iter()
                 .filter_map(|g| {
                     groups_map.remove(g).map(|items| SettingsShortcutGroup {
-                        name: g.into(),
+                        name: self.tr(g),
                         items: ModelRc::new(VecModel::from(items)),
                     })
                 })
@@ -5210,7 +5386,7 @@ impl App {
             }
             let item = SettingsActionItem {
                 id: a.id.clone().into(),
-                label: a.label.clone().into(),
+                label: self.tr(&a.label).into(),
                 target: a.target.clone().into(),
                 extensions: a.extensions.join(", ").into(),
                 program: a.program.clone().into(),
@@ -5223,9 +5399,9 @@ impl App {
             .into_iter()
             .map(|g| {
                 let name = if g.is_empty() {
-                    "一级菜单".into()
+                    self.tr("一级菜单")
                 } else {
-                    g.clone().into()
+                    self.tr(&g).into()
                 };
                 SettingsActionGroup {
                     name,
@@ -5323,7 +5499,7 @@ impl App {
         // `\\host` 不是文件系统路径（GetFileAttributes 打不开），但能列出共享，
         // 所以不能拿 exists() 卡它。
         if !p.exists() && !crate::fs::dir::is_unc_server_root(&p) {
-            self.set_status_job(format!("路径不存在：{trimmed}"));
+            self.set_status_job(self.trf("路径不存在：{}", &[trimmed.to_string()]));
             return;
         }
         self.navigate_active(Some(p));
@@ -5591,8 +5767,8 @@ impl App {
             checked: false,
         };
         let nodes = vec![
-            item(format!("netloc:edit:{}", entry.path), "编辑"),
-            item(format!("netloc:unpin:{}", entry.path), "取消固定"),
+            item(format!("netloc:edit:{}", entry.path), self.tr("编辑").as_str()),
+            item(format!("netloc:unpin:{}", entry.path), self.tr("取消固定").as_str()),
         ];
         self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false);
     }
@@ -5614,7 +5790,7 @@ impl App {
         };
         let nodes = vec![crate::sys::menu::MenuNode::Item {
             key: format!("quick:unpin:{key}"),
-            label: "取消固定".to_string(),
+            label: self.tr("取消固定").to_string(),
             enabled: !entry.is_special(),
             checked: false,
         }];
@@ -5636,7 +5812,7 @@ impl App {
         self.config.save();
         self.sidebar_fingerprint = 0;
         self.sync_sidebar();
-        self.set_status_job("已取消固定".to_string());
+        self.set_status_job(self.tr("已取消固定"));
     }
 
     /// 把文件夹固定到侧栏「快速访问」；去重（含默认系统目录），返回新增条数。
@@ -5682,7 +5858,7 @@ impl App {
 
     fn open_network_dialog(&mut self) {
         self.network_edit_target = None;
-        self.ui.set_network_dialog_title("添加网络位置".into());
+        self.ui.set_network_dialog_title(self.tr("添加网络位置"));
         self.ui.set_network_dialog_server("".into());
         self.ui.set_network_dialog_alias("".into());
         self.ui.set_network_dialog_error("".into());
@@ -5702,7 +5878,7 @@ impl App {
             return;
         };
         self.network_edit_target = Some(entry.path.clone());
-        self.ui.set_network_dialog_title("编辑网络地址".into());
+        self.ui.set_network_dialog_title(self.tr("编辑网络地址"));
         self.ui.set_network_dialog_server(entry.path.into());
         self.ui.set_network_dialog_alias(entry.label.into());
         self.ui.set_network_dialog_error("".into());
@@ -5732,9 +5908,9 @@ impl App {
         let alias = self.ui.get_network_dialog_alias().trim().to_string();
         let Some(path) = crate::config::normalize_network_path(&raw) else {
             let message = if raw.trim().is_empty() {
-                "请输入服务器地址"
+                self.tr("请输入服务器地址")
             } else {
-                "地址应形如 \\\\服务器 或 \\\\服务器\\共享名"
+                self.tr("地址应形如 \\\\服务器 或 \\\\服务器\\共享名")
             };
             self.ui.set_network_dialog_error(message.into());
             return false;
@@ -6152,7 +6328,7 @@ impl App {
             return;
         }
         if new_name == "." || new_name == ".." || new_name.contains(['\\', '/', ':', '*', '?', '"', '<', '>', '|']) {
-            self.set_status_job("名称包含非法字符");
+            self.set_status_job(self.tr("名称包含非法字符"));
             return;
         }
         let Some(parent) = path.parent() else {
@@ -6163,7 +6339,7 @@ impl App {
             return;
         }
         if new_path.exists() {
-            self.set_status_job("同名文件已存在");
+            self.set_status_job(self.tr("同名文件已存在"));
             return;
         }
         match std::fs::rename(path, &new_path) {
@@ -6193,7 +6369,7 @@ impl App {
                 }
                 self.reload_active();
             }
-            Err(e) => self.set_status_job(format!("重命名失败：{e}")),
+            Err(e) => self.set_status_job(self.trf("重命名失败：{}", &[e.to_string()])),
         }
     }
 
@@ -6212,12 +6388,12 @@ impl App {
     fn staging_transfer(&mut self, is_move: bool) {
         let entries = self.state.staging_present();
         if entries.is_empty() {
-            self.set_status_job("暂存盘为空（或文件已不存在）");
+            self.set_status_job(self.tr("暂存盘为空（或文件已不存在）"));
             self.sync_staging();
             return;
         }
         let Some(dest) = self.state.active().active().path.clone() else {
-            self.set_status_job("请先进入目标文件夹");
+            self.set_status_job(self.tr("请先进入目标文件夹"));
             return;
         };
 
@@ -6226,7 +6402,7 @@ impl App {
         if dest == fs::drives::recycle_virtual_path() {
             if !is_move {
                 self.set_status_job(
-                    "回收站不支持复制到此处；如需把这些文件放入回收站，请点「移动」",
+                    self.tr("回收站不支持复制到此处；如需把这些文件放入回收站，请点「移动」"),
                 );
                 return;
             }
@@ -6343,6 +6519,39 @@ impl App {
         }
     }
 
+    /// 延迟触发重命名：单击文件名先不起重命名，留出双击窗口。
+    /// 若窗口内再来一次按下（判定为双击打开），`cancel_rename_defer` 会取消本定时器；
+    /// 否则到点才真正进入重命名——这样「单击选中后双击名称」不再被抢成重命名。
+    fn schedule_rename(&mut self, path: PathBuf) {
+        let Some(weak) = self.self_weak.clone() else {
+            // 兜底：弱引用未就绪时直接重命名（不应发生）。
+            self.begin_rename(&path);
+            return;
+        };
+        self.rename_defer_timer.stop();
+        self.rename_defer_timer.start(
+            TimerMode::SingleShot,
+            Duration::from_millis(effective_double_click_ms() + 50),
+            move || {
+                let Some(app) = weak.upgrade() else { return };
+                // try_borrow_mut：避免与同在主线程的其它 UI 回调形成 RefCell 嵌套借入而 panic；
+                // 借不到就放弃本次重命名（用户再点一次即可），绝不 panic。
+                let Ok(mut app) = app.try_borrow_mut() else { return };
+                // 仅当该路径仍是唯一选中项时才重命名，避免窗口期内切换了选择导致重命名错对象。
+                let sel = app.state.active().active().selected_paths();
+                if sel.len() == 1 && sel[0] == path {
+                    logv!("[rename] deferred rename firing for {:?}", path);
+                    app.begin_rename(&path);
+                }
+            },
+        );
+    }
+
+    /// 取消挂起的延迟重命名（双击打开时调用）。
+    fn cancel_rename_defer(&mut self) {
+        self.rename_defer_timer.stop();
+    }
+
     /// 打开选中项。
     fn open_selection(&mut self) {
         let paths = self.state.active().active().selected_paths();
@@ -6453,7 +6662,7 @@ impl App {
                     if let MenuScope::Selection(paths) = &target {
                         let added = self.state.stage_paths(paths);
                         self.sync_staging();
-                        self.set_status_job(format!("已加入暂存盘 {added} 项"));
+                        self.set_status_job(self.trf("已加入暂存盘 {} 项", &[added.to_string()]));
                     }
                     return;
                 }
@@ -6485,9 +6694,9 @@ impl App {
                     };
                     let added = self.pin_quick_folders(&dirs);
                     self.set_status_job(if added > 0 {
-                        format!("已固定 {added} 个文件夹到快速访问")
+                        self.trf("已固定 {} 个文件夹到快速访问", &[added.to_string()])
                     } else {
-                        "文件夹已在快速访问中".to_string()
+                        self.tr("文件夹已在快速访问中").to_string()
                     });
                     return;
                 }
@@ -6500,10 +6709,14 @@ impl App {
                         };
                         match crate::ops::actions::run_action(&entry, &targets) {
                             Ok(()) => {
-                                self.set_status_job(format!("已执行：{}", entry.label));
+                                self.set_status_job(format!(
+                                    "{}：{}",
+                                    self.tr("已执行"),
+                                    self.tr(&entry.label)
+                                ));
                                 self.reload_active();
                             }
-                            Err(e) => self.set_status_job(format!("执行失败：{e}")),
+                            Err(e) => self.set_status_job(self.trf("执行失败：{}", &[e.to_string()])),
                         }
                     }
                     return;
@@ -6524,9 +6737,11 @@ impl App {
                         restored += fs::drives::restore_recycle_entry(p);
                     }
                     if restored > 0 {
-                        self.set_status_job(format!("已还原 {restored} 项到原位置"));
+                        self.set_status_job(
+                            self.trf("已还原 {} 项到原位置", &[restored.to_string()]),
+                        );
                     } else {
-                        self.set_status_job("还原失败".to_string());
+                        self.set_status_job(self.tr("还原失败"));
                     }
                     self.reload_active();
                     self.sidebar_fingerprint = 0;
@@ -6539,9 +6754,9 @@ impl App {
                 if let MenuScope::Selection(paths) = &target {
                     let n = fs::drives::purge_recycle_entries(paths);
                     self.set_status_job(if n > 0 {
-                        format!("已彻底删除 {n} 项")
+                        self.trf("已彻底删除 {} 项", &[n.to_string()])
                     } else {
-                        "删除失败".to_string()
+                        self.tr("删除失败").to_string()
                     });
                     self.reload_active();
                     self.sidebar_fingerprint = 0;
@@ -6549,9 +6764,9 @@ impl App {
             }
             "recycle-empty" => {
                 if fs::drives::empty_recycle_bin() {
-                    self.set_status_job("回收站已清空".to_string());
+                    self.set_status_job(self.tr("回收站已清空"));
                 } else {
-                    self.set_status_job("清空回收站失败".to_string());
+                    self.set_status_job(self.tr("清空回收站失败"));
                 }
                 self.reload_active();
                 self.sidebar_fingerprint = 0;
@@ -6561,7 +6776,7 @@ impl App {
                     // Shell 的 properties 动词一次只处理一个条目，多选时显示第一项。
                     if let Some(p) = paths.first() {
                         if let Err(e) = crate::sys::shell::show_properties(p) {
-                            self.set_status_job(format!("无法显示属性：{e}"));
+                            self.set_status_job(self.trf("无法显示属性：{}", &[e.to_string()]));
                         }
                     }
                 }
@@ -6583,6 +6798,39 @@ impl App {
                 if let Some(dir) = dir {
                     if let Err(e) = ops::open_terminal(&dir) {
                         self.set_status_job(e);
+                    }
+                }
+            }
+            CMD_OPEN_LOCATION => {
+                if let MenuScope::Selection(paths) = &target {
+                    if let Some(p) = paths.first() {
+                        if let Some(dir) = p.parent().map(|d| d.to_path_buf()) {
+                            self.navigate_active(Some(dir));
+                            // 导航会清空选择；把目标文件重新选中，列表加载完就能看到它。
+                            let path = p.clone();
+                            let tab = self.state.active_mut().active_mut();
+                            tab.selection.clear();
+                            tab.selection.insert(path.clone());
+                            // 让列表加载完成后滚动到目标文件（否则可能停在视口外看不到）。
+                            self.scroll_to_paths = vec![path];
+                            self.visible_cache = None;
+                            self.refresh_visible_rows();
+                            self.sync_status();
+                        }
+                    }
+                }
+            }
+            #[cfg(windows)]
+            CMD_REVEAL_EXPLORER => {
+                if let MenuScope::Selection(paths) = &target {
+                    if let Some(p) = paths.first() {
+                        let arg = format!("/select,{}", p.to_string_lossy());
+                        if let Err(e) = std::process::Command::new("explorer")
+                            .arg(arg)
+                            .spawn()
+                        {
+                            self.set_status_job(self.trf("打开路径失败：{}", &[e.to_string()]));
+                        }
                     }
                 }
             }
@@ -6608,7 +6856,7 @@ impl App {
         if is_dir {
             self.navigate_active(Some(path.to_path_buf()));
         } else if let Err(e) = open::that_detached(path) {
-            self.set_status_job(format!("打开失败：{e}"));
+            self.set_status_job(self.trf("打开失败：{}", &[e.to_string()]));
         }
     }
 
@@ -6621,11 +6869,11 @@ impl App {
         if self.state.active().active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()) {
             let n = fs::drives::restore_recycle_entry(&entry.path);
             if n > 0 {
-                self.set_status_job(format!("已还原 {} 项到原位置", n));
+                self.set_status_job(self.trf("已还原 {} 项到原位置", &[n.to_string()]));
                 self.reload_active();
                 self.sidebar_fingerprint = 0;
             } else {
-                self.set_status_job("还原失败".to_string());
+                self.set_status_job(self.tr("还原失败"));
             }
             return;
         }
@@ -6672,9 +6920,9 @@ impl App {
             self.state.cut_paths = paths.into_iter().collect();
             self.visible_cache = None;
             self.refresh_visible_rows();
-            self.set_status_job(format!(
+            self.set_status_job(self.trf(
                 "已剪切 {} 个回收站项目（粘贴即可移动到目标文件夹）",
-                self.state.clipboard_paths.len()
+                &[self.state.clipboard_paths.len().to_string()],
             ));
             return;
         }
@@ -6693,12 +6941,18 @@ impl App {
                 self.visible_cache = None;
                 self.refresh_visible_rows();
                 self.set_status_job(if is_move {
-                    format!("已剪切 {} 项", self.state.clipboard_paths.len())
+                    self.trf(
+                        "已剪切 {} 项",
+                        &[self.state.clipboard_paths.len().to_string()],
+                    )
                 } else {
-                    format!("已复制 {} 项", self.state.clipboard_paths.len())
+                    self.trf(
+                        "已复制 {} 项",
+                        &[self.state.clipboard_paths.len().to_string()],
+                    )
                 });
             }
-            Err(e) => self.set_status_job(format!("写入剪贴板失败：{e}")),
+            Err(e) => self.set_status_job(self.trf("写入剪贴板失败：{}", &[e.to_string()])),
         }
     }
 
@@ -6713,7 +6967,7 @@ impl App {
         if dest == fs::drives::recycle_virtual_path() {
             // 防护：回收站内部剪切的内容本就已在回收站中，不能再次删除。
             if self.state.clipboard_from_recycle {
-                self.set_status_job("这些项目已在回收站中");
+                self.set_status_job(self.tr("这些项目已在回收站中"));
                 return;
             }
             let (paths, is_move) = self.paste_state();
@@ -6748,7 +7002,7 @@ impl App {
             }
 
             if restored.is_empty() {
-                self.set_status_job("还原失败（项目可能已被彻底删除）");
+                self.set_status_job(self.tr("还原失败（项目可能已被彻底删除）"));
                 return;
             }
 
@@ -6766,7 +7020,10 @@ impl App {
                     dest_dir: dest,
                 });
             } else {
-                self.set_status_job(format!("已从回收站还原 {} 个项目到当前目录", paths.len()));
+                self.set_status_job(self.trf(
+                    "已从回收站还原 {} 个项目到当前目录",
+                    &[paths.len().to_string()],
+                ));
                 self.scroll_to_paths = restored_paths;
                 self.scroll_select = true;
                 self.reload_active();
@@ -6800,7 +7057,7 @@ impl App {
     /// 在当前目录新建文件夹并进入重命名。
     fn create_folder(&mut self) {
         let Some(dir) = self.state.active().active().path.clone() else {
-            self.set_status_job("请先进入一个文件夹");
+            self.set_status_job(self.tr("请先进入一个文件夹"));
             return;
         };
         let base = dir.join("新建文件夹");
@@ -6826,7 +7083,7 @@ impl App {
                 let new_path = path.clone();
                 self.begin_rename(&new_path);
             }
-            Err(e) => self.set_status_job(format!("创建文件夹失败：{e}")),
+            Err(e) => self.set_status_job(self.trf("创建文件夹失败：{}", &[e.to_string()])),
         }
     }
 
@@ -6836,7 +7093,7 @@ impl App {
         self.shell_key_suppressed_logged = false;
         let ok = self.jobs.submit(kind);
         if !ok {
-            self.set_status_job("有任务正在进行，请稍候");
+            self.set_status_job(self.tr("有任务正在进行，请稍候"));
         }
         ok
     }
@@ -6883,7 +7140,7 @@ impl App {
         // 移动操作会消耗剪贴板：系统剪贴板里仍是「剪切」语义时一并清掉，
         // 否则菜单会继续显示「粘贴（移动）」，再点就是移动已不存在的源文件。
         // 内部拖拽移动不写剪切标记，不会误伤用户的剪贴板。
-        if summary.message.starts_with("已移动") {
+        if summary.outcome == crate::ops::jobs::JobOutcome::Moved {
             if clipboard::read_files().operation == "move" {
                 let _ = clipboard::clear();
                 self.sync_status();
@@ -6896,7 +7153,7 @@ impl App {
         // 「删除已取消 / 删除失败」时保留内容，避免一次取消就丢掉整个暂存列表。
         if self.clear_staging_on_delete_success {
             self.clear_staging_on_delete_success = false;
-            if summary.failed == 0 && summary.message.starts_with("已删除") {
+            if summary.failed == 0 && summary.outcome == crate::ops::jobs::JobOutcome::Deleted {
                 self.state.staging.clear();
             }
         }
@@ -6916,6 +7173,9 @@ impl App {
     }
 
     fn sync_after_navigate(&mut self) {
+        // 导航时取消挂起的延迟重命名：导航会换目录/选择集，原路径可能不再有效，
+        // 否则 400ms 后会在新页面里误弹出重命名。
+        self.cancel_rename_defer();
         // 导航后退出地址栏编辑态。
         self.ui.set_path_editing(false);
         self.sync_tabs();
@@ -6924,7 +7184,9 @@ impl App {
         self.sync_sidebar_active();
         self.sync_status();
         self.ui.set_rename_path(SharedString::default());
-        self.ui.set_filter_text(SharedString::default());
+        // 导航后的页面自带搜索词（搜索页/目录页），不要无条件清空搜索框。
+        let nav_filter = self.state.active().active().filter.clone();
+        self.ui.set_filter_text(nav_filter.into());
         self.visible_cache = None;
 
         // 将内存中正确的 scroll_y 推给 UI，防止 UI 在重绘前乱跳。
@@ -6954,14 +7216,9 @@ impl App {
             return;
         }
         let index = tab.active().history_index - 1;
+        let before = tab.active().path.clone();
         self.state.active_mut().active_mut().jump_to(index);
-        crate::logv!(
-            "[nav] jump_to index={} target_scroll={:.1} (is_restore={})",
-            index,
-            self.state.active().active().scroll_y,
-            self.state.active().active().pending_scroll_restore
-        );
-        self.sync_after_navigate();
+        self.after_history_jump(before);
     }
 
     fn nav_forward(&mut self) {
@@ -6970,14 +7227,45 @@ impl App {
             return;
         }
         let index = tab.active().history_index + 1;
+        let before = tab.active().path.clone();
         self.state.active_mut().active_mut().jump_to(index);
-        crate::logv!(
-            "[nav] jump_to index={} target_scroll={:.1} (is_restore={})",
-            index,
-            self.state.active().active().scroll_y,
-            self.state.active().active().pending_scroll_restore
-        );
-        self.sync_after_navigate();
+        self.after_history_jump(before);
+    }
+
+    /// 前进/后退的收尾：跨目录按正常导航走；同一目录内的「搜索页 ↔ 目录页」
+    /// 只重建搜索结果，不能重新列举目录（会把搜索结果冲掉）。
+    fn after_history_jump(&mut self, before: Option<PathBuf>) {
+        let same_path = self.state.active().active().path == before;
+        if same_path {
+            self.restore_search_page();
+        } else {
+            self.sync_after_navigate();
+        }
+    }
+
+    fn restore_search_page(&mut self) {
+        let (filter, scroll, is_root, pane_index) = {
+            let tab = self.state.active();
+            let p = tab.active();
+            (
+                p.filter.clone(),
+                p.scroll_y,
+                p.path.is_none(),
+                tab.active_pane,
+            )
+        };
+        self.ui.set_filter_text(filter.clone().into());
+        if is_root {
+            self.run_global_search(&filter);
+        } else {
+            self.start_deep_search();
+            self.state.active_mut().active_mut().rebuild_display();
+        }
+        self.visible_cache = None;
+        self.sync_nav();
+        self.sync_status();
+        self.sync_file_list();
+        push_scroll(&self.ui, pane_index, scroll);
     }
 
     fn nav_up(&mut self) {
@@ -7059,7 +7347,7 @@ const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
 
 impl App {
-    fn row_pointer_event(&mut self, index: usize, event: &PointerEvent, x: f32, y: f32) {
+    fn row_pointer_event(&mut self, index: usize, event: &PointerEvent, x: f32, y: f32, on_name: bool) {
         // 任务 2.3：拖出手势（按下 → 位移超阈值 → OLE 拖放循环）。
         match event.kind {
             PointerEventKind::Up | PointerEventKind::Cancel => {
@@ -7086,6 +7374,9 @@ impl App {
         };
         match event.button {
             PointerEventButton::Right => {
+                // 右键（不走 Left 分支）也要取消挂起的延迟重命名，否则 400ms 后
+                // rename 输入框会与右键菜单共存/抢占焦点。
+                self.cancel_rename_defer();
                 // 未选中则先选中它，再弹菜单。
                 if !self.state.active().active().selection.contains(&path) {
                     let tab = self.state.active_mut().active_mut();
@@ -7101,19 +7392,46 @@ impl App {
                 self.open_menu(target);
             }
             PointerEventButton::Left => {
-                // 双击检测在 Rust 侧做（500ms 内同一路径二次按下）：
+                // 每次左键按下先取消挂起的延迟重命名，避免旧的 timer 在条件偶然重新
+                // 满足时提前触发（单击 A→点 B→再点 A：t=200 点的 A 只过 200ms 却弹出 rename）。
+                self.cancel_rename_defer();
+                // 双击检测在 Rust 侧做（有效双击间隔内同一路径二次按下）：
                 // 不依赖 Slint 的 double-clicked，行模型重建也不会打断判定。
+                // 注意：这个窗口必须 ≤ 下方延迟重命名（有效双击间隔 + 50ms），否则
+                // 「慢双击」会先触发重命名再打开。
                 let now = std::time::Instant::now();
-                if self
-                    .last_click
-                    .as_ref()
-                    .is_some_and(|(p, t)| *p == path && t.elapsed().as_millis() < 500)
-                {
+                if self.last_click.as_ref().is_some_and(|(p, t)| {
+                    *p == path && t.elapsed().as_millis() < effective_double_click_ms() as u128
+                }) {
+                    // 第二次按下 = 双击 → 打开，并取消挂起的延迟重命名。
+                    self.cancel_rename_defer();
                     self.last_click = None;
                     self.activate_row(index);
                     return;
                 }
                 self.last_click = Some((path.clone(), now));
+                // 单选后（非双击、非 Ctrl/Shift）点击文件名 → 延迟进入重命名：
+                // 先不起重命名，留出双击窗口；若再来一次按下（有效双击间隔内）则被判定为
+                // 双击打开（见上方 cancel_rename_defer），否则（有效双击间隔 + 50ms）后到
+                // 点才重命名。这样「单击选中后双击名称」不会被抢成重命名。
+                // 由 Slint 判定是否落在名称列，避免点图标/类型/大小列误触发。
+                if on_name {
+                    logv!(
+                        "[rename] on_name down path={} sel_len={} contains={}",
+                        path.display(),
+                        self.state.active().active().selection.len(),
+                        self.state.active().active().selection.contains(&path),
+                    );
+                }
+                if on_name
+                    && !key_down(VK_CONTROL)
+                    && !key_down(VK_SHIFT)
+                    && self.state.active().active().selection.len() == 1
+                    && self.state.active().active().selection.contains(&path)
+                {
+                    self.schedule_rename(path.clone());
+                    return;
+                }
                 let ctrl = key_down(VK_CONTROL);
                 let shift = key_down(VK_SHIFT);
                 let tab = self.state.active_mut().active_mut();
@@ -7401,7 +7719,7 @@ impl App {
         let mut target_dir = match target_dir_opt {
             Some(Some(p)) => p,
             Some(None) => {
-                self.set_status_job("无法将文件拖放到此电脑");
+                self.set_status_job(self.tr("无法将文件拖放到此电脑"));
                 return;
             }
             None => return,
@@ -7427,7 +7745,7 @@ impl App {
             return; // 同一目录下移动/复制，直接忽略
         }
         if paths.iter().any(|p| p == &target_dir || target_dir.starts_with(p)) {
-            self.set_status_job("无法将文件夹移动到自身或其子文件夹中");
+            self.set_status_job(self.tr("无法将文件夹移动到自身或其子文件夹中"));
             return;
         }
 
@@ -7634,26 +7952,12 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     // 合并窗口到点则触发索引重建（设置页连续改多项只重建一次）。
     maybe_run_pending_reindex();
 
-    // 无边框标题栏钩子的延迟安装兜底。
-    // show() 刚返回时 winit 窗口往往还没 realize，window_handle()
-    // 取不到 HWND（实测日志确认会走这条分支）；事件循环跑起来后
-    // 窗口必定已渲染，此时重试即可装上。每 40ms 检查一次，装上即止。
-    #[cfg(windows)]
-    {
-        let hwnd = get_window_hwnd(&app.borrow().ui);
-        if let Some(hwnd) = hwnd {
-            // 登记主窗 HWND：后台 Shell 操作（复制/移动/删除）用它做对话框宿主，
-            // 否则确认框无主、我们的窗口不会被禁用，回车会同时落回 Rove。
-            crate::sys::shell::set_owner_hwnd(hwnd);
-            if !drag_hittest::is_installed(hwnd) {
-                drag_hittest::install(hwnd);
-                sync_drag_bounds(&app.borrow(), "install");
-            }
-        }
-        // 布局落定前 Slint 几何可能仍是 0；每 40ms 重取一次，
-        // 保证最终一定收敛到真实的 drag-spacer 边界（update 内部去重）。
-        sync_drag_bounds(&app.borrow(), "poll");
-    }
+    // 主窗 HWND 登记、无边框拖拽钩子、最大化还原、首次启动居中，已全部移至
+    // on_winit_window_event 的首次 RedrawRequested（窗口 realize 后）统一应用，
+    // 见 apply_deferred_geometry（由 setup_keyboard 注册）。
+    // 布局落定前 Slint 几何可能仍是 0；每 40ms 重取一次，
+    // 保证最终一定收敛到真实的 drag-spacer 边界（update 内部去重）。
+    sync_drag_bounds(&app.borrow(), "poll");
 
     let mut app = app.borrow_mut();
                 // 布局落定 / 窗口尺寸变化监听。
@@ -7859,7 +8163,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 let mut app = app.borrow_mut();
                 let status = jobs_status.lock().ok();
                 let Some(status) = status else { return };
-                let running_text = status_text(&status);
+                let running_text = status_text(&status, app.jobs.is_english());
                 if app.ui.get_status_job().is_empty() || !running_text.is_empty() {
                     // 走统一入口：这里必须顺手把危险标记复位，否则上一条
                     // 红色提示（如「操作失败…」）会让进度文案也变红。
@@ -7902,6 +8206,23 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         .ui
         .window()
         .on_winit_window_event(move |_window, event| {
+        // 首帧重绘：此时窗口已真正 realize、HWND 与 scale 正确，
+        // 一次性应用最大化还原 / 首次启动居中（见 apply_deferred_geometry）。
+        #[cfg(windows)]
+        if matches!(event, WindowEvent::RedrawRequested) {
+            if let Some(rd_app) = key_app.upgrade() {
+                apply_deferred_geometry(&rd_app);
+            }
+            return EventResult::Propagate;
+        }
+
+        // 窗口失焦：取消挂起的延迟重命名，否则切到别的应用后后台突然弹出 rename 输入框。
+        if matches!(event, WindowEvent::Focused(false)) {
+            if let Some(focus_app) = key_app.upgrade() {
+                focus_app.borrow_mut().cancel_rename_defer();
+            }
+        }
+
         // 任务 2.2：外部 → Rove 拖入。winit 对一次投放逐文件发 DroppedFile，
         // 先缓冲，短延迟后统一判定目标并触发移动/复制管线。
         if let WindowEvent::DroppedFile(path) = event {
@@ -8051,18 +8372,15 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             "delete_perm" => app.delete_selection(false),
             "refresh" => app.user_refresh_active(),
             "focus_search" => {
+                // 进入搜索框前取消挂起的延迟重命名，否则 400ms 后 rename 输入框
+                // 弹出、抢走搜索框焦点。
+                app.cancel_rename_defer();
                 app.ui.invoke_focus_search_box();
             }
             "clear_filter" => {
+                // 走统一入口：记录「回到目录页」的历史并恢复搜索前滚动位置。
                 app.ui.set_filter_text(SharedString::default());
-                {
-                    let tab = app.state.active_mut();
-                    tab.active_mut().filter.clear();
-                }
-                app.start_deep_search();
-                app.state.active_mut().active_mut().rebuild_display();
-                app.sync_file_list();
-                app.sync_status();
+                app.apply_search_query("");
             }
             "copy" => app.copy_selection(false),
             "cut" => app.copy_selection(true),
@@ -8268,10 +8586,19 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     // ---- 文件列表 ----
     {
         let app = Rc::downgrade(app);
-        upgrade().on_file_row_pointer_event(move |index, event, x, y| {
+        // 图标视图里单选后的文件名浮层：再次点击同样进入重命名。
+        let overlay_app = app.clone();
+        upgrade().on_file_row_pointer_event(move |index, event, x, y, on_name| {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut()
-                .row_pointer_event(index as usize, &event, x, y);
+                .row_pointer_event(index as usize, &event, x, y, on_name);
+        });
+        upgrade().on_file_name_overlay_clicked(move || {
+            let Some(app) = overlay_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            if app.state.active().active().selection.len() == 1 {
+                app.start_rename();
+            }
         });
     }
     {
@@ -8390,13 +8717,13 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             });
         }
 
+        #[cfg(windows)]
         {
             // 列宽拖动/双击结束后回传，按当前目录存进配置并落盘。
             let app = app.clone();
             upgrade().on_file_col_resized(move |index, width| {
                 let Some(app) = app.upgrade() else { return };
                 let mut app = app.borrow_mut();
-                #[cfg(windows)]
                 record_col_width(&mut app, index, width);
             });
         }
@@ -8463,9 +8790,11 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 guard.sync_expand_targets();
                 guard.drag_pending = None;
                 guard.ui.invoke_set_drag_armed(false);
-                guard.set_status_job(format!(
-                    "名称超过 {MAX_FILE_NAME_UNITS} 个字符上限，已退出重命名"
-                ));
+                let too_long = guard.trf(
+                    "名称超过 {} 个字符上限，已退出重命名",
+                    &[MAX_FILE_NAME_UNITS.to_string()],
+                );
+                guard.set_status_job(too_long);
                 return;
             }
             let app = app.borrow();
@@ -8508,11 +8837,21 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        let wheel_app = app.clone();
         upgrade().on_file_scroll_user_input(move |_pane| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
             // 用户真的在滚轮/拖滚动条：立即解除重命名期的假滚动拦截。
             app.rename_scroll_guard = None;
+        });
+        upgrade().on_file_wheel_view(move |delta| {
+            // Slint 的 WheelEvent 不带修饰键，用 Win32 的 GetKeyState 同步轮询。
+            if !key_down(VK_CONTROL) {
+                return false;
+            }
+            let Some(app) = wheel_app.upgrade() else { return false };
+            app.borrow_mut().cycle_view_mode(delta > 0.0);
+            true
         });
     }
     {
@@ -8738,7 +9077,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             crate::search::index::rebuild();
             let app = app.borrow();
             app.sync_settings();
-            app.set_status_job("正在重新扫描驱动器并构建索引...");
+            app.set_status_job(app.tr("正在重新扫描驱动器并构建索引..."));
         });
     }
     {
@@ -9022,7 +9361,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                             score: 0,
                             name_parts: vec![
                                 (name.clone(), false), 
-                                (" (当前)".to_string(), true)
+                                (format!(" ({})", app.tr("当前")), true)
                             ],
                             is_local: true,
                             is_history: false,
@@ -9130,7 +9469,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                             score: 0,
                             name_parts: vec![
                                 (name.clone(), false), 
-                                (" (当前)".to_string(), true)
+                                (format!(" ({})", app.tr("当前")), true)
                             ],
                             is_local: true,
                             is_history: false,
@@ -9203,6 +9542,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        // 供下面两个下拉回调共用（第一个闭包会移走 app）。
+        let lang_app = app.clone();
+        let startup_app = app.clone();
         upgrade().on_show_hidden_toggled(move |enabled| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -9216,6 +9558,33 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                     app.reload_tab(i);
                 }
             }
+        });
+        // 通用设置：显示语言（即时换整套文案）与启动时打开。
+        upgrade().on_language_changed(move |index| {
+            let Some(app) = lang_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.language = match index {
+                1 => "zh-CN",
+                2 => "en",
+                _ => "system",
+            }
+            .to_string();
+            app.config.save();
+            i18n::apply(&app.ui, &app.config.language);
+            app.jobs
+                .set_english(!i18n::is_chinese(&app.config.language));
+            // Slint 里绑定的文案会自动刷新；由 Rust 生成的标签要重新下发。
+            app.sync_settings();
+            app.sync_tabs();
+            app.sync_sidebar();
+            app.sync_breadcrumbs();
+            app.sync_status();
+        });
+        upgrade().on_startup_changed(move |index| {
+            let Some(app) = startup_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.startup_tab = if index == 1 { "computer" } else { "last_tabs" }.to_string();
+            app.config.save();
         });
     }
     {
@@ -9273,10 +9642,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis())
                 .unwrap_or(0);
-            app.ui.set_settings_editor_title("新建动作".into());
-            app.ui.set_settings_editor_group_options(
-                ModelRc::new(VecModel::from(group_options(&app.actions))),
-            );
+            app.ui.set_settings_editor_title(app.tr("新建动作"));
+            app.ui.set_settings_editor_group_options(ModelRc::new(VecModel::from(
+                group_options(&app.actions, &app.tr("一级菜单")),
+            )));
             app.ui.set_settings_editor_open(true);
             app.ui.set_settings_editor_id(format!("custom.{stamp}").into());
             app.ui.set_settings_editor_label("".into());
@@ -9295,11 +9664,11 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let app = app.borrow();
             let id = id.to_string();
             if let Some(a) = app.actions.iter().find(|a| a.id == id) {
-                app.ui.set_settings_editor_title("编辑动作".into());
-                // 层级归属候选：已有二级分组 + 内置「一级菜单」。
-                app.ui.set_settings_editor_group_options(
-                    ModelRc::new(VecModel::from(group_options(&app.actions))),
-                );
+                app.ui.set_settings_editor_title(app.tr("编辑动作"));
+                // 层级归属候选：已有二级分组 + 内置「一级菜单」（当前语言文案）。
+                app.ui.set_settings_editor_group_options(ModelRc::new(VecModel::from(
+                    group_options(&app.actions, &app.tr("一级菜单")),
+                )));
                 app.ui.set_settings_editor_open(true);
                 app.ui.set_settings_editor_id(a.id.clone().into());
                 app.ui.set_settings_editor_label(a.label.clone().into());
@@ -9333,9 +9702,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 .map(|s| s.trim().to_lowercase())
                 .filter(|s| !s.is_empty())
                 .collect();
-            // 层级归属：空 / 「一级菜单」= 一级项；其他文本直接作为二级菜单名。
+            // 层级归属：空 / 「一级菜单」（含当前语言的内置项文案）= 一级项；
+            // 其他文本直接作为二级菜单名。同时保留中文原文匹配，兼容旧数据/手输。
             let group = group.trim();
-            let group = if group == "一级菜单" { "" } else { group };
+            let group = if group == "一级菜单" || group == app.tr("一级菜单").as_str() {
+                ""
+            } else {
+                group
+            };
             let action = crate::ops::actions::ActionEntry {
                 id: id.clone(),
                 label: label.to_string(),
@@ -9498,22 +9872,10 @@ fn schedule_destroy() {
 ///
 /// 系统关闭请求（Alt+F4 / 任务栏）与自绘关闭按钮共用此函数，
 /// 避免两处逻辑各自演化后漂移（尤其 DPI 换算这种易错点）。
-fn close_and_destroy(app_weak: &std::rc::Weak<RefCell<App>>) {
-    let Some(app) = app_weak.upgrade() else { return };
-    {
-        let mut app = app.borrow_mut();
-        // 注意：size() 是物理像素，配置里的窗口尺寸按逻辑像素保存，
-        // 否则在高 DPI 下每次会话窗口都会按缩放系数膨胀，
-        // 导致布局超出屏幕（状态栏、暂存托盘被挤到可视区外）。
-        let window = app.ui.window();
-        let scale = window.scale_factor() as f64;
-        let size = window.size();
-        app.config.window_width = (size.width as f64 / scale).round() as u32;
-        app.config.window_height = (size.height as f64 / scale).round() as u32;
-        app.config.save();
-    }
-    // 不能在关闭回调内同步销毁窗口（正在关闭中）；
-    // 延迟到事件循环下一拍再整体 drop。
+/// 关闭请求（窗口 X / 自绘关闭按钮）：只排定销毁。
+/// 「窗口几何 + 上次标签页 + 最大化」的存档统一在 `destroy_session()` 完成，
+/// 让窗口关闭与托盘退出两条出口都不会漏存。
+fn close_and_destroy(_app_weak: &std::rc::Weak<RefCell<App>>) {
     schedule_destroy();
 }
 
@@ -9848,6 +10210,27 @@ fn work_area_logical(scale: f32) -> Option<(f32, f32)> {
 
 #[cfg(not(windows))]
 fn work_area_logical(_scale: f32) -> Option<(f32, f32)> {
+    None
+}
+
+/// 屏幕分辨率（逻辑像素），用于首次启动按 75% 计算窗口大小并居中。
+/// 用物理分辨率而不是工作区，避免任务栏把「75%」再缩一次。
+#[cfg(windows)]
+fn screen_size_logical(scale: f32) -> Option<(f32, f32)> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN,
+    };
+    let w = unsafe { GetSystemMetrics(SM_CXSCREEN) };
+    let h = unsafe { GetSystemMetrics(SM_CYSCREEN) };
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let sf = if scale >= 1.0 { scale } else { 1.0 };
+    Some((w as f32 / sf, h as f32 / sf))
+}
+
+#[cfg(not(windows))]
+fn screen_size_logical(_scale: f32) -> Option<(f32, f32)> {
     None
 }
 
@@ -10226,10 +10609,129 @@ fn is_ssd_drive(_drive_letter: char) -> bool {
     true
 }
 
+/// 系统双击时间间隔（毫秒）。用户在控制面板可调（默认 500，最快约 200）。
+/// Rust 侧的双击判定与延迟重命名都基于它，避免硬编码 350/400 与用户实际
+/// 双击速度不一致导致「慢手双击被判成两次单击 → 先 rename 再打开」。
+fn double_click_ms() -> u64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetDoubleClickTime;
+        let ms = unsafe { GetDoubleClickTime() } as u64;
+        if ms == 0 {
+            500
+        } else {
+            ms
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        500
+    }
+}
+
+/// 用于「双击打开 / 延迟重命名」的有效双击间隔：取系统值但封顶 300ms。
+/// 否则系统默认 500ms 会让单击重命名延迟到 550ms 太不跟手；封顶后默认 Windows
+/// 下窗口=300、延迟=350，既跟手又保证延迟（窗口+50）> 窗口，不破坏正常双击打开。
+/// 系统设得比 300 更快时仍精确跟随。
+fn effective_double_click_ms() -> u64 {
+    double_click_ms().min(300)
+}
+
 /// 创建一个 UI 会话（窗口 + 状态 + 回调 + 定时器）。
 /// 回调/定时器均以 Weak 持有 App，销毁时整图释放。
+/// 窗口真正 realize 后的首帧重绘（RedrawRequested）时一次性应用：
+/// 主窗 HWND 登记、无边框拖拽钩子安装、最大化还原、首次启动 75% 居中。
+///
+/// 这些操作都依赖「窗口已落到显示器、HWND 与 scale_factor() 正确」。show() 之后立刻做
+/// 会拿到空 HWND / scale=1.0（实测：首次启动尺寸偏大、偏离中心）。借 on_winit_window_event
+/// 的 RedrawRequested（show() 后由 request_redraw() 立即触发）应用，比 poll_timer 每 40ms
+/// 轮询更确定、且无尺寸闪烁。first_run_pending 由 create_session 提前置位、此处消费后清除；
+/// 首帧若 HWND 仍空则保留标志，下次 redraw 重试。最大化还原已改在 create_session 的
+/// show() 之前用 ui.window().set_maximized() 于窗口构建阶段生效，不依赖首帧 redraw。
+#[cfg(windows)]
+fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
+    let hwnd = get_window_hwnd(&app.borrow().ui);
+    let Some(hwnd) = hwnd else {
+        // HWND 尚未就绪（首帧 redraw 来得比窗口 realize 早）：再请求一帧，
+        // 下次 RedrawRequested 继续重试，直到拿到 HWND 才真正居中。否则只触发
+        // 一次 redraw 时若此时 HWND 为空，首启窗口会一直停在默认左上角。
+        // 但必须设上限，避免极端情况下 HWND 永远取不到导致每帧 request_redraw
+        // 死循环、CPU 打满。
+        let (need_redraw, give_up) = {
+            let mut a = app.borrow_mut();
+            if a.geom_retries < 120 {
+                a.geom_retries += 1;
+                (true, false)
+            } else {
+                // 放弃居中：清掉 pending，窗口停默认位置（总比死循环好）。
+                a.first_run_pending = false;
+                (false, true)
+            }
+        };
+        if need_redraw {
+            logv!("[geom] HWND not ready, retry redraw ({})", app.borrow().geom_retries);
+            app.borrow().ui.window().request_redraw();
+        } else if give_up {
+            logln!("[geom] HWND never ready after 120 retries, give up centering");
+        }
+        return;
+    };
+    // 登记主窗 HWND 给后台 Shell 对话框做宿主（复制/移动/删除确认框），
+    // 与无边框钩子安装一并仅在首次（未安装时）执行，避免每帧空转。
+    if !drag_hittest::is_installed(hwnd) {
+        crate::sys::shell::set_owner_hwnd(hwnd);
+        drag_hittest::install(hwnd);
+    }
+    // 注意：最大化还原已移到 create_session 的 show() 之前，用
+    // ui.window().set_maximized(config.window_maximized) 在 winit 窗口构建阶段
+    // 直接生效（不依赖 HWND / 首帧 redraw）。否则首帧 RedrawRequested 会被首屏
+    // 索引/列表渲染拖到数秒后才触发，期间窗口停在默认位置、造成明显闪烁。
+    // 首次启动 75% 居中：此刻 scale_factor() 才是真实值（仍须等 realize 后）。
+    if app.borrow().first_run_pending {
+        app.borrow_mut().first_run_pending = false;
+        let s2 = app.borrow().ui.window().scale_factor() as f32;
+        if let Some((sw, sh)) = screen_size_logical(s2) {
+            let mut w = (sw * 0.75).max(480.0);
+            let mut h = (sh * 0.75).max(360.0);
+            if let Some((aw, ah)) = work_area_logical(s2) {
+                w = w.min(aw).max(480.0);
+                h = h.min(ah - 60.0).max(360.0); // 留出标题栏
+            }
+            app.borrow()
+                .ui
+                .window()
+                .set_size(WindowSize::Logical(LogicalSize::new(w, h)));
+            let x = ((sw - w) / 2.0).max(0.0);
+            let y = ((sh - h) / 2.0).max(0.0);
+            app.borrow()
+                .ui
+                .window()
+                .set_position(WindowPosition::Logical(LogicalPosition::new(x, y)));
+            let mut cfg = app.borrow_mut();
+            cfg.config.window_width = w as u32;
+            cfg.config.window_height = h as u32;
+            cfg.config.window_x = x as i32;
+            cfg.config.window_y = y as i32;
+            cfg.config.save();
+            logln!(
+                "[win-restore] first_run centered on redraw: w={} h={} x={} y={} scale={}",
+                w, h, x, y, s2
+            );
+        }
+    }
+}
+
 fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     let mut config = Config::load();
+    // 首次启动判定快照：用「是否首次运行」标记，而不是坐标 < 0（见下方窗口几何处说明）。
+    // 必须在下方 HDD 初始化逻辑消费 is_first_run 之前抓取。
+    let first_run = config.is_first_run;
+    // config 稍后会移入 App，先把「启动时打开」的标签页快照取出来。
+    let startup_snapshot = (
+        config.startup_tab.clone(),
+        config.last_tabs.clone(),
+        config.last_active_tab,
+    );
 
     // 首次启动保护：自动将所有非系统盘的 HDD 机械硬盘加入排除名单，避免唤醒电机
     if config.is_first_run {
@@ -10258,17 +10760,36 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         ui.window().scale_factor()
     );
     apply_theme(&ui, config.theme);
-    if config.window_width >= 480 && config.window_height >= 360 {
-        // 钳制到工作区：避免窗口高于屏幕时，底部的暂存托盘与状态栏
-        // 被裁掉（WSLg 缩放环境下尤其明显）。
-        let (mut w, mut h) = (config.window_width as f32, config.window_height as f32);
-        if let Some((aw, ah)) = work_area_logical(ui.window().scale_factor()) {
-            w = w.min(aw).max(480.0);
-            h = h.min(ah - 60.0).max(360.0); // 留出标题栏
-        }
-        ui.window().set_size(WindowSize::Logical(LogicalSize::new(w, h)));
+    // 界面文案按「显示语言」整体下发；下拉选中项同步到配置。
+    i18n::apply(&ui, &config.language);
+    ui.set_language_index(match config.language.as_str() {
+        "zh-CN" => 1,
+        "en" => 2,
+        _ => 0,
+    });
+    ui.set_startup_index(if config.startup_tab == "computer" { 1 } else { 0 });
+    // 窗口初始尺寸：直接用配置里的值（首次启动即配置默认值 1150×690）。
+    // 不要在这里用 scale_factor() 去算 75%——此时窗口尚未 show，scale 恒为 1.0，
+    // 在 2× 屏上会先弹出一个逻辑像素意义上“超屏”的瞬时大窗，再到首帧
+    // apply_deferred_geometry 用真实 scale 重算修正，产生可见闪烁。
+    // 首次启动的 75% 居中由 apply_deferred_geometry（首帧、真实 scale 已就绪）统一完成。
+    let (w, h) = (config.window_width as f32, config.window_height as f32);
+    ui.window().set_size(WindowSize::Logical(LogicalSize::new(w, h)));
+    if first_run {
+        // 位置/75% 居中交给首帧 apply_deferred_geometry；这里只给安全默认尺寸，
+        // 避免 show 前用假 scale 算出超屏大窗。
+    } else {
+        ui.window()
+            .set_position(WindowPosition::Logical(LogicalPosition::new(
+                config.window_x as f32,
+                config.window_y as f32,
+            )));
     }
     ui.set_staging_expanded(config.staging_expanded);
+    logln!(
+        "[win-restore] first_run={} w={} h={} x={} y={} maximized={}",
+        first_run, w, h, config.window_x, config.window_y, config.window_maximized
+    );
     logv!("[sidebar] want={}px (persisted)", config.sidebar_width);
     ui.set_sidebar_want(config.sidebar_width as f32);
     ui.set_view_mode(config.view_mode.clone().into());
@@ -10314,6 +10835,8 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         watch_tx,
         watch_rx,
     )));
+    // 供延迟重命名等定时器在回调里升级回 App。
+    app.borrow_mut().self_weak = Some(Rc::downgrade(&app));
     {
         let raw = crate::ops::actions::load_or_create();
         app.borrow_mut().actions = crate::ops::actions::heal_full(&raw);
@@ -10338,7 +10861,60 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         if let Some(path) = initial_path {
             let sort = app.state.active().active().sort;
             app.state.new_tab(Some(path), sort);
+        } else if startup_snapshot.0 == "last_tabs" && !startup_snapshot.1.is_empty() {
+            // 「上次的标签页(包括分屏)」：按快照重建标签与各栏路径。
+            let sort = app.state.active().active().sort;
+            let mut tabs = Vec::new();
+            for (i, snap) in startup_snapshot.1.iter().enumerate() {
+                let first = snap
+                    .paths
+                    .first()
+                    .and_then(|p| p.as_ref())
+                    .map(PathBuf::from);
+                let mut tab = if snap.is_settings {
+                    crate::state::TabState::new_settings(
+                        (i + 1) as u32,
+                        crate::state::SettingsSubpage::default(),
+                    )
+                } else {
+                    crate::state::TabState::new((i + 1) as u32, first, sort)
+                };
+                if !snap.is_settings && snap.paths.len() > 1 {
+                    let second = snap
+                        .paths
+                        .get(1)
+                        .and_then(|p| p.as_ref())
+                        .map(PathBuf::from);
+                    tab.panes
+                        .push(crate::state::PaneState::new(second, sort));
+                    tab.is_split = true;
+                    tab.active_pane = snap.active_pane.min(tab.panes.len().saturating_sub(1));
+                }
+                tabs.push(tab);
+            }
+            app.state.tabs = tabs;
+            app.state.active_tab = startup_snapshot.2.min(app.state.tabs.len() - 1);
+            app.state.next_tab_id = app.state.tabs.len() as u32 + 1;
+            // 快照只记路径：给每个恢复出来的标签/分屏都发一次列举，
+            // 否则切过去时那一页是空的（sync_active_tab 不会主动列举）。
+            let requests: Vec<(u32, usize, u64, Option<PathBuf>, crate::fs::SortState)> = app
+                .state
+                .tabs
+                .iter()
+                .flat_map(|t| {
+                    t.panes.iter().enumerate().filter_map(move |(pi, p)| {
+                        if t.kind != crate::state::TabKind::Explorer {
+                            return None;
+                        }
+                        Some((t.id, pi, p.generation, p.path.clone(), p.sort))
+                    })
+                })
+                .collect();
+            for (id, pi, gen, path, sort) in requests {
+                app.request_listing(id, pi, gen, path, sort);
+            }
         }
+        // 「电脑选项」不做事：AppState 初始就是单栏的「此电脑」。
         app.sync_tabs();
         app.sync_nav();
         app.sync_breadcrumbs();
@@ -10347,6 +10923,10 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         app.sync_staging();
         app.sync_file_list();
         app.reload_active();
+        // 快照恢复出来的标签可能直接就是设置页：补一次导航/标题下发。
+        if app.state.active().kind == crate::state::TabKind::Settings {
+            app.sync_settings();
+        }
 
         // 自动化/外部唤起钩子：ROVE_SEARCH 预填搜索词并触发完整搜索
         // （本地过滤 + 深度搜索 + 高亮），与手动输入完全同一条路径。
@@ -10362,22 +10942,25 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     // Slint 的窗口在 show() 后才真正创建并可见（new() 仅构建组件树）。
     // 因此原生窗口操作（HWND 子类化、拖拽热区几何）必须放在 show() 之后：
     // 提前安装会拿不到有效句柄，或装到随后被重建的窗口上而丢失。
+    // 启动最大化还原：在 show() 之前用 winit 的 set_maximized 在窗口构建阶段直接生效，
+    // 不依赖 HWND / 首帧 redraw——后者会被首屏索引/列表渲染拖到数秒后才触发，造成
+    // “先以普通窗口停在默认位置、再跳到最大化”的明显闪烁。win_maximized 仅控制自定义
+    // 边框的 1px 缩放边是否显示：最大化时隐藏（原生最大化时不需要可拖拽的边）。
+    app.borrow().ui.window().set_maximized(app.borrow().config.window_maximized);
+    app.borrow().ui.set_win_maximized(!app.borrow().config.window_maximized);
+
     app.borrow().ui.show().unwrap();
 
-    // 无边框标题栏：尝试安装 WM_NCHITTEST 子类化，使触屏手指也能拖拽移动窗口
-    // （Slint 的 WindowMoveArea 只覆盖鼠标）。
-    // 注意：此刻窗口可能尚未 realize 而取不到 HWND——没关系，poll_timer
-    // 会每 40ms 重试直到装上（见 setup_timers）。
-    #[cfg(windows)]
-    {
-        let hwnd = get_window_hwnd(&app.borrow().ui);
-        match hwnd {
-            Some(h) if !drag_hittest::is_installed(h) => drag_hittest::install(h),
-            Some(_) => {}
-            None => logv!("drag hittest: hwnd not ready after show(); will retry in poll_timer"),
-        }
-        sync_drag_bounds(&app.borrow(), "show");
+    // 强制立即重绘：让首次 RedrawRequested 尽快触发，及时应用首次启动 75% 居中
+    // （否则首屏列表/索引等工作会把首帧推迟到数秒后，出现“先默认位置、再居中”的闪烁）。
+    app.borrow().ui.window().request_redraw();
+
+    // 首次启动 75% 居中：必须在窗口 realize 后（scale_factor 正确）由首帧 redraw 应用，
+    // 见 apply_deferred_geometry（on_winit_window_event 注册）。
+    if first_run {
+        app.borrow_mut().first_run_pending = true;
     }
+    sync_drag_bounds(&app.borrow(), "show");
 
     logln!("session created");
 }
@@ -10409,6 +10992,100 @@ pub fn destroy_session() {
     let Some(app) = app else {
         return;
     };
+    // 退出存档：窗口几何（逻辑像素）+ 最大化状态 + 上次标签页快照。
+    // 统一在销毁出口完成，保证「窗口 X」与「托盘退出」两条路径都能落盘。
+    {
+        let mut app = app.borrow_mut();
+        // 注意：size() 是物理像素，配置里的窗口尺寸按逻辑像素保存，
+        // 否则在高 DPI 下每次会话窗口都会按缩放系数膨胀。
+        let window = app.ui.window();
+        let scale = window.scale_factor() as f64;
+        // 退出存档的窗口几何统一按「逻辑像素」保存（size()/矩形都是物理像素，
+        // 不折算的话高 DPI 下每次会话窗口都会按缩放系数膨胀）。
+        // 关键：必须用 GetWindowPlacement 的 rcNormalPosition（恢复正常矩形），
+        // 而非 GetWindowRect——后者在最大化/最小化时返回的是「最大化矩形」（会溢出
+        // 工作区、left/top 为负）。据此存盘会把正常几何污染成最大化几何，导致下次
+        // 启动还原最大化后、再「退出最大化」时落到错误的尺寸/位置。
+        #[cfg(windows)]
+        if let Some(hwnd) = get_window_hwnd(&app.ui) {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                GetWindowPlacement, IsZoomed, WINDOWPLACEMENT,
+            };
+            use windows_sys::Win32::Foundation::{POINT, RECT};
+            let mut wp = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                flags: 0,
+                showCmd: 0,
+                ptMinPosition: POINT { x: 0, y: 0 },
+                ptMaxPosition: POINT { x: 0, y: 0 },
+                rcNormalPosition: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+            };
+            if unsafe { GetWindowPlacement(hwnd as _, &mut wp as *mut _ as _) } != 0 {
+                let r = wp.rcNormalPosition;
+                app.config.window_x = (r.left as f64 / scale).round() as i32;
+                app.config.window_y = (r.top as f64 / scale).round() as i32;
+                app.config.window_width = ((r.right - r.left) as f64 / scale).round() as u32;
+                app.config.window_height = ((r.bottom - r.top) as f64 / scale).round() as u32;
+                logln!(
+                    "[win-save] normal rect l={} t={} r={} b={} scale={} -> x={} y={} w={} h={}",
+                    r.left, r.top, r.right, r.bottom, scale,
+                    app.config.window_x, app.config.window_y,
+                    app.config.window_width, app.config.window_height
+                );
+            } else {
+                // 兜底：GetWindowPlacement 异常时退回当前矩形（GetWindowRect）。
+                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                if unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(
+                        hwnd as _,
+                        &mut rect as *mut _ as _,
+                    )
+                } != 0
+                {
+                    app.config.window_x = (rect.left as f64 / scale).round() as i32;
+                    app.config.window_y = (rect.top as f64 / scale).round() as i32;
+                    app.config.window_width =
+                        ((rect.right - rect.left) as f64 / scale).round() as u32;
+                    app.config.window_height =
+                        ((rect.bottom - rect.top) as f64 / scale).round() as u32;
+                }
+            }
+            app.config.window_maximized = unsafe { IsZoomed(hwnd as _) } != 0;
+        }
+        #[cfg(not(windows))]
+        {
+            let size = window.size();
+            app.config.window_width = (size.width as f64 / scale).round() as u32;
+            app.config.window_height = (size.height as f64 / scale).round() as u32;
+        }
+        // 「上次的标签页(包括分屏)」：记下每个标签各栏的路径。
+        app.config.last_tabs = app
+            .state
+            .tabs
+            .iter()
+            .map(|t| crate::config::TabSnapshot {
+                paths: t
+                    .panes
+                    .iter()
+                    .map(|p| p.path.as_ref().map(|x| x.to_string_lossy().into_owned()))
+                    .collect(),
+                active_pane: t.active_pane,
+                is_settings: t.kind == crate::state::TabKind::Settings,
+            })
+            .collect();
+        app.config.last_active_tab = app.state.active_tab;
+        logln!(
+            "[win-save] w={} h={} x={} y={} maximized={} hwnd_present={} tabs={}",
+            app.config.window_width,
+            app.config.window_height,
+            app.config.window_x,
+            app.config.window_y,
+            app.config.window_maximized,
+            get_window_hwnd(&app.ui).is_some(),
+            app.config.last_tabs.len()
+        );
+        app.config.save();
+    }
     // 显式隐藏后整体 drop：回调均为 Weak，无强引用环，
     // Slint 组件树与 winit 窗口（GPU 纹理、表面）随之释放。
     let ui = app.borrow().ui.as_weak();

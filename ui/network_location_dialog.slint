@@ -1,3 +1,4 @@
+import { I18n } from "i18n.slint";
 // 「添加网络位置」弹窗：输入服务器地址（别名可留空，留空取地址尾段）。
 import { Theme, IconClose } from "common.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
@@ -54,7 +55,7 @@ component Field inherits Rectangle {
 }
 
 export component NetworkLocationDialog inherits Rectangle {
-    in property <string> title: "添加网络位置";
+    in property <string> title: I18n.strings[65];
     in-out property <string> server;
     in-out property <string> alias;
     in-out property <string> error: "";
@@ -138,10 +139,10 @@ export component NetworkLocationDialog inherits Rectangle {
 
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "服务器地址"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[56]; color: Theme.text-secondary; font-size: 12px; }
                 server-edit := Field {
                     text <=> root.server;
-                    placeholder: "例如：\\\\192.168.1.5\\Video";
+                    placeholder: I18n.strings[13];
                     accepted(t) => {
                         root.connect-clicked();
                     }
@@ -153,10 +154,10 @@ export component NetworkLocationDialog inherits Rectangle {
 
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "别名（可留空，留空取地址尾段）"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[24]; color: Theme.text-secondary; font-size: 12px; }
                 Field {
                     text <=> root.alias;
-                    placeholder: "例如：Video";
+                    placeholder: I18n.strings[11];
                     accepted(t) => {
                         root.connect-clicked();
                     }
@@ -187,7 +188,7 @@ export component NetworkLocationDialog inherits Rectangle {
                     border-color: Theme.border;
 
                     Text {
-                        text: "取消";
+                        text: I18n.strings[27];
                         color: Theme.text-primary;
                         font-size: 12.5px;
                         horizontal-alignment: center;
@@ -212,7 +213,7 @@ export component NetworkLocationDialog inherits Rectangle {
                     border-radius: 6px;
 
                     Text {
-                        text: "连接";
+                        text: I18n.strings[76];
                         color: white;
                         font-size: 12.5px;
                         horizontal-alignment: center;

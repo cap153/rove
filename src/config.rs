@@ -1,3 +1,4 @@
+//! src/config.rs
 //! 配置持久化：主题、最近目录、窗口尺寸、暂存盘展开态。
 //! 存储于 `%APPDATA%\Rove\config.json`。
 
@@ -24,12 +25,26 @@ pub struct ColumnLayout {
     pub widths: [f32; 5],
 }
 
+/// 上次会话的一个标签页快照（含分屏）。
+#[derive(Clone, Debug)]
+pub struct TabSnapshot {
+    /// 各分屏的路径字符串；None 表示「此电脑」。
+    pub paths: Vec<Option<String>>,
+    pub active_pane: usize,
+    pub is_settings: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub theme: ThemeChoice,
     pub recent: Vec<PathBuf>,
     pub window_width: u32,
     pub window_height: u32,
+    /// 上次窗口左上角位置（逻辑像素）。-1 = 尚未记录（首次启动）。
+    pub window_x: i32,
+    pub window_y: i32,
+    /// 上次退出时是否处于最大化状态（仅 Windows 有效）。
+    pub window_maximized: bool,
     /// 侧边栏当前宽度
     pub sidebar_width: f32,
     pub staging_expanded: bool,
@@ -47,6 +62,13 @@ pub struct Config {
     pub sidebar_order: Vec<String>,
     /// 视图模式：details | list | icons-small | icons-medium | icons-large | icons-xl。
     pub view_mode: String,
+    /// 显示语言：system（跟随系统）| zh-CN | en。
+    pub language: String,
+    /// 启动时打开：last_tabs（上次的标签页，含分屏）| computer（电脑选项）。
+    pub startup_tab: String,
+    /// 「上次的标签页」快照，关闭时写入。
+    pub last_tabs: Vec<TabSnapshot>,
+    pub last_active_tab: usize,
     /// 全局排序字段：name | size | modified | type | path。
     pub sort_key: String,
     /// 全局排序方向：true 递增 / false 递减。
@@ -179,6 +201,9 @@ impl Default for Config {
             recent: Vec::new(),
             window_width: 1150,
             window_height: 690,
+            window_x: -1,
+            window_y: -1,
+            window_maximized: false,
             sidebar_width: 236.0,
             staging_expanded: true,
             recent_expanded: false, // 默认收起
@@ -188,6 +213,10 @@ impl Default for Config {
             explorer_net_expanded: true,
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
+            language: "system".to_string(),
+            startup_tab: "last_tabs".to_string(),
+            last_tabs: Vec::new(),
+            last_active_tab: 0,
             sort_key: "name".to_string(),
             sort_ascending: true,
             column_layouts: Vec::new(),
@@ -278,6 +307,16 @@ impl Config {
                 config.window_height = h as u32;
             }
         }
+        if let Some(x) = json.get("window_x").and_then(|v| v.as_i64()) {
+            if (-10000..=10000).contains(&x) {
+                config.window_x = x as i32;
+            }
+        }
+        if let Some(y) = json.get("window_y").and_then(|v| v.as_i64()) {
+            if (-10000..=10000).contains(&y) {
+                config.window_y = y as i32;
+            }
+        }
         if let Some(sw) = json.get("sidebar_width").and_then(|v| v.as_f64()) {
             if (70.0..=1200.0).contains(&sw) {
                 config.sidebar_width = sw as f32;
@@ -330,6 +369,48 @@ impl Config {
             ) {
                 config.view_mode = vm.to_string();
             }
+        }
+        if let Some(l) = json.get("language").and_then(|v| v.as_str()) {
+            if matches!(l, "system" | "zh-CN" | "en") {
+                config.language = l.to_string();
+            }
+        }
+        if let Some(s) = json.get("startup_tab").and_then(|v| v.as_str()) {
+            if matches!(s, "last_tabs" | "computer") {
+                config.startup_tab = s.to_string();
+            }
+        }
+        if let Some(arr) = json.get("last_tabs").and_then(|v| v.as_array()) {
+            let mut snaps = Vec::new();
+            for item in arr {
+                let paths = item
+                    .get("paths")
+                    .and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .map(|v| v.as_str().map(|s| s.to_string()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                snaps.push(TabSnapshot {
+                    paths,
+                    active_pane: item
+                        .get("active_pane")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                    is_settings: item
+                        .get("is_settings")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                });
+            }
+            config.last_tabs = snaps;
+        }
+        if let Some(a) = json.get("last_active_tab").and_then(|v| v.as_u64()) {
+            config.last_active_tab = a as usize;
+        }
+        if let Some(m) = json.get("window_maximized").and_then(|v| v.as_bool()) {
+            config.window_maximized = m;
         }
         if let Some(sk) = json.get("sort_key").and_then(|v| v.as_str()) {
             if matches!(sk, "name" | "size" | "modified" | "type" | "path") {
@@ -530,6 +611,8 @@ impl Config {
             "recent": self.recent.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>(),
             "window_width": self.window_width,
             "window_height": self.window_height,
+            "window_x": self.window_x,
+            "window_y": self.window_y,
             "sidebar_width": self.sidebar_width,
             "staging_expanded": self.staging_expanded,
             "recent_expanded": self.recent_expanded,
@@ -539,6 +622,19 @@ impl Config {
             "explorer_net_expanded": self.explorer_net_expanded,
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
+            "language": self.language,
+            "startup_tab": self.startup_tab,
+            "last_tabs": self
+                .last_tabs
+                .iter()
+                .map(|t| serde_json::json!({
+                    "paths": t.paths.iter().map(|p| serde_json::json!(p)).collect::<Vec<_>>(),
+                    "active_pane": t.active_pane,
+                    "is_settings": t.is_settings,
+                }))
+                .collect::<Vec<_>>(),
+            "last_active_tab": self.last_active_tab,
+            "window_maximized": self.window_maximized,
             "sort_key": self.sort_key,
             "sort_ascending": self.sort_ascending,
             "column_layouts": self

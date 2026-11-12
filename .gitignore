@@ -1,5 +1,6 @@
 /target
 /plan
+/.bak
 Cargo.lock
 *.exe
 *.pdb

@@ -1,3 +1,4 @@
+//! src/ops/job.rs
 //! 文件操作任务系统：复制 / 移动 / 删除（回收站）在独立工作线程执行，
 //! 进度经共享状态暴露给 UI 轮询，支持协作式取消。
 
@@ -35,6 +36,18 @@ impl JobKind {
     }
 }
 
+/// 成功完成的任务类型：UI 据此决定刷新/选中策略，不依赖提示文案。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum JobOutcome {
+    /// 失败、取消或其它情况。
+    #[default]
+    Other,
+    /// 已移动（含 Shell 成功后）。
+    Moved,
+    /// 已删除（回收站或彻底删除）。
+    Deleted,
+}
+
 /// 任务完成后的摘要（供 UI 刷新受影响目录）。
 #[derive(Clone, Debug, Default)]
 #[allow(dead_code)] // failed 计数预留给更细的失败汇报
@@ -43,6 +56,21 @@ pub struct JobSummary {
     /// 需要刷新列表的目录（源父目录 + 目标目录）。
     pub affected_dirs: Vec<PathBuf>,
     pub failed: usize,
+    pub outcome: JobOutcome,
+}
+
+/// 状态栏文案的中英选择（en = 当前界面为英文）。
+fn t(en: bool, zh: &str, english: &str) -> String {
+    if en { english.to_string() } else { zh.to_string() }
+}
+
+/// 带 `{}` 占位符的文案：按顺序替换。
+fn tf(en: bool, zh: &str, english: &str, args: &[String]) -> String {
+    let mut s = t(en, zh, english);
+    for a in args {
+        s = s.replace("{}", a);
+    }
+    s
 }
 
 /// 共享任务状态（UI 线程轮询）。
@@ -62,6 +90,8 @@ pub struct JobManager {
     tx: Sender<JobKind>,
     status: Arc<Mutex<JobStatus>>,
     cancel: Arc<AtomicBool>,
+    /// 界面是否为英文：完成摘要与进度文案按此选词。
+    en: Arc<AtomicBool>,
 }
 
 impl JobManager {
@@ -69,15 +99,17 @@ impl JobManager {
         let (tx, rx) = mpsc::channel::<JobKind>();
         let status = Arc::new(Mutex::new(JobStatus::default()));
         let cancel = Arc::new(AtomicBool::new(false));
+        let en = Arc::new(AtomicBool::new(false));
         let worker_status = status.clone();
         let worker_cancel = cancel.clone();
+        let worker_en = en.clone();
 
         std::thread::Builder::new()
             .name("rove-jobs".into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
                     worker_cancel.store(false, Ordering::SeqCst);
-                    let summary = run_job(&job, &worker_status, &worker_cancel);
+                    let summary = run_job(&job, &worker_status, &worker_cancel, &worker_en);
                     if let Ok(mut s) = worker_status.lock() {
                         s.running = false;
                         s.finished = Some(summary);
@@ -86,7 +118,16 @@ impl JobManager {
             })
             .expect("spawn rove-jobs worker");
 
-        Self { tx, status, cancel }
+        Self { tx, status, cancel, en }
+    }
+
+    /// 语言切换时调用：之后完成的任务摘要按该语言生成。
+    pub fn set_english(&self, value: bool) {
+        self.en.store(value, Ordering::Relaxed);
+    }
+
+    pub fn is_english(&self) -> bool {
+        self.en.load(Ordering::Relaxed)
     }
 
     /// 提交任务；返回 false 表示已有任务在进行。
@@ -122,11 +163,21 @@ impl JobManager {
     }
 }
 
-fn run_job(job: &JobKind, status: &Arc<Mutex<JobStatus>>, cancel: &Arc<AtomicBool>) -> JobSummary {
+fn run_job(
+    job: &JobKind,
+    status: &Arc<Mutex<JobStatus>>,
+    cancel: &Arc<AtomicBool>,
+    en: &Arc<AtomicBool>,
+) -> JobSummary {
+    let en = en.load(Ordering::Relaxed);
     match job {
-        JobKind::Copy { sources, dest_dir } => run_transfer(sources, dest_dir, false, status, cancel),
-        JobKind::Move { sources, dest_dir } => run_transfer(sources, dest_dir, true, status, cancel),
-        JobKind::Delete { paths, to_trash } => run_delete(paths, *to_trash, status, cancel),
+        JobKind::Copy { sources, dest_dir } => {
+            run_transfer(sources, dest_dir, false, status, cancel, en)
+        }
+        JobKind::Move { sources, dest_dir } => {
+            run_transfer(sources, dest_dir, true, status, cancel, en)
+        }
+        JobKind::Delete { paths, to_trash } => run_delete(paths, *to_trash, status, cancel, en),
     }
 }
 
@@ -137,6 +188,7 @@ fn run_transfer(
     is_move: bool,
     status: &Arc<Mutex<JobStatus>>,
     cancel: &Arc<AtomicBool>,
+    en: bool,
 ) -> JobSummary {
     let total = sources.len();
     let mut affected = vec![dest_dir.to_path_buf()];
@@ -160,19 +212,27 @@ fn run_transfer(
         return match res {
             Ok(aborted) => JobSummary {
                 message: if aborted {
-                    "操作已取消".into()
+                    t(en, "操作已取消", "Operation cancelled")
                 } else if is_move {
-                    format!("已移动 {total} 个项目")
+                    tf(en, "已移动 {} 个项目", "Moved {} items", &[total.to_string()])
                 } else {
-                    format!("已复制 {total} 个项目")
+                    tf(en, "已复制 {} 个项目", "Copied {} items", &[total.to_string()])
                 },
                 affected_dirs: affected,
                 failed: 0,
+                outcome: if aborted {
+                    JobOutcome::Other
+                } else if is_move {
+                    JobOutcome::Moved
+                } else {
+                    JobOutcome::Other
+                },
             },
             Err(e) => JobSummary {
-                message: format!("操作失败：{e}"),
+                message: tf(en, "操作失败：{}", "Operation failed: {}", &[e.to_string()]),
                 affected_dirs: affected,
                 failed: total,
+                outcome: JobOutcome::Other,
             },
         };
     }
@@ -186,9 +246,10 @@ fn run_transfer(
         for (i, src) in sources.iter().enumerate() {
             if cancel.load(Ordering::Relaxed) {
                 return JobSummary {
-                    message: "已取消".into(),
+                    message: t(en, "已取消", "Cancelled"),
                     affected_dirs: affected,
                     failed,
+                    outcome: JobOutcome::Other,
                 };
             }
             let name = src
@@ -215,18 +276,33 @@ fn run_transfer(
         let message = match (failed, last_error) {
             (0, _) => {
                 if is_move {
-                    format!("已移动 {total} 个项目")
+                    tf(en, "已移动 {} 个项目", "Moved {} items", &[total.to_string()])
                 } else {
-                    format!("已复制 {total} 个项目")
+                    tf(en, "已复制 {} 个项目", "Copied {} items", &[total.to_string()])
                 }
             }
-            (f, Some(err)) => format!("{f}/{total} 个项目失败（{err}）"),
-            (f, None) => format!("{f}/{total} 个项目失败"),
+            (f, Some(err)) => tf(
+                en,
+                "{}/{} 个项目失败（{}）",
+                "{}/{} items failed ({})",
+                &[f.to_string(), total.to_string(), err],
+            ),
+            (f, None) => tf(
+                en,
+                "{}/{} 个项目失败",
+                "{}/{} items failed",
+                &[f.to_string(), total.to_string()],
+            ),
         };
         JobSummary {
             message,
             affected_dirs: affected,
             failed,
+            outcome: if failed == 0 && is_move {
+                JobOutcome::Moved
+            } else {
+                JobOutcome::Other
+            },
         }
     }
 }
@@ -237,6 +313,7 @@ fn run_delete(
     to_trash: bool,
     status: &Arc<Mutex<JobStatus>>,
     cancel: &Arc<AtomicBool>,
+    en: bool,
 ) -> JobSummary {
     let total = paths.len();
     let mut affected = Vec::new();
@@ -254,19 +331,35 @@ fn run_delete(
         return match res {
             Ok(aborted) => JobSummary {
                 message: if aborted {
-                    "删除已取消".into()
+                    t(en, "删除已取消", "Delete cancelled")
                 } else if to_trash {
-                    format!("已删除 {total} 个项目到回收站")
+                    tf(
+                        en,
+                        "已删除 {} 个项目到回收站",
+                        "Moved {} items to the Recycle Bin",
+                        &[total.to_string()],
+                    )
                 } else {
-                    format!("已彻底删除 {total} 个项目")
+                    tf(
+                        en,
+                        "已彻底删除 {} 个项目",
+                        "Permanently deleted {} items",
+                        &[total.to_string()],
+                    )
                 },
                 affected_dirs: affected,
                 failed: 0,
+                outcome: if aborted {
+                    JobOutcome::Other
+                } else {
+                    JobOutcome::Deleted
+                },
             },
             Err(e) => JobSummary {
-                message: format!("删除失败：{e}"),
+                message: tf(en, "删除失败：{}", "Delete failed: {}", &[e.to_string()]),
                 affected_dirs: affected,
                 failed: total,
+                outcome: JobOutcome::Other,
             },
         };
     }
@@ -283,6 +376,7 @@ fn run_delete(
                     message: "已取消".into(),
                     affected_dirs: affected,
                     failed,
+                    outcome: JobOutcome::Other,
                 };
             }
             let name = path
@@ -310,18 +404,43 @@ fn run_delete(
         let message = match (failed, last_error) {
             (0, _) => {
                 if to_trash {
-                    format!("已删除 {total} 个项目到回收站")
+                    tf(
+                        en,
+                        "已删除 {} 个项目到回收站",
+                        "Moved {} items to the Recycle Bin",
+                        &[total.to_string()],
+                    )
                 } else {
-                    format!("已彻底删除 {total} 个项目")
+                    tf(
+                        en,
+                        "已彻底删除 {} 个项目",
+                        "Permanently deleted {} items",
+                        &[total.to_string()],
+                    )
                 }
             }
-            (f, Some(err)) => format!("{f}/{total} 个项目删除失败（{err}）"),
-            (f, None) => format!("{f}/{total} 个项目删除失败"),
+            (f, Some(err)) => tf(
+                en,
+                "{}/{} 个项目删除失败（{}）",
+                "{}/{} items failed to delete ({})",
+                &[f.to_string(), total.to_string(), err],
+            ),
+            (f, None) => tf(
+                en,
+                "{}/{} 个项目删除失败",
+                "{}/{} items failed to delete",
+                &[f.to_string(), total.to_string()],
+            ),
         };
         JobSummary {
             message,
             affected_dirs: affected,
             failed,
+            outcome: if failed == 0 {
+                JobOutcome::Deleted
+            } else {
+                JobOutcome::Other
+            },
         }
     }
 }
@@ -398,14 +517,21 @@ pub fn move_path(src: &Path, dst: &Path) -> Result<(), String> {
 }
 
 /// 状态栏文本。
-pub fn status_text(status: &JobStatus) -> String {
+pub fn status_text(status: &JobStatus, en: bool) -> String {
     if !status.running {
         return String::new();
     }
-    format!(
-        "正在处理 {}/{}：{}",
-        status.done, status.total, status.current
-    )
+    if en {
+        format!(
+            "Processing {}/{}: {}",
+            status.done, status.total, status.current
+        )
+    } else {
+        format!(
+            "正在处理 {}/{}：{}",
+            status.done, status.total, status.current
+        )
+    }
 }
 
 /// 测试辅助。

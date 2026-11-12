@@ -1,3 +1,4 @@
+import { I18n } from "i18n.slint";
 // 动作编辑器弹窗（新增 / 编辑自定义右键菜单项）。
 import { Theme, IconClose } from "common.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
@@ -124,8 +125,8 @@ component TokenChip inherits Rectangle {
 }
 
 export component ActionEditorDialog inherits Rectangle {
-    in property <string> title: "新建动作";
-    in property <[string]> group-options: ["一级菜单"];
+    in property <string> title: I18n.strings[52];
+    in property <[string]> group-options: [I18n.strings[5]];
     in-out property <string> edit-id: "";
     in-out property <string> edit-label: "";
     in-out property <string> edit-group: "";
@@ -218,24 +219,24 @@ export component ActionEditorDialog inherits Rectangle {
             // 字段 1：显示名称
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "名称"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[30]; color: Theme.text-secondary; font-size: 12px; }
                 StyledInput {
                     text <=> root.edit-label;
-                    placeholder: "例如：用 VS Code 打开";
+                    placeholder: I18n.strings[15];
                 }
             }
 
             // 字段 2：程序路径 + 浏览按钮
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "执行路径"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[49]; color: Theme.text-secondary; font-size: 12px; }
                 HorizontalLayout {
                     spacing: 8px;
 
                     StyledInput {
                         horizontal-stretch: 1;
                         text <=> root.edit-program;
-                        placeholder: "可执行程序绝对路径，或环境变量中的命令";
+                        placeholder: I18n.strings[29];
                     }
 
                     Rectangle {
@@ -247,7 +248,7 @@ export component ActionEditorDialog inherits Rectangle {
                         background: browse-ta.has-hover ? Theme.bg-hover : transparent;
 
                         Text {
-                            text: "浏览…";
+                            text: I18n.strings[62];
                             color: Theme.text-primary;
                             font-size: 12px;
                             horizontal-alignment: center;
@@ -270,10 +271,10 @@ export component ActionEditorDialog inherits Rectangle {
             // 字段 3：参数模板
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "参数模板"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[26]; color: Theme.text-secondary; font-size: 12px; }
                 StyledInput {
                     text <=> root.edit-args;
-                    placeholder: "例如：\"{target_path}\"";
+                    placeholder: I18n.strings[12];
                 }
 
                 HorizontalLayout {
@@ -290,24 +291,24 @@ export component ActionEditorDialog inherits Rectangle {
             // 字段 4：作用对象（单选）
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "作用对象"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[10]; color: Theme.text-secondary; font-size: 12px; }
 
                 HorizontalLayout {
                     spacing: 16px;
                     alignment: start;
 
                     RadioDot {
-                        label: "全部";
+                        label: I18n.strings[19];
                         selected: root.edit-target == "any";
                         clicked-cb => { root.edit-target = "any"; }
                     }
                     RadioDot {
-                        label: "仅文件";
+                        label: I18n.strings[8];
                         selected: root.edit-target == "file";
                         clicked-cb => { root.edit-target = "file"; }
                     }
                     RadioDot {
-                        label: "仅文件夹";
+                        label: I18n.strings[9];
                         selected: root.edit-target == "dir";
                         clicked-cb => { root.edit-target = "dir"; }
                     }
@@ -317,7 +318,7 @@ export component ActionEditorDialog inherits Rectangle {
             // 字段 5：层级归属（可输入新名称新建二级菜单；右侧箭头列出已有分组）
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "层级归属（留空 = 一级菜单，输入新名称可新建二级菜单）"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[39]; color: Theme.text-secondary; font-size: 12px; }
 
                 drop-box := Rectangle {
                     height: 32px;
@@ -339,7 +340,7 @@ export component ActionEditorDialog inherits Rectangle {
                         x: 10px;
                         width: parent.width - 36px;
                         height: parent.height;
-                        text: "一级菜单";
+                        text: I18n.strings[5];
                         font-size: 12.5px;
                         color: Theme.text-disabled;
                         vertical-alignment: center;
@@ -401,7 +402,7 @@ export component ActionEditorDialog inherits Rectangle {
 
                                 for opt in root.group-options : Rectangle {
                                     height: 30px;
-                                    background: opt-ta.has-hover ? Theme.bg-hover : (root.edit-group == (opt == "一级菜单" ? "" : opt) ? Theme.bg-selected : transparent);
+                                    background: opt-ta.has-hover ? Theme.bg-hover : (root.edit-group == (opt == I18n.strings[5] ? "" : opt) ? Theme.bg-selected : transparent);
 
                                     HorizontalLayout {
                                         padding-left: 10px;
@@ -409,9 +410,9 @@ export component ActionEditorDialog inherits Rectangle {
 
                                         Text {
                                             text: opt;
-                                            color: root.edit-group == (opt == "一级菜单" ? "" : opt) ? Theme.accent : Theme.text-primary;
+                                            color: root.edit-group == (opt == I18n.strings[5] ? "" : opt) ? Theme.accent : Theme.text-primary;
                                             font-size: 12px;
-                                            font-weight: root.edit-group == (opt == "一级菜单" ? "" : opt) ? 600 : 400;
+                                            font-weight: root.edit-group == (opt == I18n.strings[5] ? "" : opt) ? 600 : 400;
                                             vertical-alignment: center;
                                         }
                                     }
@@ -420,7 +421,7 @@ export component ActionEditorDialog inherits Rectangle {
                                         width: 100%;
                                         height: 100%;
                                         clicked => {
-                                            root.edit-group = (opt == "一级菜单" ? "" : opt);
+                                            root.edit-group = (opt == I18n.strings[5] ? "" : opt);
                                             root.dropdown-open = false;
                                         }
                                     }
@@ -434,10 +435,10 @@ export component ActionEditorDialog inherits Rectangle {
             // 字段 6：适用扩展名
             VerticalLayout {
                 spacing: 4px;
-                Text { text: "适用扩展名（仅「仅文件」，逗号分隔，可空）"; color: Theme.text-secondary; font-size: 12px; }
+                Text { text: I18n.strings[77]; color: Theme.text-secondary; font-size: 12px; }
                 StyledInput {
                     text <=> root.edit-extensions;
-                    placeholder: "例如：txt, md, rs（留空匹配全部）";
+                    placeholder: I18n.strings[14];
                 }
             }
 
@@ -456,7 +457,7 @@ export component ActionEditorDialog inherits Rectangle {
                     border-color: Theme.border;
 
                     Text {
-                        text: "取消";
+                        text: I18n.strings[27];
                         color: Theme.text-primary;
                         font-size: 12.5px;
                         horizontal-alignment: center;
@@ -481,7 +482,7 @@ export component ActionEditorDialog inherits Rectangle {
                     border-radius: 6px;
 
                     Text {
-                        text: "保存";
+                        text: I18n.strings[16];
                         color: white;
                         font-size: 12.5px;
                         horizontal-alignment: center;

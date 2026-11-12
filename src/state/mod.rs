@@ -1,3 +1,4 @@
+//! src/state/mod.rs
 //! 应用状态：标签页、导航历史、暂存托盘、选择集。
 
 use std::collections::HashSet;
@@ -39,6 +40,13 @@ pub struct PaneState {
     pub path: Option<PathBuf>,
     /// 导航历史（含当前位置）。
     pub history: Vec<Option<PathBuf>>,
+    /// 与 `history` 平行：每个页面的搜索词。搜索也作为一个独立页面，
+    /// 因此后退可以回到搜索前的目录、前进可以回到搜索结果。
+    pub history_filters: Vec<String>,
+    /// 与 `history` 平行：每个页面各自的滚动位置。
+    pub history_scroll: Vec<f32>,
+    /// 进入搜索前的滚动位置；清空搜索框时恢复到这里。
+    pub pre_filter_scroll_y: f32,
     /// 记录每个目录的滚动位置。只要标签不关，不管用什么方式回到该目录，都能精准恢复。
     /// 用 `Option<PathBuf>` 作为 Key，是为了兼容“此电脑（None）”视图的滚动记忆。
     pub path_scroll_memo: std::collections::HashMap<Option<PathBuf>, f32>,
@@ -85,6 +93,9 @@ impl PaneState {
         Self {
             path: path.clone(),
             history: vec![path],
+            history_filters: vec![String::new()],
+            history_scroll: vec![0.0],
+            pre_filter_scroll_y: 0.0,
             path_scroll_memo: std::collections::HashMap::new(), // 按路径记忆滚动位置
             history_index: 0,
             pending_scroll_restore: false,
@@ -125,47 +136,106 @@ impl PaneState {
 
     /// 导航到新路径（压入历史，丢弃前进记录）。
     pub fn navigate(&mut self, path: Option<PathBuf>) {
-        // 核心修复：离开当前页面时，按路径保存它的滚动位置
+        // 离开当前页面时，按路径与按页面各保存一次滚动位置。
         self.path_scroll_memo.insert(self.path.clone(), self.scroll_y);
+        if let Some(s) = self.history_scroll.get_mut(self.history_index) {
+            *s = self.scroll_y;
+        }
 
-        self.history.truncate(self.history_index + 1);
+        let n = self.history_index + 1;
+        self.history.truncate(n);
+        self.history_filters.truncate(n);
+        self.history_scroll.truncate(n);
         self.history.push(path.clone());
+        self.history_filters.push(String::new());
+        let restored = self.path_scroll_memo.get(&path).copied().unwrap_or(0.0);
+        self.history_scroll.push(restored);
         self.history_index = self.history.len() - 1;
         self.path = path.clone();
         self.selection.clear();
         self.anchor = None;
 
-        // 核心修复：检查是否有记忆，有则恢复，无则顶部
-        self.scroll_y = self.path_scroll_memo.get(&path).copied().unwrap_or(0.0);
+        // 检查是否有记忆，有则恢复，无则顶部
+        self.scroll_y = restored;
         self.pending_scroll_restore = true; // 只要导航了，就等数据回来再推 UI
         self.generation += 1;
         self.loading = true;
         self.filter.clear();
+        self.pre_filter_scroll_y = 0.0;
         self.search_total = None;
         self.clear_deep();
     }
 
-    /// 后退/前进（不重新入栈）。
+    /// 后退/前进（不重新入栈）。同一路径内的「搜索页 ↔ 目录页」也走这里，
+    /// 此时只恢复搜索词和滚动，不重新列举目录（否则搜索结果会被冲掉）。
     pub fn jump_to(&mut self, index: usize) {
         if index >= self.history.len() {
             return;
         }
-        // 核心修复：离开当前页面时，按路径保存滚动位置
         self.path_scroll_memo.insert(self.path.clone(), self.scroll_y);
+        if let Some(s) = self.history_scroll.get_mut(self.history_index) {
+            *s = self.scroll_y;
+        }
 
+        let same_path = self.path == self.history[index];
         self.history_index = index;
         self.path = self.history[index].clone();
+        // 搜索页面本身带着搜索词，前进/后退时一并恢复（不再无条件清空）。
+        self.filter = self
+            .history_filters
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
         self.selection.clear();
         self.anchor = None;
 
-        // 核心修复：恢复目标路径的滚动位置
-        self.scroll_y = self.path_scroll_memo.get(&self.path).copied().unwrap_or(0.0);
-        self.pending_scroll_restore = true;
-        self.generation += 1;
-        self.loading = true;
-        self.filter.clear();
-        self.search_total = None;
-        self.clear_deep();
+        self.scroll_y = self
+            .history_scroll
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| self.path_scroll_memo.get(&self.path).copied().unwrap_or(0.0));
+        // 同一路径不会触发异步列举，别让 pending 标记永远挡住滚动回调。
+        self.pending_scroll_restore = !same_path;
+        if !same_path {
+            self.generation += 1;
+            self.loading = true;
+            self.search_total = None;
+            self.clear_deep();
+        }
+    }
+
+    /// 搜索词变化：把「开始搜索」和「清空搜索」各记成一个可前进/后退的页面。
+    /// 同一页里继续改词只更新本页的搜索词，不新增历史项。
+    pub fn set_filter_from_search(&mut self, text: &str) {
+        let was_empty = self.filter.is_empty();
+        let now_empty = text.is_empty();
+        if let Some(s) = self.history_scroll.get_mut(self.history_index) {
+            *s = self.scroll_y;
+        }
+        if was_empty && !now_empty {
+            // 记住搜索前的滚动位置，清空搜索框时回到这里。
+            self.pre_filter_scroll_y = self.scroll_y;
+            self.push_search_page(text.to_string(), 0.0);
+        } else if !was_empty && now_empty {
+            self.push_search_page(String::new(), self.pre_filter_scroll_y);
+        } else if !now_empty {
+            if let Some(f) = self.history_filters.get_mut(self.history_index) {
+                *f = text.to_string();
+            }
+        }
+        self.filter = text.to_string();
+    }
+
+    fn push_search_page(&mut self, filter: String, scroll: f32) {
+        let n = self.history_index + 1;
+        self.history.truncate(n);
+        self.history_filters.truncate(n);
+        self.history_scroll.truncate(n);
+        self.history.push(self.path.clone());
+        self.history_filters.push(filter);
+        self.history_scroll.push(scroll);
+        self.history_index = self.history.len() - 1;
+        self.scroll_y = scroll;
     }
 
     /// 上一级目录（盘符根之上为"此电脑"）。
@@ -435,6 +505,8 @@ impl AppState {
                 let pane = tab.active_mut();
                 pane.path = Some(current.clone());
                 pane.history = vec![Some(current)];
+                pane.history_filters = vec![String::new()];
+                pane.history_scroll = vec![0.0];
             }
         }
         self.tabs.push(tab);
@@ -513,5 +585,52 @@ impl AppState {
             .filter(|s| s.path.exists())
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pane() -> PaneState {
+        PaneState::new(Some(PathBuf::from("C:\\work")), SortState::default())
+    }
+
+    /// 搜索页 ↔ 目录页要能前进/后退，且清空搜索时回到搜索前的滚动位置。
+    #[test]
+    fn search_pages_are_navigable() {
+        let mut p = pane();
+        p.scroll_y = 240.0;
+        p.set_filter_from_search("abc");
+        assert_eq!(p.history.len(), 2);
+        assert_eq!(p.filter, "abc");
+        assert_eq!(p.history_filters[1], "abc");
+        assert_eq!(p.scroll_y, 0.0);
+        // 同一页里继续改词不新增历史项。
+        p.set_filter_from_search("abcd");
+        assert_eq!(p.history.len(), 2);
+        assert_eq!(p.history_filters[1], "abcd");
+        p.scroll_y = 80.0;
+        p.set_filter_from_search("");
+        assert_eq!(p.history.len(), 3);
+        assert_eq!(p.scroll_y, 240.0);
+        p.jump_to(1);
+        assert_eq!(p.filter, "abcd");
+        assert_eq!(p.scroll_y, 80.0);
+        p.jump_to(2);
+        assert!(p.filter.is_empty());
+        assert_eq!(p.scroll_y, 240.0);
+    }
+
+    /// 导航到新路径仍是普通页面（搜索词为空），并丢弃前进记录。
+    #[test]
+    fn navigate_clears_search_and_forward_history() {
+        let mut p = pane();
+        p.set_filter_from_search("abc");
+        p.navigate(Some(PathBuf::from("C:\\other")));
+        assert_eq!(p.history.len(), 3);
+        assert!(p.filter.is_empty());
+        assert_eq!(p.history_filters.last().unwrap(), "");
+        assert_eq!(p.history_index, 2);
     }
 }

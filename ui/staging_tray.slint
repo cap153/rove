@@ -1,3 +1,4 @@
+import { I18n } from "i18n.slint";
 import { Theme, StagingItem, IconClose } from "common.slint";
 
 // 临时暂存托盘：跨标签收集文件，一键批量复制/移动到当前目录。
@@ -79,7 +80,7 @@ export component StagingTray inherits Rectangle {
 
                 // 宽屏时显示全名，窄屏时显示“暂存”
                 Text {
-                    text: root.is-narrow ? "暂存" : "临时暂存托盘";
+                    text: root.is-narrow ? I18n.strings[54] : I18n.strings[7];
                     color: Theme.text-primary;
                     font-size: 12px;
                     font-weight: 600;
@@ -220,13 +221,13 @@ export component StagingTray inherits Rectangle {
                 spacing: 4px;
 
                 Text {
-                    text: "暂存区是空的";
+                    text: I18n.strings[55];
                     color: Theme.text-disabled;
                     font-size: 11.5px;
                     horizontal-alignment: center;
                 }
                 Text {
-                    text: "在文件上右键「添加到暂存盘」";
+                    text: I18n.strings[35];
                     color: Theme.text-disabled;
                     font-size: 10px;
                     horizontal-alignment: center;
@@ -253,7 +254,7 @@ export component StagingTray inherits Rectangle {
                     border-radius: 6px;
                     background: root.items.length > 0 ? Theme.accent : Theme.border;
                     Text {
-                        text: "复制到此处";
+                        text: I18n.strings[37];
                         color: root.items.length > 0 ? Theme.accent-text : Theme.text-disabled;
                         font-size: 11.5px;
                         horizontal-alignment: center;
@@ -280,7 +281,7 @@ export component StagingTray inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.border;
                     Text {
-                        text: "移动";
+                        text: I18n.strings[67];
                         color: root.items.length > 0 ? Theme.text-primary : Theme.text-disabled;
                         font-size: 11.5px;
                         horizontal-alignment: center;
@@ -335,7 +336,7 @@ export component StagingTray inherits Rectangle {
                     border-radius: 6px;
                     background: root.items.length > 0 ? Theme.accent : Theme.border;
                     Text {
-                        text: "复制";
+                        text: I18n.strings[36];
                         color: root.items.length > 0 ? Theme.accent-text : Theme.text-disabled;
                         font-size: 11.5px;
                         horizontal-alignment: center;
@@ -360,7 +361,7 @@ export component StagingTray inherits Rectangle {
                     border-width: 1px;
                     border-color: Theme.border;
                     Text {
-                        text: "移动";
+                        text: I18n.strings[67];
                         color: root.items.length > 0 ? Theme.text-primary : Theme.text-disabled;
                         font-size: 11.5px;
                         horizontal-alignment: center;
@@ -383,7 +384,7 @@ export component StagingTray inherits Rectangle {
                     border-radius: 6px;
                     background: (root.items.length > 0 && clear-ta-narrow.has-hover) ? Theme.close-hover : transparent;
                     Text {
-                        text: "清空";
+                        text: I18n.strings[66];
                         color: root.items.length == 0 ? Theme.text-disabled : (clear-ta-narrow.has-hover ? #FFFFFF : Theme.text-secondary);
                         font-size: 11.5px;
                         horizontal-alignment: center;
