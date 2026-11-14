@@ -7388,6 +7388,33 @@ impl App {
         // 不再有 `act:builtin.*` 的菜单分支；它们的实现函数仍在快捷键路径上使用。
         if let Some(action_id) = id.strip_prefix("act:") {
             match action_id {
+                "builtin.copy_path" => {
+                    if let MenuScope::Selection(paths) = &target {
+                        if paths.is_empty() {
+                            return;
+                        }
+                        let text = ops::clipboard::paths_text(paths);
+                        match ops::clipboard::set_text(&text) {
+                            Ok(()) => {
+                                // 系统剪贴板已被改写为纯文本：把内部那份「回收站内剪切」
+                                // 兜底缓存一起清掉，否则接下来的「粘贴」会莫名其妙把
+                                // 回收站里的条目搬出去（那是上一次剪切留下的语义）。
+                                self.state.clipboard_paths.clear();
+                                self.state.clipboard_from_recycle = false;
+                                self.state.cut_paths.clear();
+                                self.visible_cache = None;
+                                self.refresh_visible_rows();
+                                self.set_status_job(if paths.len() > 1 {
+                                    self.trf("已复制 {} 项路径", &[paths.len().to_string()])
+                                } else {
+                                    self.tr("已复制路径").to_string()
+                                })
+                            }
+                            Err(e) => self.set_status_job(e),
+                        }
+                    }
+                    return;
+                }
                 "builtin.copy" => {
                     self.copy_selection(false);
                     return;
@@ -9429,6 +9456,57 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
     });
 }
 
+/// 延后重试的上限与间隔。
+///
+/// 借用被占用的时间通常只是「这一帧的 sync 阶段」，几毫秒内必然放开；
+/// 留 60 次 × 16ms ≈ 1 秒余量，超了就放弃本次处理（丢的只是折叠状态或
+/// 一次搜索词重算，下一次交互还会再来）。**不能**无限 0ms 重试：那会在
+/// 借用长期被占时变成忙等 + 日志刷屏。
+const DEFER_TRIES: u32 = 60;
+const DEFER_DELAY_MS: u64 = 16;
+
+/// Slint → Rust 回调里安全地拿 App 可变借用。
+///
+/// 为什么不能直接 `borrow_mut()`：写界面属性会**同步**派发 Slint 的 `changed`
+/// 回调，而这些写操作常常发生在 40ms 轮询定时器持着 `borrow_mut()` 的区间里
+/// （那个闭包从取借用一直用到结尾，中间还有一大堆 `sync_*` 界面写操作）。
+/// 一旦撞上就是 RefCell 双借用 → panic → 进程 abort，用户看到的是
+/// 「启动就崩、连窗口都不出」。取不到借用就延后重试，而不是 abort。
+fn defer_app_mut(
+    what: &'static str,
+    app: &Rc<RefCell<App>>,
+    action: impl Fn(&mut App) + 'static,
+) {
+    attempt_app_mut(what, app, Rc::new(action), DEFER_TRIES);
+}
+
+fn attempt_app_mut<F: Fn(&mut App) + 'static>(
+    what: &'static str,
+    app: &Rc<RefCell<App>>,
+    action: Rc<F>,
+    tries: u32,
+) {
+    if let Ok(mut app) = app.try_borrow_mut() {
+        action(&mut app);
+        return;
+    }
+    if tries == 0 {
+        logln!("!! {what} 回调连续 {} 次命中 App 借用中，放弃本次处理", DEFER_TRIES);
+        return;
+    }
+    if tries == DEFER_TRIES {
+        // 只记第一次：借用占着的那段时间里每次重试都会失败，逐次记就是刷屏。
+        // 这条日志是「有代码持着 borrow 写界面属性」的唯一线索，值得留。
+        logln!("!! {what} 回调命中 App 借用中，延后重试");
+    }
+    let weak = Rc::downgrade(app);
+    slint::Timer::single_shot(Duration::from_millis(DEFER_DELAY_MS), move || {
+        if let Some(app) = weak.upgrade() {
+            attempt_app_mut(what, &app, action, tries - 1);
+        }
+    });
+}
+
 /// 全部 UI 回调接线。
 /// 注意：生成的 MainWindow 不可 Clone，所有回调统一经由 `app.borrow().ui`
 /// 临时借用注册；闭包捕获的是 Rc 克隆，与后续的事件循环调用不冲突。
@@ -10165,12 +10243,18 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         // 幂等判断会挡掉那次无谓的 save。
         upgrade().on_staging_expanded_changed(move |expanded| {
             let Some(app) = app.upgrade() else { return };
-            let mut app = app.borrow_mut();
-            if app.config.staging_expanded == expanded {
-                return;
-            }
-            app.config.staging_expanded = expanded;
-            app.config.save();
+            defer_app_mut("staging-expanded", &app, move |app| {
+                // 延后重试期间用户可能又点了几次：只认界面上的最新值，
+                // 否则旧的那次会把新状态覆盖掉。
+                if app.ui.get_staging_expanded() != expanded {
+                    return;
+                }
+                if app.config.staging_expanded == expanded {
+                    return;
+                }
+                app.config.staging_expanded = expanded;
+                app.config.save();
+            });
         });
     }
 
@@ -10179,8 +10263,15 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_filter_edited(move |text| {
             let Some(app) = app.upgrade() else { return };
-            let mut app = app.borrow_mut();
-            app.apply_search_query(&text.to_string());
+            // 搜索框的文本也会被 Rust 自己回写（导航/标签切换/清空），
+            // 那时可能正在某个 `borrow_mut()` 区间里 —— 不能直接借。
+            defer_app_mut("filter", &app, move |app| {
+                // 同上：延后期间可能已有新的一次输入生效，旧文本不能覆盖新结果。
+                if app.ui.get_filter_text() != text {
+                    return;
+                }
+                app.apply_search_query(&text);
+            });
         });
     }
     {

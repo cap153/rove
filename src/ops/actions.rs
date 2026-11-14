@@ -87,6 +87,21 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             group: "".into(),
             builtin: true,
         },
+        // 「复制路径」放在「剪切」下面：菜单按本函数顺序输出一级项，
+        // 复制 / 剪切 / 复制路径 三个密切相关，摆在一起更好认。
+        ActionEntry {
+            id: "builtin.copy_path".into(),
+            label: "复制路径".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
         ActionEntry {
             id: "builtin.stage".into(),
             label: "添加到暂存盘".into(),
@@ -607,5 +622,17 @@ mod tests {
         let targets = vec![PathBuf::from("C:/a.txt"), PathBuf::from("C:/b.txt")];
         let out = build_substituted("{target_paths}", &targets);
         assert_eq!(out, "\"C:/a.txt\" \"C:/b.txt\"");
+    }
+
+    /// 「复制路径」紧跟在「剪切」下面（复制 / 剪切 / 复制路径 三项相邻）：
+    /// heal_full 会把内置动作按本函数顺序重排，所以只靠这里的顺序就成。
+    #[test]
+    fn copy_path_sits_right_below_cut() {
+        let actions = builtin_actions();
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(
+            &ids[..3],
+            &["builtin.copy", "builtin.move", "builtin.copy_path"],
+        );
     }
 }

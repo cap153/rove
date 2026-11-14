@@ -25,7 +25,7 @@ mod imp {
         OpenClipboard, RegisterClipboardFormatW, SetClipboardData,
     };
     use windows_sys::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GHND};
-    use windows_sys::Win32::System::Ole::{CF_HDROP, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
+    use windows_sys::Win32::System::Ole::{CF_HDROP, CF_UNICODETEXT, DROPEFFECT_COPY, DROPEFFECT_LINK, DROPEFFECT_MOVE};
     use windows_sys::Win32::UI::Shell::{DragQueryFileW, DROPFILES, HDROP};
     use windows_sys::core::w;
 
@@ -169,6 +169,33 @@ mod imp {
         }
     }
 
+    /// 把纯文本写进剪贴板（CF_UNICODETEXT）。
+    ///
+    /// 会被 EmptyClipboard 清掉原有的 CF_HDROP：这是预期的，因为 Rove 只会在
+    /// 用户显式点「复制路径」时调它。不附结尾换行（否则粘进对话框会多一行）。
+    pub fn set_text(text: &str) -> Result<(), String> {
+        let _guard = CLIPBOARD_MUTEX
+            .lock()
+            .map_err(|_| "clipboard mutex poisoned".to_string())?;
+        ensure_ole();
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let bytes = unsafe {
+            std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2)
+        };
+        unsafe {
+            open_clipboard()?;
+            let result = (|| {
+                if EmptyClipboard() == 0 {
+                    return Err("EmptyClipboard failed".to_string());
+                }
+                set_clipboard_bytes(CF_UNICODETEXT as u32, bytes)
+            })();
+            let _ = CloseClipboard();
+            result
+        }
+    }
+
     pub fn clear() -> Result<(), String> {
         let _guard = CLIPBOARD_MUTEX
             .lock()
@@ -253,6 +280,10 @@ mod imp {
         Err("clipboard is only implemented on Windows".to_string())
     }
 
+    pub fn set_text(_text: &str) -> Result<(), String> {
+        Err("clipboard is only implemented on Windows".to_string())
+    }
+
     pub fn clear() -> Result<(), String> {
         Err("clipboard is only implemented on Windows".to_string())
     }
@@ -267,6 +298,20 @@ pub fn set_files(paths: &[std::path::PathBuf], is_move: bool) -> Result<(), Stri
     imp::set_files(paths, is_move)
 }
 
+/// 把选中项的完整路径（含文件名）拼成多行文本：一项一行，不带引号、不带结尾换行。
+pub fn paths_text(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+/// 把纯文本写进剪贴板（复制路径）。
+pub fn set_text(text: &str) -> Result<(), String> {
+    imp::set_text(text)
+}
+
 /// 清空剪贴板（预留给「剪切后取消」等场景）。
 #[allow(dead_code)]
 pub fn clear() -> Result<(), String> {
@@ -276,4 +321,24 @@ pub fn clear() -> Result<(), String> {
 /// 读取文件剪贴板。
 pub fn read_files() -> ClipboardFiles {
     imp::read_files()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_text_is_one_path_per_line_without_quotes() {
+        let paths = vec![
+            std::path::PathBuf::from(r"C:\Users\x\a b.txt"),
+            std::path::PathBuf::from(r"D:\重\素晴"),
+        ];
+        assert_eq!(paths_text(&paths), "C:\\Users\\x\\a b.txt\r\nD:\\重\\素晴");
+    }
+
+    #[test]
+    fn paths_text_single_has_no_trailing_newline() {
+        let paths = vec![std::path::PathBuf::from(r"D:\重")];
+        assert_eq!(paths_text(&paths), r"D:\重");
+    }
 }

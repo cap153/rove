@@ -252,6 +252,9 @@ pub const ZH: &[&str] = &[
     "关闭右侧",
     "开机自启动",
     "登录 Windows 时在后台常驻：托盘、文件对话框吸附、索引预热立即可用（不弹窗口）。",
+    "复制路径",
+    "已复制路径",
+    "已复制 {} 项路径",
 ];
 
 pub const EN: &[&str] = &[
@@ -501,6 +504,9 @@ pub const EN: &[&str] = &[
     "Close to the right",
     "Start with Windows",
     "Stay resident in the background after sign-in: tray, dialog attach and index warm-up (no window).",
+    "Copy path",
+    "Path copied",
+    "Copied {} item paths",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -584,6 +590,11 @@ mod tests {
         assert_eq!(ZH[244], "开机自启动");
         assert_eq!(EN[244], "Start with Windows");
         assert_eq!(EN[245].is_empty(), false);
+        // 「复制路径」内置动作（菜单项 + 状态栏提示）。
+        assert_eq!(ZH[246], "复制路径");
+        assert_eq!(EN[246], "Copy path");
+        assert_eq!(EN[247].is_empty(), false);
+        assert_eq!(EN[248].is_empty(), false);
     }
 
     #[test]
