@@ -772,18 +772,57 @@ out property <length> row-height-out: file-list.row-height-out;
                         // 旧实现直接赋 content-x = -10000px：此时布局还没算完，
                         // content-width 可能还是旧值（或 0），越界修正拿不到正确下限，
                         // 结果可能停在任意偏移 —— 窄窗口下的“地址栏一片空白”就是这么来的。
-                        // 改为：先挂一个待滚动标记，等下一帧布局落定后再算精确下限。
+                        //
+                        // 现在改成「反复补滚直到布局跟上」：
+                        // 一次 0ms 定时器并不够 —— 从资源管理器接管打开时，请求发生在
+                        // 窗口还最小化/刚显示的时刻，那一帧 Slint 还没重新算布局，
+                        // content-width 仍是旧值，算出来的偏移是错的，而且此后再也没人
+                        // 补滚（表现为新标签的地址栏没有滚到最右边）。
+                        // 所以：把「应得的宽度」和实际 content-width 比一比，不一致就留
+                        // 标记，等 content-width / 视口宽度真正变化时再补，直到一致为止。
                         private property <[BreadcrumbSegment]> breadcrumbs-watch: root.breadcrumbs;
                         private property <bool> scroll-end-pending: true;
+                        private property <int> scroll-end-tries: 0;
+
+                        /// 滚到最右；布局还没落定就留着待办标记。
+                        function apply-scroll-end() {
+                            // 与上面的 content-width 绑定保持一致：这是布局落定后
+                            // 应该得到的值。两者不同说明这一帧的布局还是旧的。
+                            let want = max(crumbs-layout.preferred-width + 24px, crumbs-flick.width);
+                            crumbs-flick.content-x = min(0px, crumbs-flick.width - crumbs-flick.content-width);
+                            if (abs(crumbs-flick.content-width - want) <= 1px || crumbs-flick.scroll-end-tries > 20) {
+                                crumbs-flick.scroll-end-pending = false;
+                                crumbs-flick.scroll-end-tries = 0;
+                            } else {
+                                crumbs-flick.scroll-end-tries += 1;
+                            }
+                        }
+
                         changed breadcrumbs-watch => {
                             crumbs-flick.scroll-end-pending = true;
+                            crumbs-flick.scroll-end-tries = 0;
                         }
+
+                        // 布局宽度变了（新标签建行、窗口从最小化恢复、窗口缩放）：
+                        // 只有在待办状态下才补滚，避免抢走用户手动滚动的位置。
+                        changed content-width => {
+                            if (crumbs-flick.scroll-end-pending) {
+                                crumbs-flick.apply-scroll-end();
+                            }
+                        }
+                        changed width => {
+                            if (crumbs-flick.scroll-end-pending) {
+                                crumbs-flick.apply-scroll-end();
+                            }
+                        }
+
+                        // 16ms 一档、最多约 20 档（≈320ms）：布局一旦落定就停，
+                        // 落不定也会自己停，不会变成常驻定时器。
                         Timer {
-                            interval: 0ms;
+                            interval: 16ms;
                             running: crumbs-flick.scroll-end-pending;
                             triggered => {
-                                crumbs-flick.scroll-end-pending = false;
-                                crumbs-flick.content-x = min(0px, crumbs-flick.width - crumbs-flick.content-width);
+                                crumbs-flick.apply-scroll-end();
                                 root.crumb_dbg(
                                     crumbs-flick.width,
                                     crumbs-flick.content-width,
