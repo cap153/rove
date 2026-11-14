@@ -285,18 +285,24 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <bool> is-split: false;
     in-out property <int> active-pane: 0;
 
-    /// 按目录下发列宽到当前活动分屏（Rust 切目录时调用）。
-    public function apply-col-widths(n: length, m: length, t: length, s: length) {
-        // 列宽是全局语义（Rust 侧只有一份 cur_col_widths），两栏同时下发。
-        // 只设 active-pane 会让另一栏停留在默认 320px，尤其「打开分屏后对左栏
-        // 重新自适应」时焦点在右栏，左栏完全收不到新宽度。
-        file-list.set-col-widths(n, m, t, s);
-        file-list-right.set-col-widths(n, m, t, s);
+    /// 按栏下发列宽（Rust 切目录 / 自适应时调用）。列宽是每栏独立的：
+    /// 两栏可能在不同目录（甚至一边此电脑、一边普通目录），共用一个宽度会让
+    /// 切换焦点时两栏的列宽互相覆盖、看起来在“自己跳”。
+    public function apply-col-widths(pane: int, n: length, m: length, t: length, s: length) {
+        if (pane == 1) {
+            file-list-right.set-col-widths(n, m, t, s);
+        } else {
+            file-list.set-col-widths(n, m, t, s);
+        }
     }
-    // 在 Slint 侧切换「名称列窗口自适应」开关（见 FileList.set-auto-col-widths 说明）。
-    public function apply-auto-col-widths(flag: bool) {
-        file-list.set-auto-col-widths(flag);
-        file-list-right.set-auto-col-widths(flag);
+    // 在 Slint 侧切换“名称列窗口自适应”开关（见 FileList.set-auto-col-widths 说明）。
+    // 同样按栏切换，不能一个开关管两栏。
+    public function apply-auto-col-widths(pane: int, flag: bool) {
+        if (pane == 1) {
+            file-list-right.set-auto-col-widths(flag);
+        } else {
+            file-list.set-auto-col-widths(flag);
+        }
     }
     in-out property <float> split-ratio: 0.5; // 左右分屏**显示**比例（受限后）
     // 分屏**期望**比例：用户拖出来的值（Rust 存 tab.split_ratio 并回推这个），
@@ -443,17 +449,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback file_wheel_view(delta_y: length) -> bool;
     callback file_row_double_clicked(index: int);
     callback file_header_clicked(key: string);
-    /// 详细信息列宽：由 Rust 按目录下发，用户拖动后经回调回传落盘。
-    /// 用双向绑定让子组件里的拖动结果同步到这里的真源属性上。
-    in-out property <length> col-w-name: 320px;
-    in-out property <length> col-w-modified: 150px;
-    in-out property <length> col-w-type: 116px;
-    in-out property <length> col-w-size: 96px;
-    /// 双击列边界时的估算宽度（名称/修改时间/类型/大小），由 Rust 计算下发。
-    in property <[length]> col-autofit-widths: [];
-    /// 当前目录没有手动列宽记录 → 允许 FileList 自适应压缩名称列（避免横向滚动条）。
-    in-out property <bool> col-auto-widths: true;
-    callback file_col_resized(index: int, width: length, name-w: length);
+    callback file_col_resized(pane: int, index: int, width: length, name-w: length);
     callback file_scroll_changed(offset: length);
     /// 排查用：滚动位置变化时连同几何一并上报（Rust 仅在重命名期间落日志）。
     callback file_scroll_dbg(pane: int, offset: length, content-h: length, view-h: length, min-y: length, content-y: length);
@@ -1234,13 +1230,11 @@ out property <length> row-height-out: file-list.row-height-out;
                     row_double_clicked(index) => {
                         root.file_row_double_clicked(index);
                     }
-                    autofit-widths: root.col-autofit-widths;
-                    auto-col-widths: root.col-auto-widths;
                     mouse-left-pressed: root.mouse-left-pressed;
                     single-selection: root.file-single-selection;
                     is-computer-view: root.file-is-computer-view;
                     col_resized(index, width, name-w) => {
-                        root.file_col_resized(index, width, name-w);
+                        root.file_col_resized(0, index, width, name-w);
                     }
                     header_clicked(key) => {
                         root.pane_focused(0);
@@ -1386,14 +1380,12 @@ out property <length> row-height-out: file-list.row-height-out;
                         row_double_clicked(index) => {
                             root.file_row_double_clicked(index);
                         }
-                        autofit-widths: root.col-autofit-widths;
-                        auto-col-widths: root.col-auto-widths;
                         mouse-left-pressed: root.mouse-left-pressed;
                         single-selection: root.file-single-selection-right;
                         show-path-column: root.show-path-column-right;
                         is-computer-view: root.file-is-computer-view-right;
                         col_resized(index, width, name-w) => {
-                            root.file_col_resized(index, width, name-w);
+                            root.file_col_resized(1, index, width, name-w);
                         }
                         header_clicked(key) => {
                             root.pane_focused(1);

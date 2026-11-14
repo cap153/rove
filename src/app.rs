@@ -625,12 +625,14 @@ pub struct App {
     /// 框选基线：按下时若按住 Ctrl/Shift，记录当时的选择集作为累加底本；
     /// None 表示普通替换式框选。预览与结束都基于它重算，矩形缩回时高亮也跟着缩回。
     rubber_band_base: Option<HashSet<PathBuf>>,
-    /// 已经做过「列宽自适应」的目录键。每个目录只在打开时算一次，
-    /// 避免滚动 / 刷新时反复重算导致列宽跳动。
-    autofit_key: Option<String>,
-    /// 界面上当前实际生效的四列宽度（名称/修改时间/类型/大小）。
+    /// 已经做过「列宽自适应」的目录键，按栏记录（左 0 / 右 1）。
+    /// 每个目录只在打开时算一次，避免滚动 / 刷新时反复重算导致列宽跳动。
+    /// 必须按栏分：两栏可能在不同目录，共用一个键会让切焦点时用另一栏的内容
+    /// 重新拟合，表现为「顶栏列宽自己变」。
+    autofit_key: [Option<String>; 2],
+    /// 界面上当前实际生效的四列宽度（名称/修改时间/类型/大小），按栏一份。
     /// 拖动某列时以它为基准，避免把没动过的列弹回默认值。
-    cur_col_widths: [f32; 4],
+    cur_col_widths: [[f32; 4]; 2],
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
     /// 切换标签时置位，屏蔽切换过程中 Slint 因内容高度变化自动 Clamp 而
@@ -824,12 +826,20 @@ impl App {
             drop_timer: Timer::default(),
             drag_pending: None,
             rubber_band_base: None,
-            autofit_key: None,
+            autofit_key: [None, None],
             cur_col_widths: [
-                crate::config::DEFAULT_COLUMN_WIDTHS[0],
-                crate::config::DEFAULT_COLUMN_WIDTHS[1],
-                crate::config::DEFAULT_COLUMN_WIDTHS[2],
-                crate::config::DEFAULT_COLUMN_WIDTHS[3],
+                [
+                    crate::config::DEFAULT_COLUMN_WIDTHS[0],
+                    crate::config::DEFAULT_COLUMN_WIDTHS[1],
+                    crate::config::DEFAULT_COLUMN_WIDTHS[2],
+                    crate::config::DEFAULT_COLUMN_WIDTHS[3],
+                ],
+                [
+                    crate::config::DEFAULT_COLUMN_WIDTHS[0],
+                    crate::config::DEFAULT_COLUMN_WIDTHS[1],
+                    crate::config::DEFAULT_COLUMN_WIDTHS[2],
+                    crate::config::DEFAULT_COLUMN_WIDTHS[3],
+                ],
             ],
             size_sort_pending: false,
             list_geom: (-1.0, 0, -1.0, false, -1.0, -1.0),
@@ -5071,11 +5081,11 @@ fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::pa
     app.submit_job(kind);
 }
 
-/// 自适应去重用键：当前活动目录的路径字符串，虚拟目录用固定前缀。
+/// 自适应去重用键：指定栏当前目录的路径字符串，虚拟目录用固定前缀。
 /// 只用于避免每次刷新重复估算列宽，不再对应任何持久化记录。
 #[cfg(windows)]
-fn column_layout_key(app: &App) -> String {
-    match app.state.active().active().path.as_ref() {
+fn column_layout_key(app: &App, pane: usize) -> String {
+    match app.state.active().panes.get(pane).and_then(|p| p.path.as_ref()) {
         Some(p) => p.to_string_lossy().into_owned(),
         None => "::root".to_string(),
     }
@@ -5132,85 +5142,99 @@ fn autofit_widths_for_pane(app: &App, pane_index: usize) -> [f32; 5] {
     ]
 }
 
-/// 统一下发列宽。
+/// 下发某一栏的列宽。
 ///
-/// 用户明确要求：「此电脑」的「修改时间」列**始终没有具体时间，但这一列照常展示**，
-/// 因为四种排序状态是全局统一的 —— 在别的文件夹按「修改时间」排序后，若此处隐藏
-/// 该列，排序就指向了一个不存在的列，很奇怪。所以此电脑只把该列的**数据留空**，
-/// 表头、列宽、排序入口都保留。
-///
-/// 据此这里不做「有没有时间值」的后台扫描或特判（每次下发都遍历几千条目纯属
-/// 浪费算力，而且此电脑的结论恒定为空）；空数据由 `format_time(None)` 自然产生，
-/// 列宽走正常路径（含 110px 下限，保证空列也展示得出来）。
+/// 「此电脑」没有修改时间列，这只是一个占位值（Slint 侧按 0 参与列排布），
+/// 不影响普通目录的时间列宽。
 #[cfg(windows)]
-fn push_col_widths(app: &mut App, w: [f32; 5]) {
-    app.cur_col_widths = [w[0], w[1], w[2], w[3]];
-    app.ui.invoke_apply_col_widths(w[0], w[1], w[2], w[3]);
+fn push_col_widths(app: &mut App, pane: usize, w: [f32; 5]) {
+    let pane = pane.min(1);
+    app.cur_col_widths[pane] = [w[0], w[1], w[2], w[3]];
+    app.ui
+        .invoke_apply_col_widths(pane as i32, w[0], w[1], w[2], w[3]);
 }
 
-/// 切目录时重置自适应标记：列宽不再按目录持久化，每个目录统一重新自适应。
-/// 数据真正到位后 `autofit_column_widths_if_needed` 会按下发一次估算值。
+/// 切目录时重新开启「名称列窗口自适应」。
+/// 注意：不动「已拟合过哪个目录」的记号——记号不变就不再重算，
+/// 否则切焦点 / 切标签时两栏会用重新拟合的宽度互相覆盖（表现为顶栏列宽自己变）。
 #[cfg(windows)]
 fn apply_column_widths(app: &mut App) {
-    app.autofit_key = None;
-    // 必须从 Slint 侧切换 auto 开关（invoke_apply_auto_col_widths），Rust 的
-    // set_col_auto_widths 不会可靠传播到 col-name-w 的求值。
-    app.ui.invoke_apply_auto_col_widths(true);
+    let panes = if app.state.active().is_split { 2 } else { 1 };
+    for pane in 0..panes {
+        let key = column_layout_key(app, pane);
+        if app.autofit_key[pane].as_deref() == Some(key.as_str()) {
+            continue;
+        }
+        // 「名称列窗口自适应」开关存在 FileList 里，只能通过 Slint 侧函数切换；
+        // 从 Rust 直接改主窗口属性不会传到那一栏的求值。
+        app.ui.invoke_apply_auto_col_widths(pane as i32, true);
+    }
 }
 
 /// 数据就绪后按目录下发列宽，每个目录只做一次（统一自适应，不落盘）。
 /// Slint 侧会在 `auto-col-widths=true` 时按视口压缩名称列，
 /// 保证不出现横向滚动条、「大小」列右侧留框选空白。
+///
+/// 两栏各自判定、各自拟合：两栏可能在不同目录（甚至一边此电脑），
+/// 共用一份宽度或共用一个「已自适应」记号，会让切换焦点时用另一栏的内容
+/// 重新拟合，表现为顶栏列宽自己变。
 #[cfg(windows)]
 fn autofit_column_widths_if_needed(app: &mut App) {
-    let key = column_layout_key(app);
-    // 导航时 display 仍是上一个目录的数据（项目特意保留旧内容避免白屏），
-    // loading 期间不能拿它估算新目录的列宽，也不能就此打上「已自适应」标记。
-    if app.state.active().active().loading {
-        return;
+    let panes = if app.state.active().is_split { 2 } else { 1 };
+    for pane in 0..panes {
+        let key = column_layout_key(app, pane);
+        // 导航时 display 仍是上一个目录的数据（项目特意保留旧内容避免白屏），
+        // loading 期间不能拿它估算新目录的列宽，也不能就此打上「已自适应」标记。
+        let ready = app
+            .state
+            .active()
+            .panes
+            .get(pane)
+            .is_some_and(|p| !p.loading && !p.display.is_empty());
+        if !ready {
+            continue;
+        }
+        if app.autofit_key[pane].as_deref() == Some(key.as_str()) {
+            continue;
+        }
+        app.autofit_key[pane] = Some(key);
+        app.ui.invoke_apply_auto_col_widths(pane as i32, true);
+        let w = autofit_widths_for_pane(app, pane);
+        push_col_widths(app, pane, w);
     }
-    if app.autofit_key.as_deref() == Some(key.as_str()) {
-        return;
-    }
-    if app.state.active().active().display.is_empty() {
-        return;
-    }
-    app.autofit_key = Some(key.clone());
-    app.ui.invoke_apply_auto_col_widths(true);
-    let pane = app.state.active().active_pane;
-    let w = autofit_widths_for_pane(app, pane);
-    push_col_widths(app, w);
 }
 
-/// 强制重新自适应一次（分屏切换后左栏视口变窄时用）。
+/// 强制某一栏重新自适应一次（分屏开关改变视口宽度时用）。
 #[cfg(windows)]
 fn refit_columns_now(app: &mut App, pane_index: usize) {
-    app.ui.invoke_apply_auto_col_widths(true);
-    let w = autofit_widths_for_pane(app, pane_index);
-    push_col_widths(app, w);
-    app.autofit_key = Some(column_layout_key(app));
+    let pane = pane_index.min(1);
+    app.ui.invoke_apply_auto_col_widths(pane as i32, true);
+    let w = autofit_widths_for_pane(app, pane);
+    push_col_widths(app, pane, w);
+    app.autofit_key[pane] = Some(column_layout_key(app, pane));
 }
 
 /// 用户拖动 / 双击列边界：只在本次会话生效，不写配置、不按目录记忆。
 /// 下一次切目录会由 `apply_column_widths` 重新统一自适应。
 #[cfg(windows)]
-fn record_col_width(app: &mut App, index: i32, width: f32, name_w_hint: f32) {
+fn record_col_width(app: &mut App, pane: usize, index: i32, width: f32, name_w_hint: f32) {
+    let pane = pane.min(1);
     let idx = index.clamp(0, 4) as usize;
     // 名称列宽度必须用 Slint 上报的「松手瞬间显示宽」，不能读 w-name。
     // 自适应模式下 w-name 只是上一次下发的旧值（通常是内容拟合宽或默认 320），
     // 与用户眼前看到的宽度无关；早期版本读它，导致拖一下右列就把名称列
     // 钉死在 320 / 拟合值。同理也不能读 cur_col_widths[0]。
     let name_w = if idx == 0 { width } else { name_w_hint };
+    let cur = app.cur_col_widths[pane];
     let mut w = [
         name_w.clamp(crate::config::MIN_COLUMN_W, crate::config::MAX_COLUMN_W),
-        app.cur_col_widths[1],
-        app.cur_col_widths[2],
-        app.cur_col_widths[3],
+        cur[1],
+        cur[2],
+        cur[3],
         crate::config::DEFAULT_COLUMN_WIDTHS[4],
     ];
     if width < 0.0 {
-        // 双击列边界（-1）：按当前目录内容现算「刚好放下最长内容」的宽度。
-        let pane = app.state.active().active_pane;
+        // 双击列边界（-1）：按这一栏当前目录的内容现算「刚好放下最长内容」的宽度。
         let fit = autofit_widths_for_pane(app, pane);
         w[idx] = fit[idx];
     } else {
@@ -5221,8 +5245,8 @@ fn record_col_width(app: &mut App, index: i32, width: f32, name_w_hint: f32) {
     // 刚写进去的 w[0] 根本不参与显示（名称列会跟着右列反向变化）。
     // 这个开关只在 Slint 侧生效，所以必须走 invoke。切目录 / 分屏时由
     // apply_column_widths 重新置 true 恢复自适应。
-    app.ui.invoke_apply_auto_col_widths(false);
-    push_col_widths(app, w);
+    app.ui.invoke_apply_auto_col_widths(pane as i32, false);
+    push_col_widths(app, pane, w);
 }
 
 /// 纯文本版本（仅供单测断言用）。
@@ -9674,10 +9698,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         {
             // 列宽拖动/双击结束后回传，按当前目录存进配置并落盘。
             let app = app.clone();
-            upgrade().on_file_col_resized(move |index, width, name_w| {
+            upgrade().on_file_col_resized(move |pane, index, width, name_w| {
                 let Some(app) = app.upgrade() else { return };
                 let mut app = app.borrow_mut();
-                record_col_width(&mut app, index, width, name_w);
+                record_col_width(&mut app, pane.max(0) as usize, index, width, name_w);
             });
         }
 

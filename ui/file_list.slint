@@ -440,9 +440,6 @@ export component FileList inherits Rectangle {
     /// 此时名称列会被压缩到不出横向滚动条；手动调过的目录完全按记录值，
     /// 用户拖宽就允许出现滚动条（不能悄悄改回去）。
     in-out property <bool> auto-col-widths: true;
-    /// 双击列边界时用的估算宽度（Rust 按最长内容字符数估算后下发），
-    /// 顺序：名称 / 修改时间 / 类型 / 大小 / 路径。
-    in property <[length]> autofit-widths: [];
     /// 鼠标左键是否按住（main_window 从 Rust/winit 回填）。Slint 的 TextInput
     /// 拖选期间抓住鼠标，行内 TouchArea 收不到事件，重命名输入框的
     /// 「拖选贴边自动滚动」只能从这里拿按下状态。
