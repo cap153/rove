@@ -336,8 +336,14 @@ export component FileList inherits Rectangle {
     private property <length> ex-want-x: ex-item-x + (root.item-w - ex-box-w) / 2;
     /// 兜底夹取：窗口极窄（列数=1 且浮层比可视区还宽）时才生效。
     private property <length> ex-box-x: max(4px, min(ex-want-x, root.width - 4px - ex-box-w));
-    private property <length> ex-box-y: flick.y + flick.content-y + ex-row * root.cell-h
+    /// 名称区顶边的自然位置（浮层向下生长的起点）。
+    private property <length> ex-natural-y: flick.y + flick.content-y + ex-row * root.cell-h
         + 4px + root.cell-thumb + 3px;
+    /// 下方放不下时整体上移，底边贴住可视区底（tooltip 的标准做法）。
+    /// 只向上让位、不翻面：自然位置和夹取位置都随 content-y 线性移动，
+    /// 滚动时是连续滑动而不是「跨过某一行突然翻面」。
+    /// 顶边再夹 4px：名字长到比整个面板还高时优先保住行首。
+    private property <length> ex-box-y: max(4px, min(root.ex-natural-y, root.height - 4px - root.ex-box-h));
 
     // 悬停浮层的同一套几何（与选中浮层完全对称，只是换了索引/行/宽）。
     private property <length> hv-item-x: root.cell-x(root.hv-col);
@@ -345,8 +351,10 @@ export component FileList inherits Rectangle {
     private property <length> hv-box-h: max(root.hover-expand-lines.length * root.line-h + 14px, 30px);
     private property <length> hv-want-x: hv-item-x + (root.item-w - hv-box-w) / 2;
     private property <length> hv-box-x: max(4px, min(hv-want-x, root.width - 4px - hv-box-w));
-    private property <length> hv-box-y: flick.y + flick.content-y + hv-row * root.cell-h
+    /// 悬停浮层的向上让位规则与选中浮层完全一致（见 ex-box-y）。
+    private property <length> hv-natural-y: flick.y + flick.content-y + hv-row * root.cell-h
         + 4px + root.cell-thumb + 3px;
+    private property <length> hv-box-y: max(4px, min(root.hv-natural-y, root.height - 4px - root.hv-box-h));
 
     /// 滚动到顶端（导航/过滤变化时由 Rust 调用）。
     public function scroll-to-top() {
