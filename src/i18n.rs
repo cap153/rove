@@ -247,6 +247,9 @@ pub const ZH: &[&str] = &[
     "接管资源管理器",
     "在资源管理器打开文件夹、磁盘和此电脑时，改用 Rove 新标签打开。",
     "用 Rove 打开",
+    "关闭其他",
+    "关闭左侧",
+    "关闭右侧",
 ];
 
 pub const EN: &[&str] = &[
@@ -491,6 +494,9 @@ pub const EN: &[&str] = &[
     "Take over Explorer",
     "Open folders, drives and This PC in a new Rove tab instead of Explorer.",
     "Open with Rove",
+    "Close others",
+    "Close to the left",
+    "Close to the right",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -563,6 +569,13 @@ mod tests {
         // 资源管理器右键菜单里的谓词名（写入注册表，跟随界面语言）。
         assert_eq!(ZH[240], "用 Rove 打开");
         assert_eq!(EN[240], "Open with Rove");
+        // 标签栏右键菜单（ui/tab_bar.slint 不引用下标，这里是 Rust 侧用 tr() 查）。
+        assert_eq!(ZH[241], "关闭其他");
+        assert_eq!(EN[241], "Close others");
+        assert_eq!(ZH[242], "关闭左侧");
+        assert_eq!(EN[242], "Close to the left");
+        assert_eq!(ZH[243], "关闭右侧");
+        assert_eq!(EN[243], "Close to the right");
     }
 
     #[test]

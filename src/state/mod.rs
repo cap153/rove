@@ -28,6 +28,17 @@ pub enum TabKind {
     Settings,
 }
 
+/// 批量关闭标签的范围（标签栏右键菜单）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TabCloseScope {
+    /// 只留下被右键的标签。
+    Others,
+    /// 关掉锚点左边的所有标签。
+    Left,
+    /// 关掉锚点右边的所有标签。
+    Right,
+}
+
 impl Default for TabKind {
     fn default() -> Self {
         TabKind::Explorer
@@ -567,6 +578,35 @@ impl AppState {
         true
     }
 
+    /// 批量关闭标签的范围（右键菜单「关闭其他 / 左侧 / 右侧」）。
+    ///
+    /// 三种范围都以被右键的那个标签为锚点，**锚点本身永远保留** ——
+    /// 这样批量关闭后至少有 1 个标签，不会出现「全关掉」的歧义。
+    pub fn close_tabs_scope(&mut self, anchor_id: u32, scope: TabCloseScope) -> usize {
+        let Some(anchor) = self.tab_by_id(anchor_id) else {
+            return 0;
+        };
+        let before = self.tabs.len();
+        let mut index = 0usize;
+        self.tabs.retain(|_| {
+            let keep = match scope {
+                TabCloseScope::Others => index == anchor,
+                TabCloseScope::Left => index >= anchor,
+                TabCloseScope::Right => index <= anchor,
+            };
+            index += 1;
+            keep
+        });
+        let closed = before - self.tabs.len();
+        if closed == 0 {
+            return 0;
+        }
+        // 当前聚焦的标签若被关掉，落到锚点上（与资源管理器一致：
+        // 批量关闭后显示你右键的那一页，而不是随便找一个）。
+        self.active_tab = self.tab_by_id(anchor_id).unwrap_or(0);
+        closed
+    }
+
     /// 记录最近访问目录。
     pub fn push_recent(&mut self, path: &PathBuf) {
         // 虚拟位置（回收站）不进最近列表。
@@ -673,6 +713,70 @@ mod new_tab_tests {
         let mut st = state_with_one_tab(Some(PathBuf::from(r"D:\\重")));
         st.new_tab_ex(None, SortState::default(), false);
         assert_eq!(st.active().active().path, None);
+    }
+
+    /// 建 5 个标签，返回各自 id。
+    fn five_tabs() -> (AppState, Vec<u32>) {
+        let mut st = state_with_one_tab(Some(PathBuf::from(r"D:\\a")));
+        let ids = vec![st.tabs[0].id];
+        let mut ids = ids;
+        for name in ["b", "c", "d", "e"] {
+            ids.push(st.new_tab(Some(PathBuf::from(format!("D:\\{name}"))), SortState::default()));
+        }
+        (st, ids)
+    }
+
+    #[test]
+    fn close_others_keeps_only_the_anchor() {
+        let (mut st, ids) = five_tabs();
+        assert_eq!(st.close_tabs_scope(ids[2], TabCloseScope::Others), 4);
+        assert_eq!(st.tabs.len(), 1);
+        assert_eq!(st.active().id, ids[2]);
+    }
+
+    #[test]
+    fn close_left_drops_tabs_before_the_anchor() {
+        let (mut st, ids) = five_tabs();
+        assert_eq!(st.close_tabs_scope(ids[2], TabCloseScope::Left), 2);
+        // 锚点及右侧原样保留、顺序不变。
+        let left: Vec<u32> = st.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![ids[2], ids[3], ids[4]]);
+        assert_eq!(st.active().id, ids[2]);
+    }
+
+    #[test]
+    fn close_right_drops_tabs_after_the_anchor() {
+        let (mut st, ids) = five_tabs();
+        assert_eq!(st.close_tabs_scope(ids[1], TabCloseScope::Right), 3);
+        let left: Vec<u32> = st.tabs.iter().map(|t| t.id).collect();
+        assert_eq!(left, vec![ids[0], ids[1]]);
+        assert_eq!(st.active().id, ids[1]);
+    }
+
+    #[test]
+    fn close_scope_is_a_noop_when_nothing_to_close() {
+        let (mut st, ids) = five_tabs();
+        // 第一个标签左边没有东西、最后一个右边没有东西。
+        assert_eq!(st.close_tabs_scope(ids[0], TabCloseScope::Left), 0);
+        assert_eq!(st.close_tabs_scope(ids[4], TabCloseScope::Right), 0);
+        assert_eq!(st.tabs.len(), 5);
+    }
+
+    #[test]
+    fn close_scope_keeps_anchor_active_when_active_was_closed() {
+        let (mut st, ids) = five_tabs();
+        // 聚焦最后一个，然后关掉它右边的（没有）；改为聚焦第 0 个，
+        // 关闭右侧 —— 锚点必须变成当前标签，而不是随便留一个。
+        st.active_tab = 0;
+        st.close_tabs_scope(ids[3], TabCloseScope::Right);
+        assert_eq!(st.active().id, ids[3]);
+    }
+
+    #[test]
+    fn close_scope_ignores_unknown_anchor() {
+        let (mut st, _ids) = five_tabs();
+        assert_eq!(st.close_tabs_scope(9999, TabCloseScope::Others), 0);
+        assert_eq!(st.tabs.len(), 5);
     }
 
     #[test]

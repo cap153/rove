@@ -15,6 +15,8 @@ export component TabBar inherits Rectangle {
 
     callback tab_activated(id: int);
     callback tab_closed(id: int);
+    /// 标签页右键菜单（关闭其他 / 关闭左侧 / 关闭右侧）。
+    callback tab_context_requested(id: int);
     callback new_tab_requested();
     /// 拖动交换：phase 0 按下 / 1 拖动 / 2 松开，x 为行内局部横坐标。
     callback tab_drag(index: int, phase: int, x: length);
@@ -201,6 +203,12 @@ export component TabBar inherits Rectangle {
                             pointer-event(event) => {
                                 if (event.kind == PointerEventKind.down && event.button == PointerEventButton.middle) {
                                     root.tab_closed(tab.id);
+                                    return EventResult.accept;
+                                }
+                                // 右键弹菜单。accept 掉，避免事件继续传给下层
+                                // （下层是拖拽用的 ta 之外的东西，重复触发会弹两次菜单）。
+                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.right) {
+                                    root.tab_context_requested(tab.id);
                                     return EventResult.accept;
                                 }
                                 // 左键按下/松开上报拖动（与侧栏三阶段一致，中键关闭不受影响）。

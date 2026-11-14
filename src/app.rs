@@ -6469,6 +6469,71 @@ impl App {
     #[cfg(not(windows))]
     fn show_quick_item_menu(&mut self, _key: &str) {}
 
+    /// 标签页右键菜单：关闭其他 / 左侧 / 右侧。
+    ///
+    /// 没有可关的项时对应菜单项置灰（左侧在第一页时、右侧在最后一页时），
+    /// 避免点了没反应。
+    #[cfg(windows)]
+    fn show_tab_context_menu(&mut self, id: u32) {
+        let Some(index) = self.state.tab_by_id(id) else {
+            return;
+        };
+        let total = self.state.tabs.len();
+        let item = |key: String, label: String, enabled: bool| crate::sys::menu::MenuNode::Item {
+            key,
+            label,
+            enabled,
+            checked: false,
+        };
+        let nodes = vec![
+            item(
+                format!("tab:close-others:{id}"),
+                self.tr("关闭其他").to_string(),
+                total > 1,
+            ),
+            item(
+                format!("tab:close-left:{id}"),
+                self.tr("关闭左侧").to_string(),
+                index > 0,
+            ),
+            item(
+                format!("tab:close-right:{id}"),
+                self.tr("关闭右侧").to_string(),
+                index + 1 < total,
+            ),
+        ];
+        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false);
+    }
+
+    #[cfg(not(windows))]
+    fn show_tab_context_menu(&mut self, _id: u32) {}
+
+    /// 执行标签栏右键菜单命令：`tab:close-{others|left|right}:<锚点 id>`。
+    fn run_tab_menu_action(&mut self, id: &str) -> bool {
+        use crate::state::TabCloseScope;
+        let Some(rest) = id.strip_prefix("tab:close-") else {
+            return false;
+        };
+        let (scope, anchor) = if let Some(v) = rest.strip_prefix("others:") {
+            (TabCloseScope::Others, v)
+        } else if let Some(v) = rest.strip_prefix("left:") {
+            (TabCloseScope::Left, v)
+        } else if let Some(v) = rest.strip_prefix("right:") {
+            (TabCloseScope::Right, v)
+        } else {
+            return false;
+        };
+        let Ok(anchor) = anchor.parse::<u32>() else {
+            return false;
+        };
+        let closed = self.state.close_tabs_scope(anchor, scope);
+        if closed > 0 {
+            logv!("[tab] 批量关闭 {scope:?} 锚点={anchor} 关闭 {closed} 个");
+            self.sync_active_tab();
+        }
+        true
+    }
+
     /// 取消固定：只从侧栏移除，不动磁盘上的文件夹；特殊项不可移除。
     fn unpin_quick_item(&mut self, key: &str) {
         let before = self.config.quick_items.len();
@@ -7278,6 +7343,11 @@ impl App {
                 let path = path.to_string();
                 self.unpin_network_location(&path);
             }
+            return;
+        }
+
+        // 0.05 标签栏批量关闭（不依赖选中项）。
+        if self.run_tab_menu_action(id) {
             return;
         }
 
@@ -9435,6 +9505,13 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
 
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_tab_context_requested(move |id| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().show_tab_context_menu(id as u32);
+        });
+    }
     {
         let app = Rc::downgrade(app);
         upgrade().on_tab_drag(move |index, phase, x| {

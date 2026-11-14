@@ -403,6 +403,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback new_tab_requested();
     callback tab_activated(id: int);
     callback tab_closed(id: int);
+    callback tab_context_requested(id: int);
     callback tab_drag(index: int, phase: int, x: length);
 
     // 窗口控制（无边框标题栏）：由 TabBar 右侧按钮触发；
@@ -637,6 +638,9 @@ out property <length> row-height-out: file-list.row-height-out;
             }
             tab_closed(id) => {
                 root.tab_closed(id);
+            }
+            tab_context_requested(id) => {
+                root.tab_context_requested(id);
             }
             new_tab_requested() => {
                 root.clear-all-focus();
