@@ -250,6 +250,8 @@ pub const ZH: &[&str] = &[
     "关闭其他",
     "关闭左侧",
     "关闭右侧",
+    "开机自启动",
+    "登录 Windows 时在后台常驻：托盘、文件对话框吸附、索引预热立即可用（不弹窗口）。",
 ];
 
 pub const EN: &[&str] = &[
@@ -497,6 +499,8 @@ pub const EN: &[&str] = &[
     "Close others",
     "Close to the left",
     "Close to the right",
+    "Start with Windows",
+    "Stay resident in the background after sign-in: tray, dialog attach and index warm-up (no window).",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -576,6 +580,10 @@ mod tests {
         assert_eq!(EN[242], "Close to the left");
         assert_eq!(ZH[243], "关闭右侧");
         assert_eq!(EN[243], "Close to the right");
+        // 通用页「开机自启动」开关（ui/settings_page.slint 硬编码 244/245）。
+        assert_eq!(ZH[244], "开机自启动");
+        assert_eq!(EN[244], "Start with Windows");
+        assert_eq!(EN[245].is_empty(), false);
     }
 
     #[test]

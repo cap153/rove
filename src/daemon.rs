@@ -25,6 +25,8 @@ pub struct WakeRequest {
 
 /// 解析启动参数。
 ///
+/// `--background` 是登录自启动（Run 键）带的后台常驻参数，见 [`wants_background`]。
+///
 /// `--shell-open <路径>`（文件夹/磁盘）与 `--this-pc`（此电脑）是资源管理器
 /// 转来的打开请求，一律新开标签；其他参数沿用旧行为：取第一个存在的目录，
 /// 在当前标签里导航。
@@ -55,6 +57,14 @@ pub fn parse_args(args: &[String]) -> WakeRequest {
             .find(|p| p.is_dir()),
         new_tab: false,
     }
+}
+
+/// 是否以「后台常驻」方式启动（登录自启动写进 Run 键的那个参数）。
+///
+/// 后台模式不显示主窗口，只保留管道守护、托盘和文件对话框吸附；
+/// 用户点托盘 / 双击文件夹 / 再次启动 Rove 时窗口才会出现。
+pub fn wants_background(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--background")
 }
 
 /// 把「抢前台」的许可移交给守护进程。

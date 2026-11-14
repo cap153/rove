@@ -42,7 +42,7 @@ fn string_bytes(text: &str) -> Vec<u8> {
 }
 
 /// REG_SZ 字节 → 字符串（读到别人的值时用来比较）。
-fn bytes_to_string(data: &[u8]) -> String {
+pub(super) fn bytes_to_string(data: &[u8]) -> String {
     let units: Vec<u16> = data
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -52,7 +52,7 @@ fn bytes_to_string(data: &[u8]) -> String {
 }
 
 #[cfg(windows)]
-mod reg {
+pub(super) mod reg {
     use super::wide;
     use std::io;
     use windows::core::PCWSTR;
@@ -239,7 +239,7 @@ mod reg {
 }
 
 #[cfg(not(windows))]
-mod reg {
+pub(super) mod reg {
     use std::io;
 
     pub fn key_exists(_key: &str) -> bool {

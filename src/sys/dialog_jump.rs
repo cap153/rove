@@ -20,7 +20,7 @@ mod imp {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, EnumChildWindows, FindWindowExW, GetAncestor, GetClassNameW, GetDlgCtrlID,
         GetDlgItem, GetForegroundWindow, GetMessageW, GetParent, GetSystemMetrics, GetWindowLongW, GetWindowRect,
-        GetWindowThreadProcessId, IsWindowVisible,
+        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible,
         PostMessageW, SendMessageTimeoutW, SendMessageW, SetForegroundWindow, SMTO_ABORTIFHUNG, SMTO_BLOCK,
         SM_CYSCREEN, TranslateMessage, BN_CLICKED, EVENT_OBJECT_DESTROY, EVENT_OBJECT_LOCATIONCHANGE,
         EVENT_SYSTEM_FOREGROUND, GA_ROOT, GWL_EXSTYLE, IDOK, WM_COMMAND, WM_GETTEXT, WM_GETTEXTLENGTH,
@@ -38,6 +38,15 @@ mod imp {
     /// 登记吸附窗 HWND，供事件钩子识别自隐藏边界。
     pub fn register_jump_window(hwnd: isize) {
         JUMP_WINDOW_HWND.store(hwnd, Ordering::SeqCst);
+    }
+
+    /// 忘掉当前吸附的对话框。
+    ///
+    /// 吸附窗是被「我们自己」隐藏的时候必须调一下：否则钩子那边仍认为
+    /// 「已经吸附在那个对话框上」，之后同一个对话框再也不会触发 show
+    /// （poll 直接 return，钩子只走「仅跟随位置」分支），吸附窗就永久消失。
+    pub fn forget_current_dialog() {
+        CURRENT_DIALOG.store(0, Ordering::SeqCst);
     }
 
     /// 前台窗口是否属于本进程（吸附窗、主窗口等自身 UI）。
@@ -172,15 +181,43 @@ mod imp {
     /// 跳转并发守卫：同一时刻只允许一个跳转线程改写文件名框，避免连点 / 回车+点击互相覆盖。
     static NAVIGATING: AtomicBool = AtomicBool::new(false);
 
-    /// 暴露给外部，用于判断是否正在执行跳转。
+    /// 跳转线程开始时间：用于给并发守卫加超时。否则线程一旦卡死（对话框进程挂起、
+    /// 跨进程消息迟迟不返回），之后每一次点击都只会得到「已有跳转进行中」，
+    /// 表现为「只跳转成功一次，后面点击全部没反应」。
+    static NAV_STARTED: std::sync::Mutex<Option<std::time::Instant>> =
+        std::sync::Mutex::new(None);
+
+    /// 单次跳转的最长允许时间：正常流程 50ms + (10ms + 400ms) × 3 个候选 ≈ 1.4s，
+    /// 20s 只为兜住「线程卡死」，不参与正常判定。
+    const NAV_TIMEOUT_MS: u128 = 20_000;
+
+    /// 当前跳转已进行多久（毫秒）；没有跳转时为 None。
+    fn nav_age_ms() -> Option<u128> {
+        NAV_STARTED
+            .lock()
+            .ok()
+            .and_then(|g| g.map(|t| t.elapsed().as_millis()))
+    }
+
+    /// 暴露给外部，用于判断是否正在执行跳转（超时后视为未在跳转）。
     pub fn is_navigating() -> bool {
-        NAVIGATING.load(Ordering::SeqCst)
+        matches!(nav_age_ms(), Some(ms) if ms < NAV_TIMEOUT_MS)
     }
 
     /// RAII 守卫：无论跳转线程正常结束还是 panic，都复位守卫位。
-    struct NavGuard;
+    ///
+    /// 带上自己的开始时间：守卫超时被强制接管后，旧线程晚一点才结束时
+    /// **不能**把新跳转的状态一起清掉（否则新跳转期间隐藏判定会误以为空闲）。
+    struct NavGuard(std::time::Instant);
     impl Drop for NavGuard {
         fn drop(&mut self) {
+            if let Ok(mut g) = NAV_STARTED.lock() {
+                if g.as_ref() != Some(&self.0) {
+                    // 已被更新的跳转接管，不要动它的状态。
+                    return;
+                }
+                *g = None;
+            }
             NAVIGATING.store(false, Ordering::SeqCst);
         }
     }
@@ -358,6 +395,15 @@ mod imp {
             return false;
         }
 
+        // 0. 必须是真实可见的窗口。登录瞬间系统/启动项会创建大量隐藏或最小化的
+        //    #32770 窗口，它们偶尔也会有 Shell 控件子窗口，误判一次就是
+        //    「明明没有另存为框，吸附条闪了一下」。
+        unsafe {
+            if IsWindowVisible(hwnd) == 0 || IsIconic(hwnd) != 0 {
+                return false;
+            }
+        }
+
         // 1. 权威指纹：Shell 文件夹视图 (SHELLDLL_DefView 或 DirectUI)。
         // 只有真正的文件打开/保存框才会有这俩控件；属性页、DiskGenius SMART 绝对没有。
         let has_shell = unsafe {
@@ -365,9 +411,6 @@ mod imp {
             let dv = FindWindowExW(hwnd, 0 as HWND, w!("DUIViewWndClassName"), std::ptr::null::<u16>());
             !sv.is_null() || !dv.is_null()
         };
-        if has_shell {
-            return true;
-        }
 
         // 2. 兼容指纹：极老式的通用对话框（没有 Shell 视图，但有经典的地址栏 ToolbarWindow32）。
         // 地址栏是属性页极少会拥有的控件。
@@ -375,13 +418,62 @@ mod imp {
             let tb = FindWindowExW(hwnd, 0 as HWND, w!("ToolbarWindow32"), std::ptr::null::<u16>());
             !tb.is_null()
         };
-        if has_toolbar {
-            return true;
+
+        if !has_shell && !has_toolbar {
+            return false;
         }
 
-        // 3. 彻底删除原有的 `!find_file_edit(hwnd).is_null()` 兜底。
-        // 只要不满足以上指纹，即便是 #32770 且带 Edit / Button，也一律视为普通弹窗。
-        false
+        // 3. 真正的文件对话框一定有「文件名」编辑框。
+        // 用纯句柄查找判定（不跨进程读文本，不会卡住轮询）：
+        // 「带地址栏 ToolbarWindow32 的 #32770」在老式程序里很常见，单靠指纹仍会误判，
+        // 文件名框是它们没有的。
+        if !has_filename_edit(hwnd) {
+            logv!(
+                "[rove:dialog_jump] probe: {:#x} has shell/toolbar but no filename edit -> not a file dialog",
+                hwnd as usize
+            );
+            return false;
+        }
+        true
+    }
+
+    /// 是否存在文件名编辑框（纯结构判定，不发送任何窗口消息）。
+    ///
+    /// 顺序：控件 ID 0x0480 / 0x047C → Vista+ IFileDialog 的 FloatNotifySink→ComboBox→Edit
+    /// → 经典直接子 Edit。
+    fn has_filename_edit(dialog: HWND) -> bool {
+        unsafe {
+            if !GetDlgItem(dialog, 0x0480).is_null() || !GetDlgItem(dialog, 0x047C).is_null() {
+                return true;
+            }
+            let dui =
+                FindWindowExW(dialog, 0 as HWND, w!("DUIViewWndClassName"), std::ptr::null::<u16>());
+            if !dui.is_null() {
+                let direct =
+                    FindWindowExW(dui, 0 as HWND, w!("DirectUIHWND"), std::ptr::null::<u16>());
+                if !direct.is_null() {
+                    let mut sink =
+                        FindWindowExW(direct, 0 as HWND, w!("FloatNotifySink"), std::ptr::null::<u16>());
+                    while !sink.is_null() {
+                        let combo =
+                            FindWindowExW(sink, 0 as HWND, w!("ComboBox"), std::ptr::null::<u16>());
+                        if !combo.is_null()
+                            && !FindWindowExW(combo, 0 as HWND, w!("Edit"), std::ptr::null::<u16>())
+                                .is_null()
+                        {
+                            return true;
+                        }
+                        sink = FindWindowExW(
+                            direct,
+                            sink,
+                            w!("FloatNotifySink"),
+                            std::ptr::null::<u16>(),
+                        );
+                    }
+                }
+            }
+            !FindWindowExW(dialog, 0 as HWND, w!("Edit"), std::ptr::null::<u16>()).is_null()
+        }
     }
 
     pub fn extract_current_folder(dialog: HWND) -> Option<PathBuf> {
@@ -470,8 +562,25 @@ mod imp {
         // 并发守卫：连点 / 回车 + 点击会让多个线程同时改写文件名框、各自触发确认并还原，
         // 目录与文件名都不可预测。已在进行中则直接放弃本次。
         if NAVIGATING.swap(true, Ordering::SeqCst) {
-            logv!("[rove:dialog_jump] navigate_dialog rejected: already navigating");
-            return Err("已有跳转进行中".into());
+            let age = nav_age_ms().unwrap_or(0);
+            if age < NAV_TIMEOUT_MS {
+                logln!(
+                    "[rove:dialog_jump] 跳转被拒绝：上一个跳转仍在进行中（{}ms）",
+                    age
+                );
+                return Err("已有跳转进行中".into());
+            }
+            // 超时：上一个线程卡死了（对话框进程挂起等）。这里不能继续沉默 ——
+            // 否则用户会觉得「只成功跳转一次，之后再点都没反应」。
+            logln!(
+                "!! [rove:dialog_jump] 上一个跳转已卡住 {}ms，强制接管本次跳转",
+                age
+            );
+        }
+        // 记下本次跳转的开始时间：既是超时判定的基准，也是本线程守卫的身份。
+        let started = std::time::Instant::now();
+        if let Ok(mut g) = NAV_STARTED.lock() {
+            *g = Some(started);
         }
 
         // 末尾反斜杠：Windows 对话框识别到目录后直接跳转，而不是当成文件名保存
@@ -484,13 +593,16 @@ mod imp {
         // 放进后台线程，避免点击瞬间主线程卡顿。
         let dialog_as = dialog as usize;
         std::thread::spawn(move || {
-            let _guard = NavGuard;
+            let _guard = NavGuard(started);
             let dialog = dialog_as as HWND;
             logln!("[rove:dialog_jump] thread started for target: {}", target_str);
             let candidates: Vec<usize> =
                 edit_candidates(dialog).into_iter().map(|h| h as usize).take(3).collect();
             if candidates.is_empty() {
-                logln!("[rove:dialog_jump] navigation failed: no filename edit found");
+                logln!(
+                    "!! [rove:dialog_jump] 跳转失败：对话框里找不到文件名输入框（句柄可能已失效） dialog={:#x}",
+                    dialog as usize
+                );
                 return;
             }
             // 强制抢回前台焦点，防止后台消息被文件对话框忽略
@@ -559,6 +671,12 @@ mod imp {
             }
             unsafe {
                 SetForegroundWindow(dialog);
+            }
+            if restore.is_none() {
+                logln!(
+                    "!! [rove:dialog_jump] 跳转未生效：{} 个候选控件都没能驱动对话框",
+                    candidates.len()
+                );
             }
             logv!(
                 "[rove:dialog_jump] navigation completed, filename restored: {}",
@@ -639,10 +757,13 @@ mod imp {
             if prev != hwnd as isize {
                 let folder = extract_current_folder(hwnd);
                 let (x, y, w, placement) = get_dialog_placement(hwnd);
-                logv!(
-                    "[rove:dialog_jump] poll: attaching to dialog {:#x}, placement={}",
+                // level 1：吸附条出现是用户可见事件，也是「根本不该出现」误判的现场。
+                logln!(
+                    "[rove:dialog_jump] attach(poll) dialog={:#x} class={:?} title={:?} rect=({},{} w={}) placement={} dir={:?}",
                     hwnd as usize,
-                    placement
+                    get_class_name(hwnd),
+                    get_window_text(hwnd),
+                    x, y, w, placement, folder
                 );
                 let hwnd_usize = hwnd as usize;
                 let p = placement.to_string();
@@ -653,13 +774,25 @@ mod imp {
         } else {
             let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
             if prev != 0 {
-                logv!("[rove:dialog_jump] POLL hide trigger, new hwnd class={:?}", get_class_name(hwnd));
-                logv!("[rove:dialog_jump] poll: dialog blurred, hiding search bar");
+                logln!(
+                    "[rove:dialog_jump] detach(poll): foreground is {:#x} class={:?} -> hiding",
+                    hwnd as usize,
+                    get_class_name(hwnd)
+                );
                 let _ = slint::invoke_from_event_loop(|| {
                     crate::app::hide_dialog_jump();
                 });
             }
         }
+    }
+
+    /// 当前吸附目标是否仍是那个真正的文件对话框。
+    ///
+    /// 用户在吸附窗里点选时先过这一关：对话框可能已经被关掉、切走或被重建
+    /// （跳转后 DirectUI 会重建、旧句柄作废），继续往旧句柄写字符串只会静默失败，
+    /// 表现为「点了没反应」而且永远不恢复。
+    pub fn target_still_valid(hwnd: HWND) -> bool {
+        !hwnd.is_null() && unsafe { IsWindow(hwnd) } != 0 && probe_file_dialog(hwnd)
     }
 
     pub fn start_daemon() {
@@ -723,10 +856,12 @@ mod imp {
                     if prev != hwnd as isize {
                         let folder = extract_current_folder(hwnd);
                         let (x, y, w, placement) = get_dialog_placement(hwnd);
-                        logv!(
-                            "[rove:dialog_jump] auto-attaching to dialog {:#x}, placement={}",
+                        logln!(
+                            "[rove:dialog_jump] attach(hook) dialog={:#x} class={:?} title={:?} rect=({},{} w={}) placement={} dir={:?}",
                             hwnd as usize,
-                            placement
+                            get_class_name(hwnd),
+                            get_window_text(hwnd),
+                            x, y, w, placement, folder
                         );
                         let hwnd_usize = hwnd as usize;
                         let p = placement.to_string();
@@ -754,8 +889,11 @@ mod imp {
 
                     let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
                     if prev != 0 {
-                        logv!("[rove:dialog_jump] EVENT hide trigger, new hwnd class={:?}", get_class_name(hwnd));
-                        logv!("[rove:dialog_jump] dialog blurred, hiding search bar");
+                        logln!(
+                            "[rove:dialog_jump] detach(hook): foreground is {:#x} class={:?} -> hiding",
+                            hwnd as usize,
+                            get_class_name(hwnd)
+                        );
                         let _ = slint::invoke_from_event_loop(|| {
                             crate::app::hide_dialog_jump();
                         });
@@ -766,7 +904,7 @@ mod imp {
                 let cur = CURRENT_DIALOG.load(Ordering::SeqCst);
                 if cur == hwnd as isize {
                     CURRENT_DIALOG.store(0, Ordering::SeqCst);
-                    logv!("[rove:dialog_jump] dialog closed, hiding search bar");
+                    logln!("[rove:dialog_jump] dialog {:#x} destroyed, hiding", hwnd as usize);
                     let _ = slint::invoke_from_event_loop(|| {
                         crate::app::hide_dialog_jump();
                     });
@@ -790,6 +928,17 @@ mod imp {
 #[cfg(not(windows))]
 mod imp {
     pub fn start_daemon() {}
+
+    /// 非 Windows 下没有吸附功能，永远视为无效目标。
+    pub fn target_still_valid(_hwnd: *mut core::ffi::c_void) -> bool {
+        false
+    }
+
+    /// 非 Windows 下没有吸附窗，登记/注销都是空操作。
+    pub fn register_jump_window(_hwnd: isize) {}
+
+    /// 非 Windows 下没有吸附目标可忘。
+    pub fn forget_current_dialog() {}
 }
 
 pub use imp::*;

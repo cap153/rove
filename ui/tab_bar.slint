@@ -67,9 +67,19 @@ export component TabBar inherits Rectangle {
         let total-w = max(estimated, laid-out);
         let max-scroll = max(0px, total-w - view-w);
 
-        // 视口宽度还没算出来（窗口尚未显示）：这一刻算出来的偏移必然是错的
-        // （-total 甚至超出真实下限），先不动，只留待办标记。
-        if (view-w <= 0px) {
+        // 每格 150px + 3px 间距，所以 n 个标签的内容宽度应该正好是 153n - 3。
+        // 差得多说明 Repeater 还没重建，布局还是上一个标签数时的样子。
+        let expected = max(root.tabs.length * 153px - 3px, 0px);
+        let stale = abs(laid-out - expected) > 4px;
+
+        // 布局没跟上模型时，这一帧算出来的偏移必然是错的，一个像素都不能写：
+        // - view-w <= 0：窗口尚未显示（-total 甚至超出真实下限）；
+        // - stale：视口还是旧的标签数宽度。例如「最小化时被资源管理器唤醒并
+        //   新开一个标签」，此刻视口仍是 1 格的 150px，右边界 303px 被判定为
+        //   「超出可视区」，content-x 被写成 150-303=-153 —— 整个老标签被推到
+        //   视野左侧外，界面上只剩 1 个标签（表现为「接管打开吞掉一个标签」），
+        //   而且布局补上来之后也没有任何地方会把它拉回去。
+        if (view-w <= 0px || stale) {
             if (root.scroll-tries < 20) {
                 root.scroll-tries += 1;
                 root.scroll-pending = true;
@@ -77,6 +87,12 @@ export component TabBar inherits Rectangle {
                 root.scroll-pending = false;
             }
             return;
+        }
+
+        // 偏移必须永远落在 [-max-scroll, 0] 内。上面那种按旧宽度写进去的
+        // 越界值不会自己回来（Slint 只在用户拖动时夹），每次补滚都顺手夹一次。
+        if (tabs-flick.content-x < -max-scroll || tabs-flick.content-x > 0px) {
+            tabs-flick.content-x = max(-max-scroll, min(0px, tabs-flick.content-x));
         }
 
         if (root.scroll-target < 0) {
@@ -93,19 +109,9 @@ export component TabBar inherits Rectangle {
             }
         }
 
-        // 布局有没有跟上：每格 150px + 3px 间距，所以 n 个标签的内容宽度应该
-        // 正好是 153n - 3。差得多说明 Repeater 还没重建（这一帧的结果不可信），
-        // 留标记等变化；最多重试 20 次后放弃，避免永远算不平的舍入误差把
-        // 定时器留在常开状态。
-        let expected = max(root.tabs.length * 153px - 3px, 0px);
-        let stale = abs(laid-out - expected) > 4px;
-        if (stale && root.scroll-tries < 20) {
-            root.scroll-tries += 1;
-            root.scroll-pending = true;
-        } else {
-            root.scroll-pending = false;
-            root.scroll-tries = 0;
-        }
+        // 位置写完了：布局已经跟上（stale 已在入口挡掉），收尾复位。
+        root.scroll-pending = false;
+        root.scroll-tries = 0;
     }
 
     // 布局迟迟不更新时的兜底：16ms 一档、最多约 20 档（≈320ms）。

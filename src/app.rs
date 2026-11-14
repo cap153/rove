@@ -642,6 +642,11 @@ pub struct App {
     /// 落到显示器），必须等到首帧 RedrawRequested 窗口已 realize、scale 正确时再居中，
     /// 否则尺寸会按物理像素当逻辑像素计算而偏大、偏离中心。
     first_run_pending: bool,
+    /// 会话是 `--background` 建的、窗口还没显示过。
+    ///
+    /// 那种情况下 `set_maximized` / `show` / 拖拽热区初始化全都没做，等真正
+    /// 显示窗口（托盘点击 / 资源管理器接管 / 二次启动）时补做一次，然后清位。
+    window_pending_show: bool,
     /// 首帧居中重试计数：HWND 未就绪时每次 redraw 重试一次，超过上限就放弃居中
     /// （避免极端情况下 HWND 永远取不到导致每帧 request_redraw 死循环、CPU 打满）。
     geom_retries: u32,
@@ -736,16 +741,6 @@ pub struct App {
     /// 不能与 `refresh_timer`（1s 目录轮询）共用：Slint Timer 重复 start
     /// 会以后一次为准，共用会把 1s 轮询错降为 15s。
     sidebar_periodic_timer: Timer,
-    /// 文件对话框跳转吸附窗。
-    jump_window: DialogJumpWindow,
-    /// 当前跳转目标：(对话框 HWND, 当前目录)。
-    jump_target: Option<(usize, Option<PathBuf>)>,
-    /// 最近一次吸附几何 (x, y, w, placement)，供结果数 / 焦点变化时重新锚定。
-    #[cfg(windows)]
-    jump_geom: Option<(i32, i32, i32, String)>,
-    /// 文件对话框吸附轮询定时器（仅 Windows 生效，见 wire_callbacks）。
-    /// 必须挂在 App 字段上：局部 Timer 会在函数返回时停止。
-    jump_poll_timer: Timer,
     /// 单击文件名重命名的延迟定时器：按下先不起重命名，留出双击窗口；
     /// 窗口内再来一次按下即判定为双击打开（取消本定时器），否则到点才重命名。
     rename_defer_timer: Timer,
@@ -792,7 +787,6 @@ impl App {
         };
         let state = AppState::new(None, sort);
         let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
-        let jump_window = DialogJumpWindow::new().unwrap();
         Self {
             ui,
             state,
@@ -870,6 +864,7 @@ impl App {
             thumb_needs_refresh: false,
             syncing_tab: false,
             first_run_pending: false,
+            window_pending_show: false,
             geom_retries: 0,
             pending_scroll_index: None,
             rename_scroll_guard: None,
@@ -890,11 +885,6 @@ impl App {
             sidebar_timer: Timer::default(),
             refresh_timer: Timer::default(),
             sidebar_periodic_timer: Timer::default(),
-            jump_window,
-            jump_target: None,
-            #[cfg(windows)]
-            jump_geom: None,
-            jump_poll_timer: Timer::default(),
             rename_defer_timer: Timer::default(),
             shell_open_timer: Timer::default(),
             shell_open_queue: Vec::new(),
@@ -2142,6 +2132,19 @@ fn drag_gesture_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 接管资源管理器（--shell-open）转来的路径，在「会话被 X 关掉、只剩守护进程」
+    /// 这一刻只能落到 create_session 上：必须新开标签，绝不能顶掉用户原来那个标签。
+    #[test]
+    fn takeover_request_never_replaces_the_existing_tab() {
+        // 接管 / 命令行明确要求新开标签：无论有没有恢复上次的标签页，都新开。
+        assert!(initial_path_opens_new_tab(true, false));
+        assert!(initial_path_opens_new_tab(true, true));
+        // 恢复过上次的标签页：那是用户的标签，同样不能被顶掉。
+        assert!(initial_path_opens_new_tab(false, true));
+        // 冷启动直接带路径（双击 exe 传目录）：允许顶掉那个空的默认标签。
+        assert!(!initial_path_opens_new_tab(false, false));
+    }
 
     /// 三种视图必须能区分开：普通目录、此电脑（路径 None）、回收站。
     #[test]
@@ -5960,6 +5963,9 @@ impl App {
         self.ui.set_show_hidden(self.config.show_hidden);
         self.ui.set_auto_edit_path_on_new_tab(self.config.auto_edit_path_on_new_tab);
         self.ui.set_explorer_takeover(self.config.explorer_takeover);
+        // 开机自启动没有配置项：注册表 Run 键就是唯一真源，进设置页按实况显示，
+        // 这样用户在任务管理器里停用/删掉之后，开关不会骗人。
+        self.ui.set_autostart(crate::sys::autostart::enabled());
 
         // 子页标题 / 描述 / 新增入口。
         let (title, desc, show_add) = match current {
@@ -10511,236 +10517,6 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
     {
-        let app = app.clone();
-        let weak = Rc::downgrade(&app);
-        app.borrow().jump_window.on_text_changed(move |query| {
-            let Some(app) = weak.upgrade() else { return };
-            let app = app.borrow_mut();
-
-            // 空查询：列出最新的 5 个历史目录（含 clear-query 的程序化清空）
-            if query.is_empty() {
-                let mut hits = crate::search::jump::search("", None);
-                
-                // 核心新增：将 Rove 当前聚焦的目录插入到最前面
-                let current_path = app.state.active().active().path.clone();
-                if let Some(p) = current_path {
-                    if p != crate::fs::drives::recycle_virtual_path() {
-                        let name = p.file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| p.to_string_lossy().into_owned());
-                        
-                        let ch = crate::search::jump::JumpHit {
-                            name: name.clone(),
-                            path: p.clone(),
-                            score: 0,
-                            name_parts: vec![
-                                (name.clone(), false), 
-                                (format!(" ({})", app.tr("当前")), true)
-                            ],
-                            is_local: true,
-                            is_history: false,
-                            last_time: 0,
-                        };
-                        
-                        hits.retain(|h| h.path != ch.path);
-                        hits.insert(0, ch);
-                        hits.truncate(6); // 允许比平时多展示一个
-                    }
-                }
-
-                let results: Vec<JumpResult> = hits
-                    .into_iter()
-                    .map(|hit| JumpResult {
-                        name: hit.name.into(),
-                        path: hit.path.to_string_lossy().into_owned().into(),
-                        name_parts: ModelRc::new(VecModel::from(
-                            hit.name_parts
-                                .into_iter()
-                                .map(|(t, hl)| NamePart { text: t.into(), hl })
-                                .collect::<Vec<_>>(),
-                        )),
-                        is_history: hit.is_history,
-                    })
-                    .collect();
-
-                app.jump_window.set_results(ModelRc::new(VecModel::from(results)));
-
-                // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
-                // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行
-                #[cfg(windows)]
-                if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
-                    if gplacement == "bottom" {
-                        reposition_bottom_next_tick(gx, gy, gw, gplacement.clone());
-                    } else {
-                        position_jump_window(&app, gx, gy, gw, gplacement);
-                    }
-                }
-                return;
-            }
-
-            // 🎯 核心补丁：每次输入实时从对话框提取最新路径，避免跳转后目录滞后
-            #[cfg(windows)]
-            let current_latest_dir = app
-                .jump_target
-                .as_ref()
-                .and_then(|(hwnd, _)| crate::sys::dialog_jump::extract_current_folder(*hwnd as _));
-            #[cfg(not(windows))]
-            let current_latest_dir: Option<std::path::PathBuf> = None;
-
-            let hits = crate::search::jump::search(&query, current_latest_dir.as_deref());
-            let results: Vec<JumpResult> = hits
-                .into_iter()
-                .map(|hit| JumpResult {
-                    name: hit.name.into(),
-                    path: hit.path.to_string_lossy().into_owned().into(),
-                    name_parts: ModelRc::new(VecModel::from(
-                        hit.name_parts
-                            .into_iter()
-                            .map(|(t, hl)| NamePart { text: t.into(), hl })
-                            .collect::<Vec<_>>(),
-                    )),
-                    is_history: hit.is_history,
-                })
-                .collect();
-
-            app.jump_window.set_results(ModelRc::new(VecModel::from(results)));
-
-            // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
-            // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行
-            #[cfg(windows)]
-            if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
-                if gplacement == "bottom" {
-                    reposition_bottom_next_tick(gx, gy, gw, gplacement.clone());
-                } else {
-                    position_jump_window(&app, gx, gy, gw, gplacement);
-                }
-            }
-        });
-    }
-    #[cfg(windows)]
-    {
-        let app = app.clone();
-        let weak = Rc::downgrade(&app);
-        app.borrow().jump_window.on_focus_changed(move || {
-            let Some(app) = weak.upgrade() else { return };
-            let app = app.borrow();
-
-            // 核心修复：吸附窗获得焦点且输入框为空时，主动拉取一次历史记录
-            if app.jump_window.get_query().is_empty() {
-                let mut hits = crate::search::jump::search("", None);
-                
-                // 核心新增：将 Rove 当前聚焦的目录插入到最前面
-                let current_path = app.state.active().active().path.clone();
-                if let Some(p) = current_path {
-                    if p != crate::fs::drives::recycle_virtual_path() {
-                        let name = p.file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| p.to_string_lossy().into_owned());
-                        
-                        let ch = crate::search::jump::JumpHit {
-                            name: name.clone(),
-                            path: p.clone(),
-                            score: 0,
-                            name_parts: vec![
-                                (name.clone(), false), 
-                                (format!(" ({})", app.tr("当前")), true)
-                            ],
-                            is_local: true,
-                            is_history: false,
-                            last_time: 0,
-                        };
-                        
-                        hits.retain(|h| h.path != ch.path);
-                        hits.insert(0, ch);
-                        hits.truncate(6); // 允许比平时多展示一个
-                    }
-                }
-
-                let results: Vec<JumpResult> = hits
-                    .into_iter()
-                    .map(|hit| JumpResult {
-                        name: hit.name.into(),
-                        path: hit.path.to_string_lossy().into_owned().into(),
-                        name_parts: ModelRc::new(VecModel::from(
-                            hit.name_parts
-                                .into_iter()
-                                .map(|(t, hl)| NamePart { text: t.into(), hl })
-                                .collect::<Vec<_>>(),
-                        )),
-                        is_history: hit.is_history,
-                    })
-                    .collect();
-                app.jump_window.set_results(ModelRc::new(VecModel::from(results)));
-            }
-
-            // 失焦收缩 / 聚焦展开都会改变窗口高度，bottom 吸附需重新锚定底边：
-            if let Some((gx, gy, gw, ref gplacement)) = app.jump_geom {
-                if gplacement == "bottom" {
-                    reposition_bottom_next_tick(gx, gy, gw, gplacement.clone());
-                } else {
-                    position_jump_window(&app, gx, gy, gw, gplacement);
-                }
-            }
-        });
-    }
-    {
-        let app = app.clone();
-        let weak = Rc::downgrade(&app);
-        app.borrow().jump_window.on_item_activated(move |_path| {
-            let Some(app) = weak.upgrade() else { return };
-            let jump_target = app.borrow().jump_target.clone();
-            if let Some((_hwnd, _)) = jump_target {
-                #[cfg(windows)]
-                let _ = crate::sys::dialog_jump::navigate_dialog(_hwnd as _, Path::new(_path.as_str()));
-            }
-            // 修复：将写历史记录丢到后台线程，避免同步磁盘 IO 导致主线程 IME 上下文丢失
-            let path_str = _path.to_string();
-            std::thread::spawn(move || {
-                crate::search::jump::record_history(Path::new(&path_str));
-            });
-
-            app.borrow().jump_window.invoke_clear_query();
-        });
-        // 吸附窗是独立 Window，主窗口的 winit 事件钩子收不到它的鼠标事件；
-        // 单独挂一个，把左键按住状态回填给它的输入框（拖选贴边自动滚动用）。
-        {
-            use slint::winit_030::winit::event::{ElementState, MouseButton, WindowEvent};
-            use slint::winit_030::{EventResult, WinitWindowAccessor};
-            let jw = app.borrow().jump_window.clone_strong();
-            app.borrow()
-                .jump_window
-                .window()
-                .on_winit_window_event(move |_w, event| {
-                    if let WindowEvent::MouseInput {
-                        state,
-                        button: MouseButton::Left,
-                        ..
-                    } = event
-                    {
-                        jw.set_mouse_left_pressed(matches!(state, ElementState::Pressed));
-                    }
-                    // 与主窗口同理：失焦后“松开”可能收不到，先清掉按住态，
-                    // 避免自动滚动定时器在后台继续跑。
-                    if matches!(event, WindowEvent::Focused(false)) {
-                        jw.set_mouse_left_pressed(false);
-                    }
-                    EventResult::Propagate
-                });
-        }
-    }
-    {
-        // 文件对话框吸附轮询：跑在主线程事件循环上。
-        // 不能挂在钩子线程——那里会被 WINEVENT 的事件洪水饿死 WM_TIMER。
-        app.borrow().jump_poll_timer.start(
-            TimerMode::Repeated,
-            Duration::from_millis(500),
-            || {
-                #[cfg(windows)]
-                crate::sys::dialog_jump::poll_foreground();
-            },
-        );
-    }
-    {
         let app = Rc::downgrade(app);
         // 供下面两个下拉回调共用（第一个闭包会移走 app）。
         let lang_app = app.clone();
@@ -10770,6 +10546,24 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.config.save();
             app.ui.set_explorer_takeover(enabled);
         });
+        // 开机自启动：写/删 HKCU 的 Run 键，成败都以注册表实况回填开关。
+        let autostart_app = app.clone();
+        upgrade().on_autostart_toggled(move |enabled| {
+            let Some(app) = autostart_app.upgrade() else { return };
+            let app = app.borrow();
+            if let Err(err) = crate::sys::autostart::set_enabled(enabled) {
+                logln!("!! 开机自启动{}失败：{err}", if enabled { "开启" } else { "关闭" });
+                app.set_status_job(app.trf("开机自启动未生效：{}", &[err]));
+            } else {
+                logv!(
+                    "开机自启动{}",
+                    if enabled { "已开启" } else { "已关闭" }
+                );
+            }
+            // 无论成败都按注册表实况回填（可能被别的程序占用而维持原状）。
+            let actual = crate::sys::autostart::enabled();
+            app.ui.set_autostart(actual);
+        });
         upgrade().on_show_hidden_toggled(move |enabled| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -10796,6 +10590,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             .to_string();
             app.config.save();
             i18n::apply(&app.ui, &app.config.language);
+            // 吸附窗不在主窗口的 i18n 绑定里，语言要单独同步。
+            set_jump_language(&app.config.language);
             app.jobs
                 .set_english(!i18n::is_chinese(&app.config.language));
             // Slint 里绑定的文案会自动刷新；由 Rust 生成的标签要重新下发。
@@ -11464,6 +11260,9 @@ fn screen_size_logical(_scale: f32) -> Option<(f32, f32)> {
 // `invoke_from_event_loop`（空捕获、可跨线程）在本线程执行时访问。
 thread_local! {
     static SESSION: RefCell<Option<Rc<RefCell<App>>>> = const { RefCell::new(None) };
+    /// 本次会话是否「只建不显示」（`--background` 开机自启动）。
+    /// create_session 消费一次后复位，所以之后由托盘/资源管理器拉起的窗口照常显示。
+    static START_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// 原生菜单的结果回投（由菜单线程经 `invoke_from_event_loop` 调回 UI 线程）。
@@ -11543,23 +11342,254 @@ pub(crate) fn clear_global_focus() {
 /// bottom 的坑：Slint 窗口只能设左上角，resize 默认顶边锚定 → 高度一变底边就弹走一帧。
 /// 故 bottom 不走 `set_position`，而是直接调 Win32 `SetWindowPos`，在**同一次 API 调用**
 /// 里同时设定位置与大小，把底边锚定做成原子的，不留中间帧。
+// ---------------------------------------------------------------------------
+// 文件对话框吸附窗（独立于会话常驻）
+// ---------------------------------------------------------------------------
+//
+// 早期实现把吸附窗挂在 App 里，于是「关掉主窗口 → 会话销毁 → 吸附窗跟着没了」，
+// 文件对话框吸附静默失效（这正是 `--background` 开机常驻最需要的功能）。
+// 现在窗口、被吸附的对话框、几何、界面语言全部搬到进程级的 `JUMP` 里：
+// 会话有没有、主窗口开没开都不影响它，主窗口只负责它自己的东西。
+
+/// 吸附窗常驻状态（进程级，不随会话销毁）。
+struct JumpState {
+    window: DialogJumpWindow,
+    /// 被吸附的对话框 HWND + 当时目录（`None` 表示当前没有吸附目标）。
+    target: Option<(usize, Option<PathBuf>)>,
+    /// 最近一次吸附几何 (x, y, w, placement)，供结果数 / 焦点变化时重新锚定。
+    geom: Option<(i32, i32, i32, String)>,
+    /// 界面语言快照：会话销毁后就没有 App 可以问了。
+    language: String,
+}
+
+thread_local! {
+    static JUMP: RefCell<Option<JumpState>> = const { RefCell::new(None) };
+}
+
+/// 只读/可变访问吸附窗状态；未初始化（非 Windows 或初始化失败）时返回 None。
+fn with_jump<R>(f: impl FnOnce(&mut JumpState) -> R) -> Option<R> {
+    JUMP.with(|slot| slot.borrow_mut().as_mut().map(f))
+}
+
+/// 切换界面语言后同步吸附窗文案（它不随主窗口的 i18n 绑定刷新）。
+pub(crate) fn set_jump_language(language: &str) {
+    with_jump(|state| state.language = language.to_string());
+}
+
+/// 当前会话正在看的目录（没有会话 / App 正被借用时返回 None）。
+fn session_current_dir() -> Option<PathBuf> {
+    let app = SESSION.with(|slot| slot.try_borrow().ok().and_then(|s| s.clone()))?;
+    let app = app.try_borrow().ok()?;
+    app.state.active().active().path.clone()
+}
+
+/// 「当前目录」快捷项：把 Rove 正在看的目录插到历史列表最前面。
+fn with_current_dir_pin(hits: &mut Vec<crate::search::jump::JumpHit>, language: &str) {
+    let Some(p) = session_current_dir() else { return };
+    if p == crate::fs::drives::recycle_virtual_path() {
+        return;
+    }
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| p.to_string_lossy().into_owned());
+    let pin = crate::search::jump::JumpHit {
+        name: name.clone(),
+        path: p.clone(),
+        score: 0,
+        name_parts: vec![
+            (name, false),
+            (format!(" ({})", i18n::text(language, "当前")), true),
+        ],
+        is_local: true,
+        is_history: false,
+        last_time: 0,
+    };
+    hits.retain(|h| h.path != pin.path);
+    hits.insert(0, pin);
+    hits.truncate(6); // 允许比平时多展示一个
+}
+
+/// 建好吸附窗并接线。进程内只做一次（见 `run()`），与主窗口生命周期无关。
+pub(crate) fn init_dialog_jump(language: &str) {
+    let window = DialogJumpWindow::new().unwrap();
+    window.set_mouse_left_pressed(false);
+    JUMP.with(|slot| {
+        *slot.borrow_mut() = Some(JumpState {
+            window: window.clone_strong(),
+            target: None,
+            geom: None,
+            language: language.to_string(),
+        });
+    });
+
+    // 所有回调都遵循同一条铁律：**持有 JUMP 借用时绝不回调进 Slint**。
+    // set_results / show / hide / invoke_clear_query 都可能同步派发 Slint 回调
+    // （例如 clear-query 立刻触发 text-changed），那时再借 JUMP 就是 RefCell
+    // 二次借用 → 进程 abort。所以先算出结果、释放借用，再动 UI。
+    let refresh = move |empty_only: bool| {
+        let snapshot = with_jump(|state| {
+            let hits = if empty_only && !state.window.get_query().is_empty() {
+                None
+            } else if state.window.get_query().is_empty() {
+                let mut hits = crate::search::jump::search("", None);
+                with_current_dir_pin(&mut hits, &state.language);
+                Some(hits)
+            } else {
+                // 每次输入实时从对话框提取最新路径，避免跳转后目录滞后。
+                #[cfg(windows)]
+                let latest_dir = state
+                    .target
+                    .as_ref()
+                    .and_then(|(hwnd, _)| crate::sys::dialog_jump::extract_current_folder(*hwnd as _));
+                #[cfg(not(windows))]
+                let latest_dir: Option<PathBuf> = None;
+                Some(crate::search::jump::search(
+                    &state.window.get_query(),
+                    latest_dir.as_deref(),
+                ))
+            };
+            hits.map(jump_results_model)
+        })
+        .flatten();
+        if let Some(model) = snapshot {
+            with_jump(|state| state.window.set_results(model));
+        }
+        // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
+        // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行。
+        #[cfg(windows)]
+        if let Some((gx, gy, gw, gplacement)) = with_jump(|state| state.geom.clone()).flatten() {
+            if gplacement == "bottom" {
+                reposition_bottom_next_tick(gx, gy, gw, gplacement);
+            } else {
+                with_jump(|state| position_jump_window(&state.window, gx, gy, gw, &gplacement));
+            }
+        }
+    };
+
+    // 输入变化（含程序化清空）：重算候选。
+    let refresh_input = refresh.clone();
+    window.on_text_changed(move |_query| refresh_input(false));
+
+    // 聚焦：输入为空时主动拉一次历史，并按新的高度重新锚定。
+    let refresh_focus = refresh.clone();
+    window.on_focus_changed(move || refresh_focus(true));
+
+    // 选中一条：把路径写进原生对话框并确认（不依赖会话）。
+    window.on_item_activated(|path| {
+        let target = with_jump(|state| state.target.clone()).flatten();
+        let Some((hwnd, _)) = target else {
+            logln!(
+                "!! [rove:dialog_jump] 点选被忽略：当前没有吸附目标（{}），先隐藏吸附窗",
+                path
+            );
+            hide_dialog_jump();
+            return;
+        };
+        // 对话框可能已经关掉 / 被重建（跳转后 DirectUI 会重建，旧句柄作废）。
+        // 继续往失效句柄写字符串只会静默失败，用户会觉得「点了没反应」。
+        #[cfg(windows)]
+        if !crate::sys::dialog_jump::target_still_valid(hwnd as _) {
+            logln!(
+                "!! [rove:dialog_jump] 点选被忽略：目标对话框 {:#x} 已失效，隐藏吸附窗（下次打开对话框会重新吸附）",
+                hwnd
+            );
+            hide_dialog_jump();
+            return;
+        }
+        #[cfg(windows)]
+        match crate::sys::dialog_jump::navigate_dialog(hwnd as _, Path::new(path.as_str())) {
+            Ok(()) => logln!("[rove:dialog_jump] 跳转已发起 -> {}", path),
+            Err(err) => logln!("!! [rove:dialog_jump] 跳转失败：{}（目标 {}）", err, path),
+        }
+        // 历史记录写盘丢到后台线程：同步磁盘 IO 会破坏输入法的 IME 上下文。
+        let recorded = path.to_string();
+        std::thread::spawn(move || {
+            crate::search::jump::record_history(Path::new(&recorded));
+        });
+        // 清空输入必须放在释放借用之后：它会同步触发 text-changed。
+        with_jump(|state| state.window.clone_strong())
+            .map(|window| window.invoke_clear_query());
+    });
+
+    // 吸附窗是独立 Window，主窗口的 winit 钩子收不到它的鼠标事件；单独挂一个，
+    // 把左键按住状态回填给输入框（拖选贴边自动滚动用）。
+    {
+        use slint::winit_030::winit::event::{ElementState, MouseButton, WindowEvent};
+        use slint::winit_030::{EventResult, WinitWindowAccessor};
+        let jw = window.clone_strong();
+        window.window().on_winit_window_event(move |_w, event| {
+            if let WindowEvent::MouseInput {
+                state,
+                button: MouseButton::Left,
+                ..
+            } = event
+            {
+                jw.set_mouse_left_pressed(matches!(state, ElementState::Pressed));
+            }
+            // 失焦后「松开」可能收不到，先清掉按住态，避免自动滚动定时器在后台继续跑。
+            if matches!(event, WindowEvent::Focused(false)) {
+                jw.set_mouse_left_pressed(false);
+            }
+            EventResult::Propagate
+        });
+    }
+
+    // 文件对话框吸附轮询：跑在事件循环线程上（钩子线程会被 WINEVENT 洪水饿死）。
+    // 定时器必须存活到进程结束，所以由 JUMP 之外的一个进程级 Timer 承载。
+    POLL.with(|slot| {
+        slot.borrow_mut().replace({
+            let timer = Timer::default();
+            timer.start(TimerMode::Repeated, Duration::from_millis(500), || {
+                #[cfg(windows)]
+                crate::sys::dialog_jump::poll_foreground();
+            });
+            timer
+        });
+    });
+}
+
+thread_local! {
+    /// 吸附轮询定时器（进程级保活，`Option` 只是为了让它在事件循环线程上创建）。
+    static POLL: RefCell<Option<Timer>> = const { RefCell::new(None) };
+}
+
+/// 搜索命中 → Slint 结果模型。
+fn jump_results_model(hits: Vec<crate::search::jump::JumpHit>) -> ModelRc<JumpResult> {
+    let results: Vec<JumpResult> = hits
+        .into_iter()
+        .map(|hit| JumpResult {
+            name: hit.name.into(),
+            path: hit.path.to_string_lossy().into_owned().into(),
+            name_parts: ModelRc::new(VecModel::from(
+                hit.name_parts
+                    .into_iter()
+                    .map(|(t, hl)| NamePart { text: t.into(), hl })
+                    .collect::<Vec<_>>(),
+            )),
+            is_history: hit.is_history,
+        })
+        .collect();
+    ModelRc::new(VecModel::from(results))
+}
+
 #[cfg(windows)]
-fn position_jump_window(app: &App, x: i32, y: i32, w: i32, placement: &str) {
-    let window = app.jump_window.window();
+fn position_jump_window(jump: &DialogJumpWindow, x: i32, y: i32, w: i32, placement: &str) {
+    let window = jump.window();
     let scale = window.scale_factor();
     let bar: i32 = (40.0 * scale) as i32;
 
     // 1. 先同步逻辑宽度和吸附方向给 Slint，确保 Slint 视口按正确宽度渲染，
     //    避免 SetWindowPos 设完物理尺寸后又被逻辑宽度回写打桩
-    app.jump_window.set_window_width((w as f32 / scale) as f32);
-    app.jump_window.set_placement(placement.into());
+    jump.set_window_width((w as f32 / scale) as f32);
+    jump.set_placement(placement.into());
 
     if placement == "top" {
         // 顶边固定：搜索框不动，结果向下生长，resize 不会让搜索框移动
         window.set_position(slint::PhysicalPosition::new(x, y - bar));
     } else {
         // bottom：底边必须固定 → 用 SetWindowPos 原子设定位置 + 大小
-        let h = (app.jump_window.get_content_height() * scale) as i32;
+        let h = (jump.get_content_height() * scale) as i32;
         let top = y + bar - h;
         if let Some(hwnd) = jump_window_hwnd(window) {
             use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -11607,14 +11637,18 @@ fn jump_window_hwnd(window: &slint::Window) -> Option<windows_sys::Win32::Founda
 #[cfg(windows)]
 fn reposition_bottom_next_tick(x: i32, y: i32, w: i32, placement: String) {
     let _ = slint::invoke_from_event_loop(move || {
-        if let Some(app_rc) = SESSION.with(|slot| slot.borrow().clone()) {
-            let app = app_rc.borrow();
-            position_jump_window(&app, x, y, w, &placement);
-        }
+        with_jump(|state| {
+            #[cfg(windows)]
+            position_jump_window(&state.window, x, y, w, &placement);
+            #[cfg(not(windows))]
+            let _ = (x, y, w, &placement);
+        });
     });
 }
 
 /// 呼出文件对话框跳转吸附窗，并贴合到对话框边缘。
+///
+/// 不依赖任何会话：主窗口关掉之后吸附窗照样要能弹出。
 #[cfg(windows)]
 pub(crate) fn show_dialog_jump(
     hwnd: usize,
@@ -11624,51 +11658,66 @@ pub(crate) fn show_dialog_jump(
     w: i32,
     placement: String,
 ) {
-    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
-        let mut app = app.borrow_mut();
-        app.jump_target = Some((hwnd, current_dir));
-        app.jump_geom = Some((x, y, w, placement.clone()));
+    // 记下目标与几何，然后把借用放掉再动窗口：show() 会同步派发焦点回调，
+    // 那时回调还要借 JUMP（RefCell 二次借用会让进程直接 abort）。
+    let Some(window) = with_jump(|state| {
+        state.target = Some((hwnd, current_dir.clone()));
+        state.geom = Some((x, y, w, placement.clone()));
+        state.window.clone_strong()
+    }) else {
+        return;
+    };
 
-        // 1. 先 show() 让底层 HWND 创建完毕，否则首次呼出时
-        //    jump_window_hwnd 拿不到句柄，SetWindowPos 定位会静默失效
-        let window = app.jump_window.window();
-        let _ = app.jump_window.show();
+    // 1. 先 show() 让底层 HWND 创建完毕，否则首次呼出时
+    //    jump_window_hwnd 拿不到句柄，SetWindowPos 定位会静默失效
+    let _ = window.show();
 
-        // 2. 再定位（此时必然能取到有效 HWND，底边锚定一次到位）
-        position_jump_window(&app, x, y, w, &placement);
+    // level 1：每次弹出都留一条现场（含被吸附窗口的几何），误吸附 / 位置偏移
+    // 这类偶发问题只能靠它定位。
+    logln!(
+        "[rove:dialog_jump] show dialog={:#x} rect=({},{} w={}) placement={} dir={:?}",
+        hwnd, x, y, w, placement, current_dir
+    );
 
-        // 默认不抢焦点：由用户主动点击吸附条再聚焦，避免在原生对话框里打字被劫持。
-        // 仅登记吸附窗自身 HWND，供事件钩子豁免「用户点击吸附条」引发的 FOREGROUND 事件。
-        use raw_window_handle::HasWindowHandle;
-        let handle = window.window_handle();
-        if let Ok(rh) = handle.window_handle() {
-            if let raw_window_handle::RawWindowHandle::Win32(win) = rh.as_raw() {
-                let slint_hwnd = win.hwnd.get() as windows_sys::Win32::Foundation::HWND;
-                crate::sys::dialog_jump::register_jump_window(slint_hwnd as isize);
-            }
+    // 2. 再定位（此时必然能取到有效 HWND，底边锚定一次到位）
+    with_jump(|state| position_jump_window(&state.window, x, y, w, &placement));
+
+    // 默认不抢焦点：由用户主动点击吸附条再聚焦，避免在原生对话框里打字被劫持。
+    // 仅登记吸附窗自身 HWND，供事件钩子豁免「用户点击吸附条」引发的 FOREGROUND 事件。
+    use raw_window_handle::HasWindowHandle;
+    if let Ok(rh) = window.window().window_handle().window_handle() {
+        if let raw_window_handle::RawWindowHandle::Win32(win) = rh.as_raw() {
+            let slint_hwnd = win.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+            crate::sys::dialog_jump::register_jump_window(slint_hwnd as isize);
         }
     }
 }
 
 /// 对话框移动时实时跟随更新吸附窗位置与吸附方向。
-#[cfg(windows)]
-pub(crate) fn update_dialog_jump_position(x: i32, y: i32, w: i32, placement: String) {
-    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
-        let mut app = app.borrow_mut();
-        app.jump_geom = Some((x, y, w, placement.clone()));
-        position_jump_window(&app, x, y, w, &placement);
-    }
+#[cfg(windows)]pub(crate) fn update_dialog_jump_position(x: i32, y: i32, w: i32, placement: String) {
+    with_jump(|state| {
+        state.geom = Some((x, y, w, placement.clone()));
+        position_jump_window(&state.window, x, y, w, &placement);
+    });
 }
 
 /// 对话框失焦 / 销毁时自动隐藏吸附窗。
-#[cfg(windows)]
+///
+/// 后端的「已吸附」标记一起清掉：本函数也会被吸附窗自己调用（目标失效 /
+/// 没有目标），那种情况钩子那边还记着旧对话框，不清就会永久不再吸附。
 pub(crate) fn hide_dialog_jump() {
-    logv!("[rove:dialog_jump] hide_dialog_jump called!");
-    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
-        let mut app = app.borrow_mut();
-        app.jump_target = None;
-        app.jump_geom = None;
-        let _ = app.jump_window.window().hide();
+    crate::sys::dialog_jump::forget_current_dialog();
+    let had_target = with_jump(|state| state.target.is_some()).unwrap_or(false);
+    if had_target {
+        logln!("[rove:dialog_jump] hide（本次是真的在隐藏）");
+    }
+    let window = with_jump(|state| {
+        state.target = None;
+        state.geom = None;
+        state.window.clone_strong()
+    });
+    if let Some(window) = window {
+        let _ = window.window().hide();
         // 不再 clear_query：防止切换输入法/失焦时清空用户输入。
         // 只有用户真正跳转或主动关闭时才清空。
     }
@@ -11699,14 +11748,21 @@ pub fn run() {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let request = crate::daemon::parse_args(&args);
+    // 登录自启动（Run 键）带的是 --background：不动已经开着的窗口，什么也不显示。
+    let background = crate::daemon::wants_background(&args);
 
     // ---- 单实例：已存在守护则转发路径后立即退出 ----
     // 先交前台许可：本进程是资源管理器拉起的，带着这个权限，窗口却由守护进程显示。
     crate::daemon::hand_over_foreground();
-    if crate::daemon::try_forward(&request) {
+    // 后台启动绝不走转发：转发路径会唤醒并前置窗口，登录瞬间就弹一个窗口。
+    if !background && crate::daemon::try_forward(&request) {
         logln!("forwarded to running daemon, exiting");
         return;
     }
+
+    // 文件对话框吸附窗：进程级常驻，和主窗口完全解耦（关了主窗口它还在）。
+    // 放在转发判断之后：转发进程秒退，没必要建这一套。
+    crate::app::init_dialog_jump(&crate::config::Config::load().language);
 
     // ---- 守护模式：管道服务线程（唤醒请求投递到事件循环） ----
     let bound = crate::daemon::spawn_server(move |request| {
@@ -11715,6 +11771,11 @@ pub fn run() {
             wake_session(request);
         });
     });
+    if !bound && background {
+        // 后台启动时已有实例在跑：什么都不做，直接退出（正是期望行为）。
+        logln!("--background: another instance owns the ipc pipe, exiting");
+        return;
+    }
     if !bound {
         // 竞态失败：短暂重试转发（另一实例正在启动）。
         for _ in 0..15 {
@@ -11725,6 +11786,15 @@ pub fn run() {
             }
         }
         logln!("ipc bind failed; running standalone");
+    }
+
+    // 便携版换了目录（Downloads → 别处）后，把 Run 键里的登录启动命令改写到当前路径。
+    // 只在真正的守护进程里做，转发的那一次进程不碰注册表。
+    crate::sys::autostart::heal();
+
+    if background {
+        START_HIDDEN.with(|flag| flag.set(true));
+        logln!("starting in background (--background), no window will be shown");
     }
 
     // 首个会话：若启动参数带目录则直接打开（首个会话没有已有标签，新开标签无意义）。
@@ -11967,7 +12037,19 @@ fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
     }
 }
 
-fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
+/// 初始化路径该「新开标签」还是「占用当前（默认）标签」。
+///
+/// - `requested_new_tab`：请求方（`--shell-open` / `--this-pc`，即资源管理器接管）
+///   明确要求新开标签。会话被 X 关掉、守护进程处于「无会话」状态时，这条请求
+///   只能落到 create_session 上，**绝不能退化成导航**：否则用户正在那一个标签里
+///   看的东西会被目标目录顶掉（表现为「接管打开吞掉一个标签」）。
+/// - `restored_last_tabs`：这次会话恢复了「上次的标签页」，那是用户的标签，
+///   同样不能被顶掉。
+fn initial_path_opens_new_tab(requested_new_tab: bool, restored_last_tabs: bool) -> bool {
+    requested_new_tab || restored_last_tabs
+}
+
+fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new_tab: bool) {
     let mut config = Config::load();
     // 首次启动判定快照：用「是否首次运行」标记，而不是坐标 < 0（见下方窗口几何处说明）。
     // 必须在下方 HDD 初始化逻辑消费 is_first_run 之前抓取。
@@ -12177,9 +12259,10 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         // 「再多 push 一个标签」，默认的「此电脑」标签就既没列举也没人切过去，
         // 表现为最左侧多出一个显示「此文件夹为空」的此电脑标签。
         if let Some(path) = initial_path {
-            if restored_last_tabs {
+            if initial_path_opens_new_tab(requested_new_tab, restored_last_tabs) {
+                // inherit=false：路径是明确给的，新标签不该再继承当前目录。
                 let sort = app.state.active().active().sort;
-                app.state.new_tab(Some(path), sort);
+                app.state.new_tab_ex(Some(path), sort, false);
             } else {
                 app.state.active_mut().active_mut().navigate(Some(path));
             }
@@ -12216,6 +12299,21 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
                 app.apply_search_query(&q);
             }
         }
+    }
+
+    // `--background`（登录自启动）：只把会话建起来，不显示窗口。
+    // 托盘、文件对话框吸附、全盘索引预热都依赖 SESSION 存在，所以会话照建，
+    // 只是省掉 show() —— 窗口留到用户点托盘 / 双击文件夹 / 再次启动 Rove 时再出现。
+    // 注意：HWND 登记与无边框拖拽钩子装在 on_winit_window_event 的 RedrawRequested
+    // 里，首次 show() 时会补做，所以这里跳过的不是「只做一次」的初始化。
+    if START_HIDDEN.with(|flag| flag.replace(false)) {
+        let mut app = app.borrow_mut();
+        if first_run {
+            app.first_run_pending = true;
+        }
+        app.window_pending_show = true;
+        logln!("session created hidden (--background); tray + dialog hook are live");
+        return;
     }
 
     // Slint 的窗口在 show() 后才真正创建并可见（new() 仅构建组件树）。
@@ -12265,14 +12363,31 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
         // 借用必须先释放：ShowWindow / SetForegroundWindow 会同步派发窗口消息
         // 到我们子类化的窗口过程，Slint 侧回调可能再次借用 App → 进程被 abort。
         let ui = slint::ComponentHandle::clone_strong(&app.borrow().ui);
+        // 后台会话（--background）的窗口是「建了但没显示」的：最大化状态、首帧
+        // 重绘、拖拽热区都还没落地，这里补一次（与 create_session 里 show 前后那几步一致）。
+        let pending_show = {
+            let mut a = app.borrow_mut();
+            std::mem::replace(&mut a.window_pending_show, false)
+        };
+        if pending_show {
+            let maximized = app.borrow().config.window_maximized;
+            ui.window().set_maximized(maximized);
+            ui.set_win_maximized(!maximized);
+        }
         let _ = ui.show();
+        if pending_show {
+            // 首帧重绘要显式请求：后台会话没有走过启动时的 request_redraw，
+            // 首帧不来的话 HWND 登记与无边框拖拽钩子会一直缺位。
+            ui.window().request_redraw();
+            sync_drag_bounds(&app.borrow(), "show-late");
+        }
         focus_window(&ui);
         logv!("woke existing session, path={:?} new_tab={}", request.path, request.new_tab);
         return;
     }
     // JobManager 的任务线程跨会话存活；此处为新会话重建一份管理句柄，
     // 使 jobs 状态与 UI 生命周期解耦。
-    create_session(request.path, JobManager::new());
+    create_session(request.path, JobManager::new(), request.new_tab);
 }
 
 /// 销毁当前会话：丢弃窗口（释放 GPU 资源与组件树）与全部状态，
@@ -12291,6 +12406,11 @@ pub fn destroy_session() {
         // 否则在高 DPI 下每次会话窗口都会按缩放系数膨胀。
         let window = app.ui.window();
         let scale = window.scale_factor() as f64;
+        // `--background` 建的会话可能从未显示过窗口：这时窗口还没真正显示，
+        // GetWindowPlacement / IsZoomed 拿到的是初始值（w/h 可能是 0、最大化恒为
+        // false），存盘会把用户上次的窗口几何和最大化状态冲掉。宁可不存这些字段。
+        // 典型路径：登录后台常驻 → 直接托盘「退出」，全程没开窗口。
+        let never_shown = app.window_pending_show;
         // 退出存档的窗口几何统一按「逻辑像素」保存（size()/矩形都是物理像素，
         // 不折算的话高 DPI 下每次会话窗口都会按缩放系数膨胀）。
         // 关键：必须用 GetWindowPlacement 的 rcNormalPosition（恢复正常矩形），
@@ -12298,53 +12418,55 @@ pub fn destroy_session() {
         // 工作区、left/top 为负）。据此存盘会把正常几何污染成最大化几何，导致下次
         // 启动还原最大化后、再「退出最大化」时落到错误的尺寸/位置。
         #[cfg(windows)]
-        if let Some(hwnd) = get_window_hwnd(&app.ui) {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{
-                GetWindowPlacement, IsZoomed, WINDOWPLACEMENT,
-            };
-            use windows_sys::Win32::Foundation::{POINT, RECT};
-            let mut wp = WINDOWPLACEMENT {
-                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                flags: 0,
-                showCmd: 0,
-                ptMinPosition: POINT { x: 0, y: 0 },
-                ptMaxPosition: POINT { x: 0, y: 0 },
-                rcNormalPosition: RECT { left: 0, top: 0, right: 0, bottom: 0 },
-            };
-            if unsafe { GetWindowPlacement(hwnd as _, &mut wp as *mut _ as _) } != 0 {
-                let r = wp.rcNormalPosition;
-                app.config.window_x = (r.left as f64 / scale).round() as i32;
-                app.config.window_y = (r.top as f64 / scale).round() as i32;
-                app.config.window_width = ((r.right - r.left) as f64 / scale).round() as u32;
-                app.config.window_height = ((r.bottom - r.top) as f64 / scale).round() as u32;
-                logv!(
-                    "[win-save] normal rect l={} t={} r={} b={} scale={} -> x={} y={} w={} h={}",
-                    r.left, r.top, r.right, r.bottom, scale,
-                    app.config.window_x, app.config.window_y,
-                    app.config.window_width, app.config.window_height
-                );
-            } else {
-                // 兜底：GetWindowPlacement 异常时退回当前矩形（GetWindowRect）。
-                let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-                if unsafe {
-                    windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(
-                        hwnd as _,
-                        &mut rect as *mut _ as _,
-                    )
-                } != 0
-                {
-                    app.config.window_x = (rect.left as f64 / scale).round() as i32;
-                    app.config.window_y = (rect.top as f64 / scale).round() as i32;
-                    app.config.window_width =
-                        ((rect.right - rect.left) as f64 / scale).round() as u32;
-                    app.config.window_height =
-                        ((rect.bottom - rect.top) as f64 / scale).round() as u32;
+        if !never_shown {
+            if let Some(hwnd) = get_window_hwnd(&app.ui) {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetWindowPlacement, IsZoomed, WINDOWPLACEMENT,
+                };
+                use windows_sys::Win32::Foundation::{POINT, RECT};
+                let mut wp = WINDOWPLACEMENT {
+                    length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                    flags: 0,
+                    showCmd: 0,
+                    ptMinPosition: POINT { x: 0, y: 0 },
+                    ptMaxPosition: POINT { x: 0, y: 0 },
+                    rcNormalPosition: RECT { left: 0, top: 0, right: 0, bottom: 0 },
+                };
+                if unsafe { GetWindowPlacement(hwnd as _, &mut wp as *mut _ as _) } != 0 {
+                    let r = wp.rcNormalPosition;
+                    app.config.window_x = (r.left as f64 / scale).round() as i32;
+                    app.config.window_y = (r.top as f64 / scale).round() as i32;
+                    app.config.window_width = ((r.right - r.left) as f64 / scale).round() as u32;
+                    app.config.window_height = ((r.bottom - r.top) as f64 / scale).round() as u32;
+                    logv!(
+                        "[win-save] normal rect l={} t={} r={} b={} scale={} -> x={} y={} w={} h={}",
+                        r.left, r.top, r.right, r.bottom, scale,
+                        app.config.window_x, app.config.window_y,
+                        app.config.window_width, app.config.window_height
+                    );
+                } else {
+                    // 兜底：GetWindowPlacement 异常时退回当前矩形（GetWindowRect）。
+                    let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+                    if unsafe {
+                        windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect(
+                            hwnd as _,
+                            &mut rect as *mut _ as _,
+                        )
+                    } != 0
+                    {
+                        app.config.window_x = (rect.left as f64 / scale).round() as i32;
+                        app.config.window_y = (rect.top as f64 / scale).round() as i32;
+                        app.config.window_width =
+                            ((rect.right - rect.left) as f64 / scale).round() as u32;
+                        app.config.window_height =
+                            ((rect.bottom - rect.top) as f64 / scale).round() as u32;
+                    }
                 }
+                app.config.window_maximized = unsafe { IsZoomed(hwnd as _) } != 0;
             }
-            app.config.window_maximized = unsafe { IsZoomed(hwnd as _) } != 0;
         }
         #[cfg(not(windows))]
-        {
+        if !never_shown {
             let size = window.size();
             app.config.window_width = (size.width as f64 / scale).round() as u32;
             app.config.window_height = (size.height as f64 / scale).round() as u32;
@@ -12366,14 +12488,15 @@ pub fn destroy_session() {
             .collect();
         app.config.last_active_tab = app.state.active_tab;
         logv!(
-            "[win-save] w={} h={} x={} y={} maximized={} hwnd_present={} tabs={}",
+            "[win-save] w={} h={} x={} y={} maximized={} hwnd_present={} tabs={} never_shown={}",
             app.config.window_width,
             app.config.window_height,
             app.config.window_x,
             app.config.window_y,
             app.config.window_maximized,
             get_window_hwnd(&app.ui).is_some(),
-            app.config.last_tabs.len()
+            app.config.last_tabs.len(),
+            never_shown
         );
         app.config.save();
     }

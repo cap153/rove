@@ -464,6 +464,9 @@ export component SettingsPage inherits Rectangle {
     /// 「接管资源管理器」开关（来自 config.explorer_takeover，默认关闭）。
     in-out property <bool> explorer-takeover: false;
     callback explorer_takeover_toggled(bool);
+    /// 「开机自启动」开关（真源是注册表 Run 键，由 Rust 读实况下发）。
+    in-out property <bool> autostart: false;
+    callback autostart_toggled(bool);
     /// 显示语言：0 跟随系统 / 1 简体中文 / 2 English。
     in-out property <int> language-index: 0;
     callback language_changed(int);
@@ -725,6 +728,60 @@ export component SettingsPage inherits Rectangle {
                                 toggled => {
                                     root.explorer-takeover = !root.explorer-takeover;
                                     root.explorer_takeover_toggled(root.explorer-takeover);
+                                }
+                            }
+                        }
+                    }
+
+                    // 开机自启动：登录 Windows 时后台常驻（托盘 + 对话框吸附 + 索引预热）。
+                    Rectangle {
+                        width: 100%;
+                        background: gen-autostart-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 58px;
+
+                        gen-autostart-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.autostart = !root.autostart;
+                                root.autostart_toggled(root.autostart);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: I18n.strings[244];
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: I18n.strings[245];
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.autostart;
+                                toggled => {
+                                    root.autostart = !root.autostart;
+                                    root.autostart_toggled(root.autostart);
                                 }
                             }
                         }
