@@ -29,42 +29,101 @@ export component TabBar inherits Rectangle {
     callback window_close();
     callback settings_requested(); // 标题栏设置齿轮入口
 
-    /// 「滚到最右」的待生效标记：新建标签后 tabs 模型刚换掉，Repeater 还没重建，
-    /// tabs-flick.width / content-width 仍是旧值，此刻直接算 content-x 会按旧总宽
-    /// 夹住（新标签落在可视区外，实测正好差一整格）。置位后等布局宽度真正变化时
-    /// 再滚一次。
-    private property <bool> scroll-end-pending: false;
+    /// 待生效的滚动目标：-1 = 滚到最右，>= 0 = 把该下标的标签滚进可视区。
+    ///
+    /// 为什么要「待生效」而不是算一次就完事：tabs 模型换掉后 Repeater 还没重建，
+    /// `tabs-flick.width` / `content-width` 仍是旧值（窗口刚创建时甚至还是 0），
+    /// 此刻直接算 content-x 会按旧总宽夹住，新标签/当前标签就会落在可视区外。
+    /// 所以先记下目标，等布局宽度真正变化时补滚，直到布局跟上为止。
+    private property <int> scroll-target: -1;
+    private property <bool> scroll-pending: false;
+    private property <int> scroll-tries: 0;
 
     /// 把标签条滚到最右（Rust 新建标签后调用）。
     public function scroll-to-end() {
+        root.start-scroll(-1);
+    }
+
+    /// 把第 i 个标签滚进可视区（窄窗口打开设置标签 / 启动恢复上次标签页用）。
+    public function scroll-to-index(i: int) {
+        root.start-scroll(i);
+    }
+
+    function start-scroll(target: int) {
         // 先置待生效标记：给 content-x 赋值本身就可能触发一次布局刷新，
         // 若那一次 `changed content-width` 看见标记是 false 就不会补滚，
         // 结果正好差一整格。
-        root.scroll-end-pending = true;
-        root.apply-scroll-end();
+        root.scroll-target = target;
+        root.scroll-tries = 0;
+        root.scroll-pending = true;
+        root.apply-scroll();
     }
 
-    function apply-scroll-end() {
+    function apply-scroll() {
         // 模型按 153px/格 估算（比实际宽度多几像素），用来判断布局有没有跟上。
         let estimated = root.tabs.length * 153px;
         let laid-out = tabs-flick.content-width;
-        // 布局落后于模型（Repeater 还没重建、少了一格或更多）：先滚到头，并留标记
-        // 等 content-width 真正更新后补滚一次。
-        root.scroll-end-pending = estimated > laid-out + 1px;
+        let view-w = tabs-flick.width;
         let total-w = max(estimated, laid-out);
-        tabs-flick.content-x = -max(0px, total-w - tabs-flick.width);
+        let max-scroll = max(0px, total-w - view-w);
+
+        // 视口宽度还没算出来（窗口尚未显示）：这一刻算出来的偏移必然是错的
+        // （-total 甚至超出真实下限），先不动，只留待办标记。
+        if (view-w <= 0px) {
+            if (root.scroll-tries < 20) {
+                root.scroll-tries += 1;
+                root.scroll-pending = true;
+            } else {
+                root.scroll-pending = false;
+            }
+            return;
+        }
+
+        if (root.scroll-target < 0) {
+            tabs-flick.content-x = -max-scroll;
+        } else {
+            // 目标标签在内容坐标系里的左右边界。
+            let left = root.scroll-target * 153px;
+            let right = left + 150px;
+            let visible-left = -tabs-flick.content-x;
+            if (left < visible-left) {
+                tabs-flick.content-x = max(-max-scroll, min(0px, -left));
+            } else if (right > visible-left + view-w) {
+                tabs-flick.content-x = max(-max-scroll, min(0px, view-w - right));
+            }
+        }
+
+        // 布局有没有跟上：每格 150px + 3px 间距，所以 n 个标签的内容宽度应该
+        // 正好是 153n - 3。差得多说明 Repeater 还没重建（这一帧的结果不可信），
+        // 留标记等变化；最多重试 20 次后放弃，避免永远算不平的舍入误差把
+        // 定时器留在常开状态。
+        let expected = max(root.tabs.length * 153px - 3px, 0px);
+        let stale = abs(laid-out - expected) > 4px;
+        if (stale && root.scroll-tries < 20) {
+            root.scroll-tries += 1;
+            root.scroll-pending = true;
+        } else {
+            root.scroll-pending = false;
+            root.scroll-tries = 0;
+        }
     }
 
-    /// 把第 i 个标签滚进可视区（窄窗口打开/复用设置标签时用）。
-    public function scroll-to-index(i: int) {
-        let left = i * 153px;
-        let right = left + 150px;
-        let max-scroll = max(0px, root.tabs.length * 153px - tabs-flick.width);
-        if (left < -tabs-flick.content-x) {
-            tabs-flick.content-x = max(-max-scroll, min(0px, -left));
-        } else if (right > -tabs-flick.content-x + tabs-flick.width) {
-            tabs-flick.content-x = max(-max-scroll, min(0px, tabs-flick.width - right));
+    // 布局迟迟不更新时的兜底：16ms 一档、最多约 20 档（≈320ms）。
+    // 启动恢复标签页时窗口常常还没显示，`tabs-flick.width` 是 0，
+    // 只靠 `changed content-width` 可能等不到变化（宽度一开始就是 0，
+    // 之后虽然会变，但顺序不保证），必须自己轮询几帧。
+    Timer {
+        interval: 16ms;
+        running: root.scroll-pending;
+        triggered => {
+            root.apply-scroll();
         }
+    }
+
+    // 当前标签一换（点击、快捷键、恢复上次标签页、批量关闭后落到锚点），
+    // 就保证它在可视区内：只在需要时最小位移，已经在视野里就完全不动。
+    changed active-tab => {
+        root.start-scroll(root.active-tab);
     }
 
     // 导出空白拖拽区的起止位置（供后端 WM_NCHITTEST 判定，见 app.rs drag_hittest）
@@ -95,10 +154,22 @@ export component TabBar inherits Rectangle {
                 height: 100%;
                 interactive: false;
                 content-width: tabs-layout.preferred-width;
-                // 新建标签后布局宽度才真正变大：此时补上那次「滚到最右」。
+                // 布局宽度变化（新建标签、窗口刚显示、缩放）时补滚。
+                // 只在待办状态下补，避免抢走用户手动滚动的位置。
                 changed content-width => {
-                    if (root.scroll-end-pending) {
-                        root.apply-scroll-end();
+                    if (root.scroll-pending) {
+                        root.apply-scroll();
+                    }
+                }
+                // 视口宽度变化 = 窗口缩放 / 从最大化还原 / 侧栏拖宽。
+                // 变窄后当前标签可能整个滑出可视区，用户就看不出自己在哪一页，
+                // 所以这里无条件把「当前标签」重新拉回可视范围
+                // （已在可视区内时是空操作，不会移动任何东西）。
+                changed width => {
+                    if (root.scroll-pending) {
+                        root.apply-scroll();
+                    } else {
+                        root.start-scroll(root.active-tab);
                     }
                 }
 

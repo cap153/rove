@@ -12196,6 +12196,12 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         app.sync_staging();
         app.sync_file_list();
         app.reload_active();
+        // 启动时窗口还没显示，标签条其实一个像素都没布局（视口宽度为 0），
+        // 恢复出来的「当前标签」可能落在可视区外，用户看不到自己在哪一页。
+        // 这里只丢一个目标下标，TabBar 内部会等布局落定后补滚
+        // （见 tab_bar.slint 的 scroll-pending）。已在可视区内则不会移动。
+        let active_tab = app.state.active_tab as i32;
+        app.ui.invoke_scroll_tabs_to_index(active_tab);
         // 快照恢复出来的标签可能直接就是设置页：补一次导航/标题下发。
         if app.state.active().kind == crate::state::TabKind::Settings {
             app.sync_settings();
