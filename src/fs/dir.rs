@@ -40,6 +40,51 @@ impl Default for SortState {
     }
 }
 
+/// 路径的最后一段作为显示名（标签标题、窗口标题、最近访问、跳转固定项共用）。
+///
+/// `Path::file_name()` 对 UNC 共享根返回 `None`：`\\192.168.1.5\abc` 里
+/// 「abc」属于 Prefix 组件而不是普通目录段，调用方只能退化到整条路径，
+/// 标签上就出现 `\\192.168.1.5\abc` 这种长标题（而且无法在 150px 里截断得好看）。
+/// 这里按 UNC 前缀补一个兜底：
+///   `\\server\share`  → `share`
+///   `\\server`        → `server`（服务器根，本身就是它的「名字」）
+/// 其余路径行为不变（`C:\` 这类盘根仍是原来的 `C:\`）。
+pub fn leaf_name(path: &Path) -> String {
+    if let Some(name) = path.file_name() {
+        let name = name.to_string_lossy().into_owned();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    if let Some(name) = unc_leaf(path) {
+        return name;
+    }
+    path.to_string_lossy().into_owned()
+}
+
+/// UNC 前缀里的共享名 / 服务器名（非 UNC 路径返回 `None`）。
+fn unc_leaf(path: &Path) -> Option<String> {
+    let mut comps = path.components();
+    let std::path::Component::Prefix(prefix) = comps.next()? else { return None };
+    let (server, share) = match prefix.kind() {
+        std::path::Prefix::UNC(server, share)
+        | std::path::Prefix::VerbatimUNC(server, share) => (server, share),
+        _ => return None,
+    };
+    let share = share.to_string_lossy();
+    let text = if share.trim_matches('\\').is_empty() {
+        server.to_string_lossy().into_owned()
+    } else {
+        share.into_owned()
+    };
+    let text = text.trim_matches('\\');
+    if text.is_empty() {
+        None
+    } else {
+        Some(text.to_string())
+    }
+}
+
 /// `\\host` / `\\host\` 形式：只有服务器名，没有共享名。
 /// 它不是普通文件系统路径（`GetFileAttributes` 打不开），需要枚举共享。
 pub fn is_unc_server_root(path: &Path) -> bool {
@@ -463,5 +508,25 @@ mod tests {
     fn systemtime_roundtrip_smoke() {
         let t = SystemTime::now();
         let _ = super::super::time::format_local(t);
+    }
+
+    /// 标签标题 / 最近访问 / 快速访问都取「最后一段」。
+    /// UNC 共享根的最后一段属于 Prefix，`file_name()` 拿不到，必须靠 leaf_name 兜底。
+    #[test]
+    fn leaf_name_handles_unc_roots() {
+        assert_eq!(super::leaf_name(Path::new(r"\\192.168.1.5\abc")), "abc");
+        assert_eq!(super::leaf_name(Path::new(r"\\192.168.1.5\abc\")), "abc");
+        assert_eq!(super::leaf_name(Path::new(r"\\192.168.1.5\abc\def")), "def");
+        // 服务器根本身就是它的「名字」。
+        assert_eq!(super::leaf_name(Path::new(r"\\192.168.1.5")), "192.168.1.5");
+        assert_eq!(super::leaf_name(Path::new(r"\\192.168.1.5\")), "192.168.1.5");
+    }
+
+    #[test]
+    fn leaf_name_keeps_local_behaviour() {
+        assert_eq!(super::leaf_name(Path::new(r"D:\重")), "重");
+        assert_eq!(super::leaf_name(Path::new(r"D:\重\素晴")), "素晴");
+        // 盘根保持原样（沿用历史行为，未做改动）。
+        assert_eq!(super::leaf_name(Path::new(r"C:\")), r"C:\");
     }
 }

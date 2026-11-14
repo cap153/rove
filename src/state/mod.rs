@@ -447,10 +447,9 @@ impl TabState {
         match &self.panes[self.active_pane].path {
             None => "此电脑".to_string(),
             Some(p) if *p == crate::fs::drives::recycle_virtual_path() => "回收站".to_string(),
-            Some(p) => p
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+            // 不能用 `file_name()` 直接兼底：UNC 共享根（`\\server\share`）
+            // 的最后一段属于 Prefix，`file_name()` 返回 None，会退化成整条路径。
+            Some(p) => crate::fs::dir::leaf_name(p),
         }
     }
 }

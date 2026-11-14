@@ -3108,10 +3108,8 @@ impl App {
                     #[cfg(not(windows))]
                     let icon_img = slint::Image::default();
 
-                    let label = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| path.to_string_lossy().into_owned());
+                    // UNC 共享根没有 file_name()，统一走 leaf_name 取最后一段。
+                    let label = crate::fs::dir::leaf_name(&path);
                     recent_items.push(SidebarItem {
                         id: format!("recent:{}", path.to_string_lossy()).into(),
                         label: label.into(),
@@ -3250,12 +3248,7 @@ impl App {
             .iter()
             .map(|s| StagingItem {
                 path: s.path.to_string_lossy().into_owned().into(),
-                name: s
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| s.path.to_string_lossy().into_owned())
-                    .into(),
+                name: crate::fs::dir::leaf_name(&s.path).into(),
                 is_dir: s.is_dir,
                 icon_color: if s.is_dir {
                     Color::from_rgb_u8(0xE8, 0xB3, 0x3C)
@@ -6577,10 +6570,7 @@ impl App {
             {
                 continue;
             }
-            let label = p
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| text.clone());
+            let label = crate::fs::dir::leaf_name(&p);
             self.config.quick_items.push(QuickItem {
                 id: format!("pin:{text}"),
                 label,
@@ -11389,10 +11379,7 @@ fn with_current_dir_pin(hits: &mut Vec<crate::search::jump::JumpHit>, language: 
     if p == crate::fs::drives::recycle_virtual_path() {
         return;
     }
-    let name = p
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| p.to_string_lossy().into_owned());
+    let name = crate::fs::dir::leaf_name(&p);
     let pin = crate::search::jump::JumpHit {
         name: name.clone(),
         path: p.clone(),
