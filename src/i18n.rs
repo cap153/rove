@@ -239,6 +239,10 @@ pub const ZH: &[&str] = &[
     "粘贴（移动）",
     "取消固定",
     "当前",
+    "新建标签时编辑地址栏",
+    "打开新标签后自动进入地址栏编辑态，可直接输入路径。",
+    "撤销",
+    "重做",
 ];
 
 pub const EN: &[&str] = &[
@@ -475,6 +479,10 @@ pub const EN: &[&str] = &[
     "Paste (move)",
     "Unpin",
     "current",
+    "Edit address bar on new tab",
+    "Enter path editing automatically when opening a new tab.",
+    "Undo",
+    "Redo",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。

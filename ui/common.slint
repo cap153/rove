@@ -37,7 +37,14 @@ export struct FileRow {
     thumb: image,
     // 名称高亮片段（搜索命中时由 Rust 计算填充）；
     // 空数组 = 无高亮查询，UI 回落显示 name。
+    // 小图标视图为了单行省略号会把它按格宽切过，仅用于「行内显示」。
     name-parts: [NamePart],
+    // 浮层专用的**完整**高亮片段（未做任何宽度截断）。
+    // 浮层宽度是按完整名伸展的，用截断后的 name-parts 会连省略号一起带进来。
+    tip-parts: [NamePart],
+    // 该行名称在当前视图下确实被截断（由 Rust 按视图预算判定）。
+    // 浮层出现条件统一用它，避免 Slint 测量阈值与实际名称区宽度不一致。
+    name-truncated: bool,
 }
 
 export struct TabInfo {

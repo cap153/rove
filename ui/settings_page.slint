@@ -453,6 +453,11 @@ export component SettingsPage inherits Rectangle {
     in-out property <bool> show-hidden: false;
     /// 开关「显示隐藏项目」时触发（bool = 新的开关态）。
     callback show_hidden_toggled(bool);
+    /// 鼠标左键是否按住（透传自主窗口）：输入框拖选贴边自动滚动用。
+    in property <bool> mouse-pressed: false;
+    /// 「新建标签时编辑地址栏」开关（透传自 config，默认关闭）。
+    in-out property <bool> auto-edit-path-on-new-tab: false;
+    callback auto_edit_path_on_new_tab_toggled(bool);
     /// 显示语言：0 跟随系统 / 1 简体中文 / 2 English。
     in-out property <int> language-index: 0;
     callback language_changed(int);
@@ -713,6 +718,60 @@ export component SettingsPage inherits Rectangle {
                                 toggled => {
                                     root.show-hidden = self.checked;
                                     root.show_hidden_toggled(self.checked);
+                                }
+                            }
+                        }
+                    }
+
+                    // 新建标签时是否自动进入地址栏编辑态（默认关闭）。
+                    Rectangle {
+                        width: 100%;
+                        background: gen-auto-edit-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 58px;
+
+                        gen-auto-edit-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.auto-edit-path-on-new-tab = !root.auto-edit-path-on-new-tab;
+                                root.auto_edit_path_on_new_tab_toggled(root.auto-edit-path-on-new-tab);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: I18n.strings[233];
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: I18n.strings[234];
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.auto-edit-path-on-new-tab;
+                                toggled => {
+                                    root.auto-edit-path-on-new-tab = self.checked;
+                                    root.auto_edit_path_on_new_tab_toggled(self.checked);
                                 }
                             }
                         }
@@ -1055,6 +1114,7 @@ export component SettingsPage inherits Rectangle {
                                     background: Theme.bg-main;
 
                                     input-ta := SingleLineEdit {
+                                        mouse-pressed: root.mouse-pressed;
                                         x: 8px;
                                         width: parent.width - 16px;
                                         height: 100%;
@@ -1501,6 +1561,7 @@ export component SettingsPage inherits Rectangle {
                                     background: Theme.bg-main;
 
                                     hide-input-ta := SingleLineEdit {
+                                        mouse-pressed: root.mouse-pressed;
                                         x: 8px;
                                         width: parent.width - 16px;
                                         height: 100%;

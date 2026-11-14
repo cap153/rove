@@ -114,6 +114,9 @@ export component MainWindow inherits Window {
     // 是否显示隐藏文件（来自 config.show_hidden，驱动设置页「通用」开关）。
     in-out property <bool> show-hidden: false;
     callback show_hidden_toggled(bool);
+    /// 「新建标签时编辑地址栏」开关（来自 config，默认关闭）。
+    in-out property <bool> auto-edit-path-on-new-tab: false;
+    callback auto_edit_path_on_new_tab_toggled(bool);
     /// 通用设置：显示语言 / 启动时打开（下标由 Rust 按配置下发）。
     in-out property <int> language-index: 0;
     in-out property <int> startup-index: 0;
@@ -181,6 +184,10 @@ export component MainWindow inherits Window {
     /// 浮层名称的逐行高亮分段与框宽（Rust 与切行同源算出）。
     in-out property <[GridLine]> file-expand-lines: [];
     in-out property <length> file-expand-box-w: 0px;
+    /// 悬停浮层（与选中/重命名浮层独立）：影响条目索引、逐行分段与框宽。
+    in-out property <int> file-hover-expand-index: -1;
+    in-out property <[GridLine]> file-hover-expand-lines: [];
+    in-out property <length> file-hover-expand-box-w: 0px;
     // 分屏右栏数据源（分屏关闭时不使用）。
     in-out property <[FileRow]> file-rows-right: [];
     in-out property <int> file-total-right: 0;
@@ -189,6 +196,12 @@ export component MainWindow inherits Window {
     in-out property <string> file-expand-name-right: "";
     in-out property <[GridLine]> file-expand-lines-right: [];
     in-out property <length> file-expand-box-w-right: 0px;
+    in-out property <int> file-hover-expand-index-right: -1;
+    in-out property <[GridLine]> file-hover-expand-lines-right: [];
+    in-out property <length> file-hover-expand-box-w-right: 0px;
+    /// 左右栏各自是否「恰好单选一个文件」：多选时禁止名称浮层。
+    in-out property <bool> file-single-selection: false;
+    in-out property <bool> file-single-selection-right: false;
     in-out property <string> sort-key: "name";
     in-out property <bool> sort-ascending: true;
     in-out property <string> rename-path: "";
@@ -244,6 +257,9 @@ in-out property <string> view-mode <=> file-list.view-mode;
 in-out property <bool> show-path-column <=> file-list.show-path-column;
 out property <int> cells-per-row: file-list.cells-per-row;
     out property <length> view-width: file-list.view-width;
+    /// 左右栏各自的名称区真实宽度（分屏后两栏宽度不同，不能共用一个值）。
+    out property <length> file-name-area-w: file-list.name-area-w;
+    out property <length> file-name-area-w-right: file-list-right.name-area-w;
 out property <length> row-height-out: file-list.row-height-out;
     /// 格子实际宽/高（Rust 卡选与拖放定位用；高度按真实字体行高算出来）
     out property <length> cell-w-out: file-list.cell-w-out;
@@ -264,11 +280,16 @@ out property <length> row-height-out: file-list.row-height-out;
 
     /// 按目录下发列宽到当前活动分屏（Rust 切目录时调用）。
     public function apply-col-widths(n: length, m: length, t: length, s: length) {
-        if (root.active-pane == 1) {
-            file-list-right.set-col-widths(n, m, t, s);
-        } else {
-            file-list.set-col-widths(n, m, t, s);
-        }
+        // 列宽是全局语义（Rust 侧只有一份 cur_col_widths），两栏同时下发。
+        // 只设 active-pane 会让另一栏停留在默认 320px，尤其「打开分屏后对左栏
+        // 重新自适应」时焦点在右栏，左栏完全收不到新宽度。
+        file-list.set-col-widths(n, m, t, s);
+        file-list-right.set-col-widths(n, m, t, s);
+    }
+    // 在 Slint 侧切换「名称列窗口自适应」开关（见 FileList.set-auto-col-widths 说明）。
+    public function apply-auto-col-widths(flag: bool) {
+        file-list.set-auto-col-widths(flag);
+        file-list-right.set-auto-col-widths(flag);
     }
     in-out property <float> split-ratio: 0.5; // 左右分屏**显示**比例（受限后）
     // 分屏**期望**比例：用户拖出来的值（Rust 存 tab.split_ratio 并回推这个），
@@ -408,6 +429,9 @@ out property <length> row-height-out: file-list.row-height-out;
     callback sidebar_width_changed(float);
     callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length, on_name: bool);
     callback file_name_overlay_clicked();
+    callback file_overlay_hover(pane: int, inside: bool);
+    /// 图标格子悬停（pane, 显示索引；index=-1 表示离开格子）。
+    callback file_hover_row(pane: int, index: int);
     /// Ctrl+滚轮切换视图；返回 true 表示已消费滚轮事件。
     callback file_wheel_view(delta_y: length) -> bool;
     callback file_row_double_clicked(index: int);
@@ -420,7 +444,9 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <length> col-w-size: 96px;
     /// 双击列边界时的估算宽度（名称/修改时间/类型/大小），由 Rust 计算下发。
     in property <[length]> col-autofit-widths: [];
-    callback file_col_resized(index: int, width: length);
+    /// 当前目录没有手动列宽记录 → 允许 FileList 自适应压缩名称列（避免横向滚动条）。
+    in-out property <bool> col-auto-widths: true;
+    callback file_col_resized(index: int, width: length, name-w: length);
     callback file_scroll_changed(offset: length);
     /// 排查用：滚动位置变化时连同几何一并上报（Rust 仅在重命名期间落日志）。
     callback file_scroll_dbg(pane: int, offset: length, content-h: length, view-h: length, min-y: length, content-y: length);
@@ -582,6 +608,10 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 的窗口时 IsZoomed 返回 0，回传就会把用户的最大化状态误还原。故用独立的
     /// 无副作用属性，仅用于驱动 resize-border-width 动态归零。
     in-out property <bool> win-maximized: false;
+    /// 鼠标左键是否按住（Rust 从 winit MouseInput 事件回填）。Slint 的
+    /// TextInput 拖选期间抓住鼠标、任何 TouchArea 都收不到事件，重命名
+    /// 输入框的「拖选贴边自动滚动」只能从这里拿按下状态。
+    in-out property <bool> mouse-left-pressed: false;
 
     VerticalLayout {
         spacing: 0px;
@@ -682,6 +712,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         x: 8px;
                         width: parent.width - 16px;
                         height: parent.height;
+                        mouse-pressed: root.mouse-left-pressed;
                         text <=> root.path-edit-text;
                         font-size: 12px;
                         text-color: Theme.text-primary;
@@ -996,6 +1027,7 @@ out property <length> row-height-out: file-list.row-height-out;
                             // 独占剩余宽度(占位文字已移出布局),整个框可点。
                             horizontal-stretch: 1;
                             height: parent.height;
+                            mouse-pressed: root.mouse-left-pressed;
                             text <=> root.filter-text;
                             font-size: 12px;
                             text-color: Theme.text-primary;
@@ -1169,6 +1201,9 @@ out property <length> row-height-out: file-list.row-height-out;
                         visible: true;
                         rows: root.file-rows;
                     expand-index: root.file-expand-index;
+                    hover-expand-index: root.file-hover-expand-index;
+                    hover-expand-lines: root.file-hover-expand-lines;
+                    hover-expand-box-w: root.file-hover-expand-box-w;
                     expand-name: root.file-expand-name;
                     expand-lines: root.file-expand-lines;
                     expand-box-w: root.file-expand-box-w;
@@ -1187,13 +1222,18 @@ out property <length> row-height-out: file-list.row-height-out;
                         root.file_row_pointer_event(index, event, x, y, on_name);
                     }
                     name_overlay_clicked() => { root.file_name_overlay_clicked(); }
+                    overlay-hover(inside) => { root.file_overlay_hover(0, inside); }
+                    hover_row(index) => { root.file_hover_row(0, index); }
                     row_double_clicked(index) => {
                         root.file_row_double_clicked(index);
                     }
                     autofit-widths: root.col-autofit-widths;
+                    auto-col-widths: root.col-auto-widths;
+                    mouse-left-pressed: root.mouse-left-pressed;
+                    single-selection: root.file-single-selection;
                     is-computer-view: root.file-is-computer-view;
-                    col_resized(index, width) => {
-                        root.file_col_resized(index, width);
+                    col_resized(index, width, name-w) => {
+                        root.file_col_resized(index, width, name-w);
                     }
                     header_clicked(key) => {
                         root.pane_focused(0);
@@ -1308,6 +1348,9 @@ out property <length> row-height-out: file-list.row-height-out;
                         height: 100%;
                         rows: root.file-rows-right;
                         expand-index: root.file-expand-index-right;
+                        hover-expand-index: root.file-hover-expand-index-right;
+                        hover-expand-lines: root.file-hover-expand-lines-right;
+                        hover-expand-box-w: root.file-hover-expand-box-w-right;
                         expand-name: root.file-expand-name-right;
                         expand-lines: root.file-expand-lines-right;
                         expand-box-w: root.file-expand-box-w-right;
@@ -1332,13 +1375,18 @@ out property <length> row-height-out: file-list.row-height-out;
                             }
                         }
                         name_overlay_clicked() => { root.file_name_overlay_clicked(); }
+                        overlay-hover(inside) => { root.file_overlay_hover(1, inside); }
+                        hover_row(index) => { root.file_hover_row(1, index); }
                         row_double_clicked(index) => {
                             root.file_row_double_clicked(index);
                         }
                         autofit-widths: root.col-autofit-widths;
+                        auto-col-widths: root.col-auto-widths;
+                        mouse-left-pressed: root.mouse-left-pressed;
+                        single-selection: root.file-single-selection-right;
                         is-computer-view: root.file-is-computer-view;
-                        col_resized(index, width) => {
-                            root.file_col_resized(index, width);
+                        col_resized(index, width, name-w) => {
+                            root.file_col_resized(index, width, name-w);
                         }
                         header_clicked(key) => {
                             root.pane_focused(1);
@@ -1421,6 +1469,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     content-height: root.settings-content-height;
                     show-hidden: root.show-hidden;
                     show_hidden_toggled(v) => { root.show_hidden_toggled(v); }
+                    mouse-pressed: root.mouse-left-pressed;
+                    auto-edit-path-on-new-tab: root.auto-edit-path-on-new-tab;
+                    auto_edit_path_on_new_tab_toggled(v) => { root.auto_edit_path_on_new_tab_toggled(v); }
                     language-index: root.language-index;
                     startup-index: root.startup-index;
                     language_changed(i) => { root.language_changed(i); }
@@ -1569,6 +1620,7 @@ out property <length> row-height-out: file-list.row-height-out;
 
     // 动作编辑器弹窗（新增 / 编辑自定义右键菜单）。
     ActionEditorDialog {
+        mouse-pressed: root.mouse-left-pressed;
         visible: root.settings-editor-open;
         title: root.settings-editor-title;
         group-options: root.settings-editor-group-options;
@@ -1600,6 +1652,7 @@ out property <length> row-height-out: file-list.row-height-out;
 
     // 添加网络位置弹窗。
     network-dialog := NetworkLocationDialog {
+        mouse-pressed: root.mouse-left-pressed;
         visible: root.network-dialog-open;
         title: root.network-dialog-title;
         server <=> root.network-dialog-server;

@@ -126,6 +126,23 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             group: "".into(),
             builtin: true,
         },
+        // 「在资源管理器中显示」：作为一级菜单项，可在设置页「本地右键菜单」
+        // 的「一级菜单」分组里开关。菜单构建处按 enabled 决定是否 push，
+        // 并由 CMD_REVEAL_EXPLORER 分发（不渲染成 act: 项，避免重复）。
+        ActionEntry {
+            id: "builtin.reveal_explorer".into(),
+            label: "在资源管理器中显示".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            // 默认关闭：首次启动生成 actions.toml 时不把这项塞进一级菜单。
+            enabled: false,
+            group: "".into(),
+            builtin: true,
+        },
     ]
 }
 
@@ -252,9 +269,28 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
         return Vec::new();
     };
 
+    // 一次性迁移：「在资源管理器中显示」改为首次启动默认关闭。
+    // 老配置里这一项由旧默认值写成 enabled=true，仅改 builtin_actions 的默认值
+    // 不会覆盖用户配置（heal_full 会继承 enabled）。用文件里的标记保证只回落一次，
+    // 之后用户在设置页手动打开不会再被强制关掉。
+    // 必须在取得 `items` 可变借用之前读标记，避免 doc 被同时不可变借用。
+    let reveal_default_fixed = doc
+        .get("rove_reveal_default_fixed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     let Some(items) = doc.get_mut("action").and_then(|i| i.as_array_of_tables_mut()) else {
         return Vec::new();
     };
+
+    if !reveal_default_fixed {
+        for table in items.iter_mut() {
+            if str_field(table, "id").as_deref() == Some("builtin.reveal_explorer") {
+                table["enabled"] = toml_edit::value(false);
+                logln!("actions.toml: migrate builtin.reveal_explorer -> disabled by default");
+            }
+        }
+    }
 
     // 清掉已废弃的内置动作（打开 / 打开方式 / 发送到 / 重命名 / 删除 / 属性）：
     // 它们现在由系统菜单提供，隐藏改用关键词，不再需要开关。
@@ -325,7 +361,11 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
         });
     }
 
-    // 写回（toml_edit 保留注释与排版）。
+    // 写回（toml_edit 保留注释与排版）。迁移标记写在顶层，只写一次；
+    // 之后设置页保存时也保留它（save() 只替换 action 数组，不重建整个文档）。
+    if !reveal_default_fixed {
+        doc["rove_reveal_default_fixed"] = toml_edit::value(true);
+    }
     let _ = std::fs::write(path, doc.to_string());
     entries
 }

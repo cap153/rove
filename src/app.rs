@@ -452,6 +452,10 @@ fn global_dir_sizes() -> &'static Mutex<DirSizeStore> {
     GLOBAL_DIR_SIZES.get_or_init(|| Mutex::new(DirSizeStore::new()))
 }
 
+/// 图标视图浮层签名：(选中项索引, 框宽, 行哈希, 名字哈希,
+/// 悬停项索引, 悬停框宽, 悬停行哈希)。
+type ExpandSig = (i32, u32, u64, u64, i32, u32, u64);
+
 /// 应用主体。
 pub struct App {
     ui: MainWindow,
@@ -478,7 +482,10 @@ pub struct App {
     rows_sig_right: Option<(u64, usize, usize, usize)>,
     /// 图标视图展开浮层的签名（索引 / 框宽 / 行内容哈希，左右各一份）。
     /// 未变时跳过重建嵌套 ModelRc 与 set —— 本函数每帧都会走到。
-    expand_sig: Option<[(i32, u32, u64, u64); 2]>,
+    /// 图标视图浮层签名：(选中项索引, 框宽, 行哈希, 名字哈希,
+    /// 悬停项索引, 悬停框宽, 悬停行哈希)。悬停单独占一格，因为它与选中项
+    /// 是两层独立浮层，不能共用一个索引。
+    expand_sig: Option<[ExpandSig; 2]>,
     /// 面包屑各段的窗口逻辑矩形（由 Slint 上报，拖动落点判定用）。
     ///
     /// 用独立的 `Rc<RefCell<_>>` 而不是普通字段：几何是在 Slint 的 `changed`
@@ -495,6 +502,35 @@ pub struct App {
     >,
     /// 当前右键菜单的作用范围（结果回投时用它决定作用于谁）。
     menu_scope: Option<MenuScope>,
+    /// 本次右键按下所在行的路径（多选时「打开文件所在位置」/「在资源管理器中显示」
+    /// 优先作用于它，而不是选中集的第一项）。
+    menu_anchor_path: Option<PathBuf>,
+    /// 多选状态下按下某个「已选中行」时，先保留多选以便批量拖出；
+    /// 若直到 Up 都没发生拖动，才把选择集塌缩成该行单选（资源管理器语义）。
+    pending_single_click: Option<PathBuf>,
+    /// Shell 背景菜单（含系统「新建 → 文本文档」）弹出前的目录快照：
+    /// Shell 把「新建」命令直接交回系统执行，Rove 拿不到新建项路径（zsdesk
+    /// 也只对自己的 NewFolder 命令用 IFileOperation::PostNewItem 回传）。
+    /// 这里在菜单弹出时记下当前目录已有条目，等 Shell 操作结束后的列举结果
+    /// 回来做 diff：恰好新增一个文件时选中它并进入重命名。
+    shell_new_watch: Option<(
+        PathBuf,
+        std::collections::HashSet<PathBuf>,
+        std::time::Instant,
+    )>,
+    /// diff 命中后待触发的重命名路径（等列表/滚动就绪再执行，避免抢焦点）。
+    pending_shell_new_rename: Option<PathBuf>,
+    /// 图标视图鼠标悬停的格子显示索引（分屏各一份，-1 = 无）。
+    hover_display_index: [i32; 2],
+    /// 鼠标是否压在展开的完整名浮层上（分屏各一份）。
+    /// 浮层盖住名称区：鼠标下移到文件名上时格子自己的 hover 会变 false，
+    /// 若不拦住就会「浮层消失 → 鼠标落回格子 → 浮层重现」来回闪。
+    overlay_hovered: [bool; 2],
+    /// 格子自己的 hover 上报值（-1 = 指针不在任何格子上）。
+    /// 与 overlay_hovered 取或，决定最终悬停索引。
+    cell_hovered: [i32; 2],
+    /// 名称浮层诊断日志的节流签名（视图 / 分屏 / 截断行数）。
+    tip_log_sig: Option<(String, usize, usize)>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
     last_click: Option<(PathBuf, std::time::Instant)>,
     /// 侧栏分区拖拽：正在拖动的分区 header 行索引。
@@ -571,7 +607,7 @@ pub struct App {
     /// 启动首帧布局未完成时这几个值还不可用（list_height=0 / cells_per_row=1），
     /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
     /// （表现为「此电脑」部分盘符空白，直到切标签/重开窗口才恢复）。
-    list_geom: (f32, usize, f32, bool),
+    list_geom: (f32, usize, f32, bool, f32, f32),
     /// actions.toml 驱动的右键动作（内置动作开关 + 自定义）。
     actions: Vec<crate::ops::actions::ActionEntry>,
     /// 缩略图 LRU 缓存（Key 包含 mtime/size，防止旧图）。
@@ -700,6 +736,14 @@ impl App {
                 std::collections::HashMap::new(),
             )),
             menu_scope: None,
+            menu_anchor_path: None,
+            pending_single_click: None,
+            shell_new_watch: None,
+            pending_shell_new_rename: None,
+            hover_display_index: [-1, -1],
+            overlay_hovered: [false, false],
+            cell_hovered: [-1, -1],
+            tip_log_sig: None,
             last_click: None,
             sidebar_drag: None,
             network_drag: None,
@@ -721,7 +765,7 @@ impl App {
                 crate::config::DEFAULT_COLUMN_WIDTHS[3],
             ],
             size_sort_pending: false,
-            list_geom: (-1.0, 0, -1.0, false),
+            list_geom: (-1.0, 0, -1.0, false, -1.0, -1.0),
             recording_shortcut: None,
             dir_size_tx,
             dir_size_rx,
@@ -781,7 +825,7 @@ impl App {
         path: Option<PathBuf>,
         sort: SortState,
     ) {
-        logln!("request_listing tab={tab_id} pane={pane} gen={generation} path={path:?}");
+        logv!("request_listing tab={tab_id} pane={pane} gen={generation} path={path:?}");
         let _ = self.list_tx.send(ListRequest {
             tab_id,
             pane,
@@ -875,7 +919,7 @@ impl App {
 
     /// 列举结果到达：代号匹配才应用。
     fn apply_list_result(&mut self, result: ListResult) {
-        logln!("list_result tab={} gen={} n={}", result.tab_id, result.generation, result.entries.len());
+        logv!("list_result tab={} gen={} n={}", result.tab_id, result.generation, result.entries.len());
         let Some(tab_index) = self.state.tab_by_id(result.tab_id) else {
             logln!("apply_list_result: tab not found");
             return;
@@ -973,6 +1017,36 @@ impl App {
             }
             pane.loading = false;
             pane.rebuild_display();
+            // Shell 系统菜单「新建 → 文本文档」：菜单前的快照 diff 出唯一新增文件。
+            // 只在 10 秒内、同一目录、恰好新增 1 个「文件」时生效，避免把粘贴 /
+            // 批量新建 / 无关的后台创建误判成一次新建。zsdesk 用 IFileOperation
+            // 的 PostNewItem 回调拿路径，Rove 走 Shell 菜单没有该回调，故用列举 diff。
+            if let Some((dir, before, at)) = self.shell_new_watch.take() {
+                if at.elapsed().as_secs() < 10
+                    && pane.path.as_deref() == Some(dir.as_path())
+                    && result.pane == tab.active_pane
+                {
+                    let added: Vec<PathBuf> = pane
+                        .entries
+                        .iter()
+                        .filter(|e| !e.is_dir && !before.contains(&e.path))
+                        .map(|e| e.path.clone())
+                        .collect();
+                    if added.len() == 1 {
+                        logln!(
+                            "[shell-new] detected new file {} (dir={})",
+                            added[0].display(),
+                            dir.display()
+                        );
+                        self.pending_shell_new_rename = Some(added[0].clone());
+                        self.scroll_to_paths = vec![added[0].clone()];
+                        self.scroll_select = true;
+                        self.visible_cache = None;
+                    } else if !added.is_empty() {
+                        logln!("[shell-new] ignore diff: {} new entries", added.len());
+                    }
+                }
+            }
             // 新建文件夹 / 粘贴完成：数据就位后把新条目换算成显示索引，交给
             // refresh_visible_rows 做“最小位移滚进可视区”（否则它们按排序沉到底部，看不到）。
             // 多条时取最靠前的一条，保证粘贴块的起始处可见。
@@ -993,8 +1067,23 @@ impl App {
                         pane.selection = matched.iter().map(|(_, p)| p.clone()).collect();
                         self.visible_cache = None;
                     }
+                    logln!(
+                        "[new-folder] list matched: pos={} first={} scroll_select={} rename_path={}",
+                        pos,
+                        first.display(),
+                        self.scroll_select,
+                        self.ui.get_rename_path()
+                    );
                     self.scroll_to_paths.clear();
                     self.scroll_select = false;
+                } else {
+                    // 列举结果里还没出现目标（异步竞态）→ 保留 pending，等下一批。
+                    logln!(
+                        "[new-folder] list MISS: waiting={} total={} rename_path={}",
+                        self.scroll_to_paths.len(),
+                        pane.display.len(),
+                        self.ui.get_rename_path()
+                    );
                 }
             }
         }
@@ -1145,6 +1234,13 @@ impl App {
                 }
             }
         }
+
+        // Shell 系统菜单「新建 → 文本文档」：到这里列表数据、行模型、滚动都已
+        // 就位，再进入重命名（在 diff 当场调用会抢在行模型重建之前，输入框拿不到行）。
+        if let Some(path) = self.pending_shell_new_rename.take() {
+            logln!("[shell-new] entering rename for {}", path.display());
+            self.begin_rename(&path);
+        }
     }
 
     /// 统一应用搜索词（搜索框编辑 / 外部唤起预填共用）：
@@ -1200,8 +1296,12 @@ impl App {
             tab.active_mut().filter.trim().to_string(),
         );
         // 「此电脑」/ 回收站虚拟目录没有子树搜索。
-        let Some(root) = root else { return };
+        let Some(root) = root else {
+            logv!("[deep] skip: root=none filter={:?}", query);
+            return;
+        };
         if root == fs::drives::recycle_virtual_path() || query.is_empty() {
+            logv!("[deep] skip: root={:?} q={:?}", root, query);
             return;
         }
         let _ = self.deep_tx.send(DeepRequest {
@@ -1231,11 +1331,30 @@ impl App {
         let deep_is_active = result.pane == tab.active_pane;
         let pane = &mut tab.panes[result.pane];
         if pane.generation != result.generation || pane.deep_generation != result.deep_generation {
+            logv!(
+                "[deep] drop stale gen pane={}/{} dgen={}/{} n={}",
+                pane.generation,
+                result.generation,
+                pane.deep_generation,
+                result.deep_generation,
+                result.items.len()
+            );
             return; // 过期结果
         }
         if pane.filter.trim().to_lowercase() != result.query.trim().to_lowercase() {
+            logln!(
+                "[deep] !! drop mismatched filter: pane={:?} result={:?}",
+                pane.filter,
+                result.query
+            );
             return;
         }
+        logv!(
+            "[deep] apply pane={} n={} filter={:?}",
+            result.pane,
+            result.items.len(),
+            result.query
+        );
         pane.deep_entries = result.items.iter().map(|i| i.entry.clone()).collect();
         pane.deep_pinyin = result.items.into_iter().map(|i| i.fields).collect();
         pane.deep_searching = false;
@@ -2939,7 +3058,7 @@ impl App {
 
     /// 全量同步文件列表（标题、排序态、总行数、可见窗口）。
     fn sync_file_list(&mut self) {
-        let (sort_key, sort_asc, loading0, total0, is_recycle, is_split, loading1, total1) = {
+        let (sort_key, sort_asc, loading0, total0, is_recycle, is_split, loading1, total1, single0, single1) = {
             let tab = self.state.active();
             let panes = &tab.panes;
             (
@@ -2959,8 +3078,15 @@ impl App {
                 tab.is_split,
                 panes.get(1).map(|p| p.loading).unwrap_or(false),
                 panes.get(1).map(|p| p.display.len()).unwrap_or(0) as i32,
+                // 「非多选」即可：无选中时鼠标悬停也允许显示截断浮层；
+                // 多选（>=2）时一律禁用，避免满屏浮层。
+                panes[0].selection.len() <= 1,
+                panes.get(1).map(|p| p.selection.len() <= 1).unwrap_or(false),
             )
         };
+        // 多选时不弹名称浮层（左右栏各自判定）。
+        self.ui.set_file_single_selection(single0);
+        self.ui.set_file_single_selection_right(single1);
         self.ui.set_sort_key(sort_key.into());
         self.ui.set_sort_ascending(sort_asc);
         self.ui.set_file_loading(loading0);
@@ -3203,12 +3329,17 @@ impl App {
     }
 
     /// 当前列表几何（用于检测布局落定 / 窗口尺寸变化）。
-    fn current_list_geom(&self) -> (f32, usize, f32, bool) {
+    /// 末两项是左右分屏的名称列宽：列宽变化（拖分隔符 / 自适应）不会改变
+    /// 列表高度等几何，若不纳入签名，行模型里的 `name-truncated`（浮层弹出的
+    /// 依据）会一直用拖动前的旧预算判定，浮层表现为"按之前的列宽截断"。
+    fn current_list_geom(&self) -> (f32, usize, f32, bool, f32, f32) {
         (
             self.ui.get_list_height(),
             self.ui.get_cells_per_row().max(1) as usize,
             self.ui.get_row_height_out(),
             self.ui.get_is_icons_view_out(),
+            self.ui.get_file_name_area_w(),
+            self.ui.get_file_name_area_w_right(),
         )
     }
 
@@ -3231,6 +3362,19 @@ impl App {
         // 大小列改为只显示剩余容量、表头文字改成「剩余」。
         self.ui
             .set_file_is_computer_view(self.state.active().active().path.is_none());
+
+        // 名称浮层只在「非多选」时出现。放在这里而不是 sync_file_list：
+        // 点击 / 框选 / 键盘改选择时只会走 refresh_visible_rows，不走 sync_file_list，
+        // 单选标记若不在这里同步，多选后仍停在 true → 满屏浮层。
+        {
+            let tab = self.state.active();
+            self.ui.set_file_single_selection(
+                tab.panes.first().map(|p| p.selection.len() <= 1).unwrap_or(true),
+            );
+            self.ui.set_file_single_selection_right(
+                tab.panes.get(1).map(|p| p.selection.len() <= 1).unwrap_or(true),
+            );
+        }
 
         // 核心修复：若是切换视图触发的刷新，且拿到了待恢复的条目索引，则换算成
         // 新的像素位置。必须放在下方的 clamp 块“之前”——否则残留的旧像素大偏移
@@ -3430,6 +3574,13 @@ impl App {
                     "[rename] !! no visible row matches rename-path={} rows={} first={} count={} total={}",
                     rp, rows0.len(), first0, count0, total0
                 );
+            } else {
+                // 行模型里确实有该行；下面 reuse/重建 二选一决定输入框是否被销毁。
+                // 重命名期间本函数会被 40ms 轮询反复调用，故放详细级避免刷屏。
+                logv!(
+                    "[rename] visible row HIT rename-path={} first={} count={}",
+                    rp, first0, count0
+                );
             }
         }
         let reuse_rows = renaming && self.rows_sig == Some(sig);
@@ -3525,6 +3676,22 @@ impl App {
             self.ui.set_file_expand_lines_right(ModelRc::new(VecModel::from(
                 Vec::<GridLine>::new(),
             )));
+            // 悬停层同样要清掉：`hover_display_index` 只在图标视图的行
+            // TouchArea 上更新，切走视图时不会自动归零。虽非图标视图下
+            // 两层浮层都不绘制，但旧值留着会在切回图标视图的第一帧里
+            // 拿一个早已不在鼠标下的格子画出悬停浮层。
+            self.hover_display_index = [-1, -1];
+            self.cell_hovered = [-1, -1];
+            self.overlay_hovered = [false, false];
+            self.ui.set_file_hover_expand_index(-1);
+            self.ui
+                .set_file_hover_expand_lines(ModelRc::new(VecModel::from(Vec::<GridLine>::new())));
+            self.ui.set_file_hover_expand_box_w(0.0);
+            self.ui.set_file_hover_expand_index_right(-1);
+            self.ui.set_file_hover_expand_lines_right(ModelRc::new(VecModel::from(
+                Vec::<GridLine>::new(),
+            )));
+            self.ui.set_file_hover_expand_box_w_right(0.0);
             // 切回图标视图时需要能重新下发，签名必须清空。
             self.expand_sig = None;
             return;
@@ -3533,7 +3700,16 @@ impl App {
         let rename = self.ui.get_rename_path().to_string();
         let rename_pane = self.ui.get_rename_pane() as usize;
         let is_split = self.state.active().is_split;
+        // 先拷出悬停索引，避免与 self.state 的不可变借用纠缠。
+        let hovers = self.hover_display_index;
+        // 每栏两份目标：选中/重命名（expand）与鼠标悬停（hover）。
+        // 必须分开：只有一个索引时两层浮层会轮流顶掉对方（选中一个再悬停
+        // 另一个长名文件，两个浮层就会交替闪烁）。
         let mut targets: [(i32, String, Vec<(String, bool)>); 2] = [
+            (-1, String::new(), Vec::new()),
+            (-1, String::new(), Vec::new()),
+        ];
+        let mut hover_targets: [(i32, String, Vec<(String, bool)>); 2] = [
             (-1, String::new(), Vec::new()),
             (-1, String::new(), Vec::new()),
         ];
@@ -3543,7 +3719,7 @@ impl App {
             }
             let tab = self.state.active();
             let Some(p) = tab.panes.get(pane) else { continue };
-            // 重命名发生在 rename-pane 指定的那一栏，左右分屏都要支持。
+            // 选中/重命名层：重命名 > 单选。悬停层单独算，互不占用。
             let target: Option<PathBuf> = if pane == rename_pane && !rename.is_empty() {
                 Some(PathBuf::from(&rename))
             } else if p.selection.len() == 1 {
@@ -3551,19 +3727,27 @@ impl App {
             } else {
                 None
             };
-            let Some(target) = target else { continue };
-            let hit = (0..p.display.len()).find_map(|di| {
-                let e = p.display_entry(di)?;
-                (e.path == target).then(|| (di as i32, e.name.clone()))
-            });
-            if let Some((di, name)) = hit {
+            // 悬停层：指针下的格子。与选中项相同时下面会跳过重复绘制。
+            let hover_target: Option<PathBuf> = if hovers[pane] >= 0 {
+                p.display_entry(hovers[pane] as usize)
+                    .map(|e| e.path.clone())
+            } else {
+                None
+            };
+            let rows = if pane == 1 {
+                self.ui.get_file_rows_right()
+            } else {
+                self.ui.get_file_rows()
+            };
+            let resolve = |want: Option<PathBuf>| -> Option<(i32, String, Vec<(String, bool)>)> {
+                let target = want?;
+                let hit = (0..p.display.len()).find_map(|di| {
+                    let e = p.display_entry(di)?;
+                    (e.path == target).then(|| (di as i32, e.name.clone()))
+                })?;
+                let (di, name) = hit;
                 // 该条目的完整高亮分段：行模型里存的就是未截断的原始分段，
                 // 直接复用，避免在这里重跑一遍搜索命中计算。
-                let rows = if pane == 1 {
-                    self.ui.get_file_rows_right()
-                } else {
-                    self.ui.get_file_rows()
-                };
                 let key = p
                     .display_entry(di as usize)
                     .map(|e| e.path.to_string_lossy().into_owned())
@@ -3582,7 +3766,13 @@ impl App {
                 if parts.is_empty() {
                     parts = vec![(name.clone(), false)];
                 }
-                targets[pane] = (di, name, parts);
+                Some((di, name, parts))
+            };
+            if let Some(t) = resolve(target) {
+                targets[pane] = t;
+            }
+            if let Some(t) = resolve(hover_target) {
+                hover_targets[pane] = t;
             }
         }
         // 是否需要浮层（名字超过 3 行）改在 Rust 侧判定：只有需要时才给
@@ -3612,10 +3802,23 @@ impl App {
             h
         };
 
-        let mut sigs: [(i32, u32, u64, u64); 2] = [(-1, 0, 0, 0); 2];
-        let mut plans: [Option<(f32, GridLines, SharedString)>; 2] = [None, None];
+        let mut sigs: [ExpandSig; 2] = [(-1, 0, 0, 0, -1, 0, 0); 2];
+        let mut plans: [Option<(f32, GridLines, SharedString, f32, GridLines)>; 2] = [None, None];
         for (pane, t) in targets.iter().enumerate() {
+            let ht = &hover_targets[pane];
+            // 悬停项与选中/重命名项是同一个格子：不重复画（Slint 侧也会跳过）。
+            let hover_same = ht.0 < 0 || ht.0 == t.0;
+            let mut hover_sig = (-1i32, 0u32, 0u64);
+            let mut hover_plan = (0.0f32, GridLines::new());
+            if !hover_same {
+                let (needs, box_w, lines) = expand_layout(&self.ui, &ht.2);
+                let index = if needs { ht.0 } else { -1 };
+                hover_sig = (index, box_w.to_bits(), hash_lines(&lines));
+                hover_plan = (box_w, lines);
+            }
             if t.0 < 0 {
+                sigs[pane] = (-1, 0, 0, 0, hover_sig.0, hover_sig.1, hover_sig.2);
+                plans[pane] = Some((0.0, Vec::new(), SharedString::default(), hover_plan.0, hover_plan.1));
                 continue;
             }
             // 重命名中输入框的实时文本才是浮层该显示的内容；否则每帧都会用
@@ -3631,8 +3834,16 @@ impl App {
             // 超大图标视图格子宽，名字基本都在 3 行内，之前会因 needs=false
             // 拿不到 expand-index，于是完全无法重命名。
             let index = if needs || renaming_here { t.0 } else { -1 };
-            sigs[pane] = (index, box_w.to_bits(), hash_lines(&lines), hash_str(&t.1));
-            plans[pane] = Some((box_w, lines, t.1.as_str().into()));
+            sigs[pane] = (
+                index,
+                box_w.to_bits(),
+                hash_lines(&lines),
+                hash_str(&t.1),
+                hover_sig.0,
+                hover_sig.1,
+                hover_sig.2,
+            );
+            plans[pane] = Some((box_w, lines, t.1.as_str().into(), hover_plan.0, hover_plan.1));
         }
         if self.expand_sig.as_ref() == Some(&sigs) {
             return;
@@ -3640,12 +3851,29 @@ impl App {
         self.expand_sig = Some(sigs);
 
         for (pane, plan) in plans.into_iter().enumerate() {
-            let (index, box_w, lines, name) = match plan {
-                Some((box_w, lines, name)) => (sigs[pane].0, box_w, lines, name),
-                None => (-1, 0.0f32, Vec::new(), SharedString::default()),
+            let (box_w, lines, name, hv_box_w, hv_lines) = match plan {
+                Some(v) => v,
+                None => (0.0f32, Vec::new(), SharedString::default(), 0.0f32, Vec::new()),
             };
+            let index = sigs[pane].0;
+            let hv_index = sigs[pane].4;
             let model = ModelRc::new(VecModel::from(
                 lines
+                    .into_iter()
+                    .map(|line| GridLine {
+                        parts: ModelRc::new(VecModel::from(
+                            line.into_iter()
+                                .map(|(text, hl)| NamePart {
+                                    text: text.into(),
+                                    hl,
+                                })
+                                .collect::<Vec<_>>(),
+                        )),
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            let hv_model = ModelRc::new(VecModel::from(
+                hv_lines
                     .into_iter()
                     .map(|line| GridLine {
                         parts: ModelRc::new(VecModel::from(
@@ -3664,11 +3892,17 @@ impl App {
                 self.ui.set_file_expand_name(name);
                 self.ui.set_file_expand_box_w(box_w);
                 self.ui.set_file_expand_lines(model);
+                self.ui.set_file_hover_expand_index(hv_index);
+                self.ui.set_file_hover_expand_box_w(hv_box_w);
+                self.ui.set_file_hover_expand_lines(hv_model);
             } else {
                 self.ui.set_file_expand_index_right(index);
                 self.ui.set_file_expand_name_right(name);
                 self.ui.set_file_expand_box_w_right(box_w);
                 self.ui.set_file_expand_lines_right(model);
+                self.ui.set_file_hover_expand_index_right(hv_index);
+                self.ui.set_file_hover_expand_box_w_right(hv_box_w);
+                self.ui.set_file_hover_expand_lines_right(hv_model);
             }
         }
     }
@@ -3691,19 +3925,51 @@ impl App {
                 return Vec::new();
             };
             let computer_view = pane.path.is_none();
+            // 小图标视图（横排单行）名称区宽 = item-w - 50px，item-w = cell-w - 8px。
+            // 搜索态的高亮分段走 HighlightName：它把前几段宽度钉死、最后一段
+            // 被压到 0 宽，overflow:elide 画不出省略号。这里按格宽预算做一次
+            // 单行切分，超宽时末段腾位补 `…`（保留命中高亮），与竖排 grid-lines 同源。
+            let view_mode = self.config.view_mode.clone();
+            let small_icons = view_mode == "icons-small";
+            // 名称区真实宽度直接取 UI 导出的值（含自适应压缩结果），
+            // 左右分屏各用自己那一栏，避免用下发列宽粗估导致漏判截断。
+            let name_area_w = if pane_index == 0 {
+                self.ui.get_file_name_area_w()
+            } else {
+                self.ui.get_file_name_area_w_right()
+            } as f32;
+            let name_area_w = name_area_w.max(24.0);
+            // 小图标视图：HorizontalLayout 里的名称 Text 宽度 = item-w - 58px
+            // （导出值已按视图算好，这里只在导出为 0 时退回按格宽估算）。
+            let small_name_w = if name_area_w > 24.0 {
+                name_area_w
+            } else {
+                (self.ui.get_cell_w_out() as f32 - 66.0).max(24.0)
+            };
+            let details_name_w = name_area_w;
+            let grid_name_w = name_area_w;
             // 剥离盘符前缀（如 c:），避免在文件名中误匹配 c: 里的无关字符
             let (_, clean_filter) = crate::search::parse_drive_prefix(&pane.filter);
             let hl_query = clean_filter.trim().to_lowercase();
             let cut = &self.state.cut_paths;
             let mut hl_matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
             let mut hl_bufs = (Vec::new(), Vec::new(), Vec::new());
-            let collected: Vec<(i32, FileEntry, bool, bool, Vec<(String, bool)>)> =
-                (first..first + count)
+            // (显示索引, 条目, 选中, 剪切, 行内分段, 浮层完整分段, 名称被截断)
+            let collected: Vec<(
+                i32,
+                FileEntry,
+                bool,
+                bool,
+                Vec<(String, bool)>,
+                Vec<(String, bool)>,
+                bool,
+            )> = (first..first + count)
                     .filter_map(|di| {
                         let entry = pane.display_entry(di)?.clone();
                         let selected = pane.selection.contains(&entry.path);
                         let cut = cut.contains(&entry.path);
-                        let name_parts = if hl_query.is_empty() {
+                        // 完整高亮分段（不截断）：浮层专用，保证搜索态也能显示全名。
+                        let tip_parts: Vec<(String, bool)> = if hl_query.is_empty() {
                             Vec::new()
                         } else {
                             pane.display_parts(di)
@@ -3718,7 +3984,42 @@ impl App {
                                 })
                                 .unwrap_or_default()
                         };
-                        Some((di as i32, entry, selected, cut, name_parts))
+                        // 名称是否被当前视图的名称区宽度截断。
+                        // 用与渲染同源的字符宽度估算（grid_display_lines 的预算规则），
+                        // 比 Slint 的 preferred-width 猜阈值可靠：只要**存在截断**就弹浮层。
+                        let (budget, max_lines) = if small_icons {
+                            (small_name_w, 1)
+                        } else if view_mode == "details" || view_mode == "list" {
+                            (details_name_w, 1)
+                        } else {
+                            // 中/大/超大图标：名称最多 3 行
+                            (grid_name_w, 3)
+                        };
+                        let full: Vec<(String, bool)> = if tip_parts.is_empty() {
+                            vec![(entry.name.clone(), false)]
+                        } else {
+                            tip_parts.clone()
+                        };
+                        let layout = grid_display_lines(&full, budget, max_lines);
+                        // 未截断时切行结果拼起来 == 原名；超宽时末行补 `…` 并丢掉尾部。
+                        // 用长度比较而不是「是否含 …」，避免文件名本身带省略号时误判。
+                        let original_len: usize = entry.name.chars().count();
+                        let kept_len: usize = layout
+                            .iter()
+                            .flat_map(|line| line.iter())
+                            .map(|(t, _)| t.chars().count())
+                            .sum();
+                        let name_truncated = kept_len < original_len;
+                        let name_parts = if !small_icons || tip_parts.is_empty() {
+                            tip_parts.clone()
+                        } else {
+                            // 小图标行内：按格宽预算切成单行、末段补省略号（保留高亮）。
+                            grid_display_lines(&tip_parts, small_name_w, 1)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default()
+                        };
+                        Some((di as i32, entry, selected, cut, name_parts, tip_parts, name_truncated))
                     })
                     .collect();
             (collected, computer_view)
@@ -3738,9 +4039,14 @@ impl App {
         // `scroll_y` 不是按行高换算的像素值（图标视图里两者不同步），
         // 除出来会得到一个偏离真实位置的行号，结果优先池永远收不到任务。
         // `first` 是本帧窗口的**首个条目下标**，但它包含了上方 OVERSCAN 行缓冲
-        // （见 pane_view_range：`first_row = scroll/row_h - OVERSCAN`），
-        // 所以 `first` 落在屏幕上方看不见的缓冲里。真实屏幕的首项要再跳过
-        // OVERSCAN 行，否则优先池会先从看不见的缓冲行开始做，观感就是“加载偏高”。
+        // （见 pane_view_range：`first_row = scroll/row_h - OVERSCAN`）。
+        // 真实屏幕的首项要跳过「实际存在的」上方缓冲行。
+        //
+        // 关键修复：窗口在顶部时 pane_view_range 会把 first_row clamp 到 0，
+        // 此时 first 已经是屏幕首行、**没有任何上方缓冲**。以前这里无条件
+        // 跳过 OVERSCAN(=4) 行，等于把屏幕最前 4 行排除出优先池，只能排普通
+        // 池（还会被 drop_stale_thumb_requests 优先丢掉）——表现就是「滚动条在
+        // 开头，缩略图却从第 4 行才开始渲染」。改为按 clamp 前的行数算实际缓冲。
         let row_h = if self.ui.get_row_height_out() > 0.0 {
             self.ui.get_row_height_out()
         } else {
@@ -3748,28 +4054,70 @@ impl App {
         };
         let cells_per_row = (self.ui.get_cells_per_row().max(1)) as usize;
         let visible_rows = (list_height / row_h).ceil().max(1.0) as usize;
+        let scroll = self.state.tabs[tab_index].panes[pane_index]
+            .scroll_y
+            .max(0.0);
+        let raw_first_row = (scroll / row_h).floor() as isize - OVERSCAN as isize;
+        let effective_above = if raw_first_row < 0 {
+            (OVERSCAN as isize + raw_first_row).max(0) as usize
+        } else {
+            OVERSCAN
+        };
         // 真实屏幕的条目下标区间（不含上下缓冲）。
-        let screen_first = (first + OVERSCAN * cells_per_row).min(first + count);
+        let screen_first = (first + effective_above * cells_per_row).min(first + count);
         let screen_last = (screen_first + visible_rows * cells_per_row).min(first + count);
         let core_first = screen_first;
         let core_last = screen_last;
         // 视口中心用真实屏幕首行表示，供“距中心排序”使用。
         let first_row = first / cells_per_row;
         let viewport_center_row =
-            (first_row + OVERSCAN) as f32 + visible_rows as f32 / 2.0;
+            (first_row + effective_above) as f32 + visible_rows as f32 / 2.0;
+        if effective_above != OVERSCAN {
+            // 详细级：顶部钳制是常态（每次窗口刷新都会命中），
+            // 当初只为排查「滚动条在开头、缩略图却从第4行开始渲染」而加，
+            // 那个 bug 已修，保留能力但不再刷 1 级日志。
+            logv!(
+                "[thumb] top-clamped window: first={} count={} scroll={:.1} above={} screen_first={} core=[{},{})",
+                first, count, scroll, effective_above, screen_first, core_first, core_last
+            );
+        }
 
         let thumb_px = self.thumb_size_for_view();
         // 网格名称的可换宽度 = cell-w - 16px（与 file_list.slint 内层文字宽一致）。
         let grid_name_w = (self.ui.get_cell_w_out() as f32 - 16.0).max(24.0);
+        // 关键诊断（ROVE_LOG=1）：验收「存在截断就弹浮层」时记录一次汇总。
+        // 按签名节流，避免滚动/40ms 轮询每次都刷日志。
+        let truncated_count = collected.iter().filter(|t| t.6).count();
+        let single = self.state.tabs[tab_index].panes[pane_index].selection.len() <= 1;
+        let mode = self.config.view_mode.clone();
+        let budget = if pane_index == 0 {
+            self.ui.get_file_name_area_w()
+        } else {
+            self.ui.get_file_name_area_w_right()
+        } as f32;
+        let sig = (mode.clone(), pane_index, truncated_count);
+        if self.tip_log_sig.as_ref() != Some(&sig) {
+            self.tip_log_sig = Some(sig);
+            // 详细级：每次导航/栏宽变化都会重算一次，属布局诊断噪音。
+            logv!(
+                "[tip] mode={} budget={:.1} pane={} rows={} truncated={} single={}",
+                mode,
+                budget,
+                pane_index,
+                collected.len(),
+                truncated_count,
+                single,
+            );
+        }
         let mut ordered = collected;
-        ordered.sort_by_key(|(index, _, _, _, _)| {
+        ordered.sort_by_key(|(index, _, _, _, _, _, _)| {
             let row = (*index as usize) / cells_per_row;
             let center = row as f32 + 0.5;
             (center - viewport_center_row).abs() as i64
         });
         ordered
             .into_iter()
-            .map(|(index, entry, selected, cut, name_parts)| {
+            .map(|(index, entry, selected, cut, name_parts, tip_parts, name_truncated)| {
                 let in_core = index >= core_first as i32 && (index as usize) < core_last;
                 let thumb = self.thumb_for(
                     &entry.path,
@@ -3849,6 +4197,13 @@ impl App {
                             .map(|(text, hl)| NamePart { text: text.into(), hl })
                             .collect::<Vec<_>>(),
                     )),
+                    tip_parts: ModelRc::new(VecModel::from(
+                        tip_parts
+                            .into_iter()
+                            .map(|(text, hl)| NamePart { text: text.into(), hl })
+                            .collect::<Vec<_>>(),
+                    )),
+                    name_truncated,
                 }
             })
             .collect()
@@ -3959,6 +4314,12 @@ impl App {
         self.sync_status();
         self.sync_file_list();
         self.sync_tabs();
+        // 打开/关闭分屏后左栏视口宽度变了：立刻按左栏内容重新自适应一次列宽，
+        // 否则名称列仍按分屏前的宽视口估算，右栏挤进来后会出现横向滚动条。
+        #[cfg(windows)]
+        if !self.state.active().panes.first().map(|p| p.loading).unwrap_or(true) {
+            refit_columns_now(self, 0);
+        }
     }
 
     /// 聚焦某一分屏面板（0 / 1），顶部地址栏与工具栏随之切换数据源。
@@ -4466,7 +4827,8 @@ fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::pa
     app.submit_job(kind);
 }
 
-/// 列宽的存储键：当前活动目录的路径字符串，虚拟目录用固定前缀。
+/// 自适应去重用键：当前活动目录的路径字符串，虚拟目录用固定前缀。
+/// 只用于避免每次刷新重复估算列宽，不再对应任何持久化记录。
 #[cfg(windows)]
 fn column_layout_key(app: &App) -> String {
     match app.state.active().active().path.as_ref() {
@@ -4479,22 +4841,25 @@ fn column_layout_key(app: &App) -> String {
 /// Slint 不暴露文本测量接口，只能按字符类型估：CJK 约一个字号宽，其余约 0.55 个。
 /// 直接读数据而不是读已渲染的行，避免受虚拟滚动窗口影响。
 #[cfg(windows)]
-fn autofit_widths_for_pane(app: &App) -> [f32; 5] {
+fn autofit_widths_for_pane(app: &App, pane_index: usize) -> [f32; 5] {
     fn text_w(s: &str) -> f32 {
         s.chars()
             .map(|c| if (c as u32) < 0x2E80 { 7.0 } else { 13.0 })
             .sum()
     }
-    let tab = app.state.active().active();
-    let computer = tab.path.is_none();
+    let tab = app.state.active();
+    let Some(pane) = tab.panes.get(pane_index) else {
+        return crate::config::DEFAULT_COLUMN_WIDTHS;
+    };
+    let computer = pane.path.is_none();
     let mut max = [0f32; 5];
     let mut seen = 0usize;
-    for di in 0..tab.display.len() {
+    for di in 0..pane.display.len() {
         // 超大目录只采样前若干条：估算够用，打开不必为它卡一下。
         if seen >= 4000 {
             break;
         }
-        let Some(e) = tab.display_entry(di) else { continue };
+        let Some(e) = pane.display_entry(di) else { continue };
         seen += 1;
         max[0] = max[0].max(text_w(&e.name));
         // 「此电脑」驱动器条目没有修改时间：format_time(None) 自然返回空串。
@@ -4537,25 +4902,19 @@ fn push_col_widths(app: &mut App, w: [f32; 5]) {
     app.ui.invoke_apply_col_widths(w[0], w[1], w[2], w[3]);
 }
 
-/// 切目录时先按手动记录还原一次（即时反馈），并重置自适应标记；
-/// 数据真正到位后 `autofit_column_widths_if_needed` 会再校准一次。
+/// 切目录时重置自适应标记：列宽不再按目录持久化，每个目录统一重新自适应。
+/// 数据真正到位后 `autofit_column_widths_if_needed` 会按下发一次估算值。
 #[cfg(windows)]
 fn apply_column_widths(app: &mut App) {
-    let key = column_layout_key(app);
     app.autofit_key = None;
-    if let Some(w) = app
-        .config
-        .column_layouts
-        .iter()
-        .find(|c| c.dir == key)
-        .map(|c| c.widths)
-    {
-        push_col_widths(app, w);
-    }
+    // 必须从 Slint 侧切换 auto 开关（invoke_apply_auto_col_widths），Rust 的
+    // set_col_auto_widths 不会可靠传播到 col-name-w 的求值。
+    app.ui.invoke_apply_auto_col_widths(true);
 }
 
-/// 数据就绪后按目录下发列宽，每个目录只做一次：
-/// 有手动记录 → 用记录；没有 → 按最长条目自适应（结果不落盘）。
+/// 数据就绪后按目录下发列宽，每个目录只做一次（统一自适应，不落盘）。
+/// Slint 侧会在 `auto-col-widths=true` 时按视口压缩名称列，
+/// 保证不出现横向滚动条、「大小」列右侧留框选空白。
 #[cfg(windows)]
 fn autofit_column_widths_if_needed(app: &mut App) {
     let key = column_layout_key(app);
@@ -4571,61 +4930,53 @@ fn autofit_column_widths_if_needed(app: &mut App) {
         return;
     }
     app.autofit_key = Some(key.clone());
-    let w = if let Some(saved) = app
-        .config
-        .column_layouts
-        .iter()
-        .find(|c| c.dir == key)
-        .map(|c| c.widths)
-    {
-        saved
-    } else {
-        autofit_widths_for_pane(app)
-    };
+    app.ui.invoke_apply_auto_col_widths(true);
+    let pane = app.state.active().active_pane;
+    let w = autofit_widths_for_pane(app, pane);
     push_col_widths(app, w);
 }
 
-/// 记录用户拖动后的列宽：就地更新当前目录的记录并落盘。
+/// 强制重新自适应一次（分屏切换后左栏视口变窄时用）。
 #[cfg(windows)]
-fn record_col_width(app: &mut App, index: i32, width: f32) {
+fn refit_columns_now(app: &mut App, pane_index: usize) {
+    app.ui.invoke_apply_auto_col_widths(true);
+    let w = autofit_widths_for_pane(app, pane_index);
+    push_col_widths(app, w);
+    app.autofit_key = Some(column_layout_key(app));
+}
+
+/// 用户拖动 / 双击列边界：只在本次会话生效，不写配置、不按目录记忆。
+/// 下一次切目录会由 `apply_column_widths` 重新统一自适应。
+#[cfg(windows)]
+fn record_col_width(app: &mut App, index: i32, width: f32, name_w_hint: f32) {
     let idx = index.clamp(0, 4) as usize;
-    let key = column_layout_key(app);
-    // 基准用界面上当前的宽度：没动过的列保持原样，不会被默认值顶掉。
-    let path_w = app
-        .config
-        .column_layouts
-        .iter()
-        .find(|c| c.dir == key)
-        .map(|c| c.widths[4])
-        .unwrap_or(crate::config::DEFAULT_COLUMN_WIDTHS[4]);
+    // 名称列宽度必须用 Slint 上报的「松手瞬间显示宽」，不能读 w-name。
+    // 自适应模式下 w-name 只是上一次下发的旧值（通常是内容拟合宽或默认 320），
+    // 与用户眼前看到的宽度无关；早期版本读它，导致拖一下右列就把名称列
+    // 钉死在 320 / 拟合值。同理也不能读 cur_col_widths[0]。
+    let name_w = if idx == 0 { width } else { name_w_hint };
     let mut w = [
-        app.cur_col_widths[0],
+        name_w.clamp(crate::config::MIN_COLUMN_W, crate::config::MAX_COLUMN_W),
         app.cur_col_widths[1],
         app.cur_col_widths[2],
         app.cur_col_widths[3],
-        path_w,
+        crate::config::DEFAULT_COLUMN_WIDTHS[4],
     ];
     if width < 0.0 {
         // 双击列边界（-1）：按当前目录内容现算「刚好放下最长内容」的宽度。
-        let fit = autofit_widths_for_pane(app);
+        let pane = app.state.active().active_pane;
+        let fit = autofit_widths_for_pane(app, pane);
         w[idx] = fit[idx];
     } else {
         w[idx] = width.clamp(crate::config::MIN_COLUMN_W, crate::config::MAX_COLUMN_W);
     }
-    match app.config.column_layouts.iter_mut().find(|c| c.dir == key) {
-        Some(c) => c.widths = w,
-        None => {
-            app.config
-                .column_layouts
-                .push(crate::config::ColumnLayout { dir: key, widths: w });
-            if app.config.column_layouts.len() > crate::config::MAX_COLUMN_LAYOUTS {
-                app.config.column_layouts.remove(0);
-            }
-        }
-    }
-    // 双击时 Slint 自己算不出宽度，必须由这里回写；拖动时也顺手同步一次。
+    // 拖动任意分隔符都意味着用户开始手动接管列宽：先关自适应再下发宽度，
+    // 否则 auto-col-widths 仍为 true 时 col-name-w 走 auto-name-w，
+    // 刚写进去的 w[0] 根本不参与显示（名称列会跟着右列反向变化）。
+    // 这个开关只在 Slint 侧生效，所以必须走 invoke。切目录 / 分屏时由
+    // apply_column_widths 重新置 true 恢复自适应。
+    app.ui.invoke_apply_auto_col_widths(false);
     push_col_widths(app, w);
-    app.config.save();
 }
 
 /// 纯文本版本（仅供单测断言用）。
@@ -4846,12 +5197,35 @@ impl App {
         match target {
             MenuScope::Selection(paths) => {
                 let mut nodes: Vec<MenuNode> = Vec::new();
-                // 搜索结果里的条目来自任意目录，先给出「打开路径」入口：
-                // 可以跳到文件所在目录，也可以直接在资源管理器中定位它。
-                nodes.push(item(CMD_OPEN_LOCATION, self.tr("打开文件所在位置").as_str(), true));
+                // 「打开文件所在位置」只在搜索结果里有意义：搜索页的条目来自
+                // 任意目录，需要跳回所在目录；普通目录里当前路径就是所在目录，
+                // 显示它纯属噪音。
+                let pane = self.state.active().active();
+                let is_search = !pane.filter.trim().is_empty() || !pane.deep_entries.is_empty();
+                if is_search {
+                    nodes.push(item(CMD_OPEN_LOCATION, self.tr("打开文件所在位置").as_str(), true));
+                }
+                // 「在资源管理器中显示」由设置页「一级菜单」开关控制显隐。
                 #[cfg(windows)]
-                nodes.push(item(CMD_REVEAL_EXPLORER, self.tr("在资源管理器中显示").as_str(), true));
-                nodes.push(MenuNode::Separator);
+                {
+                    let reveal_enabled = self
+                        .actions
+                        .iter()
+                        .find(|a| a.id == "builtin.reveal_explorer")
+                        .map(|a| a.enabled)
+                        .unwrap_or(true);
+                    if reveal_enabled {
+                        nodes.push(item(
+                            CMD_REVEAL_EXPLORER,
+                            self.tr("在资源管理器中显示").as_str(),
+                            true,
+                        ));
+                    }
+                }
+                // 只有确实有前置项时才需要分隔线，否则菜单顶部会出现一条空分隔。
+                if !nodes.is_empty() {
+                    nodes.push(MenuNode::Separator);
+                }
                 // 按 group 聚合："" 为一级项，其余按首次出现顺序输出为二级子菜单。
                 let mut groups: std::collections::BTreeMap<
                     String,
@@ -4861,6 +5235,9 @@ impl App {
                 for a in self
                     .actions
                     .iter()
+                    // reveal_explorer 由上面的 CMD_REVEAL_EXPLORER 单独渲染，
+                    // 这里排除掉，避免一级菜单里出现两个同名项。
+                    .filter(|a| a.id != "builtin.reveal_explorer")
                     .filter(|a| a.enabled && a.matches_selection(paths) && !dup(&a.id))
                 {
                     if !groups.contains_key(&a.group) {
@@ -5292,6 +5669,7 @@ impl App {
         self.ui.set_settings_nav_items(ModelRc::new(VecModel::from(nav_items)));
         // 向设置页「通用」开关灌入当前状态。
         self.ui.set_show_hidden(self.config.show_hidden);
+        self.ui.set_auto_edit_path_on_new_tab(self.config.auto_edit_path_on_new_tab);
 
         // 子页标题 / 描述 / 新增入口。
         let (title, desc, show_add) = match current {
@@ -5418,6 +5796,7 @@ impl App {
     /// 工具栏 ▦ 按钮：原生下拉菜单切换视图模式。
     fn open_view_picker(&mut self) {
         // 视图切换不依赖选中项，菜单目标给个空白处兜底。
+        self.menu_anchor_path = None;
         self.menu_scope = Some(MenuScope::Background);
         #[cfg(windows)]
         {
@@ -6803,19 +7182,34 @@ impl App {
             }
             CMD_OPEN_LOCATION => {
                 if let MenuScope::Selection(paths) = &target {
-                    if let Some(p) = paths.first() {
+                    // 多选时优先定位「鼠标右键所在的那一行」，而不是选中集里
+                    // 按显示顺序排第一的那个（否则定位到別的文件去了）。
+                    let chosen = self
+                        .menu_anchor_path
+                        .clone()
+                        .filter(|a| paths.contains(a))
+                        .or_else(|| paths.first().cloned());
+                    if let Some(p) = chosen {
                         if let Some(dir) = p.parent().map(|d| d.to_path_buf()) {
-                            self.navigate_active(Some(dir));
+                            self.navigate_active(Some(dir.clone()));
                             // 导航会清空选择；把目标文件重新选中，列表加载完就能看到它。
-                            let path = p.clone();
                             let tab = self.state.active_mut().active_mut();
                             tab.selection.clear();
-                            tab.selection.insert(path.clone());
+                            tab.selection.insert(p.clone());
+                            tab.anchor = Some(p.clone());
                             // 让列表加载完成后滚动到目标文件（否则可能停在视口外看不到）。
-                            self.scroll_to_paths = vec![path];
+                            // scroll_select=true：列举结果回来时把目标重新设为唯一选中项，
+                            // 并换算成显示索引做最小位移滚动。
+                            self.scroll_to_paths = vec![p.clone()];
+                            self.scroll_select = true;
                             self.visible_cache = None;
                             self.refresh_visible_rows();
                             self.sync_status();
+                            logln!(
+                                "[open-location] target={} dir={} scroll_armed=true",
+                                p.display(),
+                                dir.display()
+                            );
                         }
                     }
                 }
@@ -6823,7 +7217,13 @@ impl App {
             #[cfg(windows)]
             CMD_REVEAL_EXPLORER => {
                 if let MenuScope::Selection(paths) = &target {
-                    if let Some(p) = paths.first() {
+                    // 同上：多选时优先右键对应文件。
+                    let chosen = self
+                        .menu_anchor_path
+                        .clone()
+                        .filter(|a| paths.contains(a))
+                        .or_else(|| paths.first().cloned());
+                    if let Some(p) = chosen {
                         let arg = format!("/select,{}", p.to_string_lossy());
                         if let Err(e) = std::process::Command::new("explorer")
                             .arg(arg)
@@ -7074,14 +7474,32 @@ impl App {
                 self.drag_pending = None;
                 self.ui.invoke_set_drag_armed(false);
 
-                logv!("[rename] create_folder -> {:?}", path);
+                // 关键诊断（ROVE_LOG=1）：用户反馈「新建文件夹有概率没默认选中，
+                // 但名称框可以编辑」。这条链路跨异步列举 + 行模型重建，逐环打点，
+                // 回来测试时看哪一环断了即可定位。
+                logln!(
+                    "[new-folder] created={} scroll_select_prev={} scroll_to_paths_prev={} rename_path_prev={}",
+                    path.display(),
+                    self.scroll_select,
+                    self.scroll_to_paths.len(),
+                    self.ui.get_rename_path()
+                );
                 // 新条目会按当前排序插到任意位置（名称排序 + 全英文目录 → 沉到底部），
                 // 所以要告诉列表：数据就位后把这条滚进可视区，否则用户得自己找。
+                // 显式复位 scroll_select：它是全局状态，若上一次粘贴的 scroll_to_paths
+                // 因路径改名没匹配上就不会被消费，残留到本次新建 → 把选择集换成
+                // 别处、看起来「没选中」或「选中错行」。
                 self.scroll_to_paths = vec![path.clone()];
                 self.scroll_select = false;
                 self.reload_active();
                 let new_path = path.clone();
                 self.begin_rename(&new_path);
+                logln!(
+                    "[new-folder] armed: rename_path={} scroll_to_paths={} scroll_select={}",
+                    self.ui.get_rename_path(),
+                    self.scroll_to_paths.len(),
+                    self.scroll_select
+                );
             }
             Err(e) => self.set_status_job(self.trf("创建文件夹失败：{}", &[e.to_string()])),
         }
@@ -7186,7 +7604,8 @@ impl App {
         self.ui.set_rename_path(SharedString::default());
         // 导航后的页面自带搜索词（搜索页/目录页），不要无条件清空搜索框。
         let nav_filter = self.state.active().active().filter.clone();
-        self.ui.set_filter_text(nav_filter.into());
+        let is_search_page = !nav_filter.trim().is_empty();
+        self.ui.set_filter_text(nav_filter.clone().into());
         self.visible_cache = None;
 
         // 将内存中正确的 scroll_y 推给 UI，防止 UI 在重绘前乱跳。
@@ -7207,7 +7626,24 @@ impl App {
         }
 
         self.sync_file_list();
-        self.reload_active();
+        if is_search_page {
+            // 历史落点是搜索页：由 after_history_jump 的 restore_search_page 重发搜索。
+            // 这里绝不能 reload_active —— 列举结果回来时「此电脑」分支会
+            // pane.filter.clear()，把刚恢复的搜索词冲掉（结果变少的第二个原因）。
+            // 但也因此不会有列举结果来复位 loading / pending_scroll_restore，
+            // jump_to 刚置的 true 会一直挂着 → 列表永远盖着「正在读取…」。
+            logv!(
+                "[nav] search page: skip re-listing, clearing loading flag (filter={})",
+                nav_filter
+            );
+            let pane = self.state.active().active_pane;
+            self.state.active_mut().panes[pane].loading = false;
+            self.state.active_mut().panes[pane].pending_scroll_restore = false;
+            self.ui.set_file_loading(false);
+            self.ui.set_tab_loading(false);
+        } else {
+            self.reload_active();
+        }
     }
 
     fn nav_back(&mut self) {
@@ -7235,16 +7671,39 @@ impl App {
     /// 前进/后退的收尾：跨目录按正常导航走；同一目录内的「搜索页 ↔ 目录页」
     /// 只重建搜索结果，不能重新列举目录（会把搜索结果冲掉）。
     fn after_history_jump(&mut self, before: Option<PathBuf>) {
-        let same_path = self.state.active().active().path == before;
+        let (same_path, has_filter) = {
+            let p = self.state.active().active();
+            (p.path == before, !p.filter.trim().is_empty())
+        };
+        logv!(
+            "[nav] history jump same_path={} has_filter={} path={:?} before={:?} filter={:?} gen={} dgen={}",
+            same_path,
+            has_filter,
+            self.state.active().active().path,
+            before,
+            self.state.active().active().filter,
+            self.state.active().active().generation,
+            self.state.active().active().deep_generation
+        );
         if same_path {
-            self.restore_search_page();
+            self.restore_search_page(false);
         } else {
             self.sync_after_navigate();
+            // 跨目录后退/前进落到「带搜索词的历史页」时，sync_after_navigate 只
+            // 重新列举目录，不会重发深度/全局搜索：deep_entries 被 jump_to 清空后
+            // 一直为空，搜索结果退化成当前目录的本地过滤子集（表现为结果变少）。
+            // 这里补一次搜索页恢复，把 filter 对应的完整结果重新拉回来。
+            if has_filter {
+                logv!("[nav] history jump to a search page (cross-dir), re-running search");
+                self.restore_search_page(true);
+            }
         }
     }
 
-    fn restore_search_page(&mut self) {
-        let (filter, scroll, is_root, pane_index) = {
+    /// 恢复一个搜索页。`cross_dir` = 落点目录与离开时不同：此时 pane.entries
+    /// 还是旧目录的内容，必须先重新列举，否则本地过滤是在错的目录上跑的。
+    fn restore_search_page(&mut self, cross_dir: bool) {
+        let (filter, scroll, is_root, pane_index, was_loading) = {
             let tab = self.state.active();
             let p = tab.active();
             (
@@ -7252,18 +7711,53 @@ impl App {
                 p.scroll_y,
                 p.path.is_none(),
                 tab.active_pane,
+                p.loading,
             )
         };
+        // 跨目录后退落到搜索页：jump_to 会把 pane.loading 置 true，但搜索页
+        // 结果来自索引/deep，不会走「目录列举完成」那条复位路径（sync_after_navigate
+        // 特意跳过 reload_active，否则列举结果会 filter.clear() 冲掉搜索词）。
+        // 如果不在这里复位，列表会永远盖着「正在读取…」占位层。
+        if was_loading {
+            logv!("[nav] restore search page: clearing stale loading flag (filter={})", filter);
+        }
+        self.state.active_mut().panes[pane_index].loading = false;
+        // 跨目录 jump_to 会置 pending_scroll_restore=true，正常由列举结果复位；
+        // 搜索页跳过列举，这里必须自己清，否则滚动回调被永久忽略。
+        self.state.active_mut().panes[pane_index].pending_scroll_restore = false;
         self.ui.set_filter_text(filter.clone().into());
         if is_root {
             self.run_global_search(&filter);
         } else {
+            logv!(
+                "[nav] restore search page: cross_dir={} root={:?} filter={:?} gen={} dgen={} entries={}",
+                cross_dir,
+                self.state.active().active().path,
+                filter,
+                self.state.active().active().generation,
+                self.state.active().active().deep_generation,
+                self.state.active().active().entries.len()
+            );
             self.start_deep_search();
             self.state.active_mut().active_mut().rebuild_display();
+            if cross_dir {
+                // 深度搜索只返回 depth>=1 的结果（depth 0 = 当前目录直接子项，
+                // 由本地过滤负责）。旧目录的 entries 会让本地过滤永远匹配不到，
+                // 表现为“此文件夹为空”且一直不回。这里补列举，结果到达后
+                // 由 apply_list_result → rebuild_display 自动接上搜索词。
+                //
+                // 注意 apply_list_result 只在「此电脑」分支清 filter，不会冲掉搜索词。
+                self.reload_active();
+                // 列举在跑（网络共享可能要好几秒），“此文件夹为空”会跟真正的
+                // 空目录混淆。保持 loading，让列表盖着“正在读取…”，
+                // 由 apply_list_result 复位。
+                self.state.active_mut().panes[pane_index].loading = true;
+            }
         }
         self.visible_cache = None;
         self.sync_nav();
         self.sync_status();
+        self.sync_tabs();
         self.sync_file_list();
         push_scroll(&self.ui, pane_index, scroll);
     }
@@ -7353,6 +7847,18 @@ impl App {
             PointerEventKind::Up | PointerEventKind::Cancel => {
                 self.drag_pending = None;
                 self.ui.invoke_set_drag_armed(false);
+                // 多选下按在已选中行、但全程没拖动：此刻才塌缩成该行单选。
+                // 若已发起拖出，pending 会在 Move 分支被清掉，这里不再改动选择集
+                // （批量拖放后保持多选是符合资源管理器语义的）。
+                if let Some(p) = self.pending_single_click.take() {
+                    let tab = self.state.active_mut().active_mut();
+                    tab.selection.clear();
+                    tab.selection.insert(p.clone());
+                    tab.anchor = Some(p);
+                    self.visible_cache = None;
+                    self.refresh_visible_rows();
+                    self.sync_status();
+                }
                 logv!("[drag] armed=false (up/cancel)");
             }
             PointerEventKind::Move => {
@@ -7360,6 +7866,9 @@ impl App {
                 // 否则首次微小移动就会清空 drag_pending 导致永远拖不出（见 #2 缺陷）。
                 if let Some(paths) = drag_gesture_paths(&self.drag_pending, x, y) {
                     self.drag_pending = None;
+                    // 已经真正开始拖出：不要再塌缩选择集，也不要在 400ms 后弹重命名。
+                    self.pending_single_click = None;
+                    self.cancel_rename_defer();
                     self.ui.invoke_set_drag_armed(false);
                     self.begin_drag_out(paths);
                 }
@@ -7384,6 +7893,9 @@ impl App {
                     tab.selection.insert(path.clone());
                     tab.anchor = Some(path.clone());
                 }
+                // 记下右键所在行：多选时「打开文件所在位置」/「在资源管理器中显示」
+                // 要优先定位它，而不是选中集里按显示顺序排第一的那个。
+                self.menu_anchor_path = Some(path.clone());
                 let target = MenuScope::Selection(self.state.active().active().selected_paths());
                 self.menu_scope = Some(target.clone());
                 self.visible_cache = None;
@@ -7395,6 +7907,8 @@ impl App {
                 // 每次左键按下先取消挂起的延迟重命名，避免旧的 timer 在条件偶然重新
                 // 满足时提前触发（单击 A→点 B→再点 A：t=200 点的 A 只过 200ms 却弹出 rename）。
                 self.cancel_rename_defer();
+                // 新的一次按下：丢掉上一次未完成的「延迟塌缩单选」。
+                self.pending_single_click = None;
                 // 双击检测在 Rust 侧做（有效双击间隔内同一路径二次按下）：
                 // 不依赖 Slint 的 double-clicked，行模型重建也不会打断判定。
                 // 注意：这个窗口必须 ≤ 下方延迟重命名（有效双击间隔 + 50ms），否则
@@ -7410,6 +7924,30 @@ impl App {
                     return;
                 }
                 self.last_click = Some((path.clone(), now));
+                let ctrl = key_down(VK_CONTROL);
+                let shift = key_down(VK_SHIFT);
+                // 批量拖出：先在「按下瞬间」给选中集拍快照。必须在任何选择集
+                // 塌缩之前取，否则多选在 down 时就变成 1 个，拖出去只有当前行。
+                let (multi, row_selected, drag_paths) = {
+                    let pane = self.state.active().active();
+                    let multi = pane.selection.len() > 1;
+                    let row_selected = pane.selection.contains(&path);
+                    let paths = if !ctrl && !shift && multi && row_selected {
+                        pane.selected_paths()
+                    } else {
+                        vec![path.clone()]
+                    };
+                    (multi, row_selected, paths)
+                };
+                // 拖出手势登记提前到所有 return 之前：点名称进重命名的分支也能拖出。
+                // 重命名输入态（真正已在编辑）不登记。
+                if !(self.state.active().active().path.is_some()
+                    && !self.ui.get_rename_path().is_empty())
+                {
+                    self.drag_pending = Some((x, y, drag_paths));
+                    self.ui.invoke_set_drag_armed(true);
+                    logv!("[drag] armed=true for row {}", index);
+                }
                 // 单选后（非双击、非 Ctrl/Shift）点击文件名 → 延迟进入重命名：
                 // 先不起重命名，留出双击窗口；若再来一次按下（有效双击间隔内）则被判定为
                 // 双击打开（见上方 cancel_rename_defer），否则（有效双击间隔 + 50ms）后到
@@ -7423,17 +7961,17 @@ impl App {
                         self.state.active().active().selection.contains(&path),
                     );
                 }
-                if on_name
-                    && !key_down(VK_CONTROL)
-                    && !key_down(VK_SHIFT)
-                    && self.state.active().active().selection.len() == 1
-                    && self.state.active().active().selection.contains(&path)
-                {
+                if on_name && !ctrl && !shift && !multi && row_selected {
                     self.schedule_rename(path.clone());
                     return;
                 }
-                let ctrl = key_down(VK_CONTROL);
-                let shift = key_down(VK_SHIFT);
+                // 多选下按在某个「已选中行」：保留整个选择集，把「塌缩成单选」推迟
+                // 到 Up（且全程未拖动）时才做。这里不重建行模型，保持按下时的
+                // TouchArea 存活，后续 Move 才能持续送到同一行触发批量拖出。
+                if !ctrl && !shift && multi && row_selected {
+                    self.pending_single_click = Some(path.clone());
+                    return;
+                }
                 let tab = self.state.active_mut().active_mut();
                 logv!(
                     "[select] row down index={} ctrl={} shift={} anchor={:?} selected={}",
@@ -7491,23 +8029,6 @@ impl App {
                 self.visible_cache = None;
                 self.refresh_visible_rows();
                 self.sync_status();
-                // 登记拖出待定手势：拖动的是选中集（行在选中集中时）或该行。
-                if self.state.active().active().path.is_some() && !self.ui.get_rename_path().is_empty() {
-                    // 重命名输入态不触发拖出。
-                } else if let Some(row_path) = self.state.active().active().display_entry(index).map(|e| e.path.clone()) {
-                    let tab = self.state.active();
-                    let paths = if tab.active().selection.contains(&row_path) && tab.active().selection.len() > 1 {
-                        tab.active().selected_paths()
-                    } else if tab.active().selection.contains(&row_path) {
-                        vec![row_path]
-                    } else {
-                        vec![row_path]
-                    };
-                    self.drag_pending = Some((x, y, paths));
-                    // 上膛：禁用 flick 交互滚动，使行拖动仅用于发起拖出。
-                    self.ui.invoke_set_drag_armed(true);
-                    logv!("[drag] armed=true for row {}", index);
-                }
             }
             _ => {}
         }
@@ -7799,6 +8320,22 @@ impl App {
                 }
             }
             PointerEventButton::Right => {
+                self.menu_anchor_path = None;
+                // 记下当前目录快照：系统菜单里的「新建 → 文本文档」由 Shell 自己
+                // 执行，Rove 拿不到新文件路径。菜单结束后列举结果回来再做 diff。
+                if let Some(dir) = self.state.active().active().path.clone() {
+                    let before: std::collections::HashSet<PathBuf> = self
+                        .state
+                        .active()
+                        .active()
+                        .entries
+                        .iter()
+                        .map(|e| e.path.clone())
+                        .collect();
+                    self.shell_new_watch = Some((dir, before, std::time::Instant::now()));
+                } else {
+                    self.shell_new_watch = None;
+                }
                 let target = MenuScope::Background;
                 self.menu_scope = Some(target.clone());
                 self.open_menu(target);
@@ -8198,7 +8735,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
 /// 窗口原生键盘事件：应用级快捷键（非模态，仅常规加速键）。
 fn setup_keyboard(app: &Rc<RefCell<App>>) {
     use slint::winit_030::{EventResult, WinitWindowAccessor};
-    use slint::winit_030::winit::event::{ElementState, KeyEvent, WindowEvent};
+    use slint::winit_030::winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
     use slint::winit_030::winit::keyboard::Key;
 
     let key_app = Rc::downgrade(app);
@@ -8220,7 +8757,28 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         if matches!(event, WindowEvent::Focused(false)) {
             if let Some(focus_app) = key_app.upgrade() {
                 focus_app.borrow_mut().cancel_rename_defer();
+                // 窗口失焦时左键的「松开」可能送到别的窗口，这里先清掉按住态，
+                // 否则拖选贴边自动滚动的定时器会在后台一直推进选中范围。
+                focus_app.borrow().ui.set_mouse_left_pressed(false);
             }
+        }
+
+        // 鼠标左键按住状态回填给 UI：Slint 的 TextInput 拖选期间抓住鼠标，
+        // 任何 TouchArea 都收不到事件，重命名输入框的「拖选贴边自动滚动」
+        // 定时器只能从这里判断拖选是否仍在进行（松开即停）。
+        if let WindowEvent::MouseInput {
+            state,
+            button: MouseButton::Left,
+            ..
+        } = event
+        {
+            if let Some(btn_app) = key_app.upgrade() {
+                btn_app
+                    .borrow()
+                    .ui
+                    .set_mouse_left_pressed(matches!(state, ElementState::Pressed));
+            }
+            return EventResult::Propagate;
         }
 
         // 任务 2.2：外部 → Rove 拖入。winit 对一次投放逐文件发 DroppedFile，
@@ -8260,6 +8818,12 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                     app.ui.set_win_maximized(is_zoomed);
                 }
                 sync_drag_bounds(&app, "resize");
+                drop(app);
+                // 尺寸变化后强制下一轮 40ms 轮询重建可见行：行模型里的
+                // name-truncated（浮层弹出依据）是按旧几何算的，行内文字的
+                // 省略号由 Slint 实时画、两者会割裂（表现为「浮层按旧窗口宽
+                // 判断截断」）。置哨兵值让轮询的几何比较必定命中一次。
+                evt_app.borrow_mut().list_geom = (-1.0, 0, -1.0, false, -1.0, -1.0);
             }
             return EventResult::Propagate;
         }
@@ -8414,9 +8978,12 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.sync_active_tab();
             app.reload_active();
             app.ui.invoke_scroll_tabs_to_end();
-            // 「+」新建的标签默认进入地址栏编辑：sync_active_tab 会清编辑态，
-            // 所以必须放在整条链路最后。begin-path-edit 预填当前路径并自动聚焦全选。
-            app.ui.invoke_begin_path_edit();
+            // 「+」新建标签是否进入地址栏编辑由设置开关控制（默认关闭）。
+            // sync_active_tab 会清编辑态，所以必须放在整条链路最后。
+            // begin-path-edit 预填当前路径并自动聚焦全选。
+            if app.config.auto_edit_path_on_new_tab {
+                app.ui.invoke_begin_path_edit();
+            }
         });
     }
     {
@@ -8588,6 +9155,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         // 图标视图里单选后的文件名浮层：再次点击同样进入重命名。
         let overlay_app = app.clone();
+        let hover_app = app.clone();
+        let overlay_hover_app = app.clone();
         upgrade().on_file_row_pointer_event(move |index, event, x, y, on_name| {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut()
@@ -8596,8 +9165,130 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_file_name_overlay_clicked(move || {
             let Some(app) = overlay_app.upgrade() else { return };
             let mut app = app.borrow_mut();
-            if app.state.active().active().selection.len() == 1 {
-                app.start_rename();
+            // 浮层里的 TouchArea 吃掉了点击，格子那边收不到，所以这里要自己处理：
+            //  · 该文件还没被选中 → 先选中它（单击选中，与点图标一致）；
+            //  · 已经是唯一选中项 → 进入重命名（原有行为）。
+            // 不做这一步的话，仅因悬停而弹出的浮层被单击后会毫无反应。
+            //
+            // 选中/重命名层和悬停层是两套属性：悬停弹出来的那一层只有
+            // hover-expand-index 有值，所以两者都要看。悬停优先。
+            let hv0 = app.ui.get_file_hover_expand_index();
+            let hv1 = app.ui.get_file_hover_expand_index_right();
+            let ex0 = app.ui.get_file_expand_index();
+            let ex1 = app.ui.get_file_expand_index_right();
+            let (pane, target) = if hv0 >= 0 {
+                (0usize, hv0)
+            } else if hv1 >= 0 {
+                (1usize, hv1)
+            } else if ex0 >= 0 {
+                (0usize, ex0)
+            } else if ex1 >= 0 {
+                (1usize, ex1)
+            } else {
+                return;
+            };
+            if app.state.active().active_pane != pane {
+                app.focus_pane(pane);
+            }
+            let path = app
+                .state
+                .active()
+                .panes
+                .get(pane)
+                .and_then(|p| p.display_entry(target as usize))
+                .map(|e| e.path.clone());
+            let Some(path) = path else { return };
+            // 双击检测：浮层盖在名称区上，格子自己的 TouchArea 收不到这些点击，
+            // 所以双击打开必须在这里自己判（与 row_pointer_event 同一套机制：
+            // 有效双击间隔内同一路径第二次点击 = 打开）。
+            // 不做的话，长文件名在图标视图里双击会先选中、再进重命名，
+            // 而短文件名双击是打开文档，两者不一致。
+            let now = std::time::Instant::now();
+            if app.last_click.as_ref().is_some_and(|(p, t)| {
+                *p == path && t.elapsed().as_millis() < effective_double_click_ms() as u128
+            }) {
+                app.cancel_rename_defer();
+                app.last_click = None;
+                if app.state.active().active().selection.len() != 1
+                    || !app.state.active().active().selection.contains(&path)
+                {
+                    let tab = app.state.active_mut().active_mut();
+                    tab.selection.clear();
+                    tab.selection.insert(path.clone());
+                    tab.anchor = Some(path.clone());
+                }
+                app.activate_row(target as usize);
+                return;
+            }
+            app.last_click = Some((path.clone(), now));
+            let selected_single = {
+                let tab = app.state.active().active();
+                tab.selection.len() == 1 && tab.selection.contains(&path)
+            };
+            if !selected_single {
+                let tab = app.state.active_mut().active_mut();
+                tab.selection.clear();
+                tab.selection.insert(path.clone());
+                tab.anchor = Some(path);
+                app.visible_cache = None;
+                app.refresh_visible_rows();
+                app.sync_status();
+                return;
+            }
+            // 已经是唯一选中项：不要当场进重命名。与行内的名称点击一致，
+            // 先挂一个延时，留出双击窗口：窗口内再来一击 = 双击打开（在上面
+            // 已处理），否则窗口过后才进重命名。
+            // 当场 start-rename 的话，重命名输入框会立刻顶掉浮层，
+            // 第二次点击落到输入框上，双击打开就永远做不到。
+            app.schedule_rename(path);
+        });
+        upgrade().on_file_overlay_hover(move |pane, inside| {
+            let Some(app) = overlay_hover_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let p = pane.clamp(0, 1) as usize;
+            app.overlay_hovered[p] = inside;
+            if !inside {
+                // 指针离开浮层：若格子那边也已经不在悬停，就把悬停索引清掉，
+                // 让浮层正常收起（否则会一直挂着不走）。
+                let effective = if app.cell_hovered[p] >= 0 {
+                    app.cell_hovered[p]
+                } else {
+                    -1
+                };
+                if app.hover_display_index[p] != effective {
+                    app.hover_display_index[p] = effective;
+                    app.expand_sig = None;
+                    app.sync_expand_targets();
+                }
+            }
+        });
+        upgrade().on_file_hover_row(move |pane, index| {
+            let Some(app) = hover_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            let p = pane.clamp(0, 1) as usize;
+            app.cell_hovered[p] = index;
+            // 指针还在浮层上时，格子自己的 hover=false 不能把悬停清掉，
+            // 否则浮层会随鼠标下移到文件名上而反复闪烁。
+            let effective = if index >= 0 {
+                index
+            } else if app.overlay_hovered[p] {
+                app.hover_display_index[p]
+            } else {
+                -1
+            };
+            if app.hover_display_index[p] == effective {
+                return;
+            }
+            app.hover_display_index[p] = effective;
+            // 重算图标视图的名称浮层目标（选中 / 悬停 / 重命名）。
+            // 小图标视图有自己的行内浮层，不需要这里重建嵌套模型。
+            let icons_big = matches!(
+                app.config.view_mode.as_str(),
+                "icons-medium" | "icons-large" | "icons-xl"
+            );
+            if icons_big {
+                app.expand_sig = None;
+                app.sync_expand_targets();
             }
         });
     }
@@ -8721,10 +9412,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         {
             // 列宽拖动/双击结束后回传，按当前目录存进配置并落盘。
             let app = app.clone();
-            upgrade().on_file_col_resized(move |index, width| {
+            upgrade().on_file_col_resized(move |index, width, name_w| {
                 let Some(app) = app.upgrade() else { return };
                 let mut app = app.borrow_mut();
-                record_col_width(&mut app, index, width);
+                record_col_width(&mut app, index, width, name_w);
             });
         }
 
@@ -9527,6 +10218,32 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
 
             app.borrow().jump_window.invoke_clear_query();
         });
+        // 吸附窗是独立 Window，主窗口的 winit 事件钩子收不到它的鼠标事件；
+        // 单独挂一个，把左键按住状态回填给它的输入框（拖选贴边自动滚动用）。
+        {
+            use slint::winit_030::winit::event::{ElementState, MouseButton, WindowEvent};
+            use slint::winit_030::{EventResult, WinitWindowAccessor};
+            let jw = app.borrow().jump_window.clone_strong();
+            app.borrow()
+                .jump_window
+                .window()
+                .on_winit_window_event(move |_w, event| {
+                    if let WindowEvent::MouseInput {
+                        state,
+                        button: MouseButton::Left,
+                        ..
+                    } = event
+                    {
+                        jw.set_mouse_left_pressed(matches!(state, ElementState::Pressed));
+                    }
+                    // 与主窗口同理：失焦后“松开”可能收不到，先清掉按住态，
+                    // 避免自动滚动定时器在后台继续跑。
+                    if matches!(event, WindowEvent::Focused(false)) {
+                        jw.set_mouse_left_pressed(false);
+                    }
+                    EventResult::Propagate
+                });
+        }
     }
     {
         // 文件对话框吸附轮询：跑在主线程事件循环上。
@@ -9545,6 +10262,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         // 供下面两个下拉回调共用（第一个闭包会移走 app）。
         let lang_app = app.clone();
         let startup_app = app.clone();
+        let auto_edit_app = app.clone();
+        upgrade().on_auto_edit_path_on_new_tab_toggled(move |enabled| {
+            let Some(app) = auto_edit_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.auto_edit_path_on_new_tab = enabled;
+            app.config.save();
+            app.ui.set_auto_edit_path_on_new_tab(enabled);
+        });
         upgrade().on_show_hidden_toggled(move |enabled| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -11025,7 +11750,7 @@ pub fn destroy_session() {
                 app.config.window_y = (r.top as f64 / scale).round() as i32;
                 app.config.window_width = ((r.right - r.left) as f64 / scale).round() as u32;
                 app.config.window_height = ((r.bottom - r.top) as f64 / scale).round() as u32;
-                logln!(
+                logv!(
                     "[win-save] normal rect l={} t={} r={} b={} scale={} -> x={} y={} w={} h={}",
                     r.left, r.top, r.right, r.bottom, scale,
                     app.config.window_x, app.config.window_y,
@@ -11073,7 +11798,7 @@ pub fn destroy_session() {
             })
             .collect();
         app.config.last_active_tab = app.state.active_tab;
-        logln!(
+        logv!(
             "[win-save] w={} h={} x={} y={} maximized={} hwnd_present={} tabs={}",
             app.config.window_width,
             app.config.window_height,

@@ -107,6 +107,9 @@ export component FileList inherits Rectangle {
     in-out property <bool> loading: false;
     /// 拖拽悬停命中的行索引（-1 为无悬停）
     in-out property <int> drop-hover-index: -1;
+    /// 本栏是否恰好单选一个文件。多选时一律不显示名称浮层（避免多选时
+    /// 满屏浮层互相遮挡）。由 Rust 按当前 pane 的 selection.len() 下发。
+    in-out property <bool> single-selection: false;
 
     callback row-pointer-event(index: int, event: PointerEvent, x: length, y: length, on-name: bool);
     /// 单选后再次点击文件名才进入重命名：判断点击是否落在「名称」列。
@@ -118,6 +121,12 @@ export component FileList inherits Rectangle {
         return false;
     }
     callback name-overlay-clicked();
+    /// 浮层自身是否被鼠标压住（true = 指针在展开的完整名浮层上）。
+    /// 浮层盖住名称区，鼠标下移到文件名时格子自己的 hover 会变 false，
+    /// Rust 靠这个标志把悬停保持住，避免浮层反复出现/消失。
+    callback overlay-hover(inside: bool);
+    /// 图标格子悬停变化：上报显示索引（-1 = 离开），供 Rust 重算名称浮层目标。
+    callback hover-row(index: int);
     /// Ctrl+滚轮切视图：返回 true 表示事件已被消费，列表不再滚动。
     callback wheel-view(delta-y: length) -> bool;
     callback row-double-clicked(index: int);
@@ -233,13 +242,19 @@ export component FileList inherits Rectangle {
     out property <length> grid-gap-out: root.grid-gap;
     /// 列表可视宽度（icons 网格列数计算用，供调试观测）。
     out property <length> view-width: flick.width;
+    /// 名称区真实宽度（含自适应压缩后的值），供 Rust 精确判定「是否截断」，
+    /// 避免用下发列宽估算导致「实际截断了却判定为没截断」。
+    out property <length> name-area-w: root.view-mode == "details" || root.view-mode == "list"
+        ? root.col-name-w
+        : (root.view-mode == "icons-small" ? root.item-w - 58px : root.item-w - 8px);
     /// 当前视图是否为图标网格。
     out property <bool> is-icons-view: root.view-mode != "details" && root.view-mode != "list";
 
     // ---- 展开名称层（单个选中 / 重命名）----
     /// 本行是否正被“展开名称层”接管（接管时行内不画名字/容量，避免浮层下方漏字）
     pure function row-expanded(idx: int) -> bool {
-        return root.expand-active && root.expand-index == idx;
+        return (root.expand-active && root.expand-index == idx)
+            || (root.hover-expand-active && root.hover-expand-index == idx);
     }
 
     /// 需要“展开名称”的条目**绝对索引**（-1 = 无）。由 Rust 计算：
@@ -257,8 +272,25 @@ export component FileList inherits Rectangle {
     private property <bool> expand-active: root.is-icons-view
         && root.view-mode != "icons-small"
         && root.expand-index >= 0;
+
+    /// 悬停浮层的条目索引（-1 = 无）。
+    ///
+    /// 为什么要单独一份：`expand-index` 只能装一个值，选中项和悬停项
+    /// 只能轮流占用它——悬停别的格子时它被改成悬停项，选中项的行内名称
+    /// 随之被隐藏，下一个事件又改回去，两层浮层就一直互相顶掉（闪烁）。
+    /// 这里让「选中/重命名」和「悬停」各用一套属性，两者可以同时显示。
+    in-out property <int> hover-expand-index: -1;
+    in-out property <[GridLine]> hover-expand-lines: [];
+    in-out property <length> hover-expand-box-w: 0px;
+    /// 悬停项与选中项是同一个格子时不再重复画（否则两个浮层叠在一起）。
+    private property <bool> hover-expand-active: root.is-icons-view
+        && root.view-mode != "icons-small"
+        && root.hover-expand-index >= 0
+        && root.hover-expand-index != root.expand-index;
     private property <int> ex-col: Math.mod(max(0, root.expand-index), max(1, root.cells-per-row));
     private property <int> ex-row: floor(max(0, root.expand-index) / max(1, root.cells-per-row));
+    private property <int> hv-col: Math.mod(max(0, root.hover-expand-index), max(1, root.cells-per-row));
+    private property <int> hv-row: floor(max(0, root.hover-expand-index) / max(1, root.cells-per-row));
     private property <length> ex-item-x: root.cell-x(root.ex-col);
     /// 框的最小宽度（= 格子的可见宽，左右各留 4px 边距）
     private property <length> ex-cell-w: root.cell-w - 8px;
@@ -305,6 +337,15 @@ export component FileList inherits Rectangle {
     /// 兜底夹取：窗口极窄（列数=1 且浮层比可视区还宽）时才生效。
     private property <length> ex-box-x: max(4px, min(ex-want-x, root.width - 4px - ex-box-w));
     private property <length> ex-box-y: flick.y + flick.content-y + ex-row * root.cell-h
+        + 4px + root.cell-thumb + 3px;
+
+    // 悬停浮层的同一套几何（与选中浮层完全对称，只是换了索引/行/宽）。
+    private property <length> hv-item-x: root.cell-x(root.hv-col);
+    private property <length> hv-box-w: max(root.hover-expand-box-w, 1px);
+    private property <length> hv-box-h: max(root.hover-expand-lines.length * root.line-h + 14px, 30px);
+    private property <length> hv-want-x: hv-item-x + (root.item-w - hv-box-w) / 2;
+    private property <length> hv-box-x: max(4px, min(hv-want-x, root.width - 4px - hv-box-w));
+    private property <length> hv-box-y: flick.y + flick.content-y + hv-row * root.cell-h
         + 4px + root.cell-thumb + 3px;
 
     /// 滚动到顶端（导航/过滤变化时由 Rust 调用）。
@@ -392,24 +433,48 @@ export component FileList inherits Rectangle {
     in-out property <bool> is-computer-view: false;
     in-out property <length> w-type: 116px;
     in-out property <length> w-size: 96px;
+    /// 该目录的列宽是「自适应」（没有用户手动拖过的记录）时为 true。
+    /// 此时名称列会被压缩到不出横向滚动条；手动调过的目录完全按记录值，
+    /// 用户拖宽就允许出现滚动条（不能悄悄改回去）。
+    in-out property <bool> auto-col-widths: true;
     /// 双击列边界时用的估算宽度（Rust 按最长内容字符数估算后下发），
     /// 顺序：名称 / 修改时间 / 类型 / 大小 / 路径。
     in property <[length]> autofit-widths: [];
+    /// 鼠标左键是否按住（main_window 从 Rust/winit 回填）。Slint 的 TextInput
+    /// 拖选期间抓住鼠标，行内 TouchArea 收不到事件，重命名输入框的
+    /// 「拖选贴边自动滚动」只能从这里拿按下状态。
+    in property <bool> mouse-left-pressed: false;
     /// 用户拖动列边界结束（或双击自适应）后上报，由 Rust 按当前目录落盘。
-    callback col_resized(index: int, width: length);
+    /// `name-w` = 松手瞬间名称列的**显示宽**（自适应时是视口剩余宽，不是 w-name）。
+    /// 名称列宽度只能由 Rust 连同 auto 开关一起原子提交，原因见 record_col_width。
+    callback col_resized(index: int, width: length, name-w: length);
     // 列宽拖动状态：记录按下时的指针绝对 x 与列宽，rs-col 是正在拖的列号
     // （-1 = 没在拖，用来给分隔符上高亮色）。
     private property <length> rs-start-px: 0px;
     private property <length> rs-start-w: 0px;
     private property <int> rs-col: -1;
-    /// 最右侧留白：方便在空白处拖拽框选文件。
-    private property <length> right-pad: 96px;
+    // 本次按下周期内是否真的拖动过（位移超过阈值）。双击自动调整只在「没有拖过」
+    // 时生效，避免「先点一下分隔符、紧接着快速拖一下」被 Slint 当成双击而把刚拖出
+    // 的宽度又弹回内容自适应。
+    private property <bool> rs-dragged: false;
+    /// 拖动右侧列（修改时间 / 类型 / 大小）时，按下瞬间名称列的显示宽快照。
+    /// 拖动过程中右列一变，auto-name-w 就反向变化，松手时再读 col-name-w 会得到
+    /// 「被拖动量抵消过」的值；必须用按下时的快照才能把名称列钉在用户看到的宽度。
+    private property <length> rs-start-name-w: 0px;
+    /// 拖动期间名称列宽的本地锁定值（-1 = 未锁定）。
+    /// 拖右列时必须锁住名称列，否则 auto-name-w 会因 w-modified 变化
+    /// 反向补偿，表现为「动的是另一条分隔符」。拖名称列自身时锁存的就是
+    /// 实时拖出的宽度，等于把「跟手」也走同一个通道。
+    private property <length> rs-name-lock: -1px;
+    /// 最右侧留白：方便在空白处拖拽框选文件（减为原来一半，少占名称列空间）。
+    private property <length> right-pad: 48px;
     /// 滚动条轨道宽（含内边距）。
     private property <length> sb-width: 12px;
     /// 滚动条按下时记录的滑块 y，用于计算拖拽增量。
     private property <length> sb-drag-grab-y: 0px;
-    /// 横向滚动条按下时记录的滑块 x。
+    /// 横向滚动条按下时记录的滑块 x 与鼠标 x（拖拽用增量算目标位置）。
     private property <length> hsb-drag-start-thumb-x: 0px;
+    private property <length> hsb-drag-start-mouse-x: 0px;
 
     // 视口纵向边界，供滚轮/滚动条钳制。
     private property <length> min-content-y: min(0px, flick.height - flick.content-height);
@@ -428,9 +493,28 @@ export component FileList inherits Rectangle {
     // 列几何（表头与行共用，保证像素级对齐）。
     private property <length> col-icon-x: 8px;
     private property <length> col-name-x: 8px + root.w-icon;
+    /// 名称列上限：1920 逻辑宽（含 4K@2x）下 auto-name-w 触不到此上限，
+    /// 名称列始终撑满剩余空间；仅在超宽屏（auto-name-w 超过此值）时才封顶，
+    /// 避免名称列被拉得过长、右侧留白过多导致用不习惯。
+    private property <length> name-max-w: 2000px;
+    /// 自适应预算：视口宽扣掉图标列、其余固定列、路径列、以及「大小」列右侧
+    /// 预留的框选留白，剩下的全给名称列。只在该目录没有手动列宽记录时生效。
+    private property <length> auto-name-w: max(160px,
+        flick.width - root.col-name-x - root.w-modified - root.w-type - root.w-size
+        - root.col-path-w - root.right-pad - 8px);
     private property <length> col-name-w: root.view-mode == "list"
         ? max(140px, flick.width - root.col-name-x - 10px)
-        : root.w-name;
+        : (root.view-mode == "details"
+            ? (root.rs-name-lock >= 0px
+                // 拖动任何分隔符期间用本地锁定值：不能靠 auto-col-widths，
+                // 它要等松手后 Rust 提交才变，拖动过程中仍为 true，
+                // 而 auto-name-w 里减掉了 w-modified —— 往左拖右列会让名称列
+                // 反向变宽，用户看到的是左边那条分隔符在跑（不是手上那条）。
+                ? root.rs-name-lock
+                : (root.auto-col-widths
+                    ? min(root.auto-name-w, root.name-max-w)
+                    : root.w-name))
+            : root.w-name);
     private property <length> col-path-w: root.path-w-base;
     /// 最后一列的右边界（= 「大小」列右边那条分隔符的位置，显示路径列时顺延）。
     /// 三个用途：行点击区的右界、表头最后一条分隔线、横向滚动条的判定基准。
@@ -447,6 +531,13 @@ export component FileList inherits Rectangle {
         root.w-modified = m;
         root.w-type = t;
         root.w-size = s;
+    }
+    // 在 Slint 侧切换「名称列窗口自适应」开关。必须走 Slint 侧（而非 Rust 的
+    // set_col_auto_widths），否则 Rust 直接 set 的值不会可靠传播到 col-name-w 的求值，
+    // 导致切目录把 auto 置回 true 后，名称列仍停在 w-name（内容拟合宽）——表现为
+    // 长文件名目录出现横向滚动条、短文件名目录右侧留白。拖拽时置 false 也是 Slint 侧设的，可正常传播。
+    public function set-auto-col-widths(flag: bool) {
+        root.auto-col-widths = flag;
     }
 
     // 供 Rust 切换标签时，强制重置滚动条（直接操作底层 Flickable）
@@ -569,8 +660,11 @@ export component FileList inherits Rectangle {
 
             // 列宽拖拽手柄：后声明 → 叠在表头之上，只占 6px 条带，不影响点击
             // 标题排序。拖动结束（up）或双击自适应后上报，由 Rust 按目录落盘。
+            // 关键：表头单元格容器已经用 `x: flick.content-x` 随横向滚动移动，
+            // 这些手柄与分隔符必须同步补偿，否则出现横向滚动条后手柄停在原位，
+            // 与列边界错位、点不中（用户反馈「排序分隔符不跟着滚」）。
             h-name := TouchArea {
-                x: root.col-modified-x - 3px;
+                x: root.col-modified-x - 3px + flick.content-x;
                 width: 6px;
                 height: parent.height - 1px;
                 mouse-cursor: col-resize;
@@ -585,27 +679,51 @@ export component FileList inherits Rectangle {
                 moved => {
                     if (self.pressed) {
                         let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
-                        root.w-name = max(120px, root.rs-start-w + d);
+                        if (abs(d) > 4px) {
+                            // 首次越过拖拽阈值：先把 w-name 对齐到当前「显示宽」
+                            // （自适应时等于视口剩余宽，而非默认 320），再解除自适应，
+                            // 这样 col-name-w 从 auto-name-w 平滑过渡到 w-name，
+                            // 分隔符不会在按下瞬间跳位置、导致 up 落空。
+                            if (!root.rs-dragged) {
+                                root.w-name = root.rs-start-w;
+                                root.auto-col-widths = false;
+                                root.rs-dragged = true;
+                            }
+                            root.w-name = max(120px, root.rs-start-w + d);
+                            root.rs-name-lock = root.w-name;
+                        }
                     }
                 }
                 pointer-event(e) => {
                     if (e.kind == PointerEventKind.down) {
                         root.rs-col = 0;
+                        root.rs-dragged = false;
                         root.rs-start-px = self.absolute-position.x + self.mouse-x;
-                        root.rs-start-w = root.w-name;
+                        // 记录当前「显示宽」col-name-w（自适应时是视口剩余宽，手动时是
+                        // w-name），用它当起点，避免起点跳变。down 时不碰 auto/w-name，
+                        // 否则分隔符会瞬移、鼠标 up 落空，首拖像「被自动调整」。
+                        root.rs-start-w = root.col-name-w;
                     }
                     if (e.kind == PointerEventKind.up) {
                         root.rs-col = -1;
-                        root.col_resized(0, root.w-name);
+                        root.rs-name-lock = -1px;
+                        // 只有真正拖动过才提交，单击分隔符不锁定/不改动自适应。
+                        if (root.rs-dragged) {
+                            root.col_resized(0, root.w-name, root.w-name);
+                        }
                     }
                 }
                 // 双击 = 自适应：宽度传 -1 表示「按内容估算」，由 Rust 现算。
+                // 但若本次按下周期内真的拖动过（rs-dragged），说明用户本意是拖拽，
+                // 不是双击，跳过自动调整，避免把刚拖出的宽度弹回内容自适应。
                 double-clicked => {
-                    root.col_resized(0, -1px);
+                    if (!root.rs-dragged) {
+                        root.col_resized(0, -1px, root.w-name);
+                    }
                 }
             }
             h-mod := TouchArea {
-                x: root.col-type-x - 3px;
+                x: root.col-type-x - 3px + flick.content-x;
                 width: 6px;
                 height: parent.height - 1px;
                 mouse-cursor: col-resize;
@@ -619,26 +737,46 @@ export component FileList inherits Rectangle {
                 moved => {
                     if (self.pressed) {
                         let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
-                        root.w-modified = max(70px, root.rs-start-w + d);
+                        if (abs(d) > 4px) {
+                            if (!root.rs-dragged) {
+                                root.rs-dragged = true;
+                            }
+                            root.w-modified = max(70px, root.rs-start-w + d);
+                        }
                     }
                 }
                 pointer-event(e) => {
                     if (e.kind == PointerEventKind.down) {
                         root.rs-col = 1;
+                        root.rs-dragged = false;
                         root.rs-start-px = self.absolute-position.x + self.mouse-x;
                         root.rs-start-w = root.w-modified;
+                        // 名称列显示宽在 down 时拍快照：拖动过程中右列一变，
+                        // auto-name-w 就会跟着反向变，用它当提交值会得到「被拖动量
+                        // 反向抵消过」的宽度，等于名称列照旧不动。
+                        root.rs-start-name-w = root.col-name-w;
+                        // 名字列宽已在上两行取完，但如果按下时鼠标已贴着手柄、
+                        // 接下来第一帧就会越过阈值，那时 col-name-w 已被 w-modified
+                        // 带脏，所以马上加锁。
+                        root.rs-name-lock = root.rs-start-name-w;
                     }
                     if (e.kind == PointerEventKind.up) {
                         root.rs-col = -1;
-                        root.col_resized(1, root.w-modified);
+                        root.rs-name-lock = -1px;
+                        // 只有真正拖动过才提交，单击分隔符不改宽度。
+                        if (root.rs-dragged) {
+                            root.col_resized(1, root.w-modified, root.rs-start-name-w);
+                        }
                     }
                 }
                 double-clicked => {
-                    root.col_resized(1, -1px);
+                    if (!root.rs-dragged) {
+                        root.col_resized(1, -1px, root.rs-start-name-w);
+                    }
                 }
             }
             h-type := TouchArea {
-                x: root.col-size-x - 3px;
+                x: root.col-size-x - 3px + flick.content-x;
                 width: 6px;
                 height: parent.height - 1px;
                 mouse-cursor: col-resize;
@@ -652,26 +790,39 @@ export component FileList inherits Rectangle {
                 moved => {
                     if (self.pressed) {
                         let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
-                        root.w-type = max(60px, root.rs-start-w + d);
+                        if (abs(d) > 4px) {
+                            if (!root.rs-dragged) {
+                                root.rs-dragged = true;
+                            }
+                            root.w-type = max(60px, root.rs-start-w + d);
+                        }
                     }
                 }
                 pointer-event(e) => {
                     if (e.kind == PointerEventKind.down) {
                         root.rs-col = 2;
+                        root.rs-dragged = false;
                         root.rs-start-px = self.absolute-position.x + self.mouse-x;
                         root.rs-start-w = root.w-type;
+                        root.rs-start-name-w = root.col-name-w;
+                        root.rs-name-lock = root.rs-start-name-w;
                     }
                     if (e.kind == PointerEventKind.up) {
                         root.rs-col = -1;
-                        root.col_resized(2, root.w-type);
+                        root.rs-name-lock = -1px;
+                        if (root.rs-dragged) {
+                            root.col_resized(2, root.w-type, root.rs-start-name-w);
+                        }
                     }
                 }
                 double-clicked => {
-                    root.col_resized(2, -1px);
+                    if (!root.rs-dragged) {
+                        root.col_resized(2, -1px, root.rs-start-name-w);
+                    }
                 }
             }
             h-size := TouchArea {
-                x: root.col-path-x - 3px;
+                x: root.col-path-x - 3px + flick.content-x;
                 width: 6px;
                 height: parent.height - 1px;
                 mouse-cursor: col-resize;
@@ -685,29 +836,42 @@ export component FileList inherits Rectangle {
                 moved => {
                     if (self.pressed) {
                         let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
-                        root.w-size = max(60px, root.rs-start-w + d);
+                        if (abs(d) > 4px) {
+                            if (!root.rs-dragged) {
+                                root.rs-dragged = true;
+                            }
+                            root.w-size = max(60px, root.rs-start-w + d);
+                        }
                     }
                 }
                 pointer-event(e) => {
                     if (e.kind == PointerEventKind.down) {
                         root.rs-col = 3;
+                        root.rs-dragged = false;
                         root.rs-start-px = self.absolute-position.x + self.mouse-x;
                         root.rs-start-w = root.w-size;
+                        root.rs-start-name-w = root.col-name-w;
+                        root.rs-name-lock = root.rs-start-name-w;
                     }
                     if (e.kind == PointerEventKind.up) {
                         root.rs-col = -1;
-                        root.col_resized(3, root.w-size);
+                        root.rs-name-lock = -1px;
+                        if (root.rs-dragged) {
+                            root.col_resized(3, root.w-size, root.rs-start-name-w);
+                        }
                     }
                 }
                 double-clicked => {
-                    root.col_resized(3, -1px);
+                    if (!root.rs-dragged) {
+                        root.col_resized(3, -1px, root.rs-start-name-w);
+                    }
                 }
             }
 
             // 「大小」列右边（显示路径列时是路径列右边）的分隔符：
             // 它界定行点击区与横向滚动的边界，右侧留白从这里往后算。
             if (root.show-path-column) : Rectangle {
-                x: root.col-end - 0.5px;
+                x: root.col-end - 0.5px + flick.content-x;
                 y: (parent.height - 16px) / 2;
                 width: 1px;
                 height: 16px;
@@ -754,6 +918,14 @@ export component FileList inherits Rectangle {
                 scroll-event(event) => {
                     // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
                     if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
+                    // 只有横向滚动条时（纵向内容不溢出），垂直滚轮之前被下面的
+                    // delta-y 分支吞掉、content-y 又被 clamp 回 0，表现为「滚轮完全没反应」。
+                    // 这里把 delta-y 折算成横向滚动量，让滚轮仍然可用。
+                    if (event.delta-y != 0px && root.min-content-y >= 0px && root.min-content-x < 0px) {
+                        root.scroll-user-input();
+                        flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-y));
+                        return EventResult.accept;
+                    }
                     if (event.delta-y != 0px) {
                         root.scroll-user-input();
                         flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
@@ -825,6 +997,16 @@ export component FileList inherits Rectangle {
 
             for row[i] in root.rows : Rectangle {
                 visible: !root.is-icons-view;
+                // 名称浮层是否显示。必须只看 ta.has-hover，不能再引入浮层自身的
+                // hover：浮层里一旦放 TouchArea，就会在鼠标静止时新出现而 Slint
+                // 不会立即更新其 has-hover → 浮层永远活不过一帧，变成闪烁。
+                // 因此浮层不接管鼠标，点击靠下方 ta，并按 name-overlay-shown
+                // 把整行都当作名称区（见 ta 的 name-hit 参数）。
+                private property <bool> name-overlay-shown: root.rename-path != row.path
+                    && !root.is-selecting
+                    && (ta.has-hover || (row.selected && root.single-selection))
+                    && (row.name-truncated
+                        || name-measure-details.preferred-width > root.col-name-w);
                 y: row.index * root.row-h;
                 x: 0px;
                 // 行元素（含点击区）只铺到最后一列右边界：右侧留白里不存在行，
@@ -869,7 +1051,7 @@ export component FileList inherits Rectangle {
                             // flick.content-y 是负值（向下滚动为负），加它等于减去滚动偏移。
                             let header-h = root.view-mode == "details" ? 30px : 0px;
                             let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
-                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x));
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x) || name-overlay-shown);
                             return EventResult.accept;
                         }
                         // 拖拽手势：move/up 继续转发给按下时捕获的行 TouchArea。
@@ -880,7 +1062,7 @@ export component FileList inherits Rectangle {
                             || event.kind == PointerEventKind.cancel) {
                             let header-h = root.view-mode == "details" ? 30px : 0px;
                             let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
-                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x));
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x) || name-overlay-shown);
                             return EventResult.accept;
                         }
                         return EventResult.reject;
@@ -895,6 +1077,13 @@ export component FileList inherits Rectangle {
                     scroll-event(event) => {
                     // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
                     if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
+                        // 只有横向滚动条时把垂直滚轮折算成横向滚动（否则事件被吞、
+                        // 页面毫无反应）。行是覆盖面积最大的区域，必须在这里也处理。
+                        if (event.delta-y != 0px && root.min-content-y >= 0px && root.min-content-x < 0px) {
+                            root.scroll-user-input();
+                            flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-y));
+                            return EventResult.accept;
+                        }
                         if (event.delta-y != 0px) {
                             root.scroll-user-input();
                             flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
@@ -946,12 +1135,57 @@ export component FileList inherits Rectangle {
                     }
                 }
 
-                // 名称 / 内联重命名
-                if (root.rename-path == row.path) : rename-input-details := SingleLineEdit {
-                    x: root.col-name-x;
-                    width: root.col-name-w;
+                // 完整名称测量（不显示）：判断名称是否被列宽截断，并给浮层定宽。
+                name-measure-details := Text {
+                    visible: false;
+                    text: row.name;
+                    font-size: 13px;
+                    font-weight: row.is-dir ? 500 : 400;
+                    wrap: no-wrap;
+                }
+
+                // 名称 / 内联重命名：套一层单行浮层突出显示，宽度随输入文本
+                // 伸展/收缩，最长占整行（从名称列起点到行右边界）。
+                if (root.rename-path == row.path) : Rectangle {
+                    // 浮层几何：优先从名称列起点往右伸展，可越过「大小」列直到
+                    // 视口右边界（占满整行）；右边塞不下完整文件名时整体左移，
+                    // 覆盖本行的图标列，仍保证「最长占整行」。
+                    // 视口右边缘（相对行左）：横向未滚到底时 parent.width
+                    // 是整个内容宽，直接拿来定浮层右界会被 Flickable 裁掉。
+                    property <length> row-right: max(120px, min(parent.width, flick.width - flick.content-x) - 4px);
+                    // 视口左边缘（相对行左）：横向滚到右边时为正値，浮层不能往左
+                    // 越过它，否则左边会被列表左边缘裁掉（只有 0px 下限是不够的）。
+                    property <length> row-left: max(0px, -flick.content-x + 4px);
+                    property <length> wanted: max(80px, rename-measure-details.preferred-width + 18px);
+                    property <length> box-w: min(self.wanted, self.row-right - self.row-left);
+                    property <length> box-x: (root.col-name-x + self.box-w <= self.row-right)
+                        ? max(self.row-left, root.col-name-x)
+                        : max(self.row-left, self.row-right - self.box-w);
+                    x: self.box-x;
+                    y: 0px;
+                    width: self.box-w;
                     height: parent.height;
-                    z: 10; // 确保处于最上层，不被背景或其他透明图层拦截点击
+                    z: 10;
+                    border-radius: 4px;
+                    background: Theme.bg-input;
+                    border-width: 1.5px;
+                    border-color: Theme.accent;
+                    drop-shadow-blur: 8px;
+                    drop-shadow-color: #00000022;
+                    drop-shadow-offset-y: 2px;
+
+                    rename-measure-details := Text {
+                        visible: false;
+                        text: root.rename-text;
+                        font-size: 13px;
+                        wrap: no-wrap;
+                    }
+
+                    rename-input-details := SingleLineEdit {
+                    mouse-pressed: root.mouse-left-pressed;
+                    x: 6px;
+                    width: parent.width - 12px;
+                    height: parent.height;
                     text <=> root.rename-text;
                     // 核心修复：必须显式指定颜色，否则沿用主题默认白字 —— 在白底上就看不见了。
                     text-color: Theme.text-primary;
@@ -1036,7 +1270,9 @@ export component FileList inherits Rectangle {
                         }
                         return EventResult.reject;
                     }
+                    }
                 }
+
                 // 名称(普通):无高亮查询时的默认渲染,保持 elide。
                 if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
                     x: root.col-name-x;
@@ -1060,6 +1296,62 @@ export component FileList inherits Rectangle {
                     font-size: 13px;
                     is-dir: row.is-dir;
                     opacity: row.cut ? 0.45 : (row.is-hidden ? 0.5 : 1.0);
+                }
+
+                // 名称截断浮层：单选时（选中或鼠标悬停）展示完整文件名。
+                // 多选一律不弹，避免框选后满屏浮层互相遮挡。
+                // 截断判定分两路，务必与**行内实际渲染**同源：
+                //  · 说明：判定必须与行内实际渲染**实测同源**，不能依赖
+                //    Rust 的 row.name-truncated —— 那是 grid_display_lines
+                //    用「ASCII 7px / 非 ASCII 13px」字符宽估算的结果，遇到
+                //    ✿ ⭐ ❤️ 这类回退字体符号会低估实际宽度：行内已被
+                //    elide 截断扩展名，估算却认为放得下，浮层就不弹。
+                //    实测过 parts=3 / trunc_flag=0 / measure=375 / col=350
+                //    正是这种情形。因此统一用 name-measure-details 实测宽度，
+                //    row.name-truncated 只当兜底（两者任一成立就弹）。
+                if (name-overlay-shown) : Rectangle {
+                    // 视口右边缘（相对行左），理由同重命名浮层。
+                    property <length> row-right: max(120px, min(parent.width, flick.width - flick.content-x) - 4px);
+                    property <length> row-left: max(0px, -flick.content-x + 4px);
+                    property <length> wanted: max(80px, name-measure-details.preferred-width + 16px);
+                    property <length> box-w: min(self.wanted, self.row-right - self.row-left);
+                    // 右边还有空间 → 从名称列起点往右伸展、越过「大小」列占满整行；
+                    // 塞不下 → 整体左移覆盖自己的图标，仍保证 longest = 整行。
+                    property <length> box-x: (root.col-name-x + self.box-w <= self.row-right)
+                        ? max(self.row-left, root.col-name-x)
+                        : max(self.row-left, self.row-right - self.box-w);
+                    x: self.box-x;
+                    y: 0px;
+                    width: self.box-w;
+                    height: parent.height;
+                    z: 20;
+                    border-radius: 4px;
+                    background: Theme.bg-popup;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    drop-shadow-blur: 8px;
+                    drop-shadow-color: #00000022;
+                    drop-shadow-offset-y: 2px;
+                    // 纯文字（无搜索查询）：浮层宽度已按完整名算，无需再 elide。
+                    if (row.tip-parts.length == 0) : Text {
+                        x: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height;
+                        text: row.name;
+                        color: Theme.text-primary;
+                        font-size: 13px;
+                        font-weight: row.is-dir ? 500 : 400;
+                        vertical-alignment: center;
+                    }
+                    // 搜索态：用**未截断**的完整高亮分段，浮层才不会把省略号带进来。
+                    if (row.tip-parts.length > 0) : HighlightName {
+                        x: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height;
+                        parts: row.tip-parts;
+                        font-size: 13px;
+                        is-dir: row.is-dir;
+                    }
                 }
 
                 // 修改时间
@@ -1160,6 +1452,9 @@ export component FileList inherits Rectangle {
                 y: floor(row.index / root.cells-per-row) * root.cell-h + 4px;
                 width: root.item-w;
                 height: root.cell-h - 8px;
+                // 小图标的名称浮层会往右伸出格子；z 只在同一父级里排序，
+                // 所以要把「整个格子」抬到邻居之上，浮层才不会被右邻盖住。
+                z: (root.rename-path == row.path || row.selected || ta-icons.has-hover) ? 10 : 0;
                 border-radius: 8px;
                 // 拖拽悬停到文件夹：显示醒目的选中色 + 强调色高亮边框；悬停到普通文件显示弱悬停底色
                 background: (row.index == root.drop-hover-index && row.is-dir) || row.selected
@@ -1172,13 +1467,27 @@ export component FileList inherits Rectangle {
                     width: 100%;
                     height: 100%;
 
+                    changed has-hover => {
+                        root.hover-row(self.has-hover ? row.index : -1);
+                    }
+
                     scroll-event(event) => {
                     // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
                     if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
+                        // 仅横向可滚时把垂直滚轮折算成横向。
+                        if (event.delta-y != 0px && root.min-content-y >= 0px && root.min-content-x < 0px) {
+                            root.scroll-user-input();
+                            flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-y));
+                            return EventResult.accept;
+                        }
                         if (event.delta-y != 0px) {
                             root.scroll-user-input();
                             flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
                             root.scroll-changed(-flick.content-y);
+                            return EventResult.accept;
+                        }
+                        if (event.delta-x != 0px) {
+                            flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-x));
                             return EventResult.accept;
                         }
                         return EventResult.reject;
@@ -1267,29 +1576,130 @@ export component FileList inherits Rectangle {
                     }
 
                     // 名称:搜索命中时高亮,否则普通 elide。
-                    // 核心修复：重命名时就地渲染输入框（图标视图之前完全没有输入框，
-                    // 导致 F2/菜单进入重命名后什么都不出现，键盘还会被“重命名中”状态全吞）。
-                    if (root.rename-path == row.path) : rename-input-icon-small := SingleLineEdit {
+                    // 重命名时的输入框改由下面的「单行浮层」承载（不在布局里，
+                    // 否则 HorizontalLayout 会把宽度锁死在格子内，无法往右伸展）。
+                    if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
                         width: parent.width - 50px;
                         height: 44px;
+                        parts: row.name-parts;
+                        font-size: 12px;
+                        is-dir: row.is-dir;
+                    }
+                    if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
+                        width: parent.width - 50px;
+                        height: 44px;
+                        text: row.name;
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        font-weight: row.is-dir ? 500 : 400;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+
+                // 小图标视图的完整名测量（判断截断 + 给浮层定宽）。
+                name-measure-small := Text {
+                    visible: false;
+                    text: row.name;
+                    font-size: 12px;
+                    font-weight: row.is-dir ? 500 : 400;
+                    wrap: no-wrap;
+                }
+
+                // 小图标：重命名单行浮层 + 截断展示浮层，共用的几何：
+                //   · 起点 = 名称区左边界（图标 44px + spacing 6px）；
+                //   · 优先往右伸展，最长占「整行」；
+                //   · 右侧塞不下完整文件名时**整体往左伸展**，允许 x 为负、
+                //     越过本格子左边界盖在左边的其他文件上，直到占满整行。
+                //   · 浮层宽度 = min(完整名宽 + 内边距, 整行宽)，随文本伸展/收缩。
+                // 用格子层级而不是布局层级，才能突破格子宽度盖住左右邻居；
+                // 格子自身的 z 已在上面提升，因此负 x 的部分也在邻居之上。
+                if (root.view-mode == "icons-small"
+                    && (root.rename-path == row.path
+                        || (!root.is-selecting
+                            && (ta-icons.has-hover || (row.selected && root.single-selection))
+                            // 与详细信息视图同款修正：row.name-truncated 是 Rust 的
+                            // 字符宽估算（非 ASCII 一律按 13px），遇 ✿ ⭐ ❤️ 等
+                            // 回退字体符号会低估宽度 → 行内已截断却不弹浮层。
+                            // 行内名称文本框宽 = parent.width - 50px，用它做实测比较，
+                            // 估算值只当兜底（任一成立就弹）。
+                            && (row.name-truncated
+                                || name-measure-small.preferred-width > parent.width - 50px)))) : Rectangle {
+                    // 本格子左上角相对「整行」的可用区间：
+                    //   row-left 可为负（列表最左边在本格子左侧时），
+                    //   row-right 是格子左边到列表右边界的距离。
+                    property <length> row-left: 4px - root.cell-x(Math.mod(row.index, root.cells-per-row));
+                    property <length> row-right: max(120px,
+                        root.width - root.cell-x(Math.mod(row.index, root.cells-per-row)) - 4px);
+                    property <length> full-row-w: max(80px, self.row-right - self.row-left);
+                    property <length> wanted: (root.rename-path == row.path)
+                        ? max(60px, rename-measure-small.preferred-width + 18px)
+                        : max(60px, name-measure-small.preferred-width + 16px);
+                    // 上限改成整行宽（原来是 row-right-4px，等于禁止左伸展）。
+                    property <length> box-w: min(self.wanted, self.full-row-w);
+                    property <length> box-x: (50px + self.box-w <= self.row-right)
+                        ? 50px
+                        : max(self.row-left, self.row-right - self.box-w);
+
+                    x: self.box-x;
+                    y: (parent.height - 30px) / 2;
+                    width: self.box-w;
+                    height: 30px;
+                    z: 20;
+                    border-radius: 4px;
+                    background: root.rename-path == row.path ? Theme.bg-input : Theme.bg-popup;
+                    border-width: root.rename-path == row.path ? 1.5px : 1px;
+                    border-color: root.rename-path == row.path ? Theme.accent : Theme.border;
+                    drop-shadow-blur: 8px;
+                    drop-shadow-color: #00000022;
+                    drop-shadow-offset-y: 2px;
+
+                    rename-measure-small := Text {
+                        visible: false;
+                        text: root.rename-text;
+                        font-size: 12px;
+                        wrap: no-wrap;
+                    }
+
+                    // 非重命名：展示完整文件名（搜索态保留命中高亮）。
+                    if (root.rename-path != row.path && row.tip-parts.length == 0) : Text {
+                        x: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height;
+                        text: row.name;
+                        color: Theme.text-primary;
+                        font-size: 12px;
+                        font-weight: row.is-dir ? 500 : 400;
+                        vertical-alignment: center;
+                    }
+                    if (root.rename-path != row.path && row.tip-parts.length > 0) : HighlightName {
+                        x: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height;
+                        parts: row.tip-parts;
+                        font-size: 12px;
+                        is-dir: row.is-dir;
+                    }
+
+                    // 重命名：单行输入框（焦点/提交逻辑与之前一致，只是换了容器）。
+                    if (root.rename-path == row.path) : rename-input-icon-small := SingleLineEdit {
+                        mouse-pressed: root.mouse-left-pressed;
+                        x: 6px;
+                        width: parent.width - 12px;
+                        height: parent.height;
                         text <=> root.rename-text;
                         text-color: Theme.text-primary;
                         font-size: 12px;
                         selection-background: Theme.accent;
                         selection-foreground: Theme.accent-text;
 
-                        init => {
-                            // 不在 init 里 focus（详见详细视图输入框的说明）。
-                            root.rename-text = row.name;
-                        }
+                        init => { root.rename-text = row.name; }
 
-                        // 延迟一拍再抢焦点（详见详细视图里的说明）。
                         rename-focus-icon := Timer {
                             interval: 60ms;
                             running: true;
                             triggered => {
                                 self.running = false;
-                                // 只在 icons-small 生效（视图限定，理由见详细视图输入框）。
                                 if (root.rename-path == row.path && root.view-mode == "icons-small") {
                                     let keep-y = flick.content-y;
                                     rename-input-icon-small.focus-input();
@@ -1308,12 +1718,10 @@ export component FileList inherits Rectangle {
                             root.rename-text = t;
                             root.rename-text-changed(t);
                         }
-
                         accepted(t) => {
                             root.rename-text = t;
                             root.rename-committed(row.path, t);
                         }
-
                         key-pressed(event) => {
                             if (event.text == Key.Escape) {
                                 root.rename-cancelled();
@@ -1321,23 +1729,6 @@ export component FileList inherits Rectangle {
                             }
                             return EventResult.reject;
                         }
-                    }
-                    if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
-                        width: parent.width - 50px;
-                        height: 44px;
-                        parts: row.name-parts;
-                        font-size: 12px;
-                        is-dir: row.is-dir;
-                    }
-                    if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
-                        width: parent.width - 50px;
-                        height: 44px;
-                        text: row.name;
-                        color: Theme.text-primary;
-                        font-size: 12px;
-                        font-weight: row.is-dir ? 500 : 400;
-                        vertical-alignment: center;
-                        overflow: elide;
                     }
                 }
 
@@ -1451,6 +1842,9 @@ export component FileList inherits Rectangle {
 
             // ---- 框选视觉层（不需要 TouchArea 拦截） ----
             if (root.is-selecting) : Rectangle {
+                // 必须高于图标格子的 z（含名称浮层的格子会抬到 10，浮层自身 20），
+                // 否则框选方框被图标盖在下面，验收时看起来「框选没了」。
+                z: 40;
                 x: min(root.sel-x1, root.sel-x2);
                 y: min(root.sel-y1, root.sel-y2);
                 width: abs(root.sel-x1 - root.sel-x2);
@@ -1496,12 +1890,16 @@ export component FileList inherits Rectangle {
             pointer-event(event) => {
                 if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
                     hsb-drag-start-thumb-x = min(hscrollbar.track-w - hscrollbar.thumb-w, max(0px, hscrollbar.thumb-x));
+                    // 记下按下时的鼠标 x：拖拽位移 = 当前 mouse-x - 起始 mouse-x。
+                    // 之前直接把「当前 mouse-x + 起始滑块位置」当目标位置，
+                    // 于是滑块在最右端时按下再往左拖，目标仍被顶在最右 → 无法回拖。
+                    hsb-drag-start-mouse-x = self.mouse-x;
                 }
             }
 
             moved => {
                 if (self.pressed) {
-                    let target = self.mouse-x + hsb-drag-start-thumb-x;
+                    let target = hsb-drag-start-thumb-x + (self.mouse-x - hsb-drag-start-mouse-x);
                     let ratio = target / max(hscrollbar.track-w - hscrollbar.thumb-w, 1px);
                     flick.content-x = max(root.min-content-x, min(root.max-content-x, -ratio * (flick.content-width - flick.width)));
                 }
@@ -1565,10 +1963,20 @@ export component FileList inherits Rectangle {
             scroll-event(event) => {
                     // Ctrl+滚轮切视图：Rust 按住 Ctrl 时消费事件，列表不再滚动。
                     if (event.delta-y != 0px && root.wheel-view(event.delta-y)) { return EventResult.accept; }
+                // 只有横向滚动条时，鼠标停在纵向滚动条区域滚轮也要能横滚。
+                if (event.delta-y != 0px && root.min-content-y >= 0px && root.min-content-x < 0px) {
+                    root.scroll-user-input();
+                    flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-y));
+                    return EventResult.accept;
+                }
                 if (event.delta-y != 0px) {
                     root.scroll-user-input();
                     flick.content-y = min(root.max-content-y, max(root.min-content-y, flick.content-y + event.delta-y));
                     root.scroll-changed(-flick.content-y);
+                    return EventResult.accept;
+                }
+                if (event.delta-x != 0px) {
+                    flick.content-x = min(root.max-content-x, max(root.min-content-x, flick.content-x + event.delta-x));
                     return EventResult.accept;
                 }
                 return EventResult.reject;
@@ -1721,6 +2129,69 @@ export component FileList inherits Rectangle {
             TouchArea {
                 width: 100%;
                 height: 100%;
+                // 防闪烁：浮层是后声明的同级元素、盖住了名称区，鼠标下移到
+                // 文件名上时格子自己的 TouchArea 会收到 has-hover=false，
+                // 于是浮层消失 → 鼠标又落回格子 → 浮层再出现，来回抖。
+                // 把「鼠标在浮层上」单独上报给 Rust，由它在这次期间不把
+                // 悬停索引清成 -1（与事件到达先后无关，比重新钉索引可靠）。
+                changed has-hover => {
+                    root.overlay-hover(self.has-hover);
+                }
+                clicked => { root.name-overlay-clicked(); }
+            }
+        }
+    }
+
+    // ---- 悬停名称浮层（与选中/重命名浮层完全独立）----
+    //
+    // 为什么需要独立一层：`expand-index` 只能装一个值。选中一个文件后再悬停
+    // 另一个被截断的文件时，两者都要显示完整名，一层装不下，轮用同一个
+    // 索引就会“你出现我就消失”，鼠标一动两层互相顶掉，表现为两个浮层闪烁。
+    if (root.hover-expand-active) : Rectangle {
+        x: root.hv-box-x;
+        y: root.hv-box-y;
+        width: root.hv-box-w;
+        height: root.hv-box-h;
+        border-radius: 6px;
+        background: Theme.bg-input;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 8px;
+        drop-shadow-color: #00000022;
+        drop-shadow-offset-y: 2px;
+
+        Rectangle {
+            x: 4px;
+            y: 6px;
+            width: parent.width - 8px;
+            height: parent.height - 12px;
+            background: transparent;
+
+            for line[i] in root.hover-expand-lines : HorizontalLayout {
+                x: 0px;
+                y: i * root.line-h;
+                width: 100%;
+                height: root.line-h;
+                spacing: 0px;
+                alignment: center;
+
+                for part in line.parts : Text {
+                    width: self.preferred-width;
+                    height: 100%;
+                    text: part.text;
+                    color: part.hl ? Theme.accent : Theme.text-primary;
+                    font-size: 11.5px;
+                    vertical-alignment: top;
+                }
+            }
+
+            // 悬停浮层同样可以被点击：单击选中该文件。
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                changed has-hover => {
+                    root.overlay-hover(self.has-hover);
+                }
                 clicked => { root.name-overlay-clicked(); }
             }
         }

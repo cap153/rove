@@ -1,6 +1,7 @@
 /target
 /plan
 /.bak
+/.tmp-images
 Cargo.lock
 *.exe
 *.pdb

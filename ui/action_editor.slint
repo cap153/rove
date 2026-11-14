@@ -8,6 +8,8 @@ component StyledInput inherits Rectangle {
     in-out property <string> text;
     in property <string> placeholder: "";
     in property <bool> enabled: true;
+    /// 透传自主窗口：输入框拖选贴边自动滚动用。
+    in property <bool> mouse-pressed: false;
 
     height: 32px;
     vertical-stretch: 0;
@@ -17,6 +19,7 @@ component StyledInput inherits Rectangle {
     border-color: ti.has-focus ? Theme.accent : Theme.border;
 
     ti := SingleLineEdit {
+        mouse-pressed: root.mouse-pressed;
         x: 10px;
         width: parent.width - 20px;
         height: parent.height;
@@ -125,6 +128,8 @@ component TokenChip inherits Rectangle {
 }
 
 export component ActionEditorDialog inherits Rectangle {
+    /// 鼠标左键是否按住（透传自主窗口）：输入框拖选贴边自动滚动用。
+    in property <bool> mouse-pressed: false;
     in property <string> title: I18n.strings[52];
     in property <[string]> group-options: [I18n.strings[5]];
     in-out property <string> edit-id: "";
@@ -221,6 +226,7 @@ export component ActionEditorDialog inherits Rectangle {
                 spacing: 4px;
                 Text { text: I18n.strings[30]; color: Theme.text-secondary; font-size: 12px; }
                 StyledInput {
+                    mouse-pressed: root.mouse-pressed;
                     text <=> root.edit-label;
                     placeholder: I18n.strings[15];
                 }
@@ -234,6 +240,7 @@ export component ActionEditorDialog inherits Rectangle {
                     spacing: 8px;
 
                     StyledInput {
+                        mouse-pressed: root.mouse-pressed;
                         horizontal-stretch: 1;
                         text <=> root.edit-program;
                         placeholder: I18n.strings[29];
@@ -273,6 +280,7 @@ export component ActionEditorDialog inherits Rectangle {
                 spacing: 4px;
                 Text { text: I18n.strings[26]; color: Theme.text-secondary; font-size: 12px; }
                 StyledInput {
+                    mouse-pressed: root.mouse-pressed;
                     text <=> root.edit-args;
                     placeholder: I18n.strings[12];
                 }
@@ -328,6 +336,7 @@ export component ActionEditorDialog inherits Rectangle {
                     border-color: group-input.has-focus || root.dropdown-open ? Theme.accent : Theme.border;
 
                     group-input := SingleLineEdit {
+                        mouse-pressed: root.mouse-pressed;
                         x: 10px;
                         width: parent.width - 36px;
                         height: parent.height;
@@ -437,6 +446,7 @@ export component ActionEditorDialog inherits Rectangle {
                 spacing: 4px;
                 Text { text: I18n.strings[77]; color: Theme.text-secondary; font-size: 12px; }
                 StyledInput {
+                    mouse-pressed: root.mouse-pressed;
                     text <=> root.edit-extensions;
                     placeholder: I18n.strings[14];
                 }

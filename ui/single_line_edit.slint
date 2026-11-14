@@ -8,6 +8,14 @@
 //   外层 Rectangle 负责裁切（clip），里面放一个“按文本自然宽度撑开”的 TextInput，
 //   再用 cursor-position-changed 拿到光标自身坐标，光标靠近右边界就把文本往左推，
 //   回到左边界就推回 0。
+//   鼠标按住不放、光标一直贴在边缘时，再用 Timer 持续把选区焦点端往前推，
+//   实现原生输入框那种“拖选贴边持续滚动”。
+//
+// ⚠ mouse-pressed 必须由调用方绑定：Slint 的 TextInput 拖选时会抓住鼠标，
+//   组件内部拿不到按下状态，贴边自动滚动会静默失效。
+//   主窗口里绑 root.mouse-left-pressed（Rust 从 winit MouseInput 回填）；
+//   独立弹窗（dialog_jump / action_editor / settings 等）目前没接，
+//   它们的拖选贴边不会自动滚 —— 要补就照着这里加一条同样的绑定。
 //
 // 新增单行输入框时直接用它，不要再各自实现滚动：
 //   SingleLineEdit {
@@ -17,6 +25,7 @@
 //       accepted(t) => { ... }
 //   }
 import { Theme } from "common.slint";
+import { I18n } from "i18n.slint";
 
 export component SingleLineEdit inherits Rectangle {
     /// 文本。**必须双向绑定**到外部可写属性，否则外部清空/回填不会反映到输入框。
@@ -29,6 +38,9 @@ export component SingleLineEdit inherits Rectangle {
     in property <bool> enabled: true;
     /// 光标离右边界多近时开始推动文本（也是光标两侧保留的最小可见余量）
     in property <length> caret-margin: 10px;
+    /// 鼠标左键是否按住（由 Rust 从 winit 窗口事件回填）。Slint 的 TextInput
+    /// 拖选期间抓住鼠标，任何 TouchArea 都收不到事件，只能从这里拿按下状态。
+    in property <bool> mouse-pressed: false;
 
     out property <bool> has-focus: input.has-focus;
 
@@ -86,6 +98,59 @@ export component SingleLineEdit inherits Rectangle {
     /// 保持 0 偏移就能像资源管理器一样先看到开头的名字。
     private property <bool> user-touched: false;
 
+    // —— 拖选贴边自动滚动 ——
+    // 原生输入框按住鼠标拖到边缘会持续把文字推过去扩展选区；Slint 的滚动
+    // 只随鼠标移动产生（光标贴边后鼠标已到窗口/视口边缘，几乎无余量可动）。
+    // 这里用定时器持续把光标往端点推进（set-selection-offsets 自动收敛到
+    // 字符边界），推进触发 cursor-position-changed → scroll-x 跟随 → 文字平移。
+    private property <bool> auto-left: false;
+    private property <bool> auto-right: false;
+    /// 光标已到文本端点（推进无进展），停表避免空转。
+    private property <bool> at-limit: false;
+    /// 按住期间光标移动次数：按下本身算 1 次，真正拖动 ≥2 次。
+    /// 用来区分「在边缘单击」与「拖选」，单击不自动滚。
+    private property <int> drag-ticks: 0;
+    /// 贴边后定时器连续触发的次数，用于加速（原生输入框贴边越久滚得越快）。
+    private property <int> hold-ticks: 0;
+
+    // 编辑框右键菜单：Slint 内置 ContextMenuArea（官方文档中 LineEdit 同款实现）。
+    // 之前地址栏 / 搜索框 / 重命名框右键完全没有反应；这里统一补齐标准的
+    // 撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选，且只在可编辑时启用破坏性命令。
+    ctx-area := ContextMenuArea {
+        Menu {
+            MenuItem {
+                title: I18n.strings[235]; // 撤销 / Undo
+                activated => { input.undo(); }
+            }
+            MenuItem {
+                title: I18n.strings[236]; // 重做 / Redo
+                activated => { input.redo(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: I18n.strings[126]; // 剪切 / Cut
+                enabled: root.enabled;
+                activated => { input.cut(); }
+            }
+            MenuItem {
+                title: I18n.strings[36]; // 复制 / Copy
+                activated => { input.copy(); }
+            }
+            MenuItem {
+                title: I18n.strings[127]; // 粘贴 / Paste
+                enabled: root.enabled;
+                activated => { input.paste(); }
+            }
+            MenuSeparator { }
+            MenuItem {
+                title: I18n.strings[222]; // 全选 / Select all
+                activated => { input.select-all(); }
+            }
+        }
+
+    // 注意：TextInput 是 ContextMenuArea 的子元素（不能改成兄弟节点）。
+    // 右键菜单靠容器向下派发点击；一旦并列，输入框会先吃掉右键，
+    // 菜单就弹不出来了。下面那个多余的缩进层级对应 ctx-area 的闭合括号。
     input := TextInput {
         x: -root.scroll-x;
         y: 0px;
@@ -118,6 +183,14 @@ export component SingleLineEdit inherits Rectangle {
 
         // 光标跟随：把光标保持在视口内（左右各留 caret-margin 余量）。
         cursor-position-changed(pos) => {
+            // 左键按住时发生的任何光标移动，都是用户用鼠标在定位/拖选光标，
+            // 与键盘操作同等对待：必须先置 user-touched，否则重命名框刚打开
+            // （初始 select-all、user-touched 仍为 false）时纯鼠标拖选走到
+            // 右边缘不会跟随滚动，要先用方向键“解冻”一次才生效。
+            if (root.mouse-pressed) {
+                root.drag-ticks = root.drag-ticks + 1;
+                root.user-touched = true;
+            }
             if (root.user-touched) {
                 let visible-x = pos.x - root.scroll-x;
                 if (visible-x < 0px) {
@@ -126,7 +199,54 @@ export component SingleLineEdit inherits Rectangle {
                     root.scroll-x = pos.x - root.width + root.caret-margin;
                 }
             }
+            // 拖选贴边检测：无论是否 user-touched 都要判定（拖选选字与
+            // 打字是两条路径），但定时器只在左键按住 + 真拖动时才会跑。
+            //
+            // 判定必须用 `>=` / `<=` 而不是严格大于：上面的跟随把光标推到正好
+            // 距边缘 caret-margin 处（visible-x == width - margin），用严格大于
+            // 时贴边标志会在推完第一次后立刻变 false，定时器随即停摆，
+            // 表现为“只滚一点点、之后按住鼠标不动就再也不滚了”。
+            let visible-x = pos.x - root.scroll-x;
+            root.auto-left = visible-x <= 0px;
+            root.auto-right = visible-x >= root.width - root.caret-margin;
+            if (!root.auto-left && !root.auto-right) {
+                root.at-limit = false;
+                root.hold-ticks = 0;
+            }
         }
+
+        // 光标到左端点：按 4 字节/16ms 向后推进选区焦点端。
+        auto-scroll-l := Timer {
+            interval: 16ms;
+            running: root.auto-left && root.mouse-pressed
+                && root.drag-ticks > 1 && !root.at-limit;
+            triggered => {
+                let before = input.cursor-position-byte-offset;
+                let anchor = input.anchor-position-byte-offset;
+                input.set-selection-offsets(anchor, before - root.step-bytes());
+                if (input.cursor-position-byte-offset == before) {
+                    root.at-limit = true;
+                }
+                root.hold-ticks = root.hold-ticks + 1;
+            }
+        }
+
+        // 光标到右端点：按 4 字节/16ms 向前推进选区焦点端。
+        auto-scroll-r := Timer {
+            interval: 16ms;
+            running: root.auto-right && root.mouse-pressed
+                && root.drag-ticks > 1 && !root.at-limit;
+            triggered => {
+                let before = input.cursor-position-byte-offset;
+                let anchor = input.anchor-position-byte-offset;
+                input.set-selection-offsets(anchor, before + root.step-bytes());
+                if (input.cursor-position-byte-offset == before) {
+                    root.at-limit = true;
+                }
+                root.hold-ticks = root.hold-ticks + 1;
+            }
+        }
+    }
     }
 
     // 文本变短 / 视口变宽后，把偏移拉回有效范围，避免右侧出现空白。
@@ -139,6 +259,21 @@ export component SingleLineEdit inherits Rectangle {
     }
     changed has-focus => {
         root.focus-changed(root.has-focus);
+    }
+    // 松开鼠标即结束一轮拖选：清拖动计数、解除端点停表，
+    // 否则下次单击（只有一次光标移动）会因残留计数被误判成拖选。
+    changed mouse-pressed => {
+        if (!root.mouse-pressed) {
+            root.drag-ticks = 0;
+            root.at-limit = false;
+            root.hold-ticks = 0;
+        }
+    }
+    // 每次定时器推进的字节步长：起步 4 字节（约 1 个汉字）保持精细，
+    // 贴边持续 ~0.2s 后逐步加快到 24 字节，否则长文件名要滚好几秒。
+    // set-selection-offsets 内部按 ceil 对齐到字符边界，不会卡在半字节上。
+    function step-bytes() -> int {
+        return min(24, 4 + (root.hold-ticks / 4) * 4);
     }
     function clamp-scroll() {
         root.scroll-x = max(0px, min(root.scroll-x, root.content-w - root.width + root.caret-margin));

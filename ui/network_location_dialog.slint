@@ -6,6 +6,8 @@ import { SingleLineEdit } from "single_line_edit.slint";
 component Field inherits Rectangle {
     in-out property <string> text;
     in property <string> placeholder: "";
+    /// 透传自主窗口：输入框拖选贴边自动滚动用。
+    in property <bool> mouse-pressed: false;
 
     callback accepted(text: string);
     /// Esc
@@ -23,6 +25,7 @@ component Field inherits Rectangle {
     border-color: ti.has-focus ? Theme.accent : Theme.border;
 
     ti := SingleLineEdit {
+        mouse-pressed: root.mouse-pressed;
         x: 10px;
         width: parent.width - 20px;
         height: parent.height;
@@ -55,6 +58,8 @@ component Field inherits Rectangle {
 }
 
 export component NetworkLocationDialog inherits Rectangle {
+    /// 鼠标左键是否按住（透传自主窗口）：输入框拖选贴边自动滚动用。
+    in property <bool> mouse-pressed: false;
     in property <string> title: I18n.strings[65];
     in-out property <string> server;
     in-out property <string> alias;
@@ -141,6 +146,7 @@ export component NetworkLocationDialog inherits Rectangle {
                 spacing: 4px;
                 Text { text: I18n.strings[56]; color: Theme.text-secondary; font-size: 12px; }
                 server-edit := Field {
+                    mouse-pressed: root.mouse-pressed;
                     text <=> root.server;
                     placeholder: I18n.strings[13];
                     accepted(t) => {
@@ -156,6 +162,7 @@ export component NetworkLocationDialog inherits Rectangle {
                 spacing: 4px;
                 Text { text: I18n.strings[24]; color: Theme.text-secondary; font-size: 12px; }
                 Field {
+                    mouse-pressed: root.mouse-pressed;
                     text <=> root.alias;
                     placeholder: I18n.strings[11];
                     accepted(t) => {

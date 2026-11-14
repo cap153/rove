@@ -9,6 +9,8 @@ export struct JumpResult {
 }
 
 export component DialogJumpWindow inherits Window {
+    /// 鼠标左键是否按住（Rust 从本窗口 winit 事件回填）：输入框拖选贴边自动滚动用。
+    in-out property <bool> mouse-left-pressed: false;
     no-frame: true;
     always-on-top: true;
     background: Theme.bg-main;
@@ -105,6 +107,7 @@ export component DialogJumpWindow inherits Window {
                     }
 
                     input := SingleLineEdit {
+                        mouse-pressed: root.mouse-left-pressed;
                         horizontal-stretch: 1;
                         height: parent.height;
                         text <=> root.query;
