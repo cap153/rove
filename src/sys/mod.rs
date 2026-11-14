@@ -8,3 +8,5 @@ pub mod dnd;
 pub mod shell;
 pub mod menu;
 pub mod dialog_jump;
+// 接管资源管理器（注册表接管文件夹/磁盘/此电脑的默认打开方式）。
+pub mod integration;

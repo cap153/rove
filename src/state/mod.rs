@@ -496,11 +496,28 @@ impl AppState {
     }
 
     pub fn new_tab(&mut self, path: Option<PathBuf>, sort: SortState) -> u32 {
+        self.new_tab_ex(path, sort, true)
+    }
+
+    /// 新建标签，`inherit` 控制 path 为 None 时是否继承当前目录。
+    ///
+    /// 「+」按钮 / Ctrl+T 这类用户快捷键要继承当前目录（Explorer 习惯）；
+    /// 但资源管理器送来的「此电脑」请求（`--this-pc`）必须真的进此电脑视图，
+    /// 继承会把当前目录塞进去，右键此电脑就变成"再打开一次当前文件夹"。
+    pub fn new_tab_ex(&mut self, path: Option<PathBuf>, sort: SortState, inherit: bool) -> u32 {
         let id = self.next_tab_id;
         self.next_tab_id += 1;
         let mut tab = TabState::new(id, path, sort);
+        // 新标签马上要发起列举：必须像 navigate 那样置「正在加载」+待恢复滚动。
+        // 否则 UI 认为该标签「已经加载完且内容为空」，在列举结果回来之前
+        // 就把「此文件夹为空」画出来；结果回来得慢时这个空态会一直留着。
+        // 每个 pane 都置一遍（分屏时两栏各自有状态）。
+        for pane in tab.panes.iter_mut() {
+            pane.loading = true;
+            pane.pending_scroll_restore = true;
+        }
         // 新标签默认继承当前目录（Explorer/Pulse 习惯）：写入当前聚焦面板。
-        if tab.active().path.is_none() {
+        if inherit && tab.active().path.is_none() {
             if let Some(current) = self.active().active().path.clone() {
                 let pane = tab.active_mut();
                 pane.path = Some(current.clone());
@@ -633,4 +650,38 @@ mod tests {
         assert_eq!(p.history_filters.last().unwrap(), "");
         assert_eq!(p.history_index, 2);
     }
+
+#[cfg(test)]
+mod new_tab_tests {
+    use super::*;
+
+    fn state_with_one_tab(path: Option<PathBuf>) -> AppState {
+        AppState::new(path, SortState::default())
+    }
+
+    #[test]
+    fn new_tab_inherits_current_dir_by_default() {
+        let mut st = state_with_one_tab(Some(PathBuf::from(r"D:\\重")));
+        st.new_tab(None, SortState::default());
+        assert_eq!(st.active().active().path, Some(PathBuf::from(r"D:\\重")));
+    }
+
+    #[test]
+    fn this_pc_tab_does_not_inherit_current_dir() {
+        // 资源管理器右键「此电脑」必须真的进此电脑视图（path=None），
+        // 否则会变成"再打开一次当前文件夹"。
+        let mut st = state_with_one_tab(Some(PathBuf::from(r"D:\\重")));
+        st.new_tab_ex(None, SortState::default(), false);
+        assert_eq!(st.active().active().path, None);
+    }
+
+    #[test]
+    fn new_tab_starts_in_loading_state() {
+        // 不置 loading 的话 UI 会先画「此文件夹为空」，等列举结果回来才替换。
+        let mut st = state_with_one_tab(Some(PathBuf::from(r"D:\\重")));
+        st.new_tab(Some(PathBuf::from(r"C:\\Windows")), SortState::default());
+        assert!(st.active().active().loading);
+        assert!(st.active().active().pending_scroll_restore);
+    }
+}
 }

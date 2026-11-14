@@ -749,6 +749,13 @@ pub struct App {
     /// 单击文件名重命名的延迟定时器：按下先不起重命名，留出双击窗口；
     /// 窗口内再来一次按下即判定为双击打开（取消本定时器），否则到点才重命名。
     rename_defer_timer: Timer,
+    /// 接管资源管理器转来的「新标签打开」：先释放 App 借用，下一轮事件循环再执行。
+    /// 直接在管道回调里导航会与 Slint 布局期触发的其它 UI 回调形成 RefCell 嵌套
+    /// 借入（进程被 abort，窗口直接消失）。
+    shell_open_timer: Timer,
+    /// 待打开的资源管理器请求（None = 此电脑）。用队列而不是单个槽位，
+    /// 连点两个文件夹时两条请求都要能打开。
+    shell_open_queue: Vec<Option<PathBuf>>,
     /// 自身弱引用：供 rename_defer_timer 等定时器回调里升级回 App。
     self_weak: Option<Weak<RefCell<App>>>,
     }
@@ -889,6 +896,8 @@ impl App {
             jump_geom: None,
             jump_poll_timer: Timer::default(),
             rename_defer_timer: Timer::default(),
+            shell_open_timer: Timer::default(),
+            shell_open_queue: Vec::new(),
             self_weak: None,
         }
     }
@@ -5950,6 +5959,7 @@ impl App {
         // 向设置页「通用」开关灌入当前状态。
         self.ui.set_show_hidden(self.config.show_hidden);
         self.ui.set_auto_edit_path_on_new_tab(self.config.auto_edit_path_on_new_tab);
+        self.ui.set_explorer_takeover(self.config.explorer_takeover);
 
         // 子页标题 / 描述 / 新增入口。
         let (title, desc, show_add) = match current {
@@ -7866,11 +7876,121 @@ impl App {
 // 导航
 // ---------------------------------------------------------------------------
 
+/// 待打开的资源管理器请求上限（防止异常情况下无限制堆积）。
+const SHELL_OPEN_QUEUE_MAX: usize = 32;
+/// 借用冲突时的重试次数与间隔：约 1.5 秒后放弃（每次都记日志）。
+const SHELL_OPEN_RETRIES: u32 = 30;
+const SHELL_OPEN_RETRY_MS: u64 = 50;
+
+/// 排空「资源管理器转来的新标签打开」队列，借用拿不到就推迟再试。
+///
+/// 早先这里拿不到借用就直接丢弃请求 —— 用户点了文件夹却什么都不发生，
+/// 也没有任何提示。现在改成退避重试，只有在长时间被占用时才放弃。
+fn schedule_shell_drain(weak: Weak<RefCell<App>>, attempt: u32) {
+    let Some(app) = weak.upgrade() else { return };
+    let mut done = false;
+    if let Ok(mut app) = app.try_borrow_mut() {
+        app.drain_shell_tabs();
+        done = true;
+    }
+    if done {
+        return;
+    }
+    if attempt >= SHELL_OPEN_RETRIES {
+        logln!("!! 接管资源管理器：App 长时间被借用，放弃 {} 条打开请求", {
+            app.try_borrow().map(|a| a.shell_open_queue.len()).unwrap_or(0)
+        });
+        if let Ok(mut app) = app.try_borrow_mut() {
+            app.shell_open_queue.clear();
+        }
+        return;
+    }
+    // 队列留在 App 上，只重新排一次定时器。
+    let app2 = app.clone();
+    app.borrow().shell_open_timer.stop();
+    app.borrow().shell_open_timer.start(
+        TimerMode::SingleShot,
+        Duration::from_millis(SHELL_OPEN_RETRY_MS),
+        move || {
+            if let Ok(app) = app2.try_borrow() {
+                // 定时器要给下一轮用：这里只是借出克隆，不能在被借用时 start。
+                let weak = app.self_weak.clone();
+                drop(app);
+                if let Some(weak) = weak {
+                    schedule_shell_drain(weak, attempt + 1);
+                }
+            }
+        },
+    );
+}
+
 impl App {
     /// 当前标签导航到路径（压入历史）。
     fn navigate_active(&mut self, path: Option<PathBuf>) {
         self.state.active_mut().active_mut().navigate(path);
         self.sync_after_navigate();
+    }
+
+    /// 排队一个「新标签打开」请求：当前 App 借用还没释放，不能在这里直接导航。
+    ///
+    /// 请求存进 `shell_open_queue`（App 字段），不要每次新建闭包捕获：连点两个
+    /// 文件夹时，前一次的定时器会被后一次 `start` 直接覆盖，闭包里那条请求也
+    /// 跟着消失（表现为「第二个打开了、第一个没了」）。
+    fn queue_shell_tab(&mut self, path: Option<PathBuf>) {
+        if self.shell_open_queue.len() >= SHELL_OPEN_QUEUE_MAX {
+            logln!("!! 接管资源管理器：待打开请求过多，丢弃最旧的一条");
+            self.shell_open_queue.remove(0);
+        }
+        self.shell_open_queue.push(path);
+        let Some(weak) = self.self_weak.clone() else {
+            // 会话刚建好还没登记 self_weak：此时肯定没有别的借用，直接执行。
+            self.drain_shell_tabs();
+            return;
+        };
+        self.shell_open_timer.stop();
+        self.shell_open_timer.start(
+            TimerMode::SingleShot,
+            Duration::from_millis(0),
+            move || schedule_shell_drain(weak.clone(), 0),
+        );
+    }
+
+    /// 依次打开队列里的全部请求。
+    fn drain_shell_tabs(&mut self) {
+        // 先取出来：open_shell_tab 里若同步再排队，也不会打断这一轮。
+        let queued = std::mem::take(&mut self.shell_open_queue);
+        for path in queued {
+            self.open_shell_tab(path);
+        }
+    }
+
+    /// 资源管理器转来的打开请求：新开一个标签再导航，不覆盖用户正在看的目录。
+    fn open_shell_tab(&mut self, path: Option<PathBuf>) {
+        // 路径已经不存在（刚被删/断开网盘）：不要开一个空标签，直接忽略。
+        // 注意只对显式路径做检查；None 是「此电脑」，本来就该能打开。
+        if let Some(p) = path.as_ref() {
+            if !p.is_dir() {
+                logln!("!! 接管资源管理器：目标目录不可用，已忽略 {:?}", p);
+                return;
+            }
+        }
+        // 新标签继承的排序会被 sync_view_sort 按目标视图（普通/此电脑/回收站）
+        // 覆盖成对应视图自己的状态，这里只用当前排序占个位。
+        // 当前标签可能是设置页（没有目录），此时用全局排序做种子。
+        let sort = self.state.active().active().sort;
+        // inherit=false：path 为 None 就是真的要进「此电脑」视图，
+        // 不能因为「新标签继承当前目录」的默认习惯被悄悄换成当前文件夹。
+        self.state.new_tab_ex(path, sort, false);
+        logv!(
+            "接管资源管理器：新标签打开 {:?}",
+            self.state.active().active().path
+        );
+        // 与「普通导航」走完全相同的链路：sync_after_navigate 内部会
+        // sync_view_sort → sync_tabs/nav/... → reload_active。
+        // 这里不能用 sync_active_tab：那是「切换已有标签」用的，不发起列举，
+        // 新标签会一直停在空状态（表现为「此文件夹为空」）。
+        self.sync_after_navigate();
+        self.ui.invoke_scroll_tabs_to_end();
     }
 
     fn sync_after_navigate(&mut self) {
@@ -10556,6 +10676,23 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.config.save();
             app.ui.set_auto_edit_path_on_new_tab(enabled);
         });
+        // 接管资源管理器：改开关立刻写/还原注册表，失败只回退开关并记日志。
+        let takeover_app = app.clone();
+        upgrade().on_explorer_takeover_toggled(move |enabled| {
+            let Some(app) = takeover_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            // 菜单文字跟随界面语言（写进注册表，资源管理器直接显示这个字符串）。
+            let label = i18n::text(&app.config.language, "用 Rove 打开");
+            if let Err(err) = crate::sys::integration::sync(enabled, &label) {
+                logln!("!! 接管资源管理器{}失败：{err}", if enabled { "开启" } else { "关闭" });
+                // 回退开关到真实状态（配置没变，界面也必须跟配置一致）。
+                app.ui.set_explorer_takeover(app.config.explorer_takeover);
+                return;
+            }
+            app.config.explorer_takeover = enabled;
+            app.config.save();
+            app.ui.set_explorer_takeover(enabled);
+        });
         upgrade().on_show_hidden_toggled(move |enabled| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -11464,29 +11601,48 @@ pub(crate) fn hide_dialog_jump() {
 pub fn run() {
     logln!("starting, args: {:?}", std::env::args().collect::<Vec<_>>());
 
+    // GUI 子系统没有控制台，panic 信息会直接丢掉（表现为「窗口突然消失」）。
+    // 装个钩子把它写进 rove.log，排查崩溃时才有现场。
+    std::panic::set_hook(Box::new(|info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "?".into());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<非字符串 panic>".into());
+        logln!("!! panic at {location}: {payload}");
+    }));
+
     // 守护模式启动：拉起 Windows 文件对话框监听器（非 Windows 平台为空实现）。
     crate::sys::dialog_jump::start_daemon();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let request = crate::daemon::parse_args(&args);
 
     // ---- 单实例：已存在守护则转发路径后立即退出 ----
-    if crate::daemon::try_forward(&args) {
+    // 先交前台许可：本进程是资源管理器拉起的，带着这个权限，窗口却由守护进程显示。
+    crate::daemon::hand_over_foreground();
+    if crate::daemon::try_forward(&request) {
         logln!("forwarded to running daemon, exiting");
         return;
     }
 
     // ---- 守护模式：管道服务线程（唤醒请求投递到事件循环） ----
-    let bound = crate::daemon::spawn_server(move |path| {
-        // 闭包只捕获 path（Send），会话槽在事件循环线程的 thread_local 里。
+    let bound = crate::daemon::spawn_server(move |request| {
+        // 闭包只捕获 request（Send），会话槽在事件循环线程的 thread_local 里。
         let _ = slint::invoke_from_event_loop(move || {
-            wake_session(path);
+            wake_session(request);
         });
     });
     if !bound {
         // 竞态失败：短暂重试转发（另一实例正在启动）。
         for _ in 0..15 {
             std::thread::sleep(Duration::from_millis(100));
-            if crate::daemon::try_forward(&args) {
+            if crate::daemon::try_forward(&request) {
                 logln!("forwarded after race, exiting");
                 return;
             }
@@ -11494,9 +11650,12 @@ pub fn run() {
         logln!("ipc bind failed; running standalone");
     }
 
-    // 首个会话：若启动参数带目录则直接打开。
-    let initial = crate::daemon::wake_path_from_args(&args);
-    wake_session(initial);
+    // 首个会话：若启动参数带目录则直接打开（首个会话没有已有标签，新开标签无意义）。
+    let initial = request.path.clone();
+    wake_session(crate::daemon::WakeRequest {
+        path: initial,
+        new_tab: false,
+    });
 
     // 守护托盘：UI 销毁后的常驻入口（打开/退出）。
     // 托盘句柄保活至进程结束，drop 即移除图标。
@@ -11757,6 +11916,14 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
         config.save();
     }
 
+    // 接管资源管理器：按配置同步一次注册表。放在建窗口之前做，
+    // 这样 exe 换过路径 / 被别的程序覆盖后，启动时就能自动纠正；
+    // 切换界面语言后重启也会顺带把右键菜单文字一起换掉。
+    let takeover_label = i18n::text(&config.language, "用 Rove 打开");
+    if let Err(err) = crate::sys::integration::sync(config.explorer_takeover, &takeover_label) {
+        logln!("!! 接管资源管理器同步失败：{err}");
+    }
+
     let ui = match MainWindow::new() {
         Ok(ui) => ui,
         Err(e) => {
@@ -11868,10 +12035,9 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
     {
         let mut app = app.borrow_mut();
         app.state.recent = app.config.recent.clone();
-        if let Some(path) = initial_path {
-            let sort = app.state.active().active().sort;
-            app.state.new_tab(Some(path), sort);
-        } else if startup_snapshot.0 == "last_tabs" && !startup_snapshot.1.is_empty() {
+        // 是否真的按「上次的标签页」重建了标签（决定初始路径是新增标签还是顶替）。
+        let mut restored_last_tabs = false;
+        if startup_snapshot.0 == "last_tabs" && !startup_snapshot.1.is_empty() {
             // 「上次的标签页(包括分屏)」：按快照重建标签与各栏路径。
             let sort = app.state.active().active().sort;
             let mut tabs = Vec::new();
@@ -11925,6 +12091,20 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
                 .collect();
             for (id, pi, gen, path, sort) in requests {
                 app.request_listing(id, pi, gen, path, sort);
+            }
+            restored_last_tabs = true;
+        }
+        // 命令行 / 接管资源管理器带来的初始路径。
+        // 恢复过上次标签页时必须新开标签，不能顶掉用户上次的标签；
+        // 否则直接把默认那个「此电脑」标签换成目标目录 —— 早先这里是
+        // 「再多 push 一个标签」，默认的「此电脑」标签就既没列举也没人切过去，
+        // 表现为最左侧多出一个显示「此文件夹为空」的此电脑标签。
+        if let Some(path) = initial_path {
+            if restored_last_tabs {
+                let sort = app.state.active().active().sort;
+                app.state.new_tab(Some(path), sort);
+            } else {
+                app.state.active_mut().active_mut().navigate(Some(path));
             }
         }
         // 「电脑选项」不做事：AppState 初始就是单栏的「此电脑」。
@@ -11982,22 +12162,34 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
 }
 
 /// 唤醒：无 UI 则重建会话（冷启动 < 50ms）；有 UI 则前置窗口并导航。
-pub fn wake_session(path: Option<PathBuf>) {
+pub fn wake_session(request: crate::daemon::WakeRequest) {
     let existing = SESSION.with(|slot| slot.borrow().clone());
     if let Some(app) = existing {
-        let mut app = app.borrow_mut();
-        if let Some(p) = path.clone() {
-            app.navigate_active(Some(p));
+        {
+            let mut app = app.borrow_mut();
+            if let Some(p) = request.path.clone() {
+                if request.new_tab {
+                    // 新标签要在借用释放后由定时器执行（见 queue_shell_tab）。
+                    app.queue_shell_tab(Some(p));
+                } else {
+                    app.navigate_active(Some(p));
+                }
+            } else if request.new_tab {
+                // 此电脑：同样新开标签，不动用户当前目录。
+                app.queue_shell_tab(None);
+            }
         }
-        let ui = &app.ui;
+        // 借用必须先释放：ShowWindow / SetForegroundWindow 会同步派发窗口消息
+        // 到我们子类化的窗口过程，Slint 侧回调可能再次借用 App → 进程被 abort。
+        let ui = slint::ComponentHandle::clone_strong(&app.borrow().ui);
         let _ = ui.show();
-        focus_window(ui);
-        logln!("woke existing session, path={path:?}");
+        focus_window(&ui);
+        logv!("woke existing session, path={:?} new_tab={}", request.path, request.new_tab);
         return;
     }
     // JobManager 的任务线程跨会话存活；此处为新会话重建一份管理句柄，
     // 使 jobs 状态与 UI 生命周期解耦。
-    create_session(path, JobManager::new());
+    create_session(request.path, JobManager::new());
 }
 
 /// 销毁当前会话：丢弃窗口（释放 GPU 资源与组件树）与全部状态，
@@ -12122,7 +12314,8 @@ fn focus_window(ui: &MainWindow) {
     {
         use raw_window_handle::RawWindowHandle;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            SetForegroundWindow, ShowWindow, SW_RESTORE,
+            BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+            SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
         };
         // 两步获取：HasWindowHandle::window_handle() → rwh WindowHandle → as_raw()。
         if let Ok(h) = raw_window_handle::HasWindowHandle::window_handle(&ui.window().window_handle())
@@ -12130,8 +12323,58 @@ fn focus_window(ui: &MainWindow) {
             if let RawWindowHandle::Win32(win) = h.as_raw() {
                 let hwnd = win.hwnd.get() as isize as windows_sys::Win32::Foundation::HWND;
                 unsafe {
-                    ShowWindow(hwnd, SW_RESTORE);
-                    SetForegroundWindow(hwnd);
+                    let was_iconic = IsIconic(hwnd) != 0;
+                    let visible = IsWindowVisible(hwnd) != 0;
+                    // 只有「最小化了」才 RESTORE：SW_RESTORE 对最大化窗口会把窗口
+                    // 还原成普通大小（表现为「打开一个文件夹，Rove 就退出最大化」）。
+                    if was_iconic {
+                        ShowWindow(hwnd, SW_RESTORE);
+                    } else if !visible {
+                        ShowWindow(hwnd, SW_SHOW);
+                    }
+                    // 抢前台：本进程不是当前前台进程时 Windows 会拒绝，并让任务栏
+                    // 按钮闪黄（用户看到的就是「窗口不还原、任务栏一直闪」）。
+                    // 标准解法：临时 AttachThreadInput 到前台线程，取得同一条输入队列
+                    // 后再激活；结束后立即 detach。首次接管（由 explorer 拉起的新进程
+                    // 转发 IPC）拿不到前台权限，走这个兜底才稳。
+                    let mut set_ok = SetForegroundWindow(hwnd) != 0;
+                    if !set_ok {
+                        let foreground = GetForegroundWindow();
+                        let foreground_thread = GetWindowThreadProcessId(foreground, std::ptr::null_mut());
+                        let self_thread =
+                            windows_sys::Win32::System::Threading::GetCurrentThreadId();
+                        if foreground_thread != 0 && foreground_thread != self_thread {
+                            let attached = windows_sys::Win32::System::Threading::AttachThreadInput(
+                                self_thread,
+                                foreground_thread,
+                                1,
+                            ) != 0;
+                            if attached {
+                                BringWindowToTop(hwnd);
+                                set_ok = SetForegroundWindow(hwnd) != 0;
+                                let _ = windows_sys::Win32::System::Threading::AttachThreadInput(
+                                    self_thread,
+                                    foreground_thread,
+                                    0,
+                                );
+                            }
+                        }
+                    }
+                    // 兜底：抢前台被拒时个别 Windows 版本会连还原一起吞掉，
+                    // 这里再异步补一次还原，确保窗口不会停在任务栏。
+                    if IsIconic(hwnd) != 0 {
+                        windows_sys::Win32::UI::WindowsAndMessaging::ShowWindowAsync(
+                            hwnd,
+                            SW_RESTORE,
+                        );
+                    }
+                    logv!(
+                        "[focus] iconic {}->{} visible={} foreground={}",
+                        was_iconic,
+                        IsIconic(hwnd) != 0,
+                        IsWindowVisible(hwnd) != 0,
+                        set_ok
+                    );
                 }
             }
         }

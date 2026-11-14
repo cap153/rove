@@ -117,6 +117,9 @@ export component MainWindow inherits Window {
     /// 「新建标签时编辑地址栏」开关（来自 config，默认关闭）。
     in-out property <bool> auto-edit-path-on-new-tab: false;
     callback auto_edit_path_on_new_tab_toggled(bool);
+    /// 「接管资源管理器」开关（来自 config.explorer_takeover，默认关闭）。
+    in-out property <bool> explorer-takeover: false;
+    callback explorer_takeover_toggled(bool);
     /// 通用设置：显示语言 / 启动时打开（下标由 Rust 按配置下发）。
     in-out property <int> language-index: 0;
     in-out property <int> startup-index: 0;
@@ -1471,6 +1474,8 @@ out property <length> row-height-out: file-list.row-height-out;
                     mouse-pressed: root.mouse-left-pressed;
                     auto-edit-path-on-new-tab: root.auto-edit-path-on-new-tab;
                     auto_edit_path_on_new_tab_toggled(v) => { root.auto_edit_path_on_new_tab_toggled(v); }
+                    explorer-takeover: root.explorer-takeover;
+                    explorer_takeover_toggled(v) => { root.explorer_takeover_toggled(v); }
                     language-index: root.language-index;
                     startup-index: root.startup-index;
                     language_changed(i) => { root.language_changed(i); }

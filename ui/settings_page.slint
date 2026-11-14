@@ -6,8 +6,12 @@ import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem, Settin
 import { SingleLineEdit } from "single_line_edit.slint";
 
 component Toggle inherits Rectangle {
-    in-out property <bool> checked: true;
+    /// 只读：由外部状态驱动。内部绝不能写这个属性 —— 一旦写，Slint 会打断
+    /// 它和外部的绑定，之后开关就再也跟不上真实状态（表现为「点了设置生效，
+    /// 但右边的开关不动」）。
+    in property <bool> checked: true;
     in property <bool> enabled: true;
+    /// 点击：外部负责取反并回填状态。
     callback toggled();
 
     width: 36px;
@@ -30,7 +34,6 @@ component Toggle inherits Rectangle {
         height: 100%;
         enabled: root.enabled;
         clicked => {
-            root.checked = !root.checked;
             root.toggled();
         }
     }
@@ -67,7 +70,7 @@ component SettingRow inherits Rectangle {
             checked: root.item.enabled;
             enabled: true;
             toggled => {
-                root.toggled(root.item.id, self.checked);
+                root.toggled(root.item.id, !root.item.enabled);
             }
         }
 
@@ -458,6 +461,9 @@ export component SettingsPage inherits Rectangle {
     /// 「新建标签时编辑地址栏」开关（透传自 config，默认关闭）。
     in-out property <bool> auto-edit-path-on-new-tab: false;
     callback auto_edit_path_on_new_tab_toggled(bool);
+    /// 「接管资源管理器」开关（来自 config.explorer_takeover，默认关闭）。
+    in-out property <bool> explorer-takeover: false;
+    callback explorer_takeover_toggled(bool);
     /// 显示语言：0 跟随系统 / 1 简体中文 / 2 English。
     in-out property <int> language-index: 0;
     callback language_changed(int);
@@ -670,6 +676,60 @@ export component SettingsPage inherits Rectangle {
                     spacing: 12px;
                     alignment: start;
 
+                    // 接管资源管理器：文件夹 / 磁盘 / 此电脑的默认打开程序改为 Rove。
+                    Rectangle {
+                        width: 100%;
+                        background: gen-takeover-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
+                        border-radius: 8px;
+                        border-width: 1px;
+                        border-color: Theme.border;
+                        height: 58px;
+
+                        gen-takeover-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.explorer-takeover = !root.explorer-takeover;
+                                root.explorer_takeover_toggled(root.explorer-takeover);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: I18n.strings[238];
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: I18n.strings[239];
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.explorer-takeover;
+                                toggled => {
+                                    root.explorer-takeover = !root.explorer-takeover;
+                                    root.explorer_takeover_toggled(root.explorer-takeover);
+                                }
+                            }
+                        }
+                    }
+
                     Rectangle {
                         width: 100%;
                         background: gen-row-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
@@ -716,8 +776,8 @@ export component SettingsPage inherits Rectangle {
                                 y: (parent.height - self.height) / 2;
                                 checked: root.show-hidden;
                                 toggled => {
-                                    root.show-hidden = self.checked;
-                                    root.show_hidden_toggled(self.checked);
+                                    root.show-hidden = !root.show-hidden;
+                                    root.show_hidden_toggled(root.show-hidden);
                                 }
                             }
                         }
@@ -770,8 +830,8 @@ export component SettingsPage inherits Rectangle {
                                 y: (parent.height - self.height) / 2;
                                 checked: root.auto-edit-path-on-new-tab;
                                 toggled => {
-                                    root.auto-edit-path-on-new-tab = self.checked;
-                                    root.auto_edit_path_on_new_tab_toggled(self.checked);
+                                    root.auto-edit-path-on-new-tab = !root.auto-edit-path-on-new-tab;
+                                    root.auto_edit_path_on_new_tab_toggled(root.auto-edit-path-on-new-tab);
                                 }
                             }
                         }
@@ -1046,7 +1106,7 @@ export component SettingsPage inherits Rectangle {
                                     Toggle {
                                         y: (parent.height - self.height) / 2;
                                         checked: drive.indexed;
-                                        toggled => { root.search_drive_toggled(drive.letter, self.checked); }
+                                        toggled => { root.search_drive_toggled(drive.letter, !drive.indexed); }
                                     }
                                 }
                             }
@@ -1377,8 +1437,8 @@ export component SettingsPage inherits Rectangle {
                                     y: (parent.height - self.height) / 2;
                                     checked: root.search-idle-enabled;
                                     toggled => {
-                                        root.search-idle-enabled = self.checked;
-                                        root.search_idle_toggled(self.checked);
+                                        root.search-idle-enabled = !root.search-idle-enabled;
+                                        root.search_idle_toggled(root.search-idle-enabled);
                                     }
                                 }
 

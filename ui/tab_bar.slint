@@ -27,9 +27,29 @@ export component TabBar inherits Rectangle {
     callback window_close();
     callback settings_requested(); // 标题栏设置齿轮入口
 
-    // 新增：向右滚动到底部，保证新标签立即可见
+    /// 「滚到最右」的待生效标记：新建标签后 tabs 模型刚换掉，Repeater 还没重建，
+    /// tabs-flick.width / content-width 仍是旧值，此刻直接算 content-x 会按旧总宽
+    /// 夹住（新标签落在可视区外，实测正好差一整格）。置位后等布局宽度真正变化时
+    /// 再滚一次。
+    private property <bool> scroll-end-pending: false;
+
+    /// 把标签条滚到最右（Rust 新建标签后调用）。
     public function scroll-to-end() {
-        let total-w = root.tabs.length * 153px;
+        // 先置待生效标记：给 content-x 赋值本身就可能触发一次布局刷新，
+        // 若那一次 `changed content-width` 看见标记是 false 就不会补滚，
+        // 结果正好差一整格。
+        root.scroll-end-pending = true;
+        root.apply-scroll-end();
+    }
+
+    function apply-scroll-end() {
+        // 模型按 153px/格 估算（比实际宽度多几像素），用来判断布局有没有跟上。
+        let estimated = root.tabs.length * 153px;
+        let laid-out = tabs-flick.content-width;
+        // 布局落后于模型（Repeater 还没重建、少了一格或更多）：先滚到头，并留标记
+        // 等 content-width 真正更新后补滚一次。
+        root.scroll-end-pending = estimated > laid-out + 1px;
+        let total-w = max(estimated, laid-out);
         tabs-flick.content-x = -max(0px, total-w - tabs-flick.width);
     }
 
@@ -73,6 +93,12 @@ export component TabBar inherits Rectangle {
                 height: 100%;
                 interactive: false;
                 content-width: tabs-layout.preferred-width;
+                // 新建标签后布局宽度才真正变大：此时补上那次「滚到最右」。
+                changed content-width => {
+                    if (root.scroll-end-pending) {
+                        root.apply-scroll-end();
+                    }
+                }
 
                 tabs-layout := HorizontalLayout {
                     x: 0px;

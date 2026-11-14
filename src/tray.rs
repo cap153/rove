@@ -72,7 +72,7 @@ fn start_event_forwarder() {
                     }
                     _ => {
                         // 打开 Rove。
-                        let _ = slint::invoke_from_event_loop(|| wake_session_public(None));
+                        let _ = slint::invoke_from_event_loop(|| wake_session_public(TRAY_WAKE.clone()));
                     }
                 }
             }
@@ -90,12 +90,18 @@ fn start_event_forwarder() {
                     ..
                 } = ev
                 {
-                    let _ = slint::invoke_from_event_loop(|| wake_session_public(None));
+                    let _ = slint::invoke_from_event_loop(|| wake_session_public(TRAY_WAKE.clone()));
                 }
             }
         })
         .ok();
 }
+
+/// 托盘「打开 Rove」：只唤起窗口，不导航、不新开标签。
+const TRAY_WAKE: crate::daemon::WakeRequest = crate::daemon::WakeRequest {
+    path: None,
+    new_tab: false,
+};
 
 // 由 app.rs 注入的两个入口（避免 daemon ↔ app 循环依赖）。
 pub use crate::app::{destroy_session as destroy_session_public, wake_session as wake_session_public};

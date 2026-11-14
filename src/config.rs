@@ -77,6 +77,10 @@ pub struct Config {
     pub show_hidden: bool,
     /// 「+」新建标签后是否自动进入地址栏编辑态（默认 false，不自动进）。
     pub auto_edit_path_on_new_tab: bool,
+    /// 接管资源管理器：开启后文件夹 / 磁盘 / 此电脑的默认打开程序变成 Rove
+    /// （只写 HKCU\Software\Classes，见 src/sys/integration.rs）。
+    /// 首次启动默认关闭，用户改过之后持久化记住。
+    pub explorer_takeover: bool,
     /// 用户自定义快捷键映射: ActionId -> [Chord1, Chord2]（空字符串代表已取消绑定）。
     pub shortcuts: std::collections::HashMap<String, Vec<String>>,
     /// 排除建立索引的驱动器盘符（大写，如 ["D", "E"]，为空表示全部索引）。
@@ -225,6 +229,7 @@ impl Default for Config {
 
             show_hidden: false,
             auto_edit_path_on_new_tab: false,
+            explorer_takeover: false,
             shortcuts: std::collections::HashMap::new(),
             search_excluded_drives: Vec::new(),
             search_excluded_paths: Vec::new(),
@@ -448,6 +453,9 @@ impl Config {
         if let Some(v) = json.get("auto_edit_path_on_new_tab").and_then(|v| v.as_bool()) {
             config.auto_edit_path_on_new_tab = v;
         }
+        if let Some(v) = json.get("explorer_takeover").and_then(|v| v.as_bool()) {
+            config.explorer_takeover = v;
+        }
         if let Some(map) = json.get("shortcuts").and_then(|v| v.as_object()) {
             for (k, v) in map {
                 // 兼容旧版单个字符串与新版列表两种格式
@@ -639,6 +647,7 @@ impl Config {
             "recycle_sort_ascending": self.recycle_sort_ascending,
             "show_hidden": self.show_hidden,
             "auto_edit_path_on_new_tab": self.auto_edit_path_on_new_tab,
+            "explorer_takeover": self.explorer_takeover,
             "shortcuts": self.shortcuts,
             "search_excluded_drives": self.search_excluded_drives,
             "search_excluded_paths": self.search_excluded_paths,

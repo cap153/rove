@@ -244,6 +244,9 @@ pub const ZH: &[&str] = &[
     "撤销",
     "重做",
     "盘符",
+    "接管资源管理器",
+    "在资源管理器打开文件夹、磁盘和此电脑时，改用 Rove 新标签打开。",
+    "用 Rove 打开",
 ];
 
 pub const EN: &[&str] = &[
@@ -485,6 +488,9 @@ pub const EN: &[&str] = &[
     "Undo",
     "Redo",
     "Drive",
+    "Take over Explorer",
+    "Open folders, drives and This PC in a new Rove tab instead of Explorer.",
+    "Open with Rove",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -550,6 +556,13 @@ mod tests {
         // 新增文案必须追加在数组末尾、不能插队，否则这个下标会指向别的词。
         assert_eq!(ZH[237], "盘符");
         assert_eq!(EN[237], "Drive");
+        // 通用页「接管资源管理器」开关（ui/settings_page.slint 硬编码 238/239）。
+        assert_eq!(ZH[238], "接管资源管理器");
+        assert_eq!(EN[238], "Take over Explorer");
+        assert_eq!(EN[239].is_empty(), false);
+        // 资源管理器右键菜单里的谓词名（写入注册表，跟随界面语言）。
+        assert_eq!(ZH[240], "用 Rove 打开");
+        assert_eq!(EN[240], "Open with Rove");
     }
 
     #[test]
