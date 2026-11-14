@@ -225,6 +225,8 @@ export component MainWindow inherits Window {
     /// 重命名时只选主名（不含扩展名）的结束字节偏移；-1 表示全选。
     in-out property <int> rename-select-end: -1;
     in-out property <[StagingItem]> staging-items: [];
+    /// 「添加到暂存盘」关掉后侧栏不渲染临时暂存盘（Rust 按 actions 开关下发）。
+    in-out property <bool> staging-tray-visible: true;
     in-out property <bool> staging-expanded: true;
     /// 展开/收起变化时上报给 Rust 落盘；启动时灌入同值会被 Rust 侧幂等挡掉。
     changed staging-expanded => {
@@ -1170,6 +1172,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     active-id: root.sidebar-active-id;
                     loading: root.file-loading;
                     staging-items: root.staging-items;
+                    staging-visible: root.staging-tray-visible;
                     // 双向绑定：托盘标题栏点击改的是内部 expanded，必须回流到
                     // MainWindow 才能触发 changed 上报给 Rust 落盘。
                     staging-expanded <=> root.staging-expanded;

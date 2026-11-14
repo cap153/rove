@@ -95,6 +95,20 @@ pub fn is_unc_server_root(path: &Path) -> bool {
     !rest.is_empty() && !rest.trim_end_matches('\\').contains('\\')
 }
 
+/// 文本形态是不是网络路径（UNC）。
+///
+/// 兼容正斜杠写法 `//server/share`；`\\?\C:\...` 这种 verbatim 前缀的
+/// **本地**路径不算网络路径，而 `\\?\UNC\...` 仍然是。
+///
+/// 调用方用它来决定「要不要在界面线程上 stat」：网络盘掉线时一次 `exists()`
+/// 就能把界面卡住好几秒。
+pub fn is_network_path_text(text: &str) -> bool {
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        return rest.to_ascii_uppercase().starts_with("UNC\\");
+    }
+    text.starts_with(r"\\") || text.starts_with("//")
+}
+
 /// 枚举服务器上的共享目录（等价于资源管理器打开 `\\host` 看到的东西）。
 #[cfg(windows)]
 fn list_unc_shares(host: &str) -> Vec<FileEntry> {
@@ -423,6 +437,34 @@ pub fn calculate_dir_size(dir: &Path, stop: &AtomicBool) -> (u64, bool) {
         }
     }
     (total, is_partial)
+}
+
+#[cfg(test)]
+mod network_path_tests {
+    use super::is_network_path_text;
+
+    #[test]
+    fn unc_and_forward_slash_are_network() {
+        assert!(is_network_path_text(r"\\server\share"));
+        assert!(is_network_path_text(r"\\192.168.1.5\Video\bsf"));
+        assert!(is_network_path_text("//server/share"));
+    }
+
+    /// verbatim 本地路径（`\\?\C:\...`）不该被当成网络路径，
+    /// 而 verbatim UNC（`\\?\UNC\...`）仍然是。
+    #[test]
+    fn verbatim_prefix_is_judged_by_target() {
+        assert!(!is_network_path_text(r"\\?\C:\Users"));
+        assert!(is_network_path_text(r"\\?\UNC\server\share"));
+    }
+
+    #[test]
+    fn local_paths_are_not_network() {
+        assert!(!is_network_path_text(r"C:\Users"));
+        assert!(!is_network_path_text(r"D:\"));
+        assert!(!is_network_path_text(""));
+        assert!(!is_network_path_text(r"\wslx"));
+    }
 }
 
 #[cfg(test)]

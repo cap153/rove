@@ -44,6 +44,8 @@ export component Sidebar inherits Rectangle {
     callback quick_drag(index: int, phase: int, y: length);
     in property <bool> drop-visible: false;
     in property <length> drop-y: 0px;
+    /// 「添加到暂存盘」动作被关掉时，临时暂存盘整块不渲染（Rust 下发）。
+    in property <bool> staging-visible: true;
     callback staging_item_removed(index: int);
     callback staging_clear_requested();
     callback staging_copy_here_requested();
@@ -52,7 +54,7 @@ export component Sidebar inherits Rectangle {
     // 动态取暂存托盘的真实高度，杜绝预设高度与折叠状态不同步引发的断层。
     // （曾用 `staging-expanded ? 224px : 36px` 推演，但托盘头部点击只改内部
     // expanded、不外传，外层算式停在旧值 → 折叠后底部残留一大块幽灵空白。）
-    property <length> tray-h: tray.height;
+    property <length> tray-h: root.staging-visible ? tray.height : 0px;
 
     background: Theme.bg-sidebar;
     min-width: 70px;
@@ -405,6 +407,7 @@ export component Sidebar inherits Rectangle {
     }
 
     tray := StagingTray {
+        visible: root.staging-visible;
         x: 0px;
         y: parent.height - self.height;
         width: parent.width;

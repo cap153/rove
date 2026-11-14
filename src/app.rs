@@ -260,6 +260,22 @@ struct ListResult {
     entries: Vec<FileEntry>,
 }
 
+/// 地址栏路径校验的后台结果。
+///
+/// `exists()` 在网络盘 / WSL 共享上能卡好几秒，所以真正的校验放在后台线程，
+/// 结果回到 poll_timer 再决定「导航」还是「提示路径不存在」。
+struct PathProbe {
+    /// 请求序号：用户连按几次回车时只认最后一次。
+    seq: u64,
+    /// 用户输入的原文（错误提示里显示它，而不是展开变量后的路径）。
+    label: String,
+    /// 发起时当前面板所在的目录。结果回来时如果已经不在那儿了，
+    /// 说明用户自己换过目录，这次回车就别再硬拽他走。
+    from: Option<PathBuf>,
+    /// Ok = 可用目录，Err = 不可用。
+    outcome: Result<PathBuf, ()>,
+}
+
 /// 深度搜索请求：在目录子树中递归查找匹配项（文件夹视图搜索）。
 struct DeepRequest {
     tab_id: u32,
@@ -712,6 +728,11 @@ pub struct App {
     /// 深度搜索通道（文件夹视图子树搜索，独立线程执行）。
     deep_tx: Sender<DeepRequest>,
     deep_rx: Receiver<DeepResult>,
+    /// 地址栏路径校验通道（后台 stat，避免网络路径卡住界面线程）。
+    path_probe_tx: Sender<PathProbe>,
+    path_probe_rx: Receiver<PathProbe>,
+    /// 最近一次路径校验的序号，用于丢弃过期结果。
+    path_probe_seq: u64,
     /// 文件夹体积异步统计通道（独立 worker 线程逐个递归计算并回传）。
     dir_size_tx: Sender<DirSizeRequest>,
     dir_size_rx: Receiver<DirSizeResult>,
@@ -787,6 +808,7 @@ impl App {
         };
         let state = AppState::new(None, sort);
         let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
+        let (path_probe_tx, path_probe_rx) = mpsc::channel::<PathProbe>();
         Self {
             ui,
             state,
@@ -845,6 +867,9 @@ impl App {
             size_sort_pending: false,
             list_geom: (-1.0, 0, -1.0, false, -1.0, -1.0),
             recording_shortcut: None,
+            path_probe_tx,
+            path_probe_rx,
+            path_probe_seq: 0,
             dir_size_tx,
             dir_size_rx,
             dir_size_stop: None,
@@ -3100,7 +3125,13 @@ impl App {
                 // 又对 self 做可变借用（thumb_for），触发借用冲突。
                 let recent_paths: Vec<PathBuf> = self.state.recent.iter().take(8).cloned().collect();
                 for path in recent_paths {
-                    if !path.exists() && !crate::fs::dir::is_unc_server_root(&path) {
+                    // 网络路径不在这里 stat：掉线的共享会让界面线程卡住（还会在
+                    // 每次刷新侧栏时重复卡）。这类条目照常显示，点进去打不开时
+                    // 再由导航流程报错。
+                    if !self.path_looks_remote(&path)
+                        && !path.exists()
+                        && !crate::fs::dir::is_unc_server_root(&path)
+                    {
                         continue;
                     }
                     #[cfg(windows)]
@@ -3268,6 +3299,20 @@ impl App {
             .collect();
         self.ui
             .set_staging_items(ModelRc::new(VecModel::from(items)));
+        self.ui.set_staging_tray_visible(self.staging_tray_enabled());
+    }
+
+    /// 「添加到暂存盘」动作是否还开着。
+    ///
+    /// 关掉后没有任何入口能往暂存盘里加东西，左侧那块「临时暂存盘」
+    /// 就只是个永远空的盒子，索性整块不渲染（见 ui/sidebar.slint 的
+    /// `staging-visible`）。动作缺失时按「开」处理，与菜单默认一致。
+    fn staging_tray_enabled(&self) -> bool {
+        self.actions
+            .iter()
+            .find(|a| a.id == "builtin.stage")
+            .map(|a| a.enabled)
+            .unwrap_or(true)
     }
 
     /// 全量同步文件列表（标题、排序态、总行数、可见窗口）。
@@ -5416,6 +5461,39 @@ fn group_options(actions: &[crate::ops::actions::ActionEntry], top_label: &str) 
 }
 
 impl App {
+    /// 这条路径「访问它可能要等网络」吗（UNC 或**映射的**网络驱动器）。
+    ///
+    /// 只看缓存里的驱动器列表，不访问磁盘。用来决定要不要在界面线程上 stat：
+    /// 掉线的共享一次 `exists()` 就能把界面卡住好几秒。
+    fn path_looks_remote(&self, path: &Path) -> bool {
+        if crate::fs::dir::is_network_path_text(&path.to_string_lossy()) {
+            return true;
+        }
+        let letter = match path.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+                std::path::Prefix::Disk(drive) => (drive as char).to_ascii_uppercase(),
+                _ => return false,
+            },
+            _ => return false,
+        };
+        self.drives
+            .iter()
+            .any(|d| d.letter == letter && d.drive_type == crate::fs::drives::DriveType::Network)
+    }
+
+    /// 用**已加载的列表**判断某项是不是目录（不碰磁盘）。
+    ///
+    /// 右键菜单、固定到快速访问都要判断这个；原来直接 `is_dir()`，命中掉线的
+    /// 网络盘会把界面线程卡住。返回 None = 这条路径不在当前列表里（比如从侧栏
+    /// 发起的操作），调用方按「不知道」处理。
+    fn loaded_is_dir(&self, path: &Path) -> Option<bool> {
+        let pane = self.state.active().active();
+        pane.entries
+            .iter()
+            .find(|e| e.path == path)
+            .map(|e| e.is_dir)
+    }
+
     /// 右键菜单里 Rove 自己那一部分（Shell 项之外）——直接产出原生菜单节点。
     ///
     /// Files 视图完全由 actions.toml（含内置动作）驱动，按 `group` 字段组织
@@ -5523,9 +5601,13 @@ impl App {
 
                 for a in groups.remove("").unwrap_or_default() {
                     let mut label = self.tr(&a.label).to_string();
-                    // 终端：非目录时改标签。
+                    // 终端：非目录时改标签。判断用已加载的条目表，
+                    // 不在界面线程上 stat（网络路径的 is_dir() 会卡住）。
                     if a.id == "builtin.terminal" {
-                        let first_is_dir = paths.first().map(|p| p.is_dir()).unwrap_or(false);
+                        let first_is_dir = paths
+                            .first()
+                            .and_then(|p| self.loaded_is_dir(p))
+                            .unwrap_or(false);
                         label = if first_is_dir {
                             self.tr("在此处打开终端")
                         } else {
@@ -6155,6 +6237,12 @@ impl App {
         if trimmed.is_empty() {
             return;
         }
+        // 地址栏命令：输入 `cmd` 回车 = 在当前目录打开终端
+        // （与右键菜单「在此处打开终端」同一条实现）。
+        if is_address_bar_command(trimmed) {
+            self.open_terminal_here();
+            return;
+        }
         // 虚拟根：地址栏在“此电脑”下会以标签作为初始文本，回车视为回到此电脑
         if trimmed == "此电脑" || trimmed.eq_ignore_ascii_case("this pc") {
             self.navigate_active(None);
@@ -6164,13 +6252,62 @@ impl App {
         // 核心修复：使用 expand_path 展开环境变量和 ~
         let p = Self::expand_path(trimmed);
 
+        // 校验放到后台线程：`exists()` 命中掉线的网络盘 / WSL 共享能卡好几秒，
+        // 在界面线程上就是整窗未响应（和启动终端同一个坑）。
         // `\\host` 不是文件系统路径（GetFileAttributes 打不开），但能列出共享，
-        // 所以不能拿 exists() 卡它。
-        if !p.exists() && !crate::fs::dir::is_unc_server_root(&p) {
-            self.set_status_job(self.trf("路径不存在：{}", &[trimmed.to_string()]));
-            return;
+        // 所以不能拿 exists() 卡它 —— 这条规则同样在后台判断。
+        self.path_probe_seq += 1;
+        let seq = self.path_probe_seq;
+        let label = trimmed.to_string();
+        let from = self.state.active().active().path.clone();
+        let tx = self.path_probe_tx.clone();
+        let probe_path = p.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rove-path-probe".into())
+            .spawn(move || {
+                let ok = probe_path.exists() || crate::fs::dir::is_unc_server_root(&probe_path);
+                let outcome = if ok { Ok(probe_path) } else { Err(()) };
+                // 接收端已销毁（退出中）时忽略即可。
+                let _ = tx.send(PathProbe {
+                    seq,
+                    label,
+                    from,
+                    outcome,
+                });
+            });
+        if spawned.is_err() {
+            // 极端情况：线程都建不起来。退回同步校验 —— 宁可慢一点，
+            // 也不能让回车彻底没反应。
+            logln!("!! 路径校验线程创建失败，退回同步校验");
+            if p.exists() || crate::fs::dir::is_unc_server_root(&p) {
+                self.navigate_active(Some(p));
+            } else {
+                self.set_status_job(self.trf("路径不存在：{}", &[trimmed.to_string()]));
+            }
         }
-        self.navigate_active(Some(p));
+    }
+
+    /// 在当前聚焦面板的目录里打开终端（地址栏 `cmd` 用）。
+    fn open_terminal_here(&mut self) {
+        let dir = self.state.active().active().path.clone();
+        self.open_terminal_at(dir);
+    }
+
+    /// 在 `dir` 里开终端（右键菜单 / 地址栏 `cmd` 共用）。
+    ///
+    /// `dir` 允许是**文件**（右键选中文件时开在它所在的目录），判断交给后台
+    /// 线程做 —— 网络盘 / WSL 共享上的 `is_dir()` 能卡住，不能在界面线程上问。
+    ///
+    /// 此电脑（无路径）与回收站这类虚拟目录没有可打开的目录，只给一句状态
+    /// 提示，绝不把 `recycle://` 丢给系统去启动进程（那只会得到 os error 267）。
+    fn open_terminal_at(&mut self, dir: Option<PathBuf>) {
+        let is_virtual = dir
+            .as_deref()
+            .is_some_and(|p| p == fs::drives::recycle_virtual_path().as_path());
+        match dir {
+            Some(dir) if !is_virtual => ops::open_terminal(&dir),
+            _ => self.set_status_job(self.tr("当前视图没有可打开的目录")),
+        }
     }
 
     /// 侧栏各行的 (顶 y, 行高)（内容坐标）。必须与 `ui/sidebar.slint` 完全一致：
@@ -6557,7 +6694,10 @@ impl App {
             .collect();
         let mut added = 0;
         for p in paths {
-            if !p.is_dir() || *p == fs::drives::recycle_virtual_path() {
+            // 只认「明确是文件」的：判断来自已加载的列表，网络路径不在这 stat。
+            if self.loaded_is_dir(p) == Some(false)
+                || *p == fs::drives::recycle_virtual_path()
+            {
                 continue;
             }
             let text = p.to_string_lossy().into_owned();
@@ -7433,16 +7573,10 @@ impl App {
                 }
                 "builtin.terminal" => {
                     let dir = match &target {
-                        MenuScope::Selection(paths) => paths
-                            .first()
-                            .and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }),
+                        MenuScope::Selection(paths) => paths.first().cloned(),
                         MenuScope::Background => self.state.active().active().path.clone(),
                     };
-                    if let Some(dir) = dir {
-                        if let Err(e) = ops::open_terminal(&dir) {
-                            self.set_status_job(e);
-                        }
-                    }
+                    self.open_terminal_at(dir);
                     return;
                 }
                 "builtin.pin_quick" => {
@@ -7555,16 +7689,10 @@ impl App {
             CMD_PASTE => self.paste_clipboard(),
             CMD_TERMINAL => {
                 let dir = match &target {
-                    MenuScope::Selection(paths) => paths
-                        .first()
-                        .and_then(|p| if p.is_dir() { Some(p.clone()) } else { p.parent().map(|d| d.to_path_buf()) }),
+                    MenuScope::Selection(paths) => paths.first().cloned(),
                     MenuScope::Background => self.state.active().active().path.clone(),
                 };
-                if let Some(dir) = dir {
-                    if let Err(e) = ops::open_terminal(&dir) {
-                        self.set_status_job(e);
-                    }
-                }
+                self.open_terminal_at(dir);
             }
             CMD_OPEN_LOCATION => {
                 if let MenuScope::Selection(paths) = &target {
@@ -8988,6 +9116,12 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     // 合并窗口到点则触发索引重建（设置页连续改多项只重建一次）。
     maybe_run_pending_reindex();
 
+    // 后台线程启动终端 / 自定义动作失败（目录不存在、进程起不来）在这里显示。
+    // 逐条借一次 App，避免和下面 `sync_drag_bounds` / `borrow_mut` 抢借用。
+    for message in ops::take_launch_errors() {
+        app.borrow().set_status_job(message);
+    }
+
     // 主窗 HWND 登记、无边框拖拽钩子、最大化还原、首次启动居中，已全部移至
     // on_winit_window_event 的首次 RedrawRequested（窗口 realize 后）统一应用，
     // 见 apply_deferred_geometry（由 setup_keyboard 注册）。
@@ -9020,6 +9154,23 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 }
                 while let Ok(result) = app.dir_size_rx.try_recv() {
                     app.apply_dir_size_result(result);
+                }
+                // 地址栏路径校验结果：只认最后一次回车，且用户中途没换过目录。
+                while let Ok(probe) = app.path_probe_rx.try_recv() {
+                    if probe.seq != app.path_probe_seq {
+                        continue;
+                    }
+                    let still_here =
+                        app.state.active().active().path.as_ref() == probe.from.as_ref();
+                    match probe.outcome {
+                        Ok(path) if still_here => app.navigate_active(Some(path)),
+                        // 用户已经在别的目录里翻文件了，别把他拽回来。
+                        Ok(_) => {}
+                        Err(()) => {
+                            let label = probe.label;
+                            app.set_status_job(app.trf("路径不存在：{}", &[label]));
+                        }
+                    }
                 }
 
                 // 核心修复：缩略图批量到达后，统一在主线程刷新一次，避免 653 张
@@ -10699,6 +10850,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 app.actions[idx].enabled = enabled;
                 app.save_actions_and_reload();
                 app.sync_settings();
+                // 「添加到暂存盘」开关同时控制侧栏里那块托盘的显隐。
+                app.ui.set_staging_tray_visible(app.staging_tray_enabled());
             }
         });
     }
@@ -12115,6 +12268,14 @@ fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
     }
 }
 
+/// 地址栏命令别名（输入后回车直接执行，不再当路径解析）。
+///
+/// 目前只有 `cmd`：配合右键菜单里的「在此处打开终端」，
+/// 地址栏里敲两个字母就能在当前目录开终端。
+fn is_address_bar_command(text: &str) -> bool {
+    matches!(text.trim().to_ascii_lowercase().as_str(), "cmd" | "cmd.exe")
+}
+
 /// 初始化路径该「新开标签」还是「占用当前（默认）标签」。
 ///
 /// - `requested_new_tab`：请求方（`--shell-open` / `--this-pc`，即资源管理器接管）
@@ -12125,6 +12286,31 @@ fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
 ///   同样不能被顶掉。
 fn initial_path_opens_new_tab(requested_new_tab: bool, restored_last_tabs: bool) -> bool {
     requested_new_tab || restored_last_tabs
+}
+
+#[cfg(test)]
+mod address_bar_command_tests {
+    use super::is_address_bar_command;
+
+    #[test]
+    fn cmd_aliases_are_commands() {
+        assert!(is_address_bar_command("cmd"));
+        assert!(is_address_bar_command("CMD"));
+        assert!(is_address_bar_command("  cmd  "));
+        assert!(is_address_bar_command("cmd.exe"));
+        assert!(is_address_bar_command("CMD.EXE"));
+    }
+
+    /// 真实路径不能误判成命令：`C:\cmd`、`\\server\cmd`、`D:\tools\cmd.exe`
+    /// 都必须照旧走「当路径解析」。
+    #[test]
+    fn paths_are_not_commands() {
+        assert!(!is_address_bar_command(r"C:\cmd"));
+        assert!(!is_address_bar_command(r"\\server\cmd"));
+        assert!(!is_address_bar_command(r"D:\tools\cmd.exe"));
+        assert!(!is_address_bar_command("cmd dir"));
+        assert!(!is_address_bar_command(""));
+    }
 }
 
 fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new_tab: bool) {

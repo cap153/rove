@@ -475,10 +475,33 @@ fn str_field(table: &toml_edit::Table, key: &str) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// 执行一条动作（参数模板替换 + 启动进程）。
+///
+/// 只做「不碰文件系统」的配置检查，真正的启动在后台线程里做：工作目录和程序
+/// 路径都可能落在网络盘 / WSL 共享上，`CreateProcess` 打开它们能卡几十秒，
+/// 放在界面线程上就是整窗未响应（和终端那条路径同一个坑）。启动失败由后台
+/// 线程塞进 `ops::report_launch_error`，状态栏轮询显示。
 pub fn run_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String> {
     if targets.is_empty() {
         return Err("没有选中项".into());
     }
+    if entry.program.is_empty() {
+        return Err("未配置可执行文件".into());
+    }
+    let entry = entry.clone();
+    let targets = targets.to_vec();
+    std::thread::Builder::new()
+        .name("rove-action".into())
+        .spawn(move || {
+            if let Err(e) = launch_action(&entry, &targets) {
+                crate::ops::report_launch_error(format!("执行失败：{e}"));
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("无法创建线程：{e}"))
+}
+
+/// 真正的启动动作（只在后台线程里跑，允许阻塞在慢速磁盘/网络上）。
+fn launch_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String> {
     let target_dir = targets[0]
         .parent()
         .map(|p| p.to_path_buf())
@@ -491,11 +514,14 @@ pub fn run_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String
     };
 
     let argv = split_args(&args);
-    if entry.program.is_empty() {
-        return Err("未配置可执行文件".into());
-    }
     if !Path::new(&entry.program).is_file() {
         return Err(format!("程序不存在：{}", entry.program));
+    }
+    // 工作目录不存在（回收站里的虚拟路径、掉线的网络盘）先给一句人话，
+    // 否则只会得到 CreateProcess 的 os error 267。检查放在后台线程里，
+    // 慢速磁盘上卡住也不影响界面。
+    if !working_dir.is_dir() {
+        return Err(format!("工作目录不存在：{}", working_dir.display()));
     }
     // 控制台程序（7z/bz）不闪黑框。
     #[cfg(windows)]
@@ -575,6 +601,32 @@ fn split_args(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_entry() -> ActionEntry {
+        ActionEntry {
+            id: "user.test".into(),
+            label: "测试".into(),
+            tool: String::new(),
+            program: r"C:\Windows\System32\cmd.exe".into(),
+            args: String::new(),
+            working_dir: String::new(),
+            target: "any".into(),
+            extensions: Vec::new(),
+            enabled: true,
+            group: String::new(),
+            builtin: false,
+        }
+    }
+
+    /// 空选中 / 没填程序 这两类配置错误必须在界面线程上立刻返回，
+    /// 不能先起个后台线程再报错。
+    #[test]
+    fn run_action_reports_config_errors_synchronously() {
+        let mut entry = test_entry();
+        assert!(run_action(&entry, &[]).is_err());
+        entry.program = String::new();
+        assert!(run_action(&entry, &[PathBuf::from(r"C:\a.txt")]).is_err());
+    }
 
     #[test]
     fn split_args_respects_quotes() {
