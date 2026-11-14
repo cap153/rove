@@ -175,7 +175,9 @@ export component MainWindow inherits Window {
     in-out property <string> sidebar-active-id: "";
     in-out property <[FileRow]> file-rows: [];
     /// 当前是否「此电脑」视图：详细信息里要隐藏修改时间列、大小列改显示剩余容量。
+    /// 左右两栏各自一套：分屏时可能一边是此电脑、一边是普通目录。
     in-out property <bool> file-is-computer-view: false;
+    in-out property <bool> file-is-computer-view-right: false;
     in-out property <int> file-total: 0;
     in-out property <bool> file-loading: false;
     /// 图标视图“展开名称”目标（单个选中 / 重命名）：条目绝对索引与完整名称。
@@ -204,6 +206,10 @@ export component MainWindow inherits Window {
     in-out property <bool> file-single-selection-right: false;
     in-out property <string> sort-key: "name";
     in-out property <bool> sort-ascending: true;
+    /// 右栏自己的排序标记：分屏时两栏可能一边是此电脑（盘符）、一边是普通目录，
+    /// 表头箭头必须各看各的。
+    in-out property <string> sort-key-right: "name";
+    in-out property <bool> sort-ascending-right: true;
     in-out property <string> rename-path: "";
     /// 重命名发生在哪一栏（0 左 / 1 右）。不能用 active-pane：
     /// 重命名期间点击别处会切换聚焦面板，输入框就会跳到另一栏。
@@ -253,8 +259,9 @@ export component MainWindow inherits Window {
     in-out property <length> list-height;
 /// 视图模式（Pulse 式视图切换）。直通 FileList。
 in-out property <string> view-mode <=> file-list.view-mode;
-/// 「路径」列显隐（仅回收站开启）。直通 FileList。
+/// 「路径」列显隐（仅回收站开启）。直通 FileList。左右栏各自判定。
 in-out property <bool> show-path-column <=> file-list.show-path-column;
+in-out property <bool> show-path-column-right: false;
 out property <int> cells-per-row: file-list.cells-per-row;
     out property <length> view-width: file-list.view-width;
     /// 左右栏各自的名称区真实宽度（分屏后两栏宽度不同，不能共用一个值）。
@@ -1355,10 +1362,9 @@ out property <length> row-height-out: file-list.row-height-out;
                         expand-lines: root.file-expand-lines-right;
                         expand-box-w: root.file-expand-box-w-right;
                         total-count: root.file-total-right;
-                        sort-key: root.sort-key;
-                        sort-ascending: root.sort-ascending;
+                        sort-key: root.sort-key-right;
+                        sort-ascending: root.sort-ascending-right;
                         view-mode: root.view-mode;
-                        show-path-column: root.show-path-column;
                         rename-path: root.rename-pane == 1 ? root.rename-path : "";
                         rename-text <=> root.rename-text;
                         rename-select-end: root.rename-select-end;
@@ -1384,7 +1390,8 @@ out property <length> row-height-out: file-list.row-height-out;
                         auto-col-widths: root.col-auto-widths;
                         mouse-left-pressed: root.mouse-left-pressed;
                         single-selection: root.file-single-selection-right;
-                        is-computer-view: root.file-is-computer-view;
+                        show-path-column: root.show-path-column-right;
+                        is-computer-view: root.file-is-computer-view-right;
                         col_resized(index, width, name-w) => {
                             root.file_col_resized(index, width, name-w);
                         }

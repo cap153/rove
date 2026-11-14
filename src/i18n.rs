@@ -243,6 +243,7 @@ pub const ZH: &[&str] = &[
     "打开新标签后自动进入地址栏编辑态，可直接输入路径。",
     "撤销",
     "重做",
+    "盘符",
 ];
 
 pub const EN: &[&str] = &[
@@ -483,6 +484,7 @@ pub const EN: &[&str] = &[
     "Enter path editing automatically when opening a new tab.",
     "Undo",
     "Redo",
+    "Drive",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -544,6 +546,10 @@ mod tests {
         assert_eq!(EN[79], "General");
         assert_eq!(ZH[85], "显示语言");
         assert_eq!(EN[85], "Display language");
+        // 「此电脑」表头第一列的「盘符」：ui/file_list.slint 里硬编码了 237，
+        // 新增文案必须追加在数组末尾、不能插队，否则这个下标会指向别的词。
+        assert_eq!(ZH[237], "盘符");
+        assert_eq!(EN[237], "Drive");
     }
 
     #[test]

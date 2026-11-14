@@ -64,6 +64,13 @@ pub struct Config {
     pub sort_key: String,
     /// 全局排序方向：true 递增 / false 递减。
     pub sort_ascending: bool,
+    /// 「此电脑」视图独立的排序字段：drive | name | size | modified | type | path。
+    /// 该视图没有「修改时间」列，主键是「盘符」；独立存放以免被全局排序带走。
+    pub this_pc_sort_key: String,
+    pub this_pc_sort_ascending: bool,
+    /// 「回收站」视图独立的排序字段（默认修改时间递减）。
+    pub recycle_sort_key: String,
+    pub recycle_sort_ascending: bool,
     /// 详细信息列宽一律自适应（不按目录持久化）：用户手动拖宽只在本次会话生效，
     /// 切目录后自动重新按内容 + 视口估算，避免「某目录被记住过宽 → 一直横向滚动」。
     /// 是否显示隐藏文件/文件夹/驱动器（默认 false，即过滤掉）。
@@ -211,6 +218,10 @@ impl Default for Config {
             last_active_tab: 0,
             sort_key: "name".to_string(),
             sort_ascending: true,
+            this_pc_sort_key: "drive".to_string(),
+            this_pc_sort_ascending: true,
+            recycle_sort_key: "modified".to_string(),
+            recycle_sort_ascending: false,
 
             show_hidden: false,
             auto_edit_path_on_new_tab: false,
@@ -413,6 +424,22 @@ impl Config {
         if let Some(sa) = json.get("sort_ascending").and_then(|v| v.as_bool()) {
             config.sort_ascending = sa;
         }
+        if let Some(sk) = json.get("this_pc_sort_key").and_then(|v| v.as_str()) {
+            if matches!(sk, "drive" | "name" | "size" | "modified" | "type" | "path") {
+                config.this_pc_sort_key = sk.to_string();
+            }
+        }
+        if let Some(sa) = json.get("this_pc_sort_ascending").and_then(|v| v.as_bool()) {
+            config.this_pc_sort_ascending = sa;
+        }
+        if let Some(sk) = json.get("recycle_sort_key").and_then(|v| v.as_str()) {
+            if matches!(sk, "drive" | "name" | "size" | "modified" | "type" | "path") {
+                config.recycle_sort_key = sk.to_string();
+            }
+        }
+        if let Some(sa) = json.get("recycle_sort_ascending").and_then(|v| v.as_bool()) {
+            config.recycle_sort_ascending = sa;
+        }
         // 旧版 config.json 里的 column_layouts 一律忽略：列宽改为统一自适应，
         // 不再按目录还原用户拖过的宽度（避免某些目录被记住超宽、一直横向滚动）。
         if let Some(sh) = json.get("show_hidden").and_then(|v| v.as_bool()) {
@@ -606,6 +633,10 @@ impl Config {
             "window_maximized": self.window_maximized,
             "sort_key": self.sort_key,
             "sort_ascending": self.sort_ascending,
+            "this_pc_sort_key": self.this_pc_sort_key,
+            "this_pc_sort_ascending": self.this_pc_sort_ascending,
+            "recycle_sort_key": self.recycle_sort_key,
+            "recycle_sort_ascending": self.recycle_sort_ascending,
             "show_hidden": self.show_hidden,
             "auto_edit_path_on_new_tab": self.auto_edit_path_on_new_tab,
             "shortcuts": self.shortcuts,

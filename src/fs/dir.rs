@@ -21,6 +21,8 @@ pub enum SortKey {
     Modified,
     Type,
     Path,
+    /// 「盘符」：「此电脑」视图的主键（该视图没有名称列）。
+    Drive,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,22 +198,12 @@ pub fn sort_entries(entries: &mut [FileEntry], sort: SortState) {
                 }
             }
             SortKey::Modified => {
-                // 此电脑的驱动器条目没有修改时间（`modified: None`）。按用户要求：
-                // 全局排序选中「修改时间」时，此电脑固定按盘符 C/D/E 排，
-                // 并且不受全局升/降序影响。这里直接 return，同时跳过下面的
-                // 「相等时按名称兜底」和方向反转；只限定驱动器，避免影响
-                // 普通目录里同样没有时间的条目（仍按名称兜底）。
-                if a.modified.is_none()
-                    && b.modified.is_none()
-                    && a.style == crate::fs::entry::IconStyle::Disk
-                    && b.style == crate::fs::entry::IconStyle::Disk
-                {
-                    return a.path.cmp(&b.path);
-                }
                 a.modified.cmp(&b.modified)
             }
             SortKey::Type => a.type_text.cmp(&b.type_text),
             SortKey::Path => a.path.cmp(&b.path),
+            // 盘符：驱动器路径形如 `C:\`，按路径字典序即 C、D、E…
+            SortKey::Drive => a.path.cmp(&b.path),
         };
 
         if ord == std::cmp::Ordering::Equal && sort.key != SortKey::Name {
@@ -432,32 +424,29 @@ mod tests {
     }
 
     #[test]
-    fn drives_without_mtime_sort_by_letter_in_both_directions() {
-        // 此电脑：驱动器条目都没有修改时间。按用户要求，「修改时间」排序下
-        // 固定按盘符 C/D/E 排，且升/降序都不改变这个顺序。
-        // 卷标特意与盘符顺序不同，用来区分「按名称兜底」和「按盘符」。
+    fn drive_key_sorts_by_letter() {
+        // 此电脑：主键是「盘符」，按 C/D/E 顺序排。
+        // 卷标特意与盘符顺序不同，用来区分「按名称」和「按盘符」。
         let make = |letter: char, label: &str| {
             let mut e = test_entry(label, true, 0);
             e.path = std::path::PathBuf::from(format!("{letter}:\\"));
             e.style = crate::fs::entry::IconStyle::Disk;
             e
         };
-        for ascending in [true, false] {
-            let mut entries = vec![
-                make('E', "备份 (E:)"),
-                make('D', "linux (D:)"),
-                make('C', "本地磁盘 (C:)"),
-            ];
-            sort_entries(
-                &mut entries,
-                SortState {
-                    key: SortKey::Modified,
-                    ascending,
-                },
-            );
-            let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-            assert_eq!(names, vec!["本地磁盘 (C:)", "linux (D:)", "备份 (E:)"]);
-        }
+        let mut entries = vec![
+            make('E', "备份 (E:)"),
+            make('D', "linux (D:)"),
+            make('C', "本地磁盘 (C:)"),
+        ];
+        sort_entries(
+            &mut entries,
+            SortState {
+                key: SortKey::Drive,
+                ascending: true,
+            },
+        );
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["本地磁盘 (C:)", "linux (D:)", "备份 (E:)"]);
     }
 
     #[test]

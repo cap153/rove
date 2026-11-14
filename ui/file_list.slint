@@ -428,8 +428,11 @@ export component FileList inherits Rectangle {
     // 不再按剩余空间自动分配 —— 用户手动调过的宽度不会被窗口缩放覆盖。
     in-out property <length> w-name: 320px;
     in-out property <length> w-modified: 150px;
-    /// 此电脑视图：整个「修改时间」列不显示，「大小」列表头改成「剩余」，
-    /// 单元格只显示剩余容量。
+    /// 「修改时间」列的实际占宽：此电脑视图整列不存在，按 0 参与后面的列排布，
+    /// 这样类型/大小/路径列会自动左移，不留空洞。
+    private property <length> eff-modified-w: root.is-computer-view ? 0px : root.w-modified;
+    /// 此电脑视图：整个「修改时间」列不显示，首列表头是「盘符」，
+    /// 大小列表头改成「剩余」，单元格只显示剩余容量。
     in-out property <bool> is-computer-view: false;
     in-out property <length> w-type: 116px;
     in-out property <length> w-size: 96px;
@@ -500,7 +503,7 @@ export component FileList inherits Rectangle {
     /// 自适应预算：视口宽扣掉图标列、其余固定列、路径列、以及「大小」列右侧
     /// 预留的框选留白，剩下的全给名称列。只在该目录没有手动列宽记录时生效。
     private property <length> auto-name-w: max(160px,
-        flick.width - root.col-name-x - root.w-modified - root.w-type - root.w-size
+        flick.width - root.col-name-x - root.eff-modified-w - root.w-type - root.w-size
         - root.col-path-w - root.right-pad - 8px);
     private property <length> col-name-w: root.view-mode == "list"
         ? max(140px, flick.width - root.col-name-x - 10px)
@@ -508,7 +511,7 @@ export component FileList inherits Rectangle {
             ? (root.rs-name-lock >= 0px
                 // 拖动任何分隔符期间用本地锁定值：不能靠 auto-col-widths，
                 // 它要等松手后 Rust 提交才变，拖动过程中仍为 true，
-                // 而 auto-name-w 里减掉了 w-modified —— 往左拖右列会让名称列
+                // 而 auto-name-w 里减掉了右列宽度 —— 往左拖右列会让名称列
                 // 反向变宽，用户看到的是左边那条分隔符在跑（不是手上那条）。
                 ? root.rs-name-lock
                 : (root.auto-col-widths
@@ -520,7 +523,7 @@ export component FileList inherits Rectangle {
     /// 三个用途：行点击区的右界、表头最后一条分隔线、横向滚动条的判定基准。
     private property <length> col-end: root.col-path-x + root.col-path-w;
     private property <length> col-modified-x: root.col-name-x + root.col-name-w;
-    private property <length> col-type-x: root.col-modified-x + root.w-modified;
+    private property <length> col-type-x: root.col-modified-x + root.eff-modified-w;
     private property <length> col-size-x: root.col-type-x + root.w-type;
     private property <length> col-path-x: root.col-size-x + root.w-size;
 
@@ -603,8 +606,8 @@ export component FileList inherits Rectangle {
                 SortCell {
                     x: root.col-name-x;
                     width: root.col-name-w;
-                    key: "name";
-                    label: I18n.strings[30];
+                    key: root.is-computer-view ? "drive" : "name";
+                    label: root.is-computer-view ? I18n.strings[237] : I18n.strings[30];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -612,6 +615,7 @@ export component FileList inherits Rectangle {
                     }
                 }
                 SortCell {
+                    visible: !root.is-computer-view;
                     x: root.col-modified-x;
                     width: root.w-modified;
                     key: "modified";
@@ -723,6 +727,9 @@ export component FileList inherits Rectangle {
                 }
             }
             h-mod := TouchArea {
+                // 此电脑视图没有修改时间列，这条分隔符也就没有意义（否则会和
+                // 名称列右侧的手柄叠在同一位置，点不准）。
+                visible: !root.is-computer-view;
                 x: root.col-type-x - 3px + flick.content-x;
                 width: 6px;
                 height: parent.height - 1px;
@@ -1354,9 +1361,9 @@ export component FileList inherits Rectangle {
                     }
                 }
 
-                // 修改时间
+                // 修改时间（此电脑视图整列不存在）
                 Rectangle {
-                    visible: root.view-mode == "details";
+                    visible: root.view-mode == "details" && !root.is-computer-view;
                     x: root.col-modified-x;
                     y: 0px;
                     width: root.w-modified;

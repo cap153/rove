@@ -456,6 +456,73 @@ fn global_dir_sizes() -> &'static Mutex<DirSizeStore> {
 /// 悬停项索引, 悬停框宽, 悬停行哈希)。
 type ExpandSig = (i32, u32, u64, u64, i32, u32, u64);
 
+/// 面板所在的「视图种类」：决定它用哪一套排序状态。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewSort {
+    /// 「此电脑」（路径为 None）：主键是盘符，没有修改时间列。
+    ThisPc,
+    /// 回收站虚拟目录。
+    Recycle,
+    /// 普通目录：用全局排序。
+    Normal,
+}
+
+impl ViewSort {
+    fn of(path: Option<&std::path::Path>) -> Self {
+        match path {
+            None => Self::ThisPc,
+            Some(p) if p == crate::fs::drives::recycle_virtual_path().as_path() => Self::Recycle,
+            _ => Self::Normal,
+        }
+    }
+
+    /// 这个视图到底有哪几个列可排。
+    /// 「此电脑」没有名称列，也没有修改时间列；它的主键是「盘符」。
+    fn allows(self, key: SortKey) -> bool {
+        match (self, key) {
+            (Self::ThisPc, SortKey::Drive | SortKey::Type | SortKey::Size) => true,
+            (Self::ThisPc, _) => false,
+            (_, SortKey::Drive) => false,
+            _ => true,
+        }
+    }
+
+    /// 排序键在不可用时退回的兼底值。
+    fn fallback(self, key: SortKey) -> SortKey {
+        if self.allows(key) {
+            key
+        } else if self == Self::ThisPc {
+            SortKey::Drive
+        } else {
+            SortKey::Name
+        }
+    }
+}
+
+/// SortKey ↔ 配置文件里的字符串。
+fn sort_key_id(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Name => "name",
+        SortKey::Size => "size",
+        SortKey::Modified => "modified",
+        SortKey::Type => "type",
+        SortKey::Path => "path",
+        SortKey::Drive => "drive",
+    }
+}
+
+fn parse_sort_key(id: &str, fallback: SortKey) -> SortKey {
+    match id {
+        "name" => SortKey::Name,
+        "size" => SortKey::Size,
+        "modified" => SortKey::Modified,
+        "type" => SortKey::Type,
+        "path" => SortKey::Path,
+        "drive" => SortKey::Drive,
+        _ => fallback,
+    }
+}
+
 /// 应用主体。
 pub struct App {
     ui: MainWindow,
@@ -888,6 +955,10 @@ impl App {
 
     /// 重新列举当前标签（常规操作复用：新建/删除/拖放/还原等，不清体积缓存）。
     fn reload_active(&mut self) {
+        // 列举请求会带上 pane.sort：新建标签 / 添加网络位置 / 切换到设置页再回来这类
+        // 不经过 navigate 的路径，pane.sort 可能是从上一个视图（比如此电脑的盘符）
+        // 继承来的，直接发出去会用错排序。这里统一对齐到当前视图自己的状态。
+        self.sync_view_sort();
         self.reload_tab(self.state.active_tab);
     }
 
@@ -2053,6 +2124,65 @@ fn drag_gesture_paths(
 mod tests {
     use super::*;
 
+    /// 三种视图必须能区分开：普通目录、此电脑（路径 None）、回收站。
+    #[test]
+    fn view_sort_classifies_paths() {
+        assert!(matches!(ViewSort::of(None), ViewSort::ThisPc));
+        let recycle = crate::fs::drives::recycle_virtual_path();
+        assert!(matches!(ViewSort::of(Some(recycle.as_path())), ViewSort::Recycle));
+        let normal = std::path::PathBuf::from("D:\\重");
+        assert!(matches!(ViewSort::of(Some(normal.as_path())), ViewSort::Normal));
+    }
+
+    /// 每个视图只能按自己真实存在的列排序：否则会变成「按一列看不见的东西排」，
+    /// 用户既发现不了也改不回来。
+    #[test]
+    fn views_only_allow_their_own_columns() {
+        // 此电脑：盘符/类型/大小，没有名称列、也没有修改时间列。
+        assert!(ViewSort::ThisPc.allows(SortKey::Drive));
+        assert!(ViewSort::ThisPc.allows(SortKey::Type));
+        assert!(ViewSort::ThisPc.allows(SortKey::Size));
+        assert!(!ViewSort::ThisPc.allows(SortKey::Modified));
+        assert!(!ViewSort::ThisPc.allows(SortKey::Name));
+
+        // 回收站与普通目录：有名称/修改时间/类型/大小，没有「盘符」。
+        for view in [ViewSort::Recycle, ViewSort::Normal] {
+            for key in [
+                SortKey::Name,
+                SortKey::Modified,
+                SortKey::Type,
+                SortKey::Size,
+                SortKey::Path,
+            ] {
+                assert!(view.allows(key), "{key:?} 应该允许");
+            }
+            assert!(!view.allows(SortKey::Drive));
+        }
+
+        // 兼底：不可用时退回该视图的主键，可用时原样返回。
+        assert_eq!(ViewSort::ThisPc.fallback(SortKey::Modified), SortKey::Drive);
+        assert_eq!(ViewSort::Recycle.fallback(SortKey::Drive), SortKey::Name);
+        assert_eq!(ViewSort::Normal.fallback(SortKey::Size), SortKey::Size);
+    }
+
+    /// 排序字段的字符串标识必须能双向转换：落盘后再读回来不能变成别的字段。
+    #[test]
+    fn sort_key_ids_roundtrip() {
+        for key in [
+            SortKey::Name,
+            SortKey::Size,
+            SortKey::Modified,
+            SortKey::Type,
+            SortKey::Path,
+            SortKey::Drive,
+        ] {
+            assert_eq!(parse_sort_key(sort_key_id(key), SortKey::Name), key);
+        }
+        // 配置文件里出现未知/残缺值时不惊动现状，走调用方给的兑底值。
+        assert_eq!(parse_sort_key("", SortKey::Drive), SortKey::Drive);
+        assert_eq!(parse_sort_key("nonsense", SortKey::Modified), SortKey::Modified);
+    }
+
     /// 超长名字截断时必须保留扩展名（否则文件失去关联类型）。
     #[test]
     fn clamp_file_name_keeps_extension() {
@@ -2274,8 +2404,10 @@ mod tests {
     fn status_danger_markers() {
         assert!(status_is_danger("操作失败：Shell 操作失败，错误代码: 123"));
         assert!(status_is_danger("名称超过 255 个字符上限，已退出重命名"));
-        assert!(status_is_danger("已删除 3 个项目到回收站"));
-        assert!(status_is_danger("删除已取消"));
+        assert!(status_is_danger("删除失败：拒绝访问"));
+        // 删除成功 / 取消都不是危险提示（裸「删除」已故意从标记里移除）。
+        assert!(!status_is_danger("已删除 3 个项目到回收站"));
+        assert!(!status_is_danger("删除已取消"));
         assert!(!status_is_danger("已复制 3 个项目"));
         assert!(!status_is_danger("已重命名"));
         assert!(!status_is_danger(""));
@@ -2554,22 +2686,40 @@ impl App {
     }
 
     /// 全局应用排序并持久化。同时刷新所有已打开的面板，确保多标签/分屏统一。
+    /// 「此电脑」「回收站」各有独立排序状态：在这两个视图里点排序只改它们自己，
+    /// 不碰全局；在普通目录里点排序也只作用于普通目录，不会带走其余两者。
     fn apply_sort(&mut self, key: SortKey, ascending: bool) {
         // 显式重排优先：丢掉重命名后临时钉住的位置。
         self.rename_pin = None;
-        self.config.sort_key = match key {
-            SortKey::Name => "name",
-            SortKey::Size => "size",
-            SortKey::Modified => "modified",
-            SortKey::Type => "type",
-            SortKey::Path => "path",
-        }.to_string();
-        self.config.sort_ascending = ascending;
+        let view = ViewSort::of(self.state.active().active().path.as_deref());
+        // 此电脑没有「修改时间」列：要是这个键还落进去，状态就变成了
+        // 「按一列不显示的东西排」，用户看不出发生了什么，也改不回来。
+        if !view.allows(key) {
+            return;
+        }
+        match view {
+            ViewSort::ThisPc => {
+                self.config.this_pc_sort_key = sort_key_id(key).to_string();
+                self.config.this_pc_sort_ascending = ascending;
+            }
+            ViewSort::Recycle => {
+                self.config.recycle_sort_key = sort_key_id(key).to_string();
+                self.config.recycle_sort_ascending = ascending;
+            }
+            ViewSort::Normal => {
+                self.config.sort_key = sort_key_id(key).to_string();
+                self.config.sort_ascending = ascending;
+            }
+        }
         self.config.save();
 
         for tab in &mut self.state.tabs {
             if tab.kind == crate::state::TabKind::Settings { continue; }
             for pane in &mut tab.panes {
+                // 别的视图的面板保持自己的排序，不被本次操作带走。
+                if ViewSort::of(pane.path.as_deref()) != view {
+                    continue;
+                }
                 pane.sort.key = key;
                 pane.sort.ascending = ascending;
                 crate::fs::sort_entries(&mut pane.entries, pane.sort);
@@ -2580,6 +2730,55 @@ impl App {
         self.visible_cache = None;
         self.sync_file_list();
         self.sync_status();
+    }
+
+    /// 把每个面板的排序对齐到它所在视图的保存值。
+    /// 切目录（前进/后退/跳转/启动）后必须调用：`pane.sort` 是从上一个目录
+    /// 继承来的，进出「此电脑」/「回收站」时要替换成该视图自己的状态。
+    fn sync_view_sort(&mut self) {
+        // 配置文件可能被手改或来自旧版本：用不存在的列排序就退回兼底值。
+        let (this_pc, recycle, global) = (
+            SortState {
+                key: ViewSort::ThisPc
+                    .fallback(parse_sort_key(&self.config.this_pc_sort_key, SortKey::Drive)),
+                ascending: self.config.this_pc_sort_ascending,
+            },
+            SortState {
+                key: ViewSort::Recycle
+                    .fallback(parse_sort_key(&self.config.recycle_sort_key, SortKey::Modified)),
+                ascending: self.config.recycle_sort_ascending,
+            },
+            SortState {
+                key: ViewSort::Normal
+                    .fallback(parse_sort_key(&self.config.sort_key, SortKey::Name)),
+                ascending: self.config.sort_ascending,
+            },
+        );
+        let want = |path: Option<&std::path::Path>| match ViewSort::of(path) {
+            ViewSort::ThisPc => this_pc,
+            ViewSort::Recycle => recycle,
+            ViewSort::Normal => global,
+        };
+        let mut changed = false;
+        for tab in &mut self.state.tabs {
+            if tab.kind == crate::state::TabKind::Settings { continue; }
+            for pane in &mut tab.panes {
+                let s = want(pane.path.as_deref());
+                if pane.sort.key == s.key && pane.sort.ascending == s.ascending {
+                    continue;
+                }
+                pane.sort = s;
+                // 列表结果还没到（loading 中）时不动旧数据：worker 会用新排序重算。
+                if !pane.loading && !pane.entries.is_empty() {
+                    crate::fs::sort_entries(&mut pane.entries, pane.sort);
+                    pane.rebuild_display();
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            self.visible_cache = None;
+        }
     }
 
     /// 全局拼音秒搜：查询后台索引，结果写入当前标签（此电脑视图）。
@@ -3058,26 +3257,56 @@ impl App {
 
     /// 全量同步文件列表（标题、排序态、总行数、可见窗口）。
     fn sync_file_list(&mut self) {
-        let (sort_key, sort_asc, loading0, total0, is_recycle, is_split, loading1, total1, single0, single1) = {
+        let (
+            sort_key,
+            sort_asc,
+            sort_key_right,
+            sort_asc_right,
+            loading0,
+            total0,
+            is_recycle0,
+            is_computer0,
+            is_split,
+            loading1,
+            total1,
+            is_recycle1,
+            is_computer1,
+            single0,
+            single1,
+        ) = {
             let tab = self.state.active();
             let panes = &tab.panes;
+            // 「路径」列仅回收站显示：站内条目来源各异，路径列是唯一来源线索；
+            // 普通目录的路径与地址栏一致，隐藏以让出宽度给名称列。
+            // 左右两栏各自判定：分屏时两栏可能一个是回收站一个是普通目录。
+            let is_recycle = |p: &crate::state::PaneState| {
+                p.path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path())
+            };
+            // 排序标记按栏下发：表头箭头要看自己那一栏的排序，
+            // 不能拿「当前聚焦的那一栏」去反映给两栏。
+            let key_id = |k: SortKey| match k {
+                SortKey::Name => "name",
+                SortKey::Size => "size",
+                SortKey::Modified => "modified",
+                SortKey::Type => "type",
+                SortKey::Path => "path",
+                SortKey::Drive => "drive",
+            };
             (
-                match tab.active().sort.key {
-                    SortKey::Name => "name",
-                    SortKey::Size => "size",
-                    SortKey::Modified => "modified",
-                    SortKey::Type => "type",
-                    SortKey::Path => "path",
-                },
-                tab.active().sort.ascending,
+                key_id(panes[0].sort.key),
+                panes[0].sort.ascending,
+                // 右栏自己的排序标记（未分屏时与左栏一致）。
+                panes.get(1).map(|p| key_id(p.sort.key)),
+                panes.get(1).map(|p| p.sort.ascending),
                 panes[0].loading,
                 panes[0].display.len() as i32,
-                // 「路径」列仅回收站显示：站内条目来源各异，路径列是唯一来源线索；
-                // 普通目录的路径与地址栏一致，隐藏以让出宽度给名称列。
-                panes[0].path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()),
+                is_recycle(&panes[0]),
+                panes[0].path.is_none(),
                 tab.is_split,
                 panes.get(1).map(|p| p.loading).unwrap_or(false),
                 panes.get(1).map(|p| p.display.len()).unwrap_or(0) as i32,
+                panes.get(1).is_some_and(is_recycle),
+                panes.get(1).is_some_and(|p| p.path.is_none()),
                 // 「非多选」即可：无选中时鼠标悬停也允许显示截断浮层；
                 // 多选（>=2）时一律禁用，避免满屏浮层。
                 panes[0].selection.len() <= 1,
@@ -3089,9 +3318,17 @@ impl App {
         self.ui.set_file_single_selection_right(single1);
         self.ui.set_sort_key(sort_key.into());
         self.ui.set_sort_ascending(sort_asc);
+        self.ui.set_sort_key_right(sort_key_right.unwrap_or(sort_key).into());
+        self.ui
+            .set_sort_ascending_right(sort_asc_right.unwrap_or(sort_asc));
         self.ui.set_file_loading(loading0);
         self.ui.set_file_total(total0);
-        self.ui.set_show_path_column(is_recycle);
+        self.ui.set_show_path_column(is_recycle0);
+        self.ui.set_show_path_column_right(is_recycle1);
+        // 视图形态（此电脑无修改时间列、大小列表头叫剩余）也按栏判定，
+        // 否则分屏时「此电脑 + 普通目录」会把普通目录的修改时间列一起藏掉。
+        self.ui.set_file_is_computer_view(is_computer0);
+        self.ui.set_file_is_computer_view_right(is_computer1);
         self.ui.set_is_split(is_split);
         self.ui.set_file_loading_right(loading1);
         self.ui.set_file_total_right(total1);
@@ -3360,8 +3597,15 @@ impl App {
 
         // 「此电脑」视图（pane 没有路径）：详细信息要隐藏修改时间列，
         // 大小列改为只显示剩余容量、表头文字改成「剩余」。
-        self.ui
-            .set_file_is_computer_view(self.state.active().active().path.is_none());
+        // 左右两栏各自判定，不能只看当前聚焦的那一栏（分屏时两边可能不同）。
+        {
+            let tab = self.state.active();
+            self.ui
+                .set_file_is_computer_view(tab.panes[0].path.is_none());
+            self.ui.set_file_is_computer_view_right(
+                tab.panes.get(1).is_some_and(|p| p.path.is_none()),
+            );
+        }
 
         // 名称浮层只在「非多选」时出现。放在这里而不是 sync_file_list：
         // 点击 / 框选 / 键盘改选择时只会走 refresh_visible_rows，不走 sync_file_list，
@@ -4862,9 +5106,10 @@ fn autofit_widths_for_pane(app: &App, pane_index: usize) -> [f32; 5] {
         let Some(e) = pane.display_entry(di) else { continue };
         seen += 1;
         max[0] = max[0].max(text_w(&e.name));
-        // 「此电脑」驱动器条目没有修改时间：format_time(None) 自然返回空串。
-        // 按用户意图不再做任何特判；下面的宽度下限保证这一列仍展示、只是数据留空。
-        max[1] = max[1].max(text_w(&crate::fs::format_time(e.modified)));
+        // 「此电脑」没有修改时间列，不必估算它的宽（列宽值保留占位不使用）。
+        if !computer {
+            max[1] = max[1].max(text_w(&crate::fs::format_time(e.modified)));
+        }
         max[2] = max[2].max(text_w(&app.tr_type(&e.type_text)));
         // 此电脑视图的「剩余」列只显示 extra 的前半段。
         let size_text = if computer {
@@ -4876,7 +5121,8 @@ fn autofit_widths_for_pane(app: &App, pane_index: usize) -> [f32; 5] {
     }
     [
         (max[0] + 60.0).clamp(160.0, 900.0),
-        // 下限 110px：此电脑整列没有具体时间，但仍保留列宽和表头，数据留空。
+        // 此电脑视图的修改时间列整列不渲染（Slint 侧按 0 参与列排布），
+        // 这个值只作占位；普通目录按下限 110px 保证时间文本不拥挤。
         (max[1] + 24.0).clamp(110.0, 320.0),
         (max[2] + 24.0).clamp(70.0, 260.0),
         (max[3] + 24.0).clamp(70.0, 200.0),
@@ -5348,9 +5594,12 @@ impl App {
     }
 
     /// 「排序方式」子菜单：当前键与升降序打勾。
+    /// 首项随视图变：此电脑的主键是「盘符」（该视图没有名称列），
+    /// 回收站/普通目录是「名称」。两套状态各自记忆，互不干扰。
     #[cfg(windows)]
     fn sort_menu_nodes(&self) -> Vec<crate::sys::menu::MenuNode> {
         let sort = self.state.active().active().sort;
+        let is_computer = self.state.active().active().path.is_none();
         use crate::sys::menu::MenuNode;
         let item = |key: &str, label: &str, checked: bool| MenuNode::Item {
             key: format!("sort:{key}"),
@@ -5358,15 +5607,22 @@ impl App {
             enabled: true,
             checked,
         };
-        vec![
-            item("name", "名称", sort.key == SortKey::Name),
-            item("modified", "修改日期", sort.key == SortKey::Modified),
-            item("type", "类型", sort.key == SortKey::Type),
-            item("size", "大小", sort.key == SortKey::Size),
-            MenuNode::Separator,
-            item("asc", "递增", sort.ascending),
-            item("desc", "递减", !sort.ascending),
-        ]
+        let mut nodes = vec![if is_computer {
+            // 此电脑：首项是「盘符」（与表头一致）。
+            item("drive", "盘符", sort.key == SortKey::Drive)
+        } else {
+            item("name", "名称", sort.key == SortKey::Name)
+        }];
+        // 只列该视图真实存在的列（此电脑没有名称/修改时间列）。
+        if !is_computer {
+            nodes.push(item("modified", "修改日期", sort.key == SortKey::Modified));
+        }
+        nodes.push(item("type", "类型", sort.key == SortKey::Type));
+        nodes.push(item("size", "大小", sort.key == SortKey::Size));
+        nodes.push(MenuNode::Separator);
+        nodes.push(item("asc", "递增", sort.ascending));
+        nodes.push(item("desc", "递减", !sort.ascending));
+        nodes
     }
 
     /// 打开右键菜单：Shell 菜单（系统项）+ Rove 自己的项。
@@ -6656,6 +6912,8 @@ impl App {
             "modified" => SortKey::Modified,
             "type" => SortKey::Type,
             "path" => SortKey::Path,
+            // 「此电脑」视图第一列表头是「盘符」。
+            "drive" => SortKey::Drive,
             _ => return,
         };
         let tab = self.state.active();
@@ -7009,6 +7267,7 @@ impl App {
             let mut asc = tab.sort.ascending;
             match sort_mode {
                 "name" => { key = SortKey::Name; asc = true; }
+                "drive" => { key = SortKey::Drive; asc = true; }
                 "modified" => { key = SortKey::Modified; asc = false; } // 修改时间默认最新在前
                 "type" => { key = SortKey::Type; asc = true; }
                 "size" => { key = SortKey::Size; asc = false; } // 大小默认最大在前
@@ -7594,6 +7853,9 @@ impl App {
         // 导航时取消挂起的延迟重命名：导航会换目录/选择集，原路径可能不再有效，
         // 否则 400ms 后会在新页面里误弹出重命名。
         self.cancel_rename_defer();
+        // 进出「此电脑」/「回收站」时，把该视图自己的排序状态装回面板，
+        // 普通目录则用全局排序。必须在下发列举请求（reload_active）之前做。
+        self.sync_view_sort();
         // 导航后退出地址栏编辑态。
         self.ui.set_path_editing(false);
         self.sync_tabs();
@@ -11619,6 +11881,9 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
             app.state.tabs = tabs;
             app.state.active_tab = startup_snapshot.2.min(app.state.tabs.len() - 1);
             app.state.next_tab_id = app.state.tabs.len() as u32 + 1;
+            // 先把每个面板的排序对齐到它所在视图的保存值，
+            // 否则下面这次列举会带着「上一个目录的排序」发出，worker 白排一次。
+            app.sync_view_sort();
             // 快照只记路径：给每个恢复出来的标签/分屏都发一次列举，
             // 否则切过去时那一页是空的（sync_active_tab 不会主动列举）。
             let requests: Vec<(u32, usize, u64, Option<PathBuf>, crate::fs::SortState)> = app
@@ -11639,6 +11904,9 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager) {
             }
         }
         // 「电脑选项」不做事：AppState 初始就是单栏的「此电脑」。
+        // 但它的排序必须用「此电脑」自己的状态（主键是盘符），
+        // 不能沿用普通目录的全局排序。
+        app.sync_view_sort();
         app.sync_tabs();
         app.sync_nav();
         app.sync_breadcrumbs();
