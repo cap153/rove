@@ -256,6 +256,7 @@ pub const ZH: &[&str] = &[
     "已复制路径",
     "已复制 {} 项路径",
     "当前视图没有可打开的目录",
+    "反选",
 ];
 
 pub const EN: &[&str] = &[
@@ -509,6 +510,7 @@ pub const EN: &[&str] = &[
     "Path copied",
     "Copied {} item paths",
     "No folder to open a terminal in",
+    "Invert selection",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -600,6 +602,8 @@ mod tests {
         // 地址栏 `cmd` 在此电脑/回收站下的提示。
         assert_eq!(ZH[249], "当前视图没有可打开的目录");
         assert_eq!(EN[249], "No folder to open a terminal in");
+        assert_eq!(ZH[250], "反选");
+        assert_eq!(EN[250], "Invert selection");
     }
 
     #[test]

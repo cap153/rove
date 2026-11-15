@@ -226,6 +226,7 @@ const CMD_TERMINAL: &str = "terminal";
 const CMD_NEW_FOLDER: &str = "new_folder";
 const CMD_REFRESH: &str = "refresh";
 const CMD_SELECT_ALL: &str = "select_all";
+const CMD_INVERT_SELECTION: &str = "invert_selection";
 const CMD_MANAGE_ACTIONS: &str = "manage_actions";
 /// 搜索结果里右键打开路径：在 Rove 内跳到所在目录，或交给资源管理器定位。
 const CMD_OPEN_LOCATION: &str = "open_location";
@@ -5531,6 +5532,8 @@ impl App {
                     item("recycle-empty", self.tr("清空回收站").as_str(), true),
                     MenuNode::Separator,
                     item(CMD_REFRESH, self.tr("刷新").as_str(), true),
+                    item(CMD_SELECT_ALL, self.tr("全选").as_str(), true),
+                    item(CMD_INVERT_SELECTION, self.tr("反选").as_str(), true),
                     // 视图 / 排序是全局状态，回收站条目走同一套 sort_entries 与
                     // 行模型；`view:` / `sort:` 的分发也在 menu_scope 检查之前。
                     MenuNode::Submenu {
@@ -5664,6 +5667,7 @@ impl App {
                     item(CMD_TERMINAL, self.tr("在此处打开终端").as_str(), true),
                     item(CMD_REFRESH, self.tr("刷新").as_str(), true),
                     item(CMD_SELECT_ALL, self.tr("全选").as_str(), true),
+                    item(CMD_INVERT_SELECTION, self.tr("反选").as_str(), true),
                     item(CMD_MANAGE_ACTIONS, self.tr("管理右键动作...").as_str(), true),
                     MenuNode::Submenu {
                         label: self.tr("视图").to_string(),
@@ -7447,6 +7451,30 @@ impl App {
         }
     }
 
+    /// 反选：已选中的取消，未选中的选上。
+    ///
+    /// 只反转**当前显示**的条目（搜索/过滤时看不见的保持原状）。
+    fn invert_selection(&mut self) {
+        let displayed: Vec<PathBuf> = {
+            let pane = self.state.active().active();
+            pane.display
+                .iter()
+                .filter_map(|&i| pane.entries.get(i).map(|e| e.path.clone()))
+                .collect()
+        };
+        {
+            let pane = self.state.active_mut().active_mut();
+            for path in displayed {
+                if !pane.selection.remove(&path) {
+                    pane.selection.insert(path);
+                }
+            }
+        }
+        self.visible_cache = None;
+        self.refresh_visible_rows();
+        self.sync_status();
+    }
+
     /// 全选当前显示项。
     fn select_all(&mut self) {
         let selected: HashSet<PathBuf> = {
@@ -7760,6 +7788,7 @@ impl App {
                 self.refresh_visible_rows();
                 self.sync_status();
             }
+            CMD_INVERT_SELECTION => self.invert_selection(),
             _ => {}
         }
     }
