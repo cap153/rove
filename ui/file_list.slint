@@ -339,6 +339,15 @@ export component FileList inherits Rectangle {
     /// 名称区顶边的自然位置（浮层向下生长的起点）。
     private property <length> ex-natural-y: flick.y + flick.content-y + ex-row * root.cell-h
         + 4px + root.cell-thumb + 3px;
+    /// 条目所在格子的视口矩形：用来判断「主人还在不在画面里」。
+    private property <length> ex-cell-top: flick.y + flick.content-y + ex-row * root.cell-h;
+    private property <length> ex-cell-bottom: root.ex-cell-top + root.cell-h;
+    /// 条目还在视口内才显示浮层。
+    /// 夹取（见 ex-box-y）会把浮层钉在顶边/底边，如果条目已经滚出画面、
+    /// 浮层却还挂在边缘，就成了「没有主人的浮层卡在窗口里」——滚轮一下
+    /// 就看到它纹丝不动。所以滚出视口时直接不渲染。
+    private property <bool> ex-in-view: root.ex-cell-bottom > flick.y + 2px
+        && root.ex-cell-top < flick.y + flick.height - 2px;
     /// 下方放不下时整体上移，底边贴住可视区底（tooltip 的标准做法）。
     /// 只向上让位、不翻面：自然位置和夹取位置都随 content-y 线性移动，
     /// 滚动时是连续滑动而不是「跨过某一行突然翻面」。
@@ -354,6 +363,11 @@ export component FileList inherits Rectangle {
     /// 悬停浮层的向上让位规则与选中浮层完全一致（见 ex-box-y）。
     private property <length> hv-natural-y: flick.y + flick.content-y + hv-row * root.cell-h
         + 4px + root.cell-thumb + 3px;
+    /// 悬停浮层的可见性规则同 ex-in-view（滚出视口就不渲染）。
+    private property <length> hv-cell-top: flick.y + flick.content-y + hv-row * root.cell-h;
+    private property <length> hv-cell-bottom: root.hv-cell-top + root.cell-h;
+    private property <bool> hv-in-view: root.hv-cell-bottom > flick.y + 2px
+        && root.hv-cell-top < flick.y + flick.height - 2px;
     private property <length> hv-box-y: max(4px, min(root.hv-natural-y, root.height - 4px - root.hv-box-h));
 
     /// 滚动到顶端（导航/过滤变化时由 Rust 调用）。
@@ -2045,6 +2059,8 @@ export component FileList inherits Rectangle {
     //   · 只是“选中一个” → 纯文字，没有任何 TouchArea，鼠标穿透（双击/拖拽照常）；
     //   · “重命名中” → 里面放多行输入框，可以正常打字。
     if (root.expand-active) : Rectangle {
+        // 重命名中输入框要一直可用，哪怕条目被滚出视口也不藏。
+        visible: root.ex-in-view || root.rename-path != "";
         x: root.ex-box-x;
         y: root.ex-box-y;
         width: root.ex-box-w;
@@ -2160,6 +2176,7 @@ export component FileList inherits Rectangle {
     // 另一个被截断的文件时，两者都要显示完整名，一层装不下，轮用同一个
     // 索引就会“你出现我就消失”，鼠标一动两层互相顶掉，表现为两个浮层闪烁。
     if (root.hover-expand-active) : Rectangle {
+        visible: root.hv-in-view;
         x: root.hv-box-x;
         y: root.hv-box-y;
         width: root.hv-box-w;
