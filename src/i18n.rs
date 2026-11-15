@@ -257,6 +257,8 @@ pub const ZH: &[&str] = &[
     "已复制 {} 项路径",
     "当前视图没有可打开的目录",
     "反选",
+    // 251：标签栏右键菜单「关闭全部」（追加在末尾，见上方测试里的下标约定）。
+    "关闭全部",
 ];
 
 pub const EN: &[&str] = &[
@@ -511,6 +513,7 @@ pub const EN: &[&str] = &[
     "Copied {} item paths",
     "No folder to open a terminal in",
     "Invert selection",
+    "Close all",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -604,6 +607,9 @@ mod tests {
         assert_eq!(EN[249], "No folder to open a terminal in");
         assert_eq!(ZH[250], "反选");
         assert_eq!(EN[250], "Invert selection");
+        // 标签栏右键菜单「关闭全部」。
+        assert_eq!(ZH[251], "关闭全部");
+        assert_eq!(EN[251], "Close all");
     }
 
     #[test]

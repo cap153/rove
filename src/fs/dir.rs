@@ -109,6 +109,59 @@ pub fn is_network_path_text(text: &str) -> bool {
     text.starts_with(r"\\") || text.starts_with("//")
 }
 
+/// 这条路径所在的卷是不是网络卷：UNC 文本，**或映射到网络盘的盘符**。
+///
+/// `is_network_path_text` 只看文本，识别不出 `O:\Video` 这种映射盘；而服务器
+/// 掉线时对它做一次 `is_dir()` / 列举，界面线程会卡几十秒（窗口「未响应」）。
+///
+/// `GetDriveTypeW` 只查本机设备表，不产生任何网络 I/O，因此在界面线程上调用
+/// 是安全的 —— 这里正是用它来判断「这个 stat 到底能不能做」。
+pub fn is_remote_path(path: &std::path::Path) -> bool {
+    if is_network_path_text(&path.to_string_lossy()) {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let root = match path.components().next() {
+            Some(std::path::Component::Prefix(prefix)) => match prefix.kind() {
+                std::path::Prefix::Disk(letter) | std::path::Prefix::VerbatimDisk(letter) => {
+                    [letter as u16, b':' as u16, b'\\' as u16, 0]
+                }
+                _ => return false,
+            },
+            _ => return false,
+        };
+        // 4 = DRIVE_REMOTE：windows-sys 把这组常量放在
+        // `Win32_System_WindowsProgramming` 里，为它单独开一个 feature 不划算。
+        const DRIVE_REMOTE: u32 = 4;
+        unsafe {
+            windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(root.as_ptr()) == DRIVE_REMOTE
+        }
+    }
+    #[cfg(not(windows))]
+    false
+}
+
+/// 宽松比较两条路径是不是同一个（大小写、正/反斜杠、末尾分隔符都无所谓）。
+///
+/// 只用于「把外部给的路径和列举结果对上」：浏览器传来的 `%1` / `/select,"..."`
+/// 大小写和磁盘上的实际名字不一定一致（`C:\\Users\\Captain\\Downloads` vs
+/// `c:\\users\\captain\\downloads\\file.zip`），而 `PathBuf` 的 `==` 在
+/// Windows 上也是逐字节比较，会漏配。真正的判定仍交给文件系统。
+pub fn same_path_loose(a: &std::path::Path, b: &std::path::Path) -> bool {
+    fn norm(path: &std::path::Path) -> String {
+        let text = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+        // 盘符根 / UNC 共享根不能剥掉分隔符（`D:\` 与 `D:` 含义不同）。
+        let trimmed = text.trim_end_matches('\\');
+        if trimmed.is_empty() || (trimmed.len() <= 2 && trimmed.ends_with(':')) {
+            text
+        } else {
+            trimmed.to_string()
+        }
+    }
+    norm(a) == norm(b)
+}
+
 /// 枚举服务器上的共享目录（等价于资源管理器打开 `\\host` 看到的东西）。
 #[cfg(windows)]
 fn list_unc_shares(host: &str) -> Vec<FileEntry> {
@@ -456,6 +509,32 @@ mod network_path_tests {
     fn verbatim_prefix_is_judged_by_target() {
         assert!(!is_network_path_text(r"\\?\C:\Users"));
         assert!(is_network_path_text(r"\\?\UNC\server\share"));
+    }
+
+    #[test]
+    fn remote_detection_covers_unc_and_drive_letters() {
+        use super::is_remote_path;
+        use std::path::Path;
+        // UNC 文本一律算远端（这条判断与平台无关）。
+        assert!(is_remote_path(Path::new(r"\\192.168.1.5\Video\bsf")));
+        assert!(is_remote_path(Path::new(r"//server/share/a")));
+        // 本机不存在的盘符不该被误判成远端（非 Windows 宿主恒为 false）。
+        assert!(!is_remote_path(Path::new(r"Z:\不存在的盘")));
+        assert!(!is_remote_path(Path::new(r"D:\下载")));
+    }
+
+    #[test]
+    fn loose_path_compare_ignores_case_and_separators() {
+        use super::same_path_loose;
+        use std::path::Path;
+        assert!(same_path_loose(
+            Path::new(r"C:\Users\Captain\Downloads\a.zip"),
+            Path::new(r"c:/users/captain/downloads/A.ZIP")
+        ));
+        assert!(same_path_loose(Path::new(r"D:\下载\"), Path::new(r"D:\下载")));
+        assert!(!same_path_loose(Path::new(r"C:\a\b"), Path::new(r"C:\a\c")));
+        // 根目录不能被当成「去掉分隔符后」的空串。
+        assert!(!same_path_loose(Path::new(r"D:\"), Path::new(r"C:\")));
     }
 
     #[test]

@@ -12,3 +12,5 @@ pub mod dialog_jump;
 pub mod integration;
 // 开机自启动（登录时后台常驻，写 HKCU 的 Run 键）。
 pub mod autostart;
+// 把窗格登记成 Shell 窗口：浏览器/下载器的「打开文件所在位置」会直接选中条目。
+pub mod shell_windows;

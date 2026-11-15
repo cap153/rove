@@ -101,6 +101,7 @@ fn start_event_forwarder() {
 const TRAY_WAKE: crate::daemon::WakeRequest = crate::daemon::WakeRequest {
     path: None,
     new_tab: false,
+    select: None,
 };
 
 // 由 app.rs 注入的两个入口（避免 daemon ↔ app 循环依赖）。

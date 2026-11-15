@@ -39,16 +39,37 @@ mod i18n;
 
 /// 日志等级判定：`ROVE_LOG` 存在即启用普通级；`ROVE_LOG=2|verbose|debug` 才启用详细级。
 pub(crate) fn log_enabled(level: u8) -> bool {
-    if level < 2 {
-        return std::env::var_os("ROVE_LOG").is_some();
-    }
-    match std::env::var("ROVE_LOG") {
-        Ok(v) => {
+    level <= log_level()
+}
+
+/// 日志级别（0=静默 1=常规 2=详细），每个进程只解析一次。
+///
+/// 环境变量之外还有一个**标记文件**开关：资源管理器/浏览器拉起的接管进程
+/// 不是我们启动的，继承不到 `ROVE_LOG`，而这类冷启动恰恰是最需要日志的
+/// 场景。exe 同目录放一个空文件 `rove.verbose` 即可，效果等同 `ROVE_LOG=2`。
+fn log_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        if let Ok(v) = std::env::var("ROVE_LOG") {
             let v = v.trim();
-            v == "2" || v.eq_ignore_ascii_case("verbose") || v.eq_ignore_ascii_case("debug")
+            return if v == "2" || v.eq_ignore_ascii_case("verbose") || v.eq_ignore_ascii_case("debug")
+            {
+                2
+            } else {
+                1
+            };
         }
-        Err(_) => false,
-    }
+        let marker = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.join("rove.verbose")))
+            .map(|p| p.exists())
+            .unwrap_or(false);
+        if marker {
+            2
+        } else {
+            0
+        }
+    })
 }
 
 /// 诊断日志时间戳：本地时间 `YYYY-MM-DD HH:MM:SS.mmm`。
@@ -772,7 +793,14 @@ pub struct App {
     shell_open_timer: Timer,
     /// 待打开的资源管理器请求（None = 此电脑）。用队列而不是单个槽位，
     /// 连点两个文件夹时两条请求都要能打开。
-    shell_open_queue: Vec<Option<PathBuf>>,
+    /// 队列元素：(要打开的目录, 「在文件夹中显示」要选中的条目)。
+    shell_open_queue: Vec<(Option<PathBuf>, Option<PathBuf>)>,
+    /// 本次会话是否被「关闭全部 / 关掉最后一个标签」显式收尾。
+    ///
+    /// 这两种收尾等于用户主动说「这次就这样了」：存档时不能把当前标签写进
+    /// `last_tabs`，否则选了「启动时打开上次的标签页」时，下次又把这些标签
+    /// 原样拉回来（用户预期是只开一个「此电脑」）。
+    tabs_discarded: bool,
     /// 自身弱引用：供 rename_defer_timer 等定时器回调里升级回 App。
     self_weak: Option<Weak<RefCell<App>>>,
     }
@@ -914,6 +942,7 @@ impl App {
             rename_defer_timer: Timer::default(),
             shell_open_timer: Timer::default(),
             shell_open_queue: Vec::new(),
+            tabs_discarded: false,
             self_weak: None,
         }
     }
@@ -1160,7 +1189,13 @@ impl App {
                 let mut matched: Vec<(usize, PathBuf)> = Vec::new();
                 for (pos, &ei) in pane.display.iter().enumerate() {
                     if let Some(e) = pane.entries.get(ei) {
-                        if self.scroll_to_paths.iter().any(|p| *p == e.path) {
+                        // 宽松比较：外部（Shell 的 SelectItem / 资源管理器 `/select,`）
+                        // 给的路径大小写和磁盘上的实际名字不一定一致，精确相等会漏配。
+                        if self
+                            .scroll_to_paths
+                            .iter()
+                            .any(|p| *p == e.path || crate::fs::dir::same_path_loose(p, &e.path))
+                        {
                             matched.push((pos, e.path.clone()));
                         }
                     }
@@ -2159,17 +2194,17 @@ fn drag_gesture_paths(
 mod tests {
     use super::*;
 
-    /// 接管资源管理器（--shell-open）转来的路径，在「会话被 X 关掉、只剩守护进程」
-    /// 这一刻只能落到 create_session 上：必须新开标签，绝不能顶掉用户原来那个标签。
+    /// 新建会话时初始路径只能顶掉「那个还没列举过的默认此电脑标签」。
+    ///
+    /// 这一条管的是「冷启动 / 守护进程重建会话」：此时除了恢复出来的用户标签，
+    /// 剩下的只有默认「此电脑」标签 —— 留着它就是最左侧那个空的此电脑标签
+    /// （「此文件夹为空」），无论请求方有没有要求新开标签。
     #[test]
-    fn takeover_request_never_replaces_the_existing_tab() {
-        // 接管 / 命令行明确要求新开标签：无论有没有恢复上次的标签页，都新开。
-        assert!(initial_path_opens_new_tab(true, false));
-        assert!(initial_path_opens_new_tab(true, true));
-        // 恢复过上次的标签页：那是用户的标签，同样不能被顶掉。
-        assert!(initial_path_opens_new_tab(false, true));
-        // 冷启动直接带路径（双击 exe 传目录）：允许顶掉那个空的默认标签。
-        assert!(!initial_path_opens_new_tab(false, false));
+    fn fresh_session_reuses_the_default_tab() {
+        // 没恢复上次的标签页：占掉默认标签，绝不多留一个空的「此电脑」。
+        assert!(!initial_path_opens_new_tab(false));
+        // 恢复过上次的标签页：那是用户的标签，必须新开，不能顶掉。
+        assert!(initial_path_opens_new_tab(true));
     }
 
     /// 三种视图必须能区分开：普通目录、此电脑（路径 None）、回收站。
@@ -3394,6 +3429,109 @@ impl App {
         self.ui.set_file_loading_right(loading1);
         self.ui.set_file_total_right(total1);
         self.refresh_visible_rows();
+        // 目录/标签变了就要重新告诉 Shell「哪个窗口在显示哪个目录」，
+        // 否则「打开文件所在位置」会找不到我们（见 sys::shell_windows）。
+        self.publish_shell_windows();
+    }
+
+    /// 把当前所有窗格显示的目录交给 Shell 窗口登记器。
+    ///
+    /// 内容没变时登记器自己会跳过，所以放在 `sync_file_list` 末尾是安全的。
+    fn publish_shell_windows(&self) {
+        #[cfg(not(windows))]
+        {
+            // 非 Windows 宿主只编译不运行，登记器是空实现。
+            return;
+        }
+        #[cfg(windows)]
+        {
+            let Some(hwnd) = get_window_hwnd(&self.ui) else {
+                return;
+            };
+            let mut panes = Vec::new();
+            for (tab_index, tab) in self.state.tabs.iter().enumerate() {
+                for (pane_index, pane) in tab.panes.iter().enumerate() {
+                    let Some(path) = pane.path.as_ref() else {
+                        continue;
+                    };
+                    // 回收站/搜索结果是虚拟视图（`recycle://`），Shell 没有对应目录。
+                    if path.to_string_lossy().contains("://") {
+                        continue;
+                    }
+                    panes.push(crate::sys::shell_windows::PaneRegistration {
+                        key: ((tab_index as u64) << 8) | pane_index as u64,
+                        path: path.clone(),
+                        hwnd,
+                    });
+                }
+            }
+            crate::sys::shell_windows::publish(panes);
+        }
+    }
+
+    /// 找出正在显示 `folder` 的窗格：先看当前标签，再看其他标签。
+    ///
+    /// 选中请求可能来自「另一个标签已经打开了这个目录」，此时应该切过去，
+    /// 而不是再开一个重复的标签。
+    fn locate_folder(&self, folder: &Path) -> Option<(usize, usize)> {
+        let active = self.state.active_tab;
+        let mut tabs: Vec<usize> = vec![active];
+        tabs.extend(
+            (0..self.state.tabs.len()).filter(|index| *index != active),
+        );
+        for tab_index in tabs {
+            let Some(tab) = self.state.tabs.get(tab_index) else {
+                continue;
+            };
+            if tab.kind != crate::state::TabKind::Explorer {
+                continue;
+            }
+            if let Some(pane_index) = tab.panes.iter().position(|pane| {
+                pane.path
+                    .as_ref()
+                    .is_some_and(|current| crate::fs::dir::same_path_loose(current, folder))
+            }) {
+                return Some((tab_index, pane_index));
+            }
+        }
+        None
+    }
+
+    /// 在当前窗格里选中某个路径并滚进可视区（Shell 的「选中这个条目」请求）。
+    fn select_path_in_active_pane(&mut self, target: &Path) {
+        let mut found = None;
+        {
+            let pane = self.state.active_mut().active_mut();
+            for (pos, &entry_index) in pane.display.iter().enumerate() {
+                let Some(entry) = pane.entries.get(entry_index) else {
+                    continue;
+                };
+                if crate::fs::dir::same_path_loose(&entry.path, target) {
+                    found = Some((pos, entry.path.clone()));
+                    break;
+                }
+            }
+            if let Some((_, path)) = found.as_ref() {
+                pane.selection.clear();
+                pane.selection.insert(path.clone());
+                pane.anchor = Some(path.clone());
+            }
+        }
+        let Some((pos, path)) = found else {
+            // 列表还没加载完（冷启动时最典型：Shell 的选中请求比目录列举先到），
+            // 或者条目在当前过滤/隐藏规则下看不见。不要丢掉这次请求：转成
+            // 「列表回来后选中并滚进视口」，与接管打开的那条链路共用同一套机制。
+            logln!(
+                "[shell-windows] 列表里还没有这个条目，等列举完成后选中：{target:?}"
+            );
+            self.arm_reveal(Some(target.to_path_buf()));
+            return;
+        };
+        logln!("[shell-windows] 选中 pos={pos} {path:?}");
+        self.scroll_to_index = Some(pos);
+        self.visible_cache = None;
+        self.refresh_visible_rows();
+        self.sync_status();
     }
 
     /// 重建虚拟列表可见窗口（滚动/选择/数据变化时调用）。
@@ -6609,7 +6747,7 @@ impl App {
     #[cfg(not(windows))]
     fn show_quick_item_menu(&mut self, _key: &str) {}
 
-    /// 标签页右键菜单：关闭其他 / 左侧 / 右侧。
+    /// 标签页右键菜单：关闭全部 / 关闭其他 / 左侧 / 右侧。
     ///
     /// 没有可关的项时对应菜单项置灰（左侧在第一页时、右侧在最后一页时），
     /// 避免点了没反应。
@@ -6626,6 +6764,11 @@ impl App {
             checked: false,
         };
         let nodes = vec![
+            item(
+                format!("tab:close-all:{id}"),
+                self.tr("关闭全部").to_string(),
+                true,
+            ),
             item(
                 format!("tab:close-others:{id}"),
                 self.tr("关闭其他").to_string(),
@@ -6648,12 +6791,19 @@ impl App {
     #[cfg(not(windows))]
     fn show_tab_context_menu(&mut self, _id: u32) {}
 
-    /// 执行标签栏右键菜单命令：`tab:close-{others|left|right}:<锚点 id>`。
+    /// 执行标签栏右键菜单命令：`tab:close-{all|others|left|right}:<锚点 id>`。
     fn run_tab_menu_action(&mut self, id: &str) -> bool {
         use crate::state::TabCloseScope;
         let Some(rest) = id.strip_prefix("tab:close-") else {
             return false;
         };
+        if let Some(v) = rest.strip_prefix("all:") {
+            let Ok(anchor) = v.parse::<u32>() else {
+                return false;
+            };
+            self.close_all_tabs(anchor);
+            return true;
+        }
         let (scope, anchor) = if let Some(v) = rest.strip_prefix("others:") {
             (TabCloseScope::Others, v)
         } else if let Some(v) = rest.strip_prefix("left:") {
@@ -6672,6 +6822,29 @@ impl App {
             self.sync_active_tab();
         }
         true
+    }
+
+    /// 关闭全部标签：等价于「一个不留地把窗口关掉」。
+    ///
+    /// 与点窗口的 X 的区别只体现在下次启动：这等于用户明确表示「这一轮的
+    /// 标签不要了」，所以顺手把「上次的标签页」快照清空 —— 否则选了
+    /// 「启动时打开上次的标签页」，下次又会把这些标签原样拉回来。
+    fn close_all_tabs(&mut self, _anchor: u32) {
+        logv!("[tab] 关闭全部 {} 个标签", self.state.tabs.len());
+        self.discard_tab_snapshot();
+        // 会话销毁（窗口关闭、守护进程常驻）。借用在调用方手里，不能直接销毁，
+        // 交给事件循环排定。
+        schedule_destroy();
+    }
+
+    /// 记下「不要把当前标签留到下次启动」并立刻落盘（不依赖销毁流程的顺序）。
+    fn discard_tab_snapshot(&mut self) {
+        self.tabs_discarded = true;
+        if self.config.last_tabs.is_empty() {
+            return;
+        }
+        self.config.last_tabs.clear();
+        self.config.save();
     }
 
     /// 取消固定：只从侧栏移除，不动磁盘上的文件夹；特殊项不可移除。
@@ -8177,8 +8350,14 @@ fn schedule_shell_drain(weak: Weak<RefCell<App>>, attempt: u32) {
 impl App {
     /// 当前标签导航到路径（压入历史）。
     fn navigate_active(&mut self, path: Option<PathBuf>) {
+        self.navigate_active_reveal(path, None);
+    }
+
+    /// 同上，顺便记下加载完要选中的条目（「在文件夹中显示」）。
+    fn navigate_active_reveal(&mut self, path: Option<PathBuf>, select: Option<PathBuf>) {
         self.state.active_mut().active_mut().navigate(path);
         self.sync_after_navigate();
+        self.arm_reveal(select);
     }
 
     /// 排队一个「新标签打开」请求：当前 App 借用还没释放，不能在这里直接导航。
@@ -8186,12 +8365,12 @@ impl App {
     /// 请求存进 `shell_open_queue`（App 字段），不要每次新建闭包捕获：连点两个
     /// 文件夹时，前一次的定时器会被后一次 `start` 直接覆盖，闭包里那条请求也
     /// 跟着消失（表现为「第二个打开了、第一个没了」）。
-    fn queue_shell_tab(&mut self, path: Option<PathBuf>) {
+    fn queue_shell_tab(&mut self, path: Option<PathBuf>, select: Option<PathBuf>) {
         if self.shell_open_queue.len() >= SHELL_OPEN_QUEUE_MAX {
             logln!("!! 接管资源管理器：待打开请求过多，丢弃最旧的一条");
             self.shell_open_queue.remove(0);
         }
-        self.shell_open_queue.push(path);
+        self.shell_open_queue.push((path, select));
         let Some(weak) = self.self_weak.clone() else {
             // 会话刚建好还没登记 self_weak：此时肯定没有别的借用，直接执行。
             self.drain_shell_tabs();
@@ -8209,17 +8388,25 @@ impl App {
     fn drain_shell_tabs(&mut self) {
         // 先取出来：open_shell_tab 里若同步再排队，也不会打断这一轮。
         let queued = std::mem::take(&mut self.shell_open_queue);
-        for path in queued {
-            self.open_shell_tab(path);
+        for (path, select) in queued {
+            self.open_shell_tab(path, select);
         }
     }
 
     /// 资源管理器转来的打开请求：新开一个标签再导航，不覆盖用户正在看的目录。
-    fn open_shell_tab(&mut self, path: Option<PathBuf>) {
+    ///
+    /// `select` 是「在文件夹中显示」带来的条目：列举结果回来时选中它并滚进
+    /// 可视区（浏览器下载完点「打开所在文件夹」就是这条路）。
+    fn open_shell_tab(&mut self, path: Option<PathBuf>, select: Option<PathBuf>) {
         // 路径已经不存在（刚被删/断开网盘）：不要开一个空标签，直接忽略。
         // 注意只对显式路径做检查；None 是「此电脑」，本来就该能打开。
+        // 网络路径一律不在这里 stat：`\\wsl.localhost\...` 或断线的共享
+        // 盘上 `is_dir()` 能把 UI 线程卡几十秒（窗口「未响应」），
+        // 真不存在时列举自己会报错，和普通导航一致。
         if let Some(p) = path.as_ref() {
-            if !p.is_dir() {
+            // `is_remote_path` 同时覆盖 UNC 和**映射盘**（`O:\Video`）：它只用
+            // `GetDriveTypeW` 查本机设备表，不碰网络，所以在界面线程上判断安全。
+            if !crate::fs::dir::is_remote_path(p) && !p.is_dir() {
                 logln!("!! 接管资源管理器：目标目录不可用，已忽略 {:?}", p);
                 return;
             }
@@ -8232,15 +8419,29 @@ impl App {
         // 不能因为「新标签继承当前目录」的默认习惯被悄悄换成当前文件夹。
         self.state.new_tab_ex(path, sort, false);
         logv!(
-            "接管资源管理器：新标签打开 {:?}",
-            self.state.active().active().path
+            "接管资源管理器：新标签打开 {:?}（选中 {:?}）",
+            self.state.active().active().path,
+            select
         );
         // 与「普通导航」走完全相同的链路：sync_after_navigate 内部会
         // sync_view_sort → sync_tabs/nav/... → reload_active。
         // 这里不能用 sync_active_tab：那是「切换已有标签」用的，不发起列举，
         // 新标签会一直停在空状态（表现为「此文件夹为空」）。
         self.sync_after_navigate();
+        self.arm_reveal(select);
         self.ui.invoke_scroll_tabs_to_end();
+    }
+
+    /// 记下「列表加载完要选中并滚进可视区」的条目。
+    ///
+    /// 列举是异步的：这里只存路径，`apply_list_result` 里换算成显示索引。
+    /// 用 `scroll_to_paths` + `scroll_select` 这同一套机制（粘贴/新建文件夹
+    /// 已经在用），不另开一条代码路径。
+    fn arm_reveal(&mut self, select: Option<PathBuf>) {
+        let Some(target) = select else { return };
+        logv!("[reveal] 选中 {:?}", target);
+        self.scroll_to_paths = vec![target];
+        self.scroll_select = true;
     }
 
     fn sync_after_navigate(&mut self) {
@@ -9753,6 +9954,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 app.sync_active_tab();
             } else if app.state.tabs.len() == 1 {
                 // 关闭最后一个标签：销毁 UI，仅保留守护（Phase 2）。
+                // 与「关闭全部」同样处理：下次启动只开一个「此电脑」，
+                // 不把这一轮的标签从「上次的标签页」里捞回来。
+                app.discard_tab_snapshot();
                 drop(app);
                 schedule_destroy();
             }
@@ -12000,13 +12204,32 @@ pub fn run() {
             .map(|s| (*s).to_string())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "<非字符串 panic>".into());
-        logln!("!! panic at {location}: {payload}");
+        // 无条件写：崩溃现场不能因为「没开日志」就丢掉。
+        log_write(&format!("!! [panic] {location}: {payload}"));
     }));
 
     // 守护模式启动：拉起 Windows 文件对话框监听器（非 Windows 平台为空实现）。
     crate::sys::dialog_jump::start_daemon();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 接管资源管理器拉起的这一次进程没有继承用户的 ROVE_LOG（父进程是浏览器/
+    // 下载器），命令行就成了盲区 —— 排查这类场景要靠 exe 同目录的 `rove.verbose`
+    // 标记文件（见 `log_level`）。顺带记下有没有程序往命令行里塞 `/select`。
+    if args.iter().any(|a| {
+        a == "--shell-open" || a == "--this-pc" || a.to_ascii_lowercase().starts_with("/select")
+    }) || args.iter().any(|a| a.to_ascii_lowercase().starts_with("-select")) {
+        logln!("[takeover] argv={args:?}");
+    }
+    // 「谁接住了这次启动」：出问题时第一件事就是要分清这条请求由哪个 exe、
+    // 哪个进程处理 —— 磁盘上的 rove.exe 被换掉，已经在跑的旧进程不会跟着更新，
+    // 它照样会接住转发过来的请求，然后因为里面没有对应的修复而表现异常。
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    logln!(
+        "[boot] pid={} exe={exe} args={args:?}",
+        std::process::id()
+    );
     let request = crate::daemon::parse_args(&args);
     // 登录自启动（Run 键）带的是 --background：不动已经开着的窗口，什么也不显示。
     let background = crate::daemon::wants_background(&args);
@@ -12015,14 +12238,23 @@ pub fn run() {
     // 先交前台许可：本进程是资源管理器拉起的，带着这个权限，窗口却由守护进程显示。
     crate::daemon::hand_over_foreground();
     // 后台启动绝不走转发：转发路径会唤醒并前置窗口，登录瞬间就弹一个窗口。
-    if !background && crate::daemon::try_forward(&request) {
-        logln!("forwarded to running daemon, exiting");
-        return;
+    if !background {
+        let forwarded = crate::daemon::try_forward(&request);
+        // forwarded=true：请求交给已在运行的守护进程，本进程随即退出，
+        // 后续日志在**它的** exe 目录里 —— 排查时据此判断该去哪看。
+        logln!("[boot] forwarded={forwarded}");
+        if forwarded {
+            logln!("forwarded to running daemon, exiting");
+            return;
+        }
     }
 
     // 文件对话框吸附窗：进程级常驻，和主窗口完全解耦（关了主窗口它还在）。
     // 放在转发判断之后：转发进程秒退，没必要建这一套。
     crate::app::init_dialog_jump(&crate::config::Config::load().language);
+
+    // Shell 的「选中这个条目」投递口（IShellView::SelectItem → 事件循环）。
+    install_shell_select_sink();
 
     // ---- 守护模式：管道服务线程（唤醒请求投递到事件循环） ----
     let bound = crate::daemon::spawn_server(move |request| {
@@ -12058,10 +12290,10 @@ pub fn run() {
     }
 
     // 首个会话：若启动参数带目录则直接打开（首个会话没有已有标签，新开标签无意义）。
-    let initial = request.path.clone();
     wake_session(crate::daemon::WakeRequest {
-        path: initial,
+        path: request.path.clone(),
         new_tab: false,
+        select: request.select.clone(),
     });
 
     // 守护托盘：UI 销毁后的常驻入口（打开/退出）。
@@ -12257,6 +12489,10 @@ fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
     if !drag_hittest::is_installed(hwnd) {
         crate::sys::shell::set_owner_hwnd(hwnd);
         drag_hittest::install(hwnd);
+        // 这一帧是「窗口真正 realize」的时刻。登记给 Shell 依赖真实 HWND，
+        // 之前每一次 publish 都可能因为拿不到句柄而空转，这里补一次保证
+        // 冷启动时尽快出现在 IShellWindows 里。
+        app.borrow().publish_shell_windows();
     }
     // 注意：最大化还原已移到 create_session 的 show() 之前，用
     // ui.window().set_maximized(config.window_maximized) 在 winit 窗口构建阶段
@@ -12307,14 +12543,15 @@ fn is_address_bar_command(text: &str) -> bool {
 
 /// 初始化路径该「新开标签」还是「占用当前（默认）标签」。
 ///
-/// - `requested_new_tab`：请求方（`--shell-open` / `--this-pc`，即资源管理器接管）
-///   明确要求新开标签。会话被 X 关掉、守护进程处于「无会话」状态时，这条请求
-///   只能落到 create_session 上，**绝不能退化成导航**：否则用户正在那一个标签里
-///   看的东西会被目标目录顶掉（表现为「接管打开吞掉一个标签」）。
-/// - `restored_last_tabs`：这次会话恢复了「上次的标签页」，那是用户的标签，
-///   同样不能被顶掉。
-fn initial_path_opens_new_tab(requested_new_tab: bool, restored_last_tabs: bool) -> bool {
-    requested_new_tab || restored_last_tabs
+/// 只看 `restored_last_tabs`：`create_session` 永远是从空会话开始的，此时
+/// `state.tabs` 里除了「恢复出来的用户标签」就只剩那个还没列举过的默认
+/// 「此电脑」标签 —— 顶掉它才对。若这里也听 `requested_new_tab`（接管/命令行
+/// 传来的新开标签要求），冷启动时会留下一个没列举过的空「此电脑」标签贴在
+/// 左边（表现为「最左侧多出一个显示此文件夹为空的此电脑标签」）。
+///
+/// 会话已存在时的新开标签要求由 `queue_shell_tab` 负责，跟这里无关。
+fn initial_path_opens_new_tab(restored_last_tabs: bool) -> bool {
+    restored_last_tabs
 }
 
 #[cfg(test)]
@@ -12342,7 +12579,11 @@ mod address_bar_command_tests {
     }
 }
 
-fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new_tab: bool) {
+fn create_session(
+    initial_path: Option<PathBuf>,
+    jobs: JobManager,
+    initial_reveal: Option<PathBuf>,
+) {
     let mut config = Config::load();
     // 首次启动判定快照：用「是否首次运行」标记，而不是坐标 < 0（见下方窗口几何处说明）。
     // 必须在下方 HDD 初始化逻辑消费 is_first_run 之前抓取。
@@ -12474,10 +12715,6 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new
     // 先入槽再接线：会话槽持有唯一强引用，回调/定时器均为 Weak；
     // 漏掉此行会导致 App 在本函数返回时即被释放（列表收不到数据）。
     SESSION.with(|slot| *slot.borrow_mut() = Some(app.clone()));
-    // 启动即预热全盘索引：懒加载会让首次搜索撞上冷启动（等待扫描），
-    // 且状态栏空等。放在这里可在会话建立瞬间就让后台线程开始静默建库。
-    // shared() 是幂等的（OnceLock），守护进程常驻时重复调用无副作用。
-    let _ = crate::search::index::shared();
 
     wire_callbacks(&app);
     setup_timers(&app);
@@ -12552,7 +12789,19 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new
         // 「再多 push 一个标签」，默认的「此电脑」标签就既没列举也没人切过去，
         // 表现为最左侧多出一个显示「此文件夹为空」的此电脑标签。
         if let Some(path) = initial_path {
-            if initial_path_opens_new_tab(requested_new_tab, restored_last_tabs) {
+            // 恢复出来的标签里已经有这个目录：切过去就好，别再开一个一模一样的。
+            // 热会话的 reveal 走 locate_folder 去重，冷启动这条路径也要一致，
+            // 否则同一目录会出现两个标签（用户右键「用 Rove 打开」一个已经
+            // 恢复出来的文件夹时最容易撞上）。
+            let already_open = if restored_last_tabs {
+                app.locate_folder(&path)
+            } else {
+                None
+            };
+            if let Some((tab_index, pane_index)) = already_open {
+                app.state.active_tab = tab_index;
+                app.state.tabs[tab_index].active_pane = pane_index;
+            } else if initial_path_opens_new_tab(restored_last_tabs) {
                 // inherit=false：路径是明确给的，新标签不该再继承当前目录。
                 let sort = app.state.active().active().sort;
                 app.state.new_tab_ex(Some(path), sort, false);
@@ -12560,6 +12809,11 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new
                 app.state.active_mut().active_mut().navigate(Some(path));
             }
         }
+        // 目录已经定下来了就把窗格登记给 Shell —— 不要等下面那一串 UI 同步
+        // 和 `sync_file_list`：冷启动时「打开文件所在位置」的选中请求正在等
+        // 我们出现在 IShellWindows 里，越早越好（窗口尚未 realize 时
+        // publish 会自己跳过，最后由 sync_file_list 那一次兜底）。
+        app.publish_shell_windows();
         // 「电脑选项」不做事：AppState 初始就是单栏的「此电脑」。
         // 但它的排序必须用「此电脑」自己的状态（主键是盘符），
         // 不能沿用普通目录的全局排序。
@@ -12571,7 +12825,17 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new
         app.sync_sidebar();
         app.sync_staging();
         app.sync_file_list();
+        // 「在文件夹中显示」：必须在 reload_active 之前挂上，否则列举结果回来时
+        // 没有目标可匹配（结果可能同帧就到，来不及补挂）。
+        app.arm_reveal(initial_reveal);
         app.reload_active();
+        // 启动即预热全盘索引：懒加载会让首次搜索撞上冷启动（等待扫描），
+        // 且状态栏空等。shared() 是幂等的（OnceLock），常驻进程重复调用无副作用。
+        //
+        // 位置很关键：它要读十几万条缓存（实测约 300ms），而上面那次
+        // `sync_file_list` 已经把窗格登记给 Shell 了。冷启动时「打开文件所在
+        // 位置」的选中请求就在等这一步，绝不能让它挡在登记之前。
+        let _ = crate::search::index::shared();
         // 启动时窗口还没显示，标签条其实一个像素都没布局（视口宽度为 0），
         // 恢复出来的「当前标签」可能落在可视区外，用户看不到自己在哪一页。
         // 这里只丢一个目标下标，TabBar 内部会等布局落定后补滚
@@ -12631,8 +12895,103 @@ fn create_session(initial_path: Option<PathBuf>, jobs: JobManager, requested_new
         app.borrow_mut().first_run_pending = true;
     }
     sync_drag_bounds(&app.borrow(), "show");
+    // 登记给 Shell 必须在这里补一次：`get_window_hwnd` 在窗口 show() 之前拿不到
+    // 句柄，所以 create_session 内部那些 publish 全是空转。不补这一下，登记要等到
+    // 「第一次列举结果回来 → sync_file_list」，网络盘上就是好几秒之后 ——
+    // 冷启动时浏览器/下载器的「打开文件所在位置」早就等不及了。
+    app.borrow().publish_shell_windows();
 
     logln!("session created");
+}
+
+/// Shell 通过 `IShellView::SelectItem` 发来的「选中这个条目」请求。
+///
+/// 浏览器 / 下载器 / 微信的「打开文件所在位置」走的是 `SHOpenFolderAndSelectItems`，
+/// 选中项只在 pidl 里流转、**不进命令行**，所以只能由 Shell 回调我们的
+/// `IShellView`（见 `sys::shell_windows`）拿到。这个函数在事件循环线程上执行。
+pub fn reveal_in_session(target: PathBuf) {
+    reveal_in_session_attempt(target, 0);
+}
+
+/// 一次选中请求的处理。`attempt` 是「界面正在忙、稍后重来」的次数上限。
+fn reveal_in_session_attempt(target: PathBuf, attempt: u32) {
+    logln!("[shell-windows] 界面线程收到选中请求 {target:?}");
+    let session = SESSION.with(|slot| slot.borrow().clone());
+    if let Some(app) = session {
+        match try_reveal_in_session(&app, &target) {
+            RevealOutcome::Done => {
+                let ui = slint::ComponentHandle::clone_strong(&app.borrow().ui);
+                let _ = ui.show();
+                focus_window(&ui);
+                return;
+            }
+            RevealOutcome::Busy => {
+                // 正在处理别的 Slint 回调：稍后重来，别丢掉这次请求。
+                //
+                // 这条分支里**不能碰 app**：Busy 的含义就是「App 正被可变借用」，
+                // 此时再 `app.borrow()` 会立刻 panic（RefCell 双借用 → 进程 abort）。
+                // 窗口本来就因为会话存在而处于显示状态，这里只要安排重试即可。
+                if attempt < 20 {
+                    slint::Timer::single_shot(Duration::from_millis(50), move || {
+                        reveal_in_session_attempt(target, attempt + 1);
+                    });
+                } else {
+                    logln!("!! [shell-windows] 界面一直忙，选中请求放弃");
+                }
+                return;
+            }
+            RevealOutcome::NotOpen => {}
+        }
+    }
+    // 没有哪个窗格在显示这个目录：与「接管资源管理器」同一条链路
+    // （新标签打开 + 列表加载完选中）。
+    let folder = target.parent().map(Path::to_path_buf);
+    wake_session(crate::daemon::WakeRequest {
+        path: folder,
+        new_tab: true,
+        select: Some(target),
+    });
+}
+
+enum RevealOutcome {
+    /// 已经选中。
+    Done,
+    /// 没有窗格显示这个目录。
+    NotOpen,
+    /// App 正被别的回调借用，稍后重试。
+    Busy,
+}
+
+/// 在当前会话里找到「正在显示该目录」的窗格，切过去并选中。
+fn try_reveal_in_session(app: &Rc<RefCell<App>>, target: &Path) -> RevealOutcome {
+    let Ok(mut app) = app.try_borrow_mut() else {
+        return RevealOutcome::Busy;
+    };
+    let Some(folder) = target.parent() else {
+        return RevealOutcome::NotOpen;
+    };
+    let Some((tab_index, pane_index)) = app.locate_folder(folder) else {
+        return RevealOutcome::NotOpen;
+    };
+    let changed = tab_index != app.state.active_tab
+        || pane_index != app.state.active().active_pane;
+    if changed {
+        logv!("[shell-windows] 切到已有窗格 tab={tab_index} pane={pane_index}");
+        app.state.active_tab = tab_index;
+        app.state.tabs[tab_index].active_pane = pane_index;
+        app.sync_active_tab();
+    }
+    app.select_path_in_active_pane(target);
+    RevealOutcome::Done
+}
+
+/// 装上 Shell 的选中请求投递口（只会成功一次）。
+fn install_shell_select_sink() {
+    crate::sys::shell_windows::set_select_sink(|path| {
+        if slint::invoke_from_event_loop(move || reveal_in_session(path)).is_err() {
+            logln!("!! [shell-windows] 事件循环不可用，选中请求丢弃");
+        }
+    });
 }
 
 /// 唤醒：无 UI 则重建会话（冷启动 < 50ms）；有 UI 则前置窗口并导航。
@@ -12641,16 +13000,25 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
     if let Some(app) = existing {
         {
             let mut app = app.borrow_mut();
-            if let Some(p) = request.path.clone() {
+            let select = request.select.clone();
+            // 「在文件夹中显示」没给目录时，用条目的父目录；这里只做字符串截断，
+            // 不 stat（UI 线程碰网络路径会卡窗口）。
+            let path = request.path.clone().or_else(|| {
+                select
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(std::path::Path::to_path_buf)
+            });
+            if let Some(p) = path {
                 if request.new_tab {
                     // 新标签要在借用释放后由定时器执行（见 queue_shell_tab）。
-                    app.queue_shell_tab(Some(p));
+                    app.queue_shell_tab(Some(p), select);
                 } else {
-                    app.navigate_active(Some(p));
+                    app.navigate_active_reveal(Some(p), select);
                 }
             } else if request.new_tab {
                 // 此电脑：同样新开标签，不动用户当前目录。
-                app.queue_shell_tab(None);
+                app.queue_shell_tab(None, None);
             }
         }
         // 借用必须先释放：ShowWindow / SetForegroundWindow 会同步派发窗口消息
@@ -12669,6 +13037,7 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
         }
         let _ = ui.show();
         if pending_show {
+            app.borrow().publish_shell_windows();
             // 首帧重绘要显式请求：后台会话没有走过启动时的 request_redraw，
             // 首帧不来的话 HWND 登记与无边框拖拽钩子会一直缺位。
             ui.window().request_redraw();
@@ -12680,7 +13049,15 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
     }
     // JobManager 的任务线程跨会话存活；此处为新会话重建一份管理句柄，
     // 使 jobs 状态与 UI 生命周期解耦。
-    create_session(request.path, JobManager::new(), request.new_tab);
+    let reveal = request.select.clone();
+    let initial_path = request.path.clone().or_else(|| {
+        request
+            .select
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(std::path::Path::to_path_buf)
+    });
+    create_session(initial_path, JobManager::new(), reveal);
 }
 
 /// 销毁当前会话：丢弃窗口（释放 GPU 资源与组件树）与全部状态，
@@ -12765,20 +13142,25 @@ pub fn destroy_session() {
             app.config.window_height = (size.height as f64 / scale).round() as u32;
         }
         // 「上次的标签页(包括分屏)」：记下每个标签各栏的路径。
-        app.config.last_tabs = app
-            .state
-            .tabs
-            .iter()
-            .map(|t| crate::config::TabSnapshot {
-                paths: t
-                    .panes
-                    .iter()
-                    .map(|p| p.path.as_ref().map(|x| x.to_string_lossy().into_owned()))
-                    .collect(),
-                active_pane: t.active_pane,
-                is_settings: t.kind == crate::state::TabKind::Settings,
-            })
-            .collect();
+        // 被「关闭全部 / 关掉最后一个标签」收尾的会话不写：那是用户明确表示
+        // 这一轮的标签不要了，下次只该开一个「此电脑」。
+        app.config.last_tabs = if app.tabs_discarded {
+            Vec::new()
+        } else {
+            app.state
+                .tabs
+                .iter()
+                .map(|t| crate::config::TabSnapshot {
+                    paths: t
+                        .panes
+                        .iter()
+                        .map(|p| p.path.as_ref().map(|x| x.to_string_lossy().into_owned()))
+                        .collect(),
+                    active_pane: t.active_pane,
+                    is_settings: t.kind == crate::state::TabKind::Settings,
+                })
+                .collect()
+        };
         app.config.last_active_tab = app.state.active_tab;
         logv!(
             "[win-save] w={} h={} x={} y={} maximized={} hwnd_present={} tabs={} never_shown={}",

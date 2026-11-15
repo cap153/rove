@@ -21,6 +21,11 @@ pub struct WakeRequest {
     pub path: Option<PathBuf>,
     /// 资源管理器转来的请求新开标签，不覆盖用户当前正在看的目录。
     pub new_tab: bool,
+    /// 「打开文件所在位置」要一同选中的条目。
+    ///
+    /// 只有进程内（Shell 窗口登记器回调，见 `sys::shell_windows`）会填它：
+    /// Shell 的选中信息走 pidl，**从不进命令行**，所以通道消息里没有这个字段。
+    pub select: Option<PathBuf>,
 }
 
 /// 解析启动参数。
@@ -35,6 +40,7 @@ pub fn parse_args(args: &[String]) -> WakeRequest {
         return WakeRequest {
             path: None,
             new_tab: true,
+            select: None,
         };
     }
     if let Some(at) = args.iter().position(|a| a == "--shell-open") {
@@ -46,16 +52,15 @@ pub fn parse_args(args: &[String]) -> WakeRequest {
             Some(path) => WakeRequest {
                 path: Some(PathBuf::from(path)),
                 new_tab: true,
+                select: None,
             },
             None => WakeRequest::default(),
         };
     }
     WakeRequest {
-        path: args
-            .iter()
-            .map(PathBuf::from)
-            .find(|p| p.is_dir()),
+        path: args.iter().map(PathBuf::from).find(|p| p.is_dir()),
         new_tab: false,
+        select: None,
     }
 }
 
@@ -260,6 +265,7 @@ mod imp {
                     on_wake(super::WakeRequest {
                         path,
                         new_tab: msg.new_tab,
+                        select: None,
                     });
                 }
             }
@@ -343,7 +349,8 @@ mod tests {
             req,
             WakeRequest {
                 path: None,
-                new_tab: true
+                new_tab: true,
+                select: None
             }
         );
     }

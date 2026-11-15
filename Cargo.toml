@@ -41,6 +41,9 @@ tray-icon = "0.21"
 usn-journal-rs = "0.4.1"
 windows = { version = "0.59", features = [
     "Win32_UI_Shell",
+    # IShellView（登记成 Shell 窗口时实现 SelectItem）需要 Controls 里的
+    # LPFNSVADDPROPSHEETPAGE 类型门控。
+    "Win32_UI_Controls",
     # IFileDialog / COMDLG_FILTERSPEC（原生文件选择对话框）。
     "Win32_UI_Shell_Common",
     # 右键菜单：GetKeyState（Shift/Ctrl 修饰键）。
@@ -52,6 +55,12 @@ windows = { version = "0.59", features = [
     "Win32_System_Memory",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_SystemServices",
+    # LoadLibrary / GetProcAddress 之外还有 MsgWaitForMultipleObjectsEx 与
+    # CreateEventW：登记成 Shell 窗口的线程要泵消息，Shell 才能把
+    # IShellView::SelectItem 调进来。
+    "Win32_System_Threading",
+    # CreateEventW 需要 SECURITY_ATTRIBUTES。
+    "Win32_Security",
     "Win32_System_Com",
     # DEFCONTEXTMENU 结构体在 windows crate 里受此 feature 门控（原生右键菜单用）。
     "Win32_System_Registry",
