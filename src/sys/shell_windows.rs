@@ -50,6 +50,19 @@ pub fn publish(panes: Vec<PaneRegistration>) {
     imp::publish(panes);
 }
 
+/// 在窗口还没建出来之前，先向 Shell「预定」一个位置。
+///
+/// 「打开文件所在位置」的调用方（浏览器/IDM/微信）只等很短一会儿就要么成功、
+/// 要么自己拉资源管理器。冷启动时我们光是把进程、窗口、会话建起来就要几百
+/// 毫秒，Shell 很可能已经放弃（表现为选不中，或者半分钟后冒出资源管理器）。
+///
+/// `RegisterPending` 就是给这种情况准备的：它只要「目录 pidl + 将来承载窗口的
+/// 线程 id」，不需要窗口存在，等于告诉 Shell「这个目录的窗口马上就来，等我」。
+/// 目录已知、窗口还没有的那一刻调用它（见 `run()` 里的 `--shell-open`）。
+pub fn reserve(path: PathBuf) {
+    imp::reserve(path);
+}
+
 /// 设置「Shell 要求选中某个条目」的投递口：参数是条目的完整路径。
 ///
 /// 会在后台线程（可能还是 Shell 的线程）被调用，实现方必须立刻返回、
@@ -112,7 +125,7 @@ mod imp {
         SIGDN, SIGDN_DESKTOPABSOLUTEPARSING, SWC_BROWSER,
     };
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::System::Threading::{CreateEventW, SetEvent};
+    use windows::Win32::System::Threading::{CreateEventW, GetCurrentThreadId, SetEvent};
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetWindowThreadProcessId, IsWindowVisible,
         MsgWaitForMultipleObjectsEx, PeekMessageW, TranslateMessage, MSG, MWMO_INPUTAVAILABLE,
@@ -145,6 +158,36 @@ mod imp {
     static WAKE: Mutex<Option<isize>> = Mutex::new(None);
     static STARTED: OnceLock<()> = OnceLock::new();
 
+    /// 待预定的目录 + 将来承载窗口的线程 id（见 [`reserve`]）。
+    static RESERVE: Mutex<Option<(PathBuf, u32)>> = Mutex::new(None);
+    /// 已经 `RegisterPending`、还没真正 `Register` 的位置：
+    /// (目录, 是否 alias 形态, cookie, 登记时刻)。
+    static PENDING: Mutex<Vec<(PathBuf, bool, i32, std::time::Instant)>> = Mutex::new(Vec::new());
+
+    /// 冷启动时「马上就有窗口」的预定（界面线程调用，真正执行在 STA 线程）。
+    pub fn reserve(path: PathBuf) {
+        if path.as_os_str().is_empty() {
+            return;
+        }
+        // 预定要带上「窗口将出现在哪个线程」——此刻窗口还不存在，就是界面线程。
+        let thread_id = unsafe { GetCurrentThreadId() };
+        if let Ok(mut slot) = RESERVE.lock() {
+            *slot = Some((path, thread_id));
+        }
+        ensure_worker();
+        wake();
+    }
+
+    fn wake() {
+        if let Ok(slot) = WAKE.lock() {
+            if let Some(event) = slot.as_ref() {
+                unsafe {
+                    let _ = SetEvent(windows::Win32::Foundation::HANDLE(*event as *mut c_void));
+                }
+            }
+        }
+    }
+
     pub fn publish(panes: Vec<PaneRegistration>) {
         {
             let mut desired = match DESIRED.lock() {
@@ -158,13 +201,7 @@ mod imp {
         }
         REVISION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         ensure_worker();
-        if let Ok(slot) = WAKE.lock() {
-            if let Some(event) = slot.as_ref() {
-                unsafe {
-                    let _ = SetEvent(windows::Win32::Foundation::HANDLE(*event as *mut c_void));
-                }
-            }
-        }
+        wake();
     }
 
     fn ensure_worker() {
@@ -223,6 +260,11 @@ mod imp {
         // 先按一次快照再等唤醒：窗口建好之前就发布的窗格不会漏掉。
         // 这个线程与进程同寿（没有退出路径），所以不用清理。
         loop {
+            // 「马上就有窗口」的预定排在最前面：它就是为了赶在 Shell 放弃之前。
+            if let Some((path, thread_id)) = RESERVE.lock().ok().and_then(|mut slot| slot.take()) {
+                reserve_pending(&windows, &path, thread_id);
+            }
+            expire_pending(&windows);
             let revision = REVISION.load(std::sync::atomic::Ordering::SeqCst);
             if revision != applied {
                 applied = revision;
@@ -231,7 +273,9 @@ mod imp {
                 // 无条件记一行「第一次同步的结果」：冷启动排查全靠它 ——
                 // 它出现说明登记链路跑到了，条数为 0 说明 Shell 还没认我们，
                 // 而它完全不出现说明登记根本没被触发。
-                if first_sync {
+                // 只在真的开始登记时才记这一行：窗格还没建出来（0 个）时
+                // 它只会误导人。
+                if first_sync && !desired.is_empty() {
                     first_sync = false;
                     sw!(
                         "[first-sync] 窗格 {} 个，登记成功 {} 条",
@@ -270,6 +314,78 @@ mod imp {
         cookie: i32,
         /// 持有对象本身：`Revoke` 之后才能释放，否则 Shell 手里可能还拿着指针。
         app: IWebBrowserApp,
+    }
+
+    /// 真的去「预定」：两种 pidl 形态各一条（Shell 逐字节比较 IDList，
+    /// 不同调用方给的形态不一样，见 [`folder_pidl`]）。
+    fn reserve_pending(windows: &IShellWindows, path: &Path, thread_id: u32) {
+        for alias in [false, true] {
+            let Some(pidl) = folder_pidl(path, alias) else {
+                continue;
+            };
+            let mut location =
+                match unsafe { InitVariantFromBuffer(pidl as *const c_void, ILGetSize(Some(pidl))) } {
+                    Ok(variant) => variant,
+                    Err(err) => {
+                        sw!("!! 预定：目录变体生成失败 {err} path={path:?}");
+                        unsafe { CoTaskMemFree(Some(pidl as *const c_void)) };
+                        continue;
+                    }
+                };
+            unsafe { CoTaskMemFree(Some(pidl as *const c_void)) };
+            let root = VARIANT::default();
+            match unsafe { windows.RegisterPending(thread_id as i32, &location, &root, SWC_BROWSER) } {
+                Ok(cookie) => {
+                    if let Ok(mut slot) = PENDING.lock() {
+                        slot.push((path.to_path_buf(), alias, cookie, std::time::Instant::now()));
+                    }
+                    swv!("预定 path={path:?} alias={alias} cookie={cookie}");
+                }
+                Err(err) => sw!("!! 预定失败 path={path:?} alias={alias} err={err}"),
+            }
+            let _ = unsafe { VariantClear(&mut location) };
+        }
+    }
+
+    /// 拿走与 `(path, alias)` 对应的预定 cookie：有就复用它作为「预定位置」，
+    /// 不再重复预定一次（重复预定会在 Shell 里留下一条永远等不到的空位）。
+    fn take_pending(path: &Path, alias: bool) -> Option<i32> {
+        let mut slot = PENDING.lock().ok()?;
+        let index = slot.iter().position(|(other, other_alias, _, _)| {
+            *other_alias == alias && crate::fs::dir::same_path_loose(other, path)
+        })?;
+        Some(slot.remove(index).2)
+    }
+
+    /// 预定出去 15 秒还没被真正登记用上就撤掉（会话可能最终打开了别的目录），
+    /// 否则 Shell 会一直以为「那个目录的窗口马上就来」。
+    ///
+    /// 注意「先在锁内摘出来、再放锁去 Revoke」：`Revoke` 是跨进程的 COM 调用
+    /// （会进 Shell 的消息循环），不该在持有 `PENDING` 的情况下做。
+    fn expire_pending(windows: &IShellWindows) {
+        let expired: Vec<(PathBuf, bool, i32)> = {
+            let Ok(mut slot) = PENDING.lock() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            let mut keep = Vec::with_capacity(slot.len());
+            let mut expired = Vec::new();
+            for entry in slot.drain(..) {
+                if now.duration_since(entry.3).as_secs() >= 15 {
+                    expired.push((entry.0, entry.1, entry.2));
+                } else {
+                    keep.push(entry);
+                }
+            }
+            *slot = keep;
+            expired
+        };
+        for (path, alias, cookie) in expired {
+            if let Err(err) = unsafe { windows.Revoke(cookie) } {
+                sw!("!! 撤销过期预定失败 cookie={cookie}: {err}");
+            }
+            swv!("预定过期撤销 path={path:?} alias={alias}");
+        }
     }
 
     /// 让 Shell 里登记的内容与 `desired` 一致。
@@ -333,18 +449,26 @@ mod imp {
             let thread_id = GetWindowThreadProcessId(HWND(pane.hwnd as *mut c_void), None) as i32;
             // 先「预定」一个位置：这样 Shell 在等我们绑定时不会超时后自己
             // 拉起资源管理器（就是用户看到的「半分钟后冒出资源管理器」）。
-            let pending = match windows.RegisterPending(thread_id, &location, &root, SWC_BROWSER) {
-                Ok(cookie) => cookie,
-                Err(err) => {
-                    sw!(
-                        "!! RegisterPending 失败 key={} path={:?} alias={} err={err}",
-                        pane.key,
-                        pane.path,
-                        alias
-                    );
-                    let _ = VariantClear(&mut location);
-                    return None;
+            // 冷启动时 `reserve` 已经替这个目录预定过位置：直接复用它，
+            // Shell 那边因此是「等到了」而不是「等超时」。
+            let pending = match take_pending(&pane.path, alias) {
+                Some(cookie) => {
+                    swv!("复用预定 key={} path={:?} alias={alias} cookie={cookie}", pane.key, pane.path);
+                    cookie
                 }
+                None => match windows.RegisterPending(thread_id, &location, &root, SWC_BROWSER) {
+                    Ok(cookie) => cookie,
+                    Err(err) => {
+                        sw!(
+                            "!! RegisterPending 失败 key={} path={:?} alias={} err={err}",
+                            pane.key,
+                            pane.path,
+                            alias
+                        );
+                        let _ = VariantClear(&mut location);
+                        return None;
+                    }
+                },
             };
             let view: IShellView = View::new(pane.hwnd, pane.path.display().to_string()).into();
             let browser: IShellBrowser = Browser::new(pane.hwnd, &view).into();
@@ -371,9 +495,12 @@ mod imp {
                 }
             };
             if cookie != pending {
-                // 没有绑上预定的位置：Shell 还可能为那条预定等下去，撤掉它。
-                sw!(
-                    "!! 登记没绑上预定位置 pending={pending} cookie={cookie} path={:?}",
+                // 实测 Shell 不会把 `Register` 的 cookie 给成预定的那一个（它自己
+                // 按自己的序号发号），所以这条分支在「提前预定」场景里是常态。
+                // 关键动作是撤掉那条没用上的预定：否则 Shell 会一直以为「那个
+                // 目录的窗口马上就来」，白等到超时。
+                swv!(
+                    "预定未绑定，撤销 pending={pending} cookie={cookie} path={:?}",
                     pane.path
                 );
                 let _ = windows.Revoke(pending);
@@ -1090,6 +1217,8 @@ mod imp {
     use std::path::PathBuf;
 
     pub fn publish(_panes: Vec<PaneRegistration>) {}
+
+    pub fn reserve(_path: PathBuf) {}
 
     pub fn set_select_sink(_sink: impl Fn(PathBuf) + Send + Sync + 'static) {}
 }

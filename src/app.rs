@@ -9877,8 +9877,9 @@ fn attempt_app_mut<F: Fn(&mut App) + 'static>(
     }
     if tries == DEFER_TRIES {
         // 只记第一次：借用占着的那段时间里每次重试都会失败，逐次记就是刷屏。
-        // 这条日志是「有代码持着 borrow 写界面属性」的唯一线索，值得留。
-        logln!("!! {what} 回调命中 App 借用中，延后重试");
+        // 延后重试是**设计行为**（Slint 写属性会同步派发回调），不是异常，
+        // 所以留在详细级 —— 只有「重试到底还是失败」才值得报警（见上面那条）。
+        logv!("[defer] {what} 回调命中 App 借用中，延后重试");
     }
     let weak = Rc::downgrade(app);
     slint::Timer::single_shot(Duration::from_millis(DEFER_DELAY_MS), move || {
@@ -12255,6 +12256,16 @@ pub fn run() {
 
     // Shell 的「选中这个条目」投递口（IShellView::SelectItem → 事件循环）。
     install_shell_select_sink();
+
+    // 「打开文件所在位置」的冷启动：进程刚起来，窗口还没有，但目录已经知道了。
+    // 先把「这个目录的窗口马上就来」预定给 Shell（RegisterPending 不需要窗口），
+    // 再慢慢建会话 —— 否则 Shell 可能先放弃，表现为选不中 / 半分钟后冒资源管理器。
+    // 只对明确带目录的启动做（--this-pc 没有目录，也没什么可选的）。
+    if !background {
+        if let Some(path) = request.path.clone() {
+            crate::sys::shell_windows::reserve(path);
+        }
+    }
 
     // ---- 守护模式：管道服务线程（唤醒请求投递到事件循环） ----
     let bound = crate::daemon::spawn_server(move |request| {
