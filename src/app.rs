@@ -2140,8 +2140,10 @@ fn thumb_decode_one(tag: &str, idx: usize, key: ThumbKey) {
                     return;
                 };
                 let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
-                    crate::logln!(
-                        "[thumb] !! SESSION None when storing {} (row stays blank)",
+                    // 会话已经销毁（关窗口 / 退出时正好有缩略图在飞）。没有窗口，
+                    // 自然也没有「行」要填，属于正常收尾，不该记成异常。
+                    logv!(
+                        "[thumb] 会话已销毁，丢弃缩略图 {}",
                         key.path.display()
                     );
                     return;
@@ -2940,9 +2942,16 @@ impl App {
     }
 
     fn sync_status(&self) {
-        // 工具栏粘贴按钮与右键菜单同源：实时读系统剪贴板。
-        let (paste_paths, _) = self.paste_state();
-        self.ui.set_can_paste(!paste_paths.is_empty());
+        // 工具栏粘贴按钮与右键菜单同源。
+        //
+        // 这里只问一句「剪贴板里有没有文件列表」，**不枚举路径**：sync_status
+        // 调用很频繁（选中、刷新、切换目录都走它），枚举要为剪贴板里每个文件做
+        // 两次 Win32 调用，并且在别的程序占着剪贴板时会重试到上百毫秒——那正是
+        // 界面卡顿的来源。真正的粘贴仍由 paste_clipboard 走 paste_state() 重新读。
+        // 回收站内的剪切从不写系统剪贴板，所以保留内部缓存这条兜底。
+        let can_paste = clipboard::has_file_list()
+            || (self.state.clipboard_from_recycle && !self.state.clipboard_paths.is_empty());
+        self.ui.set_can_paste(can_paste);
         let tab = self.state.active();
         let (dirs, files, selected_size) = tab.active().stats();
         let total = tab.active().display.len();
@@ -8045,7 +8054,18 @@ impl App {
 
         // 常规目录正常写入系统剪贴板
         self.state.clipboard_from_recycle = false;
-        match clipboard::set_files(&paths, is_move) {
+        // 记耗时：这条路径在界面线程上跑，一旦又混进磁盘/网络调用，
+        // 这里会立刻显示出几百毫秒以上的「卡一下」。
+        let started = std::time::Instant::now();
+        let count = paths.len();
+        let written = clipboard::set_files(&paths, is_move);
+        logv!(
+            "[clipboard] 写 CF_HDROP {} 项 move={} 耗时 {:?}",
+            count,
+            is_move,
+            started.elapsed()
+        );
+        match written {
             Ok(()) => {
                 self.state.clipboard_paths = paths.clone();
                 self.state.clipboard_operation = if is_move { "move".into() } else { "copy".into() };
@@ -13008,6 +13028,12 @@ fn install_shell_select_sink() {
 /// 唤醒：无 UI 则重建会话（冷启动 < 50ms）；有 UI 则前置窗口并导航。
 pub fn wake_session(request: crate::daemon::WakeRequest) {
     let existing = SESSION.with(|slot| slot.borrow().clone());
+    logv!(
+        "[wake] 会话已存在={} new_tab={} path={:?}",
+        existing.is_some(),
+        request.new_tab,
+        request.path
+    );
     if let Some(app) = existing {
         {
             let mut app = app.borrow_mut();
@@ -13069,6 +13095,25 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
             .map(std::path::Path::to_path_buf)
     });
     create_session(initial_path, JobManager::new(), reveal);
+    // 会话刚建起来就再「显示 + 前置」一次。
+    //
+    // 托盘上「第一次点击只闪一下、第二次才真的打开」正是缺了这一步：第二次
+    // 点击走的是「已有会话 → show + focus」，而第一次只走到 create_session
+    // 末尾那次 show —— 长时间没有会话（窗口关掉后放着不动）时，那一次 show
+    // 偶尔不能把窗口真正落到屏幕上。这里补的正是用户手动做的第二次点击。
+    //
+    // 后台会话（--background）不能做：它的窗口本来就应该保持隐藏，
+    // `window_pending_show` 就是那个标记。
+    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+        let pending_show = app.borrow().window_pending_show;
+        if !pending_show {
+            let ui = slint::ComponentHandle::clone_strong(&app.borrow().ui);
+            logv!("[wake] 补一次 show，窗口尺寸={:?}", ui.window().size());
+            let _ = ui.show();
+            ui.window().request_redraw();
+            focus_window(&ui);
+        }
+    }
 }
 
 /// 销毁当前会话：丢弃窗口（释放 GPU 资源与组件树）与全部状态，
@@ -13202,6 +13247,16 @@ pub fn destroy_session() {
 
 /// 把窗口前置并聚焦（WSLg/真实 Windows 均适用）。
 fn focus_window(ui: &MainWindow) {
+    focus_window_attempt(ui, 0);
+}
+
+/// 取窗口句柄 + 激活的实体。返回 `false` 表示**句柄还没准备好**。
+///
+/// 这一点在托盘唤醒上很关键：`ui.show()` 之后 Slint 并不会立刻把 HWND 交出来
+/// （实测要等首帧重绘走完，约 0.3–0.4 秒），此时整个函数会静默返回，窗口就
+/// 变成「已经显示、但没被激活到前台」——用户看到的就是「点一下只闪一下，
+/// 点第二下才真的打开」。
+fn activate_window(ui: &MainWindow) -> bool {
     #[cfg(windows)]
     {
         use raw_window_handle::RawWindowHandle;
@@ -13268,11 +13323,36 @@ fn focus_window(ui: &MainWindow) {
                         set_ok
                     );
                 }
+                return true;
             }
         }
+        false
     }
     #[cfg(not(windows))]
-    let _ = ui;
+    {
+        let _ = ui;
+        true
+    }
+}
+
+/// 首帧还没落地时句柄是空的：50ms 一轮等它出现，最多 1.5 秒。
+fn focus_window_attempt(ui: &MainWindow, attempt: u32) {
+    if activate_window(ui) {
+        if attempt > 0 {
+            logv!("[focus] 等到窗口句柄，第 {} 轮激活", attempt);
+        }
+        return;
+    }
+    if attempt >= 30 {
+        logln!("!! [focus] 始终拿不到窗口句柄，放弃激活");
+        return;
+    }
+    let weak = ui.as_weak();
+    slint::Timer::single_shot(Duration::from_millis(50), move || {
+        if let Some(ui) = weak.upgrade() {
+            focus_window_attempt(&ui, attempt + 1);
+        }
+    });
 }
 
 /// 光标（屏幕）位置 → 窗口客户区逻辑坐标。

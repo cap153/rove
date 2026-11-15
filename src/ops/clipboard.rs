@@ -95,12 +95,21 @@ mod imp {
             .map_err(|_| "clipboard mutex poisoned".to_string())?;
         ensure_ole();
 
+        // 只在**真有必要**时碰文件系统：界面里给出的路径本来就是绝对的，
+        // `canonicalize` 却要逐个查询——网络盘/掉线共享上每个路径能卡几十到
+        // 几百毫秒，全选复制 20 个文件就是好几秒的「未响应」（这条调用以前
+        // 就在界面线程上）。相对路径才补一次工作目录，纯字符串拼接。
         let hdrop_paths: Vec<PathBuf> = paths
             .iter()
             .map(|p| {
-                std::fs::canonicalize(p)
-                    .map(|c| shell_path(&c))
-                    .unwrap_or_else(|_| p.clone())
+                let absolute = if p.is_relative() {
+                    std::env::current_dir()
+                        .map(|dir| dir.join(p))
+                        .unwrap_or_else(|_| p.clone())
+                } else {
+                    p.clone()
+                };
+                shell_path(&absolute)
             })
             .collect();
 
@@ -147,12 +156,14 @@ mod imp {
                 }
 
                 // 首路径的 FileNameW：某些旧程序会读该格式。
+                // CF_HDROP 已经写进去了，附属格式失败不能把整次复制报成失败
+                // （否则会出现「提示复制失败，但粘贴其实能用」的矛盾状态）。
                 if let Some(first) = hdrop_paths.first() {
                     let name_w: Vec<u16> = first.as_os_str().encode_wide().chain(once(0)).collect();
                     let fmt = RegisterClipboardFormatW(w!("FileNameW"));
                     let bytes =
                         std::slice::from_raw_parts(name_w.as_ptr() as *const u8, name_w.len() * 2);
-                    set_clipboard_bytes(fmt, bytes)?;
+                    let _ = set_clipboard_bytes(fmt, bytes);
                 }
 
                 let effect_fmt = RegisterClipboardFormatW(w!("Preferred DropEffect"));
@@ -161,7 +172,7 @@ mod imp {
                 } else {
                     DROPEFFECT_COPY | DROPEFFECT_LINK
                 };
-                set_clipboard_bytes(effect_fmt, &effect.to_ne_bytes())?;
+                let _ = set_clipboard_bytes(effect_fmt, &effect.to_ne_bytes());
                 Ok(())
             })();
             let _ = CloseClipboard();
@@ -296,6 +307,28 @@ mod imp {
 /// 写入文件剪贴板（复制/剪切）。
 pub fn set_files(paths: &[std::path::PathBuf], is_move: bool) -> Result<(), String> {
     imp::set_files(paths, is_move)
+}
+
+/// 剪贴板里有没有文件列表（`CF_HDROP`）。
+///
+/// 只做一次格式查询：**不打开剪贴板、不枚举路径、不拿进程锁**。
+/// 状态栏每次刷新都会问一次「能不能粘贴」，若用 `read_files()`，就要为剪贴板里
+/// 每个文件做两次 `DragQueryFileW`——资源管理器里复制 500 个文件时，界面每刷新
+/// 一次状态栏就多几千次 Win32 调用；更糟的是别的程序短暂占着剪贴板时，
+/// `OpenClipboard` 会重试 8 轮（最多 105 毫秒），直接把卡顿带上界面线程。
+pub fn has_file_list() -> bool {
+    #[cfg(windows)]
+    {
+        unsafe {
+            windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable(
+                windows_sys::Win32::System::Ole::CF_HDROP as u32,
+            ) != 0
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// 把选中项的完整路径（含文件名）拼成多行文本：一项一行，不带引号、不带结尾换行。

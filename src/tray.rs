@@ -65,6 +65,7 @@ fn start_event_forwarder() {
             while let Ok(ev) = rx.recv() {
                 match ev.id.as_ref() {
                     ID_QUIT => {
+                        logv!("[tray] 菜单退出");
                         let _ = slint::invoke_from_event_loop(|| {
                             destroy_session_public();
                             let _ = slint::quit_event_loop();
@@ -72,6 +73,7 @@ fn start_event_forwarder() {
                     }
                     _ => {
                         // 打开 Rove。
+                        logv!("[tray] 菜单打开");
                         let _ = slint::invoke_from_event_loop(|| wake_session_public(TRAY_WAKE.clone()));
                     }
                 }
@@ -90,6 +92,7 @@ fn start_event_forwarder() {
                     ..
                 } = ev
                 {
+                    logv!("[tray] 左键点击 -> 唤起窗口");
                     let _ = slint::invoke_from_event_loop(|| wake_session_public(TRAY_WAKE.clone()));
                 }
             }
@@ -107,5 +110,5 @@ const TRAY_WAKE: crate::daemon::WakeRequest = crate::daemon::WakeRequest {
 // 由 app.rs 注入的两个入口（避免 daemon ↔ app 循环依赖）。
 pub use crate::app::{destroy_session as destroy_session_public, wake_session as wake_session_public};
 
-// logln 由 app.rs 的宏导出（macro_export）。
-use crate::logln;
+// logln/logv 由 app.rs 的宏导出（macro_export）。
+use crate::{logln, logv};

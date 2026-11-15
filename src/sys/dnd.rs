@@ -146,6 +146,9 @@ fn drag_out_impl(paths: &[PathBuf], icon_px: u32, on_feedback: Box<dyn Fn()>) ->
                 // 记下来：拖到 rove 自己的面包屑这类「无 IDropTarget」的区域，
                 // DoDragDrop 返回值与 Esc 取消无法区分，只能靠这个标志判断。
                 DRAG_RELEASED.store(true, Ordering::SeqCst);
+                // 松手时刻：目标若在 `Drop` 里同步复制，困惑的「界面卡住」
+                // 就是从这一刻到 `DoDragDrop` 返回之间。
+                crate::logv!("[dnd] 松手，交给目标处理");
                 return DRAGDROP_S_DROP;
             }
             windows::core::HRESULT(0) // S_OK: 继续拖拽
@@ -278,8 +281,19 @@ fn drag_out_impl(paths: &[PathBuf], icon_px: u32, on_feedback: Box<dyn Fn()>) ->
         let parents: std::collections::HashSet<PathBuf> =
             paths.iter().filter_map(|p| p.parent().map(|d| d.to_path_buf())).collect();
 
-        let data_obj: IDataObject = if parents.len() == 1 {
-            let parent_s = paths[0].parent().unwrap().to_string_lossy();
+        // 全量 pidl 版数据对象：单目录优化用不上或失败时兜底。
+        let make_full = || -> Option<IDataObject> {
+            let apidls: Vec<*const ITEMIDLIST> =
+                full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
+            SHCreateDataObject(None, Some(&apidls), None).ok()
+        };
+
+        // 单目录优化：同父目录时用 pparent + ILFindChild，文件夹与文件都能被正确识别。
+        let make_single_parent = || -> Option<IDataObject> {
+            if parents.len() != 1 {
+                return None;
+            }
+            let parent_s = paths[0].parent()?.to_string_lossy();
             let parent_clean = parent_s.trim_end_matches(['\\', '/']);
             let parent_clean = if parent_clean.len() == 2 && parent_clean.ends_with(':') {
                 format!("{parent_clean}\\")
@@ -288,37 +302,36 @@ fn drag_out_impl(paths: &[PathBuf], icon_px: u32, on_feedback: Box<dyn Fn()>) ->
             };
             let parent_wide = to_wide(&parent_clean);
             let mut pparent: *mut ITEMIDLIST = std::ptr::null_mut();
-
-            if SHParseDisplayName(PCWSTR(parent_wide.as_ptr()), None, &mut pparent, 0, None).is_ok() {
-                let child_ptrs: Vec<*const ITEMIDLIST> = full_pidls
-                    .iter()
-                    .map(|&p| {
-                        let rel = ILFindChild(pparent, p);
-                        if rel.is_null() { p as *const ITEMIDLIST } else { rel as *const ITEMIDLIST }
-                    })
-                    .collect();
-
-                let obj = SHCreateDataObject::<Option<&IDataObject>, IDataObject>(
-                    Some(pparent as *const ITEMIDLIST),
-                    Some(&child_ptrs),
-                    None,
-                );
-                free_pidl(pparent);
-
-                match obj {
-                    Ok(d) => d,
-                    Err(_) => {
-                        let apidls: Vec<*const ITEMIDLIST> = full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
-                        SHCreateDataObject(None, Some(&apidls), None).unwrap()
-                    }
-                }
-            } else {
-                let apidls: Vec<*const ITEMIDLIST> = full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
-                SHCreateDataObject(None, Some(&apidls), None).unwrap()
+            if SHParseDisplayName(PCWSTR(parent_wide.as_ptr()), None, &mut pparent, 0, None).is_err() {
+                return None;
             }
-        } else {
-            let apidls: Vec<*const ITEMIDLIST> = full_pidls.iter().map(|p| *p as *const ITEMIDLIST).collect();
-            SHCreateDataObject(None, Some(&apidls), None).unwrap()
+            let child_ptrs: Vec<*const ITEMIDLIST> = full_pidls
+                .iter()
+                .map(|&p| {
+                    let rel = ILFindChild(pparent, p);
+                    if rel.is_null() { p as *const ITEMIDLIST } else { rel as *const ITEMIDLIST }
+                })
+                .collect();
+            let obj = SHCreateDataObject::<Option<&IDataObject>, IDataObject>(
+                Some(pparent as *const ITEMIDLIST),
+                Some(&child_ptrs),
+                None,
+            );
+            free_pidl(pparent);
+            obj.ok()
+        };
+
+        // 建不出数据对象就放弃这次拖拽。这里**不能 unwrap**：界面线程上一 panic
+        // 就是整个进程消失（和「拖一下窗口不见了」同义），而拿不到数据对象的
+        // 原因（路径刚好消失、被卸载的网络盘）本来就该当作「拖不成」处理。
+        let shell_obj: IDataObject = match make_single_parent().or_else(make_full) {
+            Some(obj) => obj,
+            None => {
+                for f in &full_pidls {
+                    free_pidl(*f);
+                }
+                return DragOutOutcome::Cancelled;
+            }
         };
 
         // 4. 显式注入 CF_HDROP 数据（保证跨进程通用兼容性）
@@ -330,7 +343,7 @@ fn drag_out_impl(paths: &[PathBuf], icon_px: u32, on_feedback: Box<dyn Fn()>) ->
                 tymed: TYMED_HGLOBAL.0 as u32,
                 ptd: std::ptr::null_mut(),
             };
-            let _ = data_obj.SetData(&fmt_hdrop, &medium, true);
+            let _ = shell_obj.SetData(&fmt_hdrop, &medium, true);
         }
 
         // 5. 拖拽图像：把图标交给 Shell 的 DragDropHelper，由系统创建并维持
@@ -346,7 +359,7 @@ fn drag_out_impl(paths: &[PathBuf], icon_px: u32, on_feedback: Box<dyn Fn()>) ->
                     hbmpDragImage: hbmp,
                     crColorKey: COLORREF(0xFFFFFFFF), // CLR_NONE：使用 32bpp alpha
                 };
-                let _ = src.InitializeFromBitmap(&image, &data_obj);
+                let _ = src.InitializeFromBitmap(&image, &shell_obj);
             }
             drag_bitmap = Some(hbmp);
         }
@@ -360,17 +373,24 @@ fn drag_out_impl(paths: &[PathBuf], icon_px: u32, on_feedback: Box<dyn Fn()>) ->
             let mut pt = POINT::default();
             let _ = GetCursorPos(&mut pt);
             let effects = DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0);
-            let _ = h.DragEnter(GetForegroundWindow(), &data_obj, &pt, effects);
+            let _ = h.DragEnter(GetForegroundWindow(), &shell_obj, &pt, effects);
         }
 
         // 6. 发起原生 OLE 拖放
         let source: IDropSource = DropSource { on_feedback, helper: drag_helper.clone() }.into();
         let mut out_effect = DROPEFFECT(0);
+        let drag_started = std::time::Instant::now();
         let hr = DoDragDrop(
-            &data_obj,
+            &shell_obj,
             &source,
             DROPEFFECT(DROPEFFECT_COPY.0 | DROPEFFECT_MOVE.0 | DROPEFFECT_LINK.0),
             &mut out_effect,
+        );
+        crate::logv!(
+            "[dnd] DoDragDrop 返回 ok={} effect=0x{:x} 总耗时={:?}",
+            hr.is_ok(),
+            out_effect.0,
+            drag_started.elapsed()
         );
 
         // 7. 收尾：先让 Shell 撤掉图像窗口，再释放我们创建的位图。
