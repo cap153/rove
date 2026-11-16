@@ -616,9 +616,27 @@ pub fn strings_for(language: &str) -> Vec<SharedString> {
 /// 供 Rust 侧按语言分支拼装带数字的句子。
 pub fn is_chinese(language: &str) -> bool { is_zh(language) }
 
+/// 中文键 → 字典下标。
+///
+/// 以前每个 `text()` 都拿 `ZH.iter().position(...)` 线性扫一遍整张表：一次行重建
+/// 有几十行、每行都要翻译类型文案，一秒重建几十次，等于每秒几十万次字符串比较。
+/// 建一张索引表（一次 ~300 次插入）之后每次查词是哈希查找。
+fn text_index() -> &'static std::collections::HashMap<&'static str, usize> {
+    static INDEX: std::sync::OnceLock<std::collections::HashMap<&'static str, usize>> =
+        std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut map = std::collections::HashMap::with_capacity(ZH.len());
+        for (i, key) in ZH.iter().enumerate() {
+            // 重复键保留第一条，与旧的 `position()` 语义一致。
+            map.entry(*key).or_insert(i);
+        }
+        map
+    })
+}
+
 pub fn text(language: &str, zh_key: &str) -> SharedString {
-    match ZH.iter().position(|s| *s == zh_key) {
-        Some(i) => SharedString::from((if is_zh(language) { ZH } else { EN })[i]),
+    match text_index().get(zh_key) {
+        Some(&i) => SharedString::from((if is_zh(language) { ZH } else { EN })[i]),
         None => SharedString::from(zh_key),
     }
 }
@@ -700,6 +718,20 @@ mod tests {
         assert_eq!(EN[276], "Renamed {}, skipped {}");
         assert_eq!(ZH[291], "匹配单词边界");
         assert_eq!(EN[291], "Matches a word boundary");
+    }
+
+    /// 索引表必须与旧的线性扫描语义一致：每个中文键都命中它**首次出现**的下标。
+    #[test]
+    fn text_index_matches_linear_scan() {
+        let index = text_index();
+        assert_eq!(index.len(), ZH.iter().collect::<std::collections::HashSet<_>>().len());
+        for key in ZH.iter() {
+            let first = ZH.iter().position(|s| s == key).unwrap();
+            assert_eq!(index.get(key).copied(), Some(first), "键 {key:?} 的下标不对");
+            // 每个键查出来都必须是它自己（中文）或对应英文，而不是别的词。
+            assert_eq!(text("zh-CN", key).as_str(), *key);
+            assert_eq!(text("en", key).as_str(), EN[first]);
+        }
     }
 
     #[test]

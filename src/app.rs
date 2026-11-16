@@ -709,6 +709,12 @@ pub struct App {
     mtime_probe_rx: std::sync::mpsc::Receiver<Vec<DirMtimeProbe>>,
     /// 已有一轮探测在跑：1 秒定时器到点时直接跳过，不排队。
     mtime_probe_busy: bool,
+    /// 修改时间文本的记忆表（`SystemTime` → "yyyy-MM-dd HH:mm"）。
+    ///
+    /// `fs::format_time` 每次都要走一遍 Win32 的 `SystemTimeToTzSpecificLocalTime`，
+    /// 而滚动 / 缩略图刷新会在一秒内把同一批行重建几十次。有上限（超了整体清空）：
+    /// 一次可见的只有几十行，4096 条足够覆盖来回滚动的范围。
+    time_text_memo: std::collections::HashMap<Option<SystemTime>, SharedString>,
     /// 搜索框输入防抖：`(待应用的查询词, 该词最后一次输入的时刻)`。
     ///
     /// 每个字符都会触发一次「全目录模糊匹配 + 打分 + 重排」；几万条的目录里
@@ -1034,6 +1040,7 @@ impl App {
             mtime_probe_tx,
             mtime_probe_rx,
             mtime_probe_busy: false,
+            time_text_memo: std::collections::HashMap::new(),
             pending_search: None,
             sidebar_fingerprint: 0,
             visible_cache: None,
@@ -4666,10 +4673,7 @@ impl App {
     /// 给出的是**绝对显示索引**（与 `FileRow.index` 同一坐标系）。
     /// 只在中/大/超大图标视图生效——小图标视图是横排单行，保持原样。
     fn sync_expand_targets(&mut self) {
-        let icons_big = matches!(
-            self.config.view_mode.as_str(),
-            "icons-medium" | "icons-large" | "icons-xl"
-        );
+        let icons_big = is_grid_icons_view(&self.config.view_mode);
         if !icons_big {
             self.ui.set_file_expand_index(-1);
             self.ui.set_file_expand_name(SharedString::default());
@@ -4915,7 +4919,20 @@ impl App {
 
     /// 为指定面板构建可视窗口的行模型（左栏 pane 0 / 右栏 pane 1）。
     ///
-    /// 两遍构建：第一遍在 `self.state` 的不可变借用下收集条目/选择/高亮，
+    /// 修改时间文本（带记忆表，见 `time_text_memo`）。
+    fn time_text(&mut self, time: Option<SystemTime>) -> SharedString {
+        if let Some(hit) = self.time_text_memo.get(&time) {
+            return hit.clone();
+        }
+        let text: SharedString = fs::format_time(time).into();
+        if self.time_text_memo.len() >= 4096 {
+            self.time_text_memo.clear();
+        }
+        self.time_text_memo.insert(time, text.clone());
+        text
+    }
+
+    /// 两遍构建：第一遍在 `self.state` 的不可变借用下收集条目/选择/高亮/文本，
     /// 第二遍释放借用后再调 `self.thumb_for` 填缩略图（可能需要 &mut self）。
     fn build_rows_for_pane(
         &mut self,
@@ -4925,7 +4942,7 @@ impl App {
         count: usize,
         list_height: f32,
     ) -> Vec<FileRow> {
-        let (collected, computer_view) = {
+        let collected: Vec<PreRow> = {
             let tab = &self.state.tabs[tab_index];
             let Some(pane) = tab.panes.get(pane_index) else {
                 return Vec::new();
@@ -4954,24 +4971,18 @@ impl App {
             };
             let details_name_w = name_area_w;
             let grid_name_w = name_area_w;
+            // 只有竖排图标网格真正渲染 `grid-lines`：details/list 用单行 elide，
+            // icons-small 用行内 name-parts。其余档位以前也在算三行切分，白做。
+            let grid_view = is_grid_icons_view(&view_mode);
             // 剥离盘符前缀（如 c:），避免在文件名中误匹配 c: 里的无关字符
             let (_, clean_filter) = crate::search::parse_drive_prefix(&pane.filter);
             let hl_query = clean_filter.trim().to_lowercase();
             let cut = &self.state.cut_paths;
             let mut hl_matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
             let mut hl_bufs = (Vec::new(), Vec::new(), Vec::new());
-            // (显示索引, 条目, 选中, 剪切, 行内分段, 浮层完整分段, 名称被截断)
-            let collected: Vec<(
-                i32,
-                FileEntry,
-                bool,
-                bool,
-                Vec<(String, bool)>,
-                Vec<(String, bool)>,
-                bool,
-            )> = (first..first + count)
+            let collected: Vec<PreRow> = (first..first + count)
                     .filter_map(|di| {
-                        let entry = pane.display_entry(di)?.clone();
+                        let entry = pane.display_entry(di)?;
                         let selected = pane.selection.contains(&entry.path);
                         let cut = cut.contains(&entry.path);
                         // 完整高亮分段（不截断）：浮层专用，保证搜索态也能显示全名。
@@ -5025,10 +5036,67 @@ impl App {
                                 .next()
                                 .unwrap_or_default()
                         };
-                        Some((di as i32, entry, selected, cut, name_parts, tip_parts, name_truncated))
+                        // 此电脑视图的驱动器条目：显示名里的类型标签（"本地磁盘"）走
+                        // 字典翻译，卷标保持原样（与侧边栏 / 面包屑的 tr_drive_label
+                        // 一致）。只改显示名；排序、打开、重命名仍用 entry.name/path。
+                        let display_name: SharedString = if computer_view {
+                            self.tr_drive_label(&entry.name)
+                        } else {
+                            entry.name.clone().into()
+                        };
+                        // 图标网格的 name-area-w 恰好 = item-w-8 = cell-w-16，与渲染
+                        // 预算同源，所以上面那次截断探针的切行结果可以直接当
+                        // grid-lines 用，不必再按同一预算算第二遍。
+                        // 此电脑视图的显示名被翻译过（探针用的是原名），单独再算一次。
+                        let grid_lines = if !grid_view {
+                            Vec::new()
+                        } else if computer_view {
+                            grid_display_lines(&[(display_name.to_string(), false)], grid_name_w, 3)
+                        } else {
+                            layout
+                        };
+                        Some(PreRow {
+                            index: di as i32,
+                            thumb_path: entry.path.clone(),
+                            modified: entry.modified,
+                            size: entry.size,
+                            name: display_name,
+                            grid_lines,
+                            // 「路径」列显示删除前的原始路径，而不是内部唯一 Shell id。
+                            path_text: entry
+                                .original_path
+                                .as_ref()
+                                .unwrap_or(&entry.path)
+                                .to_string_lossy()
+                                .into_owned()
+                                .into(),
+                            is_dir: entry.is_dir,
+                            is_hidden: entry.is_hidden,
+                            // 此电脑视图：extra 形如「77.5 GB / 851 GB」，只留剩余容量。
+                            size_text: if computer_view {
+                                entry
+                                    .extra
+                                    .split('/')
+                                    .next()
+                                    .unwrap_or("")
+                                    .trim()
+                                    .to_string()
+                            } else {
+                                fs::format_size(entry)
+                            }
+                            .into(),
+                            type_text: self.tr_type(&entry.type_text),
+                            icon_color: icon_color(entry),
+                            icon_text: icon_text_for(entry).into(),
+                            selected,
+                            cut,
+                            name_parts,
+                            tip_parts,
+                            name_truncated,
+                        })
                     })
                     .collect();
-            (collected, computer_view)
+            collected
         };
         // 缩略图请求顺序（见 `thumb_order_key`）：屏幕内**自上而下**，缓冲行排后面。
         //
@@ -5103,11 +5171,9 @@ impl App {
         }
 
         let thumb_px = self.thumb_size_for_view();
-        // 网格名称的可换宽度 = cell-w - 16px（与 file_list.slint 内层文字宽一致）。
-        let grid_name_w = (self.ui.get_cell_w_out() as f32 - 16.0).max(24.0);
         // 关键诊断（ROVE_LOG=1）：验收「存在截断就弹浮层」时记录一次汇总。
         // 按签名节流，避免滚动/40ms 轮询每次都刷日志。
-        let truncated_count = collected.iter().filter(|t| t.6).count();
+        let truncated_count = collected.iter().filter(|p| p.name_truncated).count();
         let single = self.state.tabs[tab_index].panes[pane_index].selection.len() <= 1;
         let mode = self.config.view_mode.clone();
         let budget = if pane_index == 0 {
@@ -5130,9 +5196,9 @@ impl App {
             );
         }
         let mut ordered = collected;
-        ordered.sort_by_key(|(index, _, _, _, _, _, _)| {
+        ordered.sort_by_key(|p| {
             thumb_order_key(
-                (*index as usize) / cells_per_row,
+                p.index.max(0) as usize / cells_per_row,
                 screen_row_first,
                 screen_row_last,
             )
@@ -5148,9 +5214,9 @@ impl App {
             let head: Vec<String> = ordered
                 .iter()
                 .take(16)
-                .map(|t| {
-                    let i = t.0 as usize;
-                    let tag = if t.0 >= core_first as i32 && i < core_last {
+                .map(|p| {
+                    let i = p.index.max(0) as usize;
+                    let tag = if p.index >= core_first as i32 && i < core_last {
                         "prio"
                     } else {
                         "main"
@@ -5183,36 +5249,22 @@ impl App {
         }
         ordered
             .into_iter()
-            .map(|(index, entry, selected, cut, name_parts, tip_parts, name_truncated)| {
-                let in_core = index >= core_first as i32 && (index as usize) < core_last;
-                let thumb = self.thumb_for(
-                    &entry.path,
-                    entry.modified,
-                    entry.size,
-                    thumb_px,
-                    in_core,
-                );
-                // 此电脑视图的驱动器条目：显示名里的类型标签（"本地磁盘"）走字典翻译，
-                // 卷标保持原样——与侧边栏 / 面包屑的 tr_drive_label 行为一致。
-                // 只改显示名；排序、打开、重命名等仍用 entry.name / entry.path。
-                let display_name = if computer_view {
-                    self.tr_drive_label(&entry.name).to_string()
-                } else {
-                    entry.name.clone()
-                };
+            .map(|p| {
+                let in_core = p.index >= core_first as i32 && (p.index as usize) < core_last;
+                let thumb =
+                    self.thumb_for(&p.thumb_path, p.modified, p.size, thumb_px, in_core);
                 FileRow {
-                    index,
-                    name: display_name.clone().into(),
-                    grid_lines: {
-                        // 名称分成「高亮分段」两路输入：搜索态直接用命中分段，
-                        // 常态退化为单个不高亮段，渲染路径因此只有一条。
-                        let parts: Vec<(String, bool)> = if name_parts.is_empty() {
-                            vec![(display_name, false)]
-                        } else {
-                            name_parts.clone()
-                        };
+                    index: p.index,
+                    name: p.name,
+                    grid_lines: if p.grid_lines.is_empty() {
+                        // details / list / icons-small 不渲染 grid-lines：给空模型，
+                        // 省掉每行一次三行切分（搜索高亮那几段在这里也没人读）。
+                        // 注意用显式空表而不是 `ModelRc::default()`——后者是 null 模型
+                        // （`Self(None)`），并非「空列表」。
+                        ModelRc::new(VecModel::from(Vec::<GridLine>::new()))
+                    } else {
                         ModelRc::new(VecModel::from(
-                            grid_display_lines(&parts, grid_name_w, 3)
+                            p.grid_lines
                                 .into_iter()
                                 .map(|line| GridLine {
                                     parts: ModelRc::new(VecModel::from(
@@ -5227,49 +5279,32 @@ impl App {
                                 .collect::<Vec<_>>(),
                         ))
                     },
-                    // 「路径」列显示删除前的原始路径，而不是内部唯一 Shell id。
-                    path: entry
-                        .original_path
-                        .as_ref()
-                        .unwrap_or(&entry.path)
-                        .to_string_lossy()
-                        .into_owned()
-                        .into(),
-                    is_dir: entry.is_dir,
-                    is_hidden: entry.is_hidden,
-                    // 此电脑视图：extra 形如「77.5 GB / 851 GB」，只留剩余容量。
-                    size_text: if computer_view {
-                        entry
-                            .extra
-                            .split('/')
-                            .next()
-                            .unwrap_or("")
-                            .trim()
-                            .to_string()
-                    } else {
-                        fs::format_size(&entry)
-                    }
-                    .into(),
-                    modified_text: fs::format_time(entry.modified).into(),
-                    type_text: self.tr_type(&entry.type_text).into(),
-                    icon_color: icon_color(&entry),
-                    icon_text: icon_text_for(&entry).into(),
-                    selected,
-                    cut,
+                    path: p.path_text,
+                    is_dir: p.is_dir,
+                    is_hidden: p.is_hidden,
+                    size_text: p.size_text,
+                    // 同一批条目每次重建都会重新格式化一遍（`format_local` 里有
+                    // Win32 的时区换算），走记忆表。
+                    modified_text: self.time_text(p.modified),
+                    type_text: p.type_text,
+                    icon_color: p.icon_color,
+                    icon_text: p.icon_text,
+                    selected: p.selected,
+                    cut: p.cut,
                     thumb,
                     name_parts: ModelRc::new(VecModel::from(
-                        name_parts
+                        p.name_parts
                             .into_iter()
                             .map(|(text, hl)| NamePart { text: text.into(), hl })
                             .collect::<Vec<_>>(),
                     )),
                     tip_parts: ModelRc::new(VecModel::from(
-                        tip_parts
+                        p.tip_parts
                             .into_iter()
                             .map(|(text, hl)| NamePart { text: text.into(), hl })
                             .collect::<Vec<_>>(),
                     )),
-                    name_truncated,
+                    name_truncated: p.name_truncated,
                 }
             })
             .collect()
@@ -5551,6 +5586,44 @@ fn is_wide_cjk(c: char) -> bool {
 
 /// 名字切行结果：每行若干 `(文本, 是否高亮)` 片段。
 type GridLines = Vec<Vec<(String, bool)>>;
+
+/// 是否「竖排图标网格」视图（中 / 大 / 超大图标）。
+///
+/// 只有这一档渲染 `FileRow.grid-lines`（竖排最多 3 行）：小图标是横排单行、
+/// details/list 是单行 elide，都不读这个字段，也就不用算。
+fn is_grid_icons_view(view_mode: &str) -> bool {
+    matches!(view_mode, "icons-medium" | "icons-large" | "icons-xl")
+}
+
+/// `build_rows_for_pane` 第一阶段的产物：与条目相关的文本 / 标志一次算好。
+///
+/// 以前这里直接把整个 `FileEntry` 克隆进元组，只为在第二阶段（要 `&mut self`
+/// 去取缩略图）不必再借用 pane；一次重建 60 行就是 60 次「name/path/ext/
+/// type_text/extra/original_path」全克隆，而其中 `ext` 和 `extra` 的行模型根本
+/// 用不到。现在只保留真的会用到的值，并且文本全部在第一阶段（共享借用下）
+/// 就算完，第二阶段只剩取缩略图。
+struct PreRow {
+    index: i32,
+    /// 缩略图键用的真实路径（回收站条目是 Shell 条目 id，不是显示用的原始路径）。
+    thumb_path: PathBuf,
+    modified: Option<SystemTime>,
+    size: u64,
+    name: SharedString,
+    /// 图标网格专用切行；其余视图留空（渲染器不读这个字段）。
+    grid_lines: GridLines,
+    path_text: SharedString,
+    is_dir: bool,
+    is_hidden: bool,
+    size_text: SharedString,
+    type_text: SharedString,
+    icon_color: Color,
+    icon_text: SharedString,
+    selected: bool,
+    cut: bool,
+    name_parts: Vec<(String, bool)>,
+    tip_parts: Vec<(String, bool)>,
+    name_truncated: bool,
+}
 
 /// 把「带高亮分段的名字」按可用宽度预切成最多 `max_lines` 行，超出时末行以
 /// `…` 收尾，返回逐行的片段列表。
