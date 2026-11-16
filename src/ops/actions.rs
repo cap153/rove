@@ -726,7 +726,7 @@ mod tests {
             builtin: false,
         };
 
-        let mut d = pick("dir");
+        let d = pick("dir");
         // 快照说是文件夹 → 显示。
         assert!(d.matches_selection(std::slice::from_ref(&dir), |_| Some(true)));
         // 快照说是文件 → 不显示（不会再去 stat 一次盘）。

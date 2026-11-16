@@ -477,6 +477,62 @@ struct ThumbKey {
     px_size: u32,
 }
 
+/// 优先池的「想要」集合：当前可视屏幕（不含缓冲行）的缩略图 key。
+///
+/// 每次重建可视行模型时由 UI 线程**整体替换**。优先池线程每取到一个任务先查这里：
+/// 不在集合里说明用户已经滚走 / 跳走，直接丢弃不浪费解码时间——连续快速跳转时，
+/// 新屏幕的请求不会排在上一个屏幕剩下的几十条后面。
+fn thumb_wanted() -> &'static Mutex<std::collections::HashSet<ThumbKey>> {
+    static WANTED: OnceLock<Mutex<std::collections::HashSet<ThumbKey>>> = OnceLock::new();
+    WANTED.get_or_init(|| Mutex::new(Default::default()))
+}
+
+/// 把一条 key 加入「想要」集合（发出优先请求时立刻加，避免 worker 抢在整轮发布之前跳过它）。
+fn thumb_want(key: &ThumbKey) {
+    if let Ok(mut w) = thumb_wanted().lock() {
+        w.insert(key.clone());
+    }
+}
+
+/// 侧栏图标（快速访问 / 网络位置）的像素尺寸。
+/// 这类请求不属于列表可视屏幕，缩略图调度整体替换「想要」集合时**不丢掉**，
+/// 否则侧栏图标会被当成过期请求排掉。`build_sidebar` 也用这份常量。
+const SIDEBAR_ICON_PX: u32 = 32;
+
+/// 整体替换「想要」集合（一轮行模型建完时调用）。
+/// 侧栏小图标（`SIDEBAR_ICON_PX`）会保留，其余全部按本轮屏幕内容重建。
+fn publish_thumb_wanted(keys: std::collections::HashSet<ThumbKey>) {
+    if let Ok(mut w) = thumb_wanted().lock() {
+        w.retain(|k| k.px_size == SIDEBAR_ICON_PX);
+        w.extend(keys);
+    }
+}
+
+fn thumb_is_wanted(key: &ThumbKey) -> bool {
+    thumb_wanted().lock().map(|w| w.contains(key)).unwrap_or(true)
+}
+
+/// 已「从普通池提到优先池」、但普通池那边还压着一份任务的 key。
+/// 普通池 worker 取到它时直接跳过：同一张图不重复解码。
+fn thumb_promoted() -> &'static Mutex<std::collections::HashSet<ThumbKey>> {
+    static PROMOTED: OnceLock<Mutex<std::collections::HashSet<ThumbKey>>> = OnceLock::new();
+    PROMOTED.get_or_init(|| Mutex::new(Default::default()))
+}
+
+fn mark_thumb_promoted(key: &ThumbKey) {
+    if let Ok(mut p) = thumb_promoted().lock() {
+        // 防泄漏：提升集合最多几百条，超过直接清空（最坏只是一次多余的解码）。
+        if p.len() > 512 {
+            p.clear();
+        }
+        p.insert(key.clone());
+    }
+}
+
+fn take_thumb_promoted(key: &ThumbKey) -> bool {
+    thumb_promoted().lock().map(|mut p| p.remove(key)).unwrap_or(false)
+}
+
 /// 缓存项：原图 + 估算字节数（用于字节预算淘汰）。
 struct CachedThumb {
     img: slint::Image,
@@ -636,6 +692,22 @@ pub struct App {
     cell_hovered: [i32; 2],
     /// 名称浮层诊断日志的节流签名（视图 / 分屏 / 截断行数）。
     tip_log_sig: Option<(String, usize, usize)>,
+    /// 缩略图诊断（ROVE_LOG=1 可观测）：当前可视窗口签名，变了才重新打印一轮。
+    thumb_diag_sig: Option<(String, usize, usize, usize, usize)>,
+    /// 本窗口还可打印多少条「发出 / 到图」明细（用完后本轮静默）。
+    thumb_diag_left: u32,
+    thumb_diag_got: u32,
+    /// 可见窗口内「还没出图」的首个条目下标 + 空白数，变化时才打印。
+    thumb_blank_sig: Option<(i32, usize)>,
+    /// 本帧可视屏幕（优先池）的 key 集合：一轮行模型建完时整体发布给优先池。
+    prio_wanted: HashSet<ThumbKey>,
+    /// 被优先池丢弃的过期请求计数 + 上次汇总时刻（避免逐条刷屏）。
+    thumb_cancel_n: usize,
+    thumb_cancel_t: std::time::Instant,
+    /// 已从普通池提升到优先池的 key（避免同一行每帧重复提升）。
+    thumb_promoted: HashSet<ThumbKey>,
+    /// 已提升的请求数（用于汇总日志）。
+    thumb_promote_n: usize,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
     last_click: Option<(PathBuf, std::time::Instant)>,
     /// 侧栏分区拖拽：正在拖动的分区 header 行索引。
@@ -865,6 +937,15 @@ impl App {
             overlay_hovered: [false, false],
             cell_hovered: [-1, -1],
             tip_log_sig: None,
+            thumb_diag_sig: None,
+            thumb_diag_left: 0,
+            thumb_diag_got: 0,
+            thumb_blank_sig: None,
+            prio_wanted: HashSet::new(),
+            thumb_cancel_n: 0,
+            thumb_cancel_t: std::time::Instant::now(),
+            thumb_promoted: HashSet::new(),
+            thumb_promote_n: 0,
             last_click: None,
             sidebar_drag: None,
             network_drag: None,
@@ -2090,6 +2171,24 @@ fn thumb_decode_one(tag: &str, idx: usize, key: ThumbKey) {
         key.path.display(),
         key.px_size
     );
+    // 优先池：取到的任务如果已经不在当前可视屏幕（用户滚走/跳走），
+    // 直接丢弃。连续快速跳转时，上一个屏幕剩下的几十条在库里被瞬间排空，
+    // 保证最新屏幕的请求总是最先解码。
+    if tag == "prio" && !thumb_is_wanted(&key) {
+        crate::logv!("[thumb] {tag}-{idx} skip stale {}", key.path.display());
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+                return;
+            };
+            app.borrow_mut().cancel_thumbnail(key);
+        });
+        return;
+    }
+    // 普通池：这行已经被提到优先池了，跳过这一份以免重复解码。
+    if tag != "prio" && take_thumb_promoted(&key) {
+        crate::logv!("[thumb] {tag}-{idx} skip promoted {}", key.path.display());
+        return;
+    }
     match crate::ops::thumbs::get_thumbnail_timed(&key.path, key.px_size) {
         Ok((w, h, rgba, pure_decode_ms)) => {
             const MIN_DECODE_MS: u128 = 30;
@@ -2256,6 +2355,68 @@ mod tests {
         let yh = |r: &(f32, f32)| *r;
         let (start, end) = visible_range(&rows, 30.0, 100.0, 0.0, yh);
         assert_eq!((start, end), (1, 3));
+    }
+
+    /// 缩略图请求顺序：屏幕内自上而下，缓冲行排后面。
+    #[test]
+    fn thumb_order_starts_at_the_top_screen_row() {
+        // 滚动条在顶部：屏幕是第 0..5 行，缓冲行只有下方 5..13。
+        let mut rows: Vec<usize> = (0..13).collect();
+        rows.sort_by_key(|r| thumb_order_key(*r, 0, 5));
+        assert_eq!(rows, (0..13).collect::<Vec<usize>>());
+
+        // 滚到中间：屏幕 20..25，上方/下方缓冲都离屏幕近者先发，
+        // 但所有屏幕内的行都排在屏幕外之前。
+        let mut rows: Vec<usize> = (16..29).collect();
+        rows.sort_by_key(|r| thumb_order_key(*r, 20, 25));
+        assert_eq!(
+            rows,
+            vec![20, 21, 22, 23, 24, 19, 25, 18, 26, 17, 27, 16, 28]
+        );
+
+        // 底部钳制：屏幕 8..12，只有一个上缓冲方向。
+        let mut rows: Vec<usize> = (3..12).collect();
+        rows.sort_by_key(|r| thumb_order_key(*r, 8, 12));
+        assert_eq!(rows, vec![8, 9, 10, 11, 7, 6, 5, 4, 3]);
+    }
+
+    /// 优先池「想要」集合：换一屏时旧 key 被丢弃，侧栏小图标不丢。
+    #[test]
+    fn publish_thumb_wanted_drops_stale_but_keeps_sidebar() {
+        let k = |name: &str, px: u32| ThumbKey {
+            path: PathBuf::from(name),
+            mtime_ms: 0,
+            file_size: 0,
+            px_size: px,
+        };
+        let sidebar = k("side", SIDEBAR_ICON_PX);
+        let screen_a = k("a", 90);
+        let screen_b = k("b", 90);
+        publish_thumb_wanted([sidebar.clone(), screen_a.clone()].into_iter().collect());
+        assert!(thumb_is_wanted(&screen_a));
+
+        // 新一屏只有 b：a 变成过期请求，侧栏图标保留。
+        publish_thumb_wanted([screen_b.clone()].into_iter().collect());
+        assert!(!thumb_is_wanted(&screen_a));
+        assert!(thumb_is_wanted(&screen_b));
+        assert!(thumb_is_wanted(&sidebar));
+    }
+
+    /// 屏幕行数：与视口相交的行都算（包括底部那半行）。
+    #[test]
+    fn visible_row_count_includes_partial_bottom_row() {
+        // 日志里的真实几何：scroll=6429.5、row_h=144、视口 659.33。
+        // 顶行 44.65、底边 49.23 → 屏幕上是第 44–49 共 6 行。
+        assert_eq!(visible_row_count(6429.5, 659.33325, 144.0), 6);
+        // 顶部：4.58 行 → 5 行。
+        assert_eq!(visible_row_count(0.0, 659.33325, 144.0), 5);
+        // 刚好一整行高 → 1 行，不能变 2。
+        assert_eq!(visible_row_count(0.0, 144.0, 144.0), 1);
+        assert_eq!(visible_row_count(0.0, 288.0, 144.0), 2);
+        // 非零且不对齐：跨 3 行。
+        assert_eq!(visible_row_count(10.0, 300.0, 144.0), 3);
+        // 行高未知时的兜底。
+        assert_eq!(visible_row_count(0.0, 500.0, 0.0), 1);
     }
 
     /// 三种视图必须能区分开：普通目录、此电脑（路径 None）、回收站。
@@ -3131,10 +3292,10 @@ impl App {
         h.icon_text = arrow_quick.into();
         let mut quick_items: Vec<SidebarItem> = vec![h];
 
-        // 侧边栏图标统一采用 Windows 标准 32px 规格：
+        // 侧栏图标统一采用 Windows 标准 32px 规格：
         // 彻底解决启动阶段 scale 由 1.0 变 1.5 导致请求 key(20) 与判定 key(30) 脱节的 Bug！
-        #[cfg(windows)]
-        const SIDEBAR_ICON_PX: u32 = 32;
+        // 尺寸常量统一定义在模块级（见 `SIDEBAR_ICON_PX`）：缩略图「想要」集合
+        // 靠这个值区分侧栏图标和列表行，两处不能各写一份。
 
         if self.config.quick_expanded {
             // 顺序与条目全部来自持久化配置；系统项按 id 从 quick_access_dirs()
@@ -3649,6 +3810,12 @@ impl App {
             file_size,
             px_size: size,
         };
+        // 优先池的「想要」注册：屏幕内的 key 立刻进集合（worker 可能瞬间就取到任务，
+        // 不能等到本轮行模型全部建完才发布），同时留给本轮结束时整体替换。
+        if priority {
+            self.prio_wanted.insert(key.clone());
+            thumb_want(&key);
+        }
 
         // 1. 内存 LRU 命中：提升至队尾（真 LRU，非 FIFO）。
         if let Some(entry) = self.thumb_cache.get(&key) {
@@ -3668,8 +3835,21 @@ impl App {
             return slint::Image::default();
         }
 
-        // 3. 未在 pending 中：先查磁盘缓存，查不到再交给后台 Shell 解码。
-        if !self.thumb_pending.contains(&key) {
+        // 3. 已在 pending：**很可能正是「跳过去后要等好几秒」的病灶**。
+        //
+        // 这些行在上一帧是屏幕外的缓冲行，已经交给了普通池；用户一跳转，它们
+        // 变成了当前可见行，但 pending 去重会让它们继续排在主池后面（主池还压着
+        // 几百条缓冲行，且慢格式有并发上限），于是能看到「只有新发出的那几行
+        // 先出图，其余要等好几秒」。所以这里允许**从普通池提到优先池**。
+        if self.thumb_pending.contains(&key) {
+            if priority {
+                self.promote_thumb(&key);
+            }
+            return slint::Image::default();
+        }
+
+        // 4. 未在 pending 中：先查磁盘缓存，查不到再交给后台 Shell 解码。
+        {
             self.thumb_pending.insert(key.clone());
 
             // 磁盘缓存优先：视频海报等慢解码项落盘后，回滚是读盘(毫秒级)
@@ -3727,10 +3907,50 @@ impl App {
                     self.thumb_failed.insert(key);
                 }
             }
+            // 缩略图诊断（ROVE_LOG=1）：本窗口前 24 条「真的发出去了」的请求。
+            // 顺序 = `[thumb] window ... order=[...]` 里的顺序。
+            if self.thumb_diag_left > 0 {
+                self.thumb_diag_left -= 1;
+                crate::logv!(
+                    "[thumb] send {} size={} {}",
+                    if priority { "prio" } else { "main" },
+                    size,
+                    path.display()
+                );
+            }
         }
-        // 命中 pending 分支不记日志：此处在热路径上（每行每次刷新都会调用），
+        // 未在 pending 时的收尾：不记日志。此处在热路径上（每行每次刷新都会调用），
         // 1538 张图加载期间可达 6 万行、占日志 79%。
         slint::Image::default()
+    }
+
+    /// 把一条已经在普通池里的任务提到优先池（行从缓冲变成屏幕内时用）。
+    fn promote_thumb(&mut self, key: &ThumbKey) {
+        if self.thumb_promoted.contains(key) {
+            return;
+        }
+        // 还在普通池的待发队列里：直接摘下来改投优先池，不会重复解码。
+        if let Some(pos) = self.thumb_queued.iter().position(|k| k == key) {
+            self.thumb_queued.remove(pos);
+        } else {
+            // 已经派给普通池了（可能卡在慢格式暂存里）：让普通池那份作废。
+            mark_thumb_promoted(key);
+        }
+        if self.thumb_prio_tx.send(key.clone()).is_err() {
+            // 优先池已关闭（收尾阶段）：不能把 key 留在 pending 里，
+            // 否则这一行以后永远空白。清掉，下一轮重建会重新请求。
+            self.thumb_pending.remove(key);
+            return;
+        }
+        self.thumb_promoted.insert(key.clone());
+        self.thumb_promote_n += 1;
+        if self.thumb_promote_n >= 8
+            || self.thumb_cancel_t.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            let n = std::mem::take(&mut self.thumb_promote_n);
+            self.thumb_cancel_t = std::time::Instant::now();
+            crate::logv!("[thumb] promoted {n} pending rows from main pool to prio");
+        }
     }
 
     /// 写入 LRU 缓存（内存），按字节预算 + 项数双上限淘汰（队首最久未用）。
@@ -3781,6 +4001,10 @@ impl App {
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
     #[allow(dead_code)]
     fn fail_thumbnail(&mut self, key: ThumbKey) {
+        self.thumb_promoted.remove(&key);
+        // 诊断（ROVE_LOG=1）：到图（含失败）顺序，与 send 顺序对照就能看出
+        // 哪几行是最后才被解出来的。
+        self.log_thumb_got("FAIL", &key.path, key.px_size);
         crate::logv!(
             "[thumb] FAILED -> negative cache {} size={} (row stays blank)",
             key.path.display(),
@@ -3791,14 +4015,44 @@ impl App {
         self.thumb_failed.insert(key);
     }
 
+    /// 优先池丢弃了一条已过期（用户已滚走/跳走）的请求：
+    /// 只把 key 从 pending 里拿出来（滚回来时会重新请求），**不进负缓存**。
+    fn cancel_thumbnail(&mut self, key: ThumbKey) {
+        self.thumb_promoted.remove(&key);
+        self.thumb_pending.remove(&key);
+        // 万一用户又滚回来了，下一轮 40ms 轮询重建行时会重新发请求。
+        self.thumb_needs_refresh = true;
+        self.thumb_cancel_n += 1;
+        if self.thumb_cancel_n >= 8
+            || self.thumb_cancel_t.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            let n = self.thumb_cancel_n;
+            self.thumb_cancel_n = 0;
+            self.thumb_cancel_t = std::time::Instant::now();
+            crate::logv!("[thumb] cancelled {n} stale prio requests (scrolled away)");
+        }
+    }
+
     /// 写入缩略图缓存（事件循环线程）：只打批量刷新标记，由 poll_timer 统一刷新。
     #[allow(dead_code)]
     fn store_thumbnail(&mut self, key: ThumbKey, img: slint::Image) {
+        self.thumb_promoted.remove(&key);
+        self.log_thumb_got("ok", &key.path, key.px_size);
         self.thumb_pending.remove(&key);
         self.thumb_queued.retain(|k| k != &key);
         self.insert_thumb_cache(key, img);
         // 核心修复：不再每次 store 都全量 refresh，只置位，由主线程 40ms 批量刷新。
         self.thumb_needs_refresh = true;
+    }
+
+    /// 缩略图诊断（ROVE_LOG=1）：本窗口前 24 条到图记录。
+    fn log_thumb_got(&mut self, tag: &str, path: &Path, px: u32) {
+        if self.thumb_diag_got >= 24 {
+            return;
+        }
+        self.thumb_diag_got += 1;
+        let n = self.thumb_diag_got;
+        crate::logv!("[thumb] got#{n} {tag} size={px} {}", path.display());
     }
 
     /// 丢弃普通池里排得太老的请求（从队首开始，即最早发出的）。
@@ -3817,6 +4071,8 @@ impl App {
                 continue;
             }
             self.thumb_pending.remove(&key);
+            // 这一行之后再变成可见行时需要能重新“提升”，所以把提升标记一并清掉。
+            self.thumb_promoted.remove(&key);
             dropped += 1;
         }
         dropped
@@ -3997,6 +4253,8 @@ impl App {
         }
 
         // 左栏始终绑定 pane 0
+        // 先清空「想要」集合：本轮两个分屏的屏幕内容都进去，最后一起发布。
+        self.prio_wanted.clear();
         let rows0 =
             self.build_rows_for_pane(self.state.active_tab, 0, first0, count0, list_height);
         // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
@@ -4009,26 +4267,43 @@ impl App {
             .filter(|r| r.thumb.size().width == 0)
             .count();
         if empty_thumbs > 0 {
-            crate::logv!(
-                "[rows] EMPTY THUMBS {}/{} | geom list_h={} (raw={}) cells={} row_h={} rows_visible={} | total={} first={} count={} scroll={:.1} mode={} is_split={} expect_px={} cache_len={} pending={} failed={}",
-                empty_thumbs,
-                rows0.len(),
-                list_height,
-                raw_list_height,
-                cells_per_row,
-                row_h,
-                rows_visible,
-                total0,
-                first0,
-                count0,
-                scroll0,
-                self.config.view_mode,
-                is_split,
-                self.thumb_size_for_view(),
-                self.thumb_cache.len(),
-                self.thumb_pending.len(),
-                self.thumb_failed.len()
-            );
+            // 诊断（ROVE_LOG=1）：哪些条目还没图。只在「空白集合」变化时打一行，
+            // 避免每 40ms 刷屏。看 first_blank 是否从 0 跳到了 3/4 行。
+            let blank: Vec<i32> = rows0
+                .iter()
+                .filter(|r| r.thumb.size().width == 0)
+                .map(|r| r.index)
+                .take(24)
+                .collect();
+            let sig = (blank.first().copied().unwrap_or(-1), empty_thumbs);
+            if self.thumb_blank_sig != Some(sig) {
+                self.thumb_blank_sig = Some(sig);
+                // 详细级：滚动/加载期间每 0.5s 一行，只用于排查“哪几行没出图”。
+                crate::logv!(
+                    "[rows] EMPTY THUMBS {}/{} blank={:?} | geom list_h={} (raw={}) cells={} row_h={} win_rows={} | total={} first={} count={} scroll={:.1} mode={} is_split={} expect_px={} cache_len={} pending={} failed={}",
+                    empty_thumbs,
+                    rows0.len(),
+                    blank,
+                    list_height,
+                    raw_list_height,
+                    cells_per_row,
+                    row_h,
+                    rows_visible,
+                    total0,
+                    first0,
+                    count0,
+                    scroll0,
+                    self.config.view_mode,
+                    is_split,
+                    self.thumb_size_for_view(),
+                    self.thumb_cache.len(),
+                    self.thumb_pending.len(),
+                    self.thumb_failed.len()
+                );
+            }
+        } else if self.thumb_blank_sig.is_some() && !rows0.is_empty() {
+            self.thumb_blank_sig = None;
+            crate::logv!("[rows] all {} visible thumbs ready", rows0.len());
         }
         // 核心修复：内联重命名期间，若可见窗口（首行/行数）未变，就不要重建行模型。
         // set_file_rows 换整个 VecModel 会让 Slint 重建每一行 → 行内的 TextInput
@@ -4152,6 +4427,9 @@ impl App {
         // 行已经就绪：没有手动列宽记录的目录，这里按最长条目自适应一次。
         #[cfg(windows)]
         autofit_column_widths_if_needed(self);
+
+        // 发布本轮可视屏幕的 key 集合：优先池里不属于「现在这一屏」的旧请求会被丢弃。
+        publish_thumb_wanted(std::mem::take(&mut self.prio_wanted));
 
         self.sync_expand_targets();
     }
@@ -4525,16 +4803,20 @@ impl App {
                     .collect();
             (collected, computer_view)
         };
-        // 缩略图请求：**按“离视口中心的距离”从近到远发出**，两步解决“滚到中段
-        // 依然从顶部一个个慢慢加载”：
+        // 缩略图请求顺序（见 `thumb_order_key`）：屏幕内**自上而下**，缓冲行排后面。
         //
         // 病灶：可视窗口 = 可视行 + 2*OVERSCAN（icons-xl 下 5 列，约 100 个条目）。
-        // 按索引顺序发时，先发的是窗口**顶部**那一批；而旧窗口已经往主池排过
-        // 成千上万个已滚走的任务，新请求只能排在它们后面，于是看起来像
-        // 从顶部线性加载。
+        // 按索引顺序发时，先发的是窗口**顶部**那一批（含上方缓冲）；而旧窗口
+        // 已经往主池排过成千上万个已滚走的任务，新请求只能排在它们后面，于是
+        // 看到的是「从顶部一个个慢慢加载」。曾经用「按离视口中心距离」排序解决：
+        // 中心先出图（跳转到中间时整屏同时出现）；但滚动条在顶部时“中心”就是
+        // 第 3/4 行，于是第 1/2 行反而最后才出图（用户看到的就是“从第 3 行开始渲染”）。
         //
-        // 1. 按“距视口中心”排序，中心先出图，观感是整屏同时出现；
-        // 2. 屏幕上正在显示的格子（不含 overscan）走独立优先池。
+        // 现在的规则同时兼顾两件事：
+        // 1. **屏幕内的行**（不含 overscan）走优先池，且自上而下——顶部时第一行
+        //    第一个出图；
+        // 2. **屏幕外的缓冲行**按离屏幕的距离由近到远，永远排在屏幕内之后——
+        //    突然滚到中间时依旧先把眼前这一屏填满，不会去凑已滚走的旧窗口。
         //
         // 注意：可见区间必须用**条目下标**算，不能用 `scroll / row_h`。
         // `scroll_y` 不是按行高换算的像素值（图标视图里两者不同步），
@@ -4554,10 +4836,15 @@ impl App {
             ROW_HEIGHT
         };
         let cells_per_row = (self.ui.get_cells_per_row().max(1)) as usize;
-        let visible_rows = (list_height / row_h).ceil().max(1.0) as usize;
         let scroll = self.state.tabs[tab_index].panes[pane_index]
             .scroll_y
             .max(0.0);
+        // 真实屏幕覆盖的行数＝**与视口相交**的行数，不是 `ceil(视口高/行高)`。
+        // 滚动位置几乎从不对齐行高：比如 scroll=6429.5、row_h=144、视口 659 →
+        // 顶行 44.65、底边 49.23，屏幕上能看到第 44–49 共 6 行（首尾各被截一半）。
+        // 用 ceil(659/144)=5 会让**最底下那半行**（第 49 行）落进缓冲区，被扔进
+        // 普通池——表现就是“整屏很快就出来了，就最底下那行要等好几秒”。
+        let visible_rows = visible_row_count(scroll, list_height, row_h);
         let raw_first_row = (scroll / row_h).floor() as isize - OVERSCAN as isize;
         let effective_above = if raw_first_row < 0 {
             (OVERSCAN as isize + raw_first_row).max(0) as usize
@@ -4566,17 +4853,22 @@ impl App {
         };
         // 真实屏幕的条目下标区间（不含上下缓冲）。
         let screen_first = (first + effective_above * cells_per_row).min(first + count);
-        let screen_last = (screen_first + visible_rows * cells_per_row).min(first + count);
+        // 至少保证一个格子落在「屏幕内」：滚到底时 scroll_y 可能超过内容高度，
+        // 这时 screen_first 已被夹到 first+count，若不再兜底，屏幕区间会是空的，
+        // 整屏都跑到普通池里去（旧代码就存在这个隐患）。
+        let screen_last = (screen_first + visible_rows * cells_per_row)
+            .min(first + count)
+            .max((screen_first + 1).min(first + count));
         let core_first = screen_first;
         let core_last = screen_last;
-        // 视口中心用真实屏幕首行表示，供“距中心排序”使用。
-        let first_row = first / cells_per_row;
-        let viewport_center_row =
-            (first_row + effective_above) as f32 + visible_rows as f32 / 2.0;
+        let screen_row_first = screen_first / cells_per_row;
+        let screen_row_last = screen_last
+            .div_ceil(cells_per_row)
+            .max(screen_row_first + 1);
         if effective_above != OVERSCAN {
-            // 详细级：顶部钳制是常态（每次窗口刷新都会命中），
-            // 当初只为排查「滚动条在开头、缩略图却从第4行开始渲染」而加，
-            // 那个 bug 已修，保留能力但不再刷 1 级日志。
+            // 顶部钳制：窗口贴着列表开头时 `first` 里已经没有上方缓冲行。
+            // 不单独刷日志（每次重建都会命中，加载期间会刷屏）；
+            // 需要时看下面那条 `[thumb] window ... above=0`。
             logv!(
                 "[thumb] top-clamped window: first={} count={} scroll={:.1} above={} screen_first={} core=[{},{})",
                 first, count, scroll, effective_above, screen_first, core_first, core_last
@@ -4612,10 +4904,56 @@ impl App {
         }
         let mut ordered = collected;
         ordered.sort_by_key(|(index, _, _, _, _, _, _)| {
-            let row = (*index as usize) / cells_per_row;
-            let center = row as f32 + 0.5;
-            (center - viewport_center_row).abs() as i64
+            thumb_order_key(
+                (*index as usize) / cells_per_row,
+                screen_row_first,
+                screen_row_last,
+            )
         });
+        // 缩略图诊断（ROVE_LOG=1）：窗口一变就打印一次「这一帧按什么顺序发请求」。
+        // `prio` = 屏幕内（走优先池，先出图），`main` = 屏幕外缓冲行（普通池）。
+        // 想确认「顶部时是不是先出第 3/4 行」，看这里的序号顺序即可。
+        let diag_sig = (mode.clone(), pane_index, first, count, cells_per_row);
+        if self.thumb_diag_sig.as_ref() != Some(&diag_sig) {
+            self.thumb_diag_sig = Some(diag_sig);
+            self.thumb_diag_left = 24;
+            self.thumb_diag_got = 0;
+            let head: Vec<String> = ordered
+                .iter()
+                .take(16)
+                .map(|t| {
+                    let i = t.0 as usize;
+                    let tag = if t.0 >= core_first as i32 && i < core_last {
+                        "prio"
+                    } else {
+                        "main"
+                    };
+                    format!("{i}:{tag}")
+                })
+                .collect();
+            logv!(
+                "[thumb] window mode={} pane={} first={} count={} rows={} cells={} rows_vis={} row_h={:.1} scroll={:.1} above={} screen=[{},{}) screen_rows=[{},{}) | cache={} pending={} queued={} failed={} | order={:?}",
+                mode,
+                pane_index,
+                first,
+                count,
+                ordered.len(),
+                cells_per_row,
+                visible_rows,
+                row_h,
+                scroll,
+                effective_above,
+                core_first,
+                core_last,
+                screen_row_first,
+                screen_row_last,
+                self.thumb_cache.len(),
+                self.thumb_pending.len(),
+                self.thumb_queued.len(),
+                self.thumb_failed.len(),
+                head,
+            );
+        }
         ordered
             .into_iter()
             .map(|(index, entry, selected, cut, name_parts, tip_parts, name_truncated)| {
@@ -5510,6 +5848,19 @@ fn cell_metrics(ui: &MainWindow) -> (f32, f32) {
     (ui.get_cell_w_out() as f32, ui.get_cell_h_out() as f32)
 }
 
+/// 与视口**相交**的行数（首尾被截一半的行也算一行）。
+///
+/// 不能用 `ceil(视口高/行高)`：滚动位置几乎从不对齐行高，那样会漏掉
+/// 视口底部那半行，让它在缩略图调度里被当成缓冲区（扔进普通池排队）。
+fn visible_row_count(scroll: f32, list_height: f32, row_h: f32) -> usize {
+    if row_h <= 0.0 {
+        return 1;
+    }
+    let top = (scroll / row_h).floor();
+    let bottom = ((scroll + list_height - 0.5) / row_h).ceil();
+    (bottom - top).max(1.0) as usize
+}
+
 /// 计算某面板的虚拟窗口条目区间（行区间 × cells-per-row）。
 fn pane_view_range(
     total: usize,
@@ -5528,6 +5879,22 @@ fn pane_view_range(
         .min(total.saturating_sub(first))
         .max(1);
     (first, count)
+}
+
+/// 缩略图请求顺序（键越小越先发）：
+///
+/// - 屏幕内的行（`[screen_row_first, screen_row_last)`）键为 `(0, 行 - 屏幕首行)`，
+///   即**自上而下**；
+/// - 屏幕外的缓冲行键为 `(1, 离屏幕的距离)`，永远排在屏幕内之后，
+///   这样突然滚到中间时优先填满眼前这一屏，而不是去凑已滚走的旧窗口。
+fn thumb_order_key(row: usize, screen_row_first: usize, screen_row_last: usize) -> (i64, i64) {
+    if row >= screen_row_first && row < screen_row_last {
+        (0, (row - screen_row_first) as i64)
+    } else if row < screen_row_first {
+        (1, (screen_row_first - row) as i64)
+    } else {
+        (1, (row - screen_row_last + 1) as i64)
+    }
 }
 
 fn header(key: &str, label: &str) -> SidebarItem {
