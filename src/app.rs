@@ -617,6 +617,73 @@ fn parse_sort_key(id: &str, fallback: SortKey) -> SortKey {
     }
 }
 
+/// 目录 mtime 探测结果（后台 `symlink_metadata` 的产物）。
+struct DirMtimeProbe {
+    path: PathBuf,
+    mtime: Option<SystemTime>,
+}
+
+/// 启动目录 mtime 探测线程：每次收到一批路径就跑一遍并回传结果。
+fn spawn_mtime_probe(
+    req_rx: std::sync::mpsc::Receiver<Vec<PathBuf>>,
+    out_tx: std::sync::mpsc::Sender<Vec<DirMtimeProbe>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("rove-mtime".into())
+        .spawn(move || {
+            while let Ok(paths) = req_rx.recv() {
+                let results: Vec<DirMtimeProbe> = paths
+                    .into_iter()
+                    .map(|path| {
+                        let mtime = std::fs::symlink_metadata(&path)
+                            .and_then(|m| m.modified())
+                            .ok();
+                        DirMtimeProbe { path, mtime }
+                    })
+                    .collect();
+                if out_tx.send(results).is_err() {
+                    break;
+                }
+            }
+        });
+}
+
+/// 侧栏后台探测的一批系统数据：盘符容量 / 回收站统计 / 网络位置。
+///
+/// 这几项全是系统调用（`GetVolumeInformationW` + `GetDiskFreeSpaceExW`、
+/// `SHQueryRecycleBinW`、`WNetOpenEnumW` 枚举、Network Shortcuts 目录遍历），
+/// 遇到掉线的映射盘或休眠的移动盘会阻塞几百毫秒到几秒，
+/// **绝不能放在 UI 线程上**。探测线程只在收到请求时跑一轮。
+#[derive(Default)]
+struct SidebarProbe {
+    drives: Vec<DriveInfo>,
+    stats: crate::fs::drives::RecycleBinStats,
+    wnet: Vec<String>,
+    places: Vec<(String, String)>,
+}
+
+/// 启动侧栏探测线程：收到一个 `()` 就跑一轮并把结果发回去。
+fn spawn_sidebar_probe(
+    req_rx: std::sync::mpsc::Receiver<()>,
+    out_tx: std::sync::mpsc::Sender<SidebarProbe>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("rove-sidebar".into())
+        .spawn(move || {
+            while req_rx.recv().is_ok() {
+                let probe = SidebarProbe {
+                    drives: list_drives(),
+                    stats: recycle_bin_stats(),
+                    wnet: list_network_locations(),
+                    places: list_network_places(),
+                };
+                if out_tx.send(probe).is_err() {
+                    break;
+                }
+            }
+        });
+}
+
 /// 应用主体。
 pub struct App {
     ui: MainWindow,
@@ -624,10 +691,40 @@ pub struct App {
     config: Config,
     jobs: JobManager,
     drives: Vec<DriveInfo>,
+    /// 回收站条目数 / 体积（来自后台探测，UI 线程不查）。
+    recycle_stats: crate::fs::drives::RecycleBinStats,
+    /// WNet 枚举到的网络位置（后台探测）。
+    net_wnet: Vec<String>,
+    /// `%APPDATA%\...\Network Shortcuts` 里的快捷方式（后台探测）。
+    net_places: Vec<(String, String)>,
+    /// 侧栏探测请求 / 结果通道（系统调用全在后台线程，见 `SidebarProbe`）。
+    sidebar_probe_tx: std::sync::mpsc::Sender<()>,
+    sidebar_probe_rx: std::sync::mpsc::Receiver<SidebarProbe>,
+    /// 已有一个探测在跑：不重复排队（15s 定时器 / 刷新按钮 / 缩略图刷新会挤在一起）。
+    sidebar_probe_busy: bool,
+    /// 侧栏 32px 图标已更新：需要同步侧栏（只此一种情况，别为每批缩略图重建侧栏）。
+    sidebar_icon_dirty: bool,
+    /// 目录 mtime 探测请求 / 结果通道（stat 在后台线程，见 `poll_dir_changes`）。
+    mtime_probe_tx: std::sync::mpsc::Sender<Vec<PathBuf>>,
+    mtime_probe_rx: std::sync::mpsc::Receiver<Vec<DirMtimeProbe>>,
+    /// 已有一轮探测在跑：1 秒定时器到点时直接跳过，不排队。
+    mtime_probe_busy: bool,
+    /// 搜索框输入防抖：`(待应用的查询词, 该词最后一次输入的时刻)`。
+    ///
+    /// 每个字符都会触发一次「全目录模糊匹配 + 打分 + 重排」；几万条的目录里
+    /// 逐字重建会明显卡手，攒 150ms 再跑一次。
+    pending_search: Option<(String, std::time::Instant)>,
     /// 侧边栏数据指纹，避免无变化时重建模型打断滚动。
     sidebar_fingerprint: u64,
-    /// 虚拟列表当前窗口 (first, count) 的失效标志（各处置 None 表示需重建）。
+    /// 左栏本帧真正写进行模型的窗口 (first, count)。
+    ///
+    /// 两个用途：
+    /// 1. 各处置 None 作为「内容变了、必须重建」的失效信号；
+    /// 2. 滚动回调里比对：行在 Slint 里是**绝对定位**（`y: index * row-h`），
+    ///    只要渲染窗口没变，像素级滚动就无需重建整整两栏的行模型。
     visible_cache: Option<(usize, usize)>,
+    /// 右栏同上。
+    visible_cache_right: Option<(usize, usize)>,
     /// 上次真正写入行模型时的签名 (generation, first, count, total)。
     /// 仅用于「重命名期间」抑制无意义重建：缩略图/体积陆续到达会不停触发刷新，
     /// 若每次都换 VecModel，行内 TextInput 会被销毁重建 → 输入丢失、焦点被抢。
@@ -910,6 +1007,16 @@ impl App {
         let state = AppState::new(None, sort);
         let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
         let (path_probe_tx, path_probe_rx) = mpsc::channel::<PathProbe>();
+        let (sidebar_probe_tx, sidebar_probe_req_rx) = mpsc::channel::<()>();
+        let (sidebar_probe_out_tx, sidebar_probe_rx) = mpsc::channel::<SidebarProbe>();
+        spawn_sidebar_probe(sidebar_probe_req_rx, sidebar_probe_out_tx);
+        let (mtime_probe_tx, mtime_probe_req_rx) = mpsc::channel::<Vec<PathBuf>>();
+        let (mtime_probe_out_tx, mtime_probe_rx) = mpsc::channel::<Vec<DirMtimeProbe>>();
+        spawn_mtime_probe(mtime_probe_req_rx, mtime_probe_out_tx);
+        // 启动时立刻排一轮侧栏探测（盘符 / 回收站 / 网络位置），
+        // 结果由 40ms 轮询应用 —— 连盘符也不在这里同步取：掉线的映射盘
+        // 上一次 `GetVolumeInformationW` 就能卡住好几秒，那会卡死在启动路径上。
+        let _ = sidebar_probe_tx.send(());
         Self {
             ui,
             state,
@@ -917,8 +1024,20 @@ impl App {
             keymap,
             jobs,
             drives: Vec::new(),
+            recycle_stats: Default::default(),
+            net_wnet: Vec::new(),
+            net_places: Vec::new(),
+            sidebar_probe_tx,
+            sidebar_probe_rx,
+            sidebar_probe_busy: true,
+            sidebar_icon_dirty: false,
+            mtime_probe_tx,
+            mtime_probe_rx,
+            mtime_probe_busy: false,
+            pending_search: None,
             sidebar_fingerprint: 0,
             visible_cache: None,
+            visible_cache_right: None,
             rows_sig: None,
             rows_sig_right: None,
             expand_sig: None,
@@ -1064,37 +1183,75 @@ impl App {
     }
 
     /// 任务 3：轮询各打开目录的 mtime，检测外部/内部变更后实时刷新对应标签。
+    ///
+    /// 只负责**收集路径并派给后台线程**：`symlink_metadata` 在休眠的移动盘、
+    /// 掉线的映射盘上会阻塞几百毫秒到几秒，以前每秒在主线程上跑一遍（每个标签
+    /// 一次），正好违反「碰文件系统不许在主线程」这条线。
     fn poll_dir_changes(&mut self) {
-        if self.ui.get_settings_open() {
+        if self.ui.get_settings_open() || self.mtime_probe_busy {
             return;
         }
-        let n = self.state.tabs.len();
-        let mut to_reload: Vec<usize> = Vec::new();
-        for i in 0..n {
-            let path = match self.state.tabs[i].active().path.clone() {
-                Some(p) => p,
-                None => continue,
+        let mut paths: Vec<PathBuf> = Vec::new();
+        for tab in &self.state.tabs {
+            let Some(path) = tab.active().path.clone() else {
+                continue;
             };
-
-            // 核心修复 1：跳过网络路径的 mtime 轮询，防止网络 IO 阻塞主线程导致 UI 假死
-            if is_network_path(&path) {
+            // 网络路径不轮询 mtime：掉线共享上的 stat 会无限超时。
+            if crate::fs::dir::is_remote_path(&path) {
                 continue;
             }
+            if !paths.contains(&path) {
+                paths.push(path);
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        if self.mtime_probe_tx.send(paths).is_ok() {
+            self.mtime_probe_busy = true;
+        }
+    }
 
-            let mtime = match std::fs::symlink_metadata(&path).and_then(|m| m.modified()) {
-                Ok(m) => m,
-                Err(_) => continue,
+    /// 消费后台 mtime 探测结果：只有「仍被某个标签打开 + mtime 真的变了」才重载。
+    fn apply_dir_mtime_probe(&mut self, probed: Vec<DirMtimeProbe>) {
+        self.mtime_probe_busy = false;
+        let open: Vec<PathBuf> = self
+            .state
+            .tabs
+            .iter()
+            .filter_map(|t| t.active().path.clone())
+            .collect();
+        let mut to_reload: Vec<PathBuf> = Vec::new();
+        for item in probed {
+            let Some(mtime) = item.mtime else {
+                // 读不到（已删除 / 无权限 / 盘已拔出）：下一轮再看，别在这里重载。
+                continue;
             };
-            match self.dir_mtimes.get(&path) {
+            if !open.contains(&item.path) {
+                self.dir_mtimes.remove(&item.path);
+                continue;
+            }
+            match self.dir_mtimes.get(&item.path) {
                 Some(prev) if *prev == mtime => {}
                 _ => {
-                    self.dir_mtimes.insert(path.clone(), mtime);
-                    to_reload.push(i);
+                    self.dir_mtimes.insert(item.path.clone(), mtime);
+                    to_reload.push(item.path);
                 }
             }
         }
-        for i in to_reload {
-            self.reload_tab(i);
+        for path in to_reload {
+            // 同一个目录可能被多个标签看着：全部重载，不能只挑第一个。
+            let hits: Vec<usize> = self
+                .state
+                .tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.active().path.as_ref() == Some(&path))
+                .map(|(i, _)| i)
+                .collect();
+            for i in hits {
+                self.reload_tab(i);
+            }
         }
     }
 
@@ -1258,6 +1415,7 @@ impl App {
                         self.scroll_to_paths = vec![added[0].clone()];
                         self.scroll_select = true;
                         self.visible_cache = None;
+                        self.visible_cache_right = None;
                     } else if !added.is_empty() {
                         logln!("[shell-new] ignore diff: {} new entries", added.len());
                     }
@@ -1288,6 +1446,7 @@ impl App {
                         pane.anchor = Some(first.clone());
                         pane.selection = matched.iter().map(|(_, p)| p.clone()).collect();
                         self.visible_cache = None;
+                        self.visible_cache_right = None;
                     }
                     logln!(
                         "[new-folder] list matched: pos={} first={} scroll_select={} rename_path={}",
@@ -1316,7 +1475,7 @@ impl App {
         // 立即再全量列举一遍 —— 表现日志里就是每次导航/重命名后都出现两条同样的
         // request_listing + list_result。网络路径不参与轮询，无需记录。
         if let Some(p) = listed_path.as_ref() {
-            if !is_network_path(p) {
+            if !crate::fs::dir::is_remote_path(p) {
                 if let Ok(m) = std::fs::symlink_metadata(p).and_then(|m| m.modified()) {
                     self.dir_mtimes.insert(p.clone(), m);
                 }
@@ -1332,6 +1491,7 @@ impl App {
         }
         if tab_index == self.state.active_tab {
             self.visible_cache = None;
+            self.visible_cache_right = None;
             self.sync_file_list();
             if listed_is_active {
                 self.sync_status();
@@ -1384,7 +1544,7 @@ impl App {
         if let Some(current_path) = self.state.tabs[tab_index].panes[result.pane].path.as_ref() {
             // ⑥ 网络路径防护：UNC 路径（\\server\share）与映射网络驱动器（Z:\）
             // 都不自动递归，避免拖垮内网 IO。
-            let is_net = is_network_path(current_path);
+            let is_net = crate::fs::dir::is_remote_path(current_path);
             if is_net {
                 dirsize_trace(format!(
                     "Network path -> skip auto scan: {}",
@@ -1412,6 +1572,7 @@ impl App {
                 // 有缓存命中且是当前标签时，先刷一遍 UI 让旧值立即显现
                 if tab_index == self.state.active_tab {
                     self.visible_cache = None;
+                    self.visible_cache_right = None;
                     self.refresh_visible_rows();
                 }
 
@@ -1435,7 +1596,7 @@ impl App {
 
                 // ---- 文件变更监听：对当前活动目录递归监听整棵子树 ----
                 if let Some(path) = self.state.tabs[tab_index].active().path.clone() {
-                    let is_net = is_network_path(&path);
+                    let is_net = crate::fs::dir::is_remote_path(&path);
                     if tab_index == self.state.active_tab && !is_net {
                         // 若当前已有监听器且监听的正是该路径，直接复用，不重复重建
                         let already_watching = self
@@ -1486,6 +1647,7 @@ impl App {
             self.state.active_mut().active_mut().rebuild_display();
         }
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_file_list();
         self.sync_status();
         // 搜索会改动历史（set_filter_from_search 压入/弹出搜索页），必须同步前进/后退
@@ -1583,6 +1745,7 @@ impl App {
         pane.rebuild_display();
         if tab_index == self.state.active_tab {
             self.visible_cache = None;
+            self.visible_cache_right = None;
             self.sync_file_list();
             if deep_is_active {
                 self.sync_status();
@@ -1648,6 +1811,7 @@ impl App {
         if tab_index == self.state.active_tab {
             // 让可见缓存失效，就地重新渲染当前视口中的行
             self.visible_cache = None;
+            self.visible_cache_right = None;
             self.refresh_visible_rows();
             if is_selected {
                 self.sync_status();
@@ -1763,25 +1927,6 @@ fn is_always_kept(path: &Path) -> bool {
             | "srf"
             | "sr2"
     )
-}
-
-fn is_network_path(path: &Path) -> bool {
-    let s = path.to_string_lossy();
-    if s.starts_with(r"\\") {
-        return true;
-    }
-    // 检查是否为映射网络驱动器（如 Z:\）
-    if let Some(std::path::Component::Prefix(prefix)) = path.components().next() {
-        if let std::path::Prefix::Disk(drive) = prefix.kind() {
-            let letter = (drive as char).to_ascii_uppercase();
-            if let Some(info) = crate::fs::list_drives().iter().find(|d| d.letter == letter) {
-                if info.drive_type == crate::fs::drives::DriveType::Network {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 /// 获取 Rove 在 %LOCALAPPDATA% 下的专属数据目录（不存在则创建）。
@@ -3004,6 +3149,7 @@ impl App {
         self.config.save();
         self.ui.set_view_mode(mode.into());
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_file_list();
     }
 
@@ -3050,6 +3196,7 @@ impl App {
         }
 
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_file_list();
         self.sync_status();
     }
@@ -3100,6 +3247,7 @@ impl App {
         }
         if changed {
             self.visible_cache = None;
+            self.visible_cache_right = None;
         }
     }
 
@@ -3162,6 +3310,7 @@ impl App {
         self.run_global_search(&query);
         // 必须清虚拟列表缓存，否则列表命中旧窗口不重渲染（只有状态栏会变）。
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_file_list();
         self.sync_status();
     }
@@ -3231,9 +3380,22 @@ impl App {
         self.ui.set_status_right(right.into());
     }
 
+    /// 请求后台重新探测整批侧栏数据（盘符 / 回收站 / 网络位置）。
+    ///
+    /// 只排队一个请求：15s 定时器、刷新按钮、缩略图符号刷新很容易挤在一起。
+    /// 结果到达后由 40ms 轮询统一应用（并重绘侧栏）。
+    fn request_sidebar_probe(&mut self) {
+        if self.sidebar_probe_busy {
+            return;
+        }
+        if self.sidebar_probe_tx.send(()).is_ok() {
+            self.sidebar_probe_busy = true;
+        }
+    }
+
+    /// 用持有数据重建侧栏模型（不再做任何系统调用，数据来自后台探测）。
     fn sync_sidebar(&mut self) {
-        self.drives = list_drives();
-        let stats = recycle_bin_stats();
+        let stats = self.recycle_stats;
         // 用户自己添加的（`网络位置` 分区，显示别名）。
         let network: Vec<(String, String)> = self
             .config
@@ -3243,7 +3405,7 @@ impl App {
             .collect();
         // 资源管理器里本来就有、但用户没加到 Rove 的（独立 `网络位置(系统)` 分区）。
         let mut detected: Vec<(String, String)> = Vec::new();
-        for remote in list_network_locations() {
+        for remote in self.net_wnet.clone() {
             if network
                 .iter()
                 .any(|(_, path)| path.eq_ignore_ascii_case(&remote))
@@ -3256,7 +3418,7 @@ impl App {
             detected.push((remote.clone(), remote));
         }
         // 「添加网络位置」向导的产物只是快捷方式，没有网络连接，WNet 枚举不到。
-        for (label, target) in list_network_places() {
+        for (label, target) in self.net_places.clone() {
             if network
                 .iter()
                 .any(|(_, path)| path.eq_ignore_ascii_case(&target))
@@ -3776,6 +3938,7 @@ impl App {
         logln!("[shell-windows] 选中 pos={pos} {path:?}");
         self.scroll_to_index = Some(pos);
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.refresh_visible_rows();
         self.sync_status();
     }
@@ -4067,9 +4230,14 @@ impl App {
         self.log_thumb_got("ok", &key.path, key.px_size);
         self.thumb_pending.remove(&key);
         self.thumb_queued.retain(|k| k != &key);
+        let is_sidebar_icon = key.px_size == SIDEBAR_ICON_PX;
         self.insert_thumb_cache(key, img);
         // 核心修复：不再每次 store 都全量 refresh，只置位，由主线程 40ms 批量刷新。
         self.thumb_needs_refresh = true;
+        // 侧栏图标（32px）也走这条管道：单独置位，避免列表缩略图每批都重建侧栏模型。
+        if is_sidebar_icon {
+            self.sidebar_icon_dirty = true;
+        }
     }
 
     /// 缩略图诊断（ROVE_LOG=1）：本窗口前 24 条到图记录。
@@ -4120,20 +4288,39 @@ impl App {
         )
     }
 
-    fn refresh_visible_rows(&mut self) {
-        // 布局未落定时的容错（启动首帧）：此时 list_height 为 0，
-        // 算出的 rows_visible 只剩 2*OVERSCAN，只能渲染前几行
-        // （表现为「此电脑」部分盘符空白）。用典型视口高度占位，
-        // 布局落定后几何监听会立即重算。
-        let raw_list_height = self.ui.get_list_height();
-        let list_height = if raw_list_height > 1.0 { raw_list_height } else { 600.0 };
-        let cells_per_row = (self.ui.get_cells_per_row().max(1)) as usize;
+    /// 视口几何的常用组合：`(视口高, 每行列数, 行高, 应渲染行数)`。
+    ///
+    /// 启动首帧布局未落定时用占位值兜底（视口 600 / 默认行高），否则只能渲染
+    /// 前两行（表现为「此电脑」部分盘符空白）。
+    fn view_metrics(&self) -> (f32, usize, f32, usize) {
+        let raw_h = self.ui.get_list_height();
+        let list_height = if raw_h > 1.0 { raw_h } else { 600.0 };
+        let cells = self.ui.get_cells_per_row().max(1) as usize;
         let row_h = if self.ui.get_row_height_out() > 0.0 {
             self.ui.get_row_height_out()
         } else {
             ROW_HEIGHT
         };
         let rows_visible = (list_height / row_h).ceil() as usize + OVERSCAN * 2;
+        (list_height, cells, row_h, rows_visible)
+    }
+
+    /// 某栏此刻应该渲染的条目窗口 `(first, count)`（与 `refresh_visible_rows` 同源）。
+    /// 只用于判断「渲染窗口变了没有」：行是绝对定位的，窗口没变就不必重建整表。
+    fn pane_window_now(&self, pane_index: usize) -> Option<(usize, usize)> {
+        let (_, cells, row_h, rows_visible) = self.view_metrics();
+        let pane = self.state.active().panes.get(pane_index)?;
+        Some(pane_view_range(
+            pane.display.len(),
+            cells,
+            row_h,
+            rows_visible,
+            pane.scroll_y.max(0.0),
+        ))
+    }
+
+    fn refresh_visible_rows(&mut self) {
+        let (list_height, cells_per_row, row_h, rows_visible) = self.view_metrics();
 
         // 「此电脑」视图（pane 没有路径）：详细信息要隐藏修改时间列，
         // 大小列改为只显示剩余容量、表头文字改成「剩余」。
@@ -4312,7 +4499,7 @@ impl App {
                     rows0.len(),
                     blank,
                     list_height,
-                    raw_list_height,
+                    self.ui.get_list_height(),
                     cells_per_row,
                     row_h,
                     rows_visible,
@@ -4361,7 +4548,7 @@ impl App {
             logv!(
                 "[rename] refresh list_h={} raw={} cells={} row_h={} rows_vis={} scroll={:.1} first={} count={} total={} icons={}",
                 list_height,
-                raw_list_height,
+                self.ui.get_list_height(),
                 cells_per_row,
                 row_h,
                 rows_visible,
@@ -4457,6 +4644,14 @@ impl App {
 
         // 发布本轮可视屏幕的 key 集合：优先池里不属于「现在这一屏」的旧请求会被丢弃。
         publish_thumb_wanted(std::mem::take(&mut self.prio_wanted));
+
+        // 记下两栏本帧真正写进行模型的窗口：滚动回调据此判断“窗口没变，不必重建”。
+        self.visible_cache = Some((first0, count0));
+        self.visible_cache_right = if is_split {
+            self.pane_window_now(1)
+        } else {
+            None
+        };
 
         self.sync_expand_targets();
     }
@@ -5118,6 +5313,7 @@ impl App {
 
         // 再更新数据和列表
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_file_list();
         self.sync_sidebar_active();
 
@@ -5173,6 +5369,7 @@ impl App {
         self.ui.set_filter_text(self.state.active().active().filter.clone().into());
         let ratio = self.state.active().split_ratio;
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_split_state();
         self.ui.set_split_ratio_want(ratio);
         self.sync_nav();
@@ -5219,6 +5416,7 @@ impl App {
             self.request_listing(id, pane, generation, path, sort);
         }
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_split_state();
         self.sync_nav();
         self.sync_breadcrumbs();
@@ -8113,6 +8311,7 @@ impl App {
             }
         }
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.refresh_visible_rows();
         self.sync_status();
     }
@@ -8128,6 +8327,7 @@ impl App {
         };
         self.state.active_mut().active_mut().selection = selected;
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.refresh_visible_rows();
         self.sync_status();
     }
@@ -8213,6 +8413,7 @@ impl App {
                                 self.state.clipboard_from_recycle = false;
                                 self.state.cut_paths.clear();
                                 self.visible_cache = None;
+                                self.visible_cache_right = None;
                                 self.refresh_visible_rows();
                                 self.set_status_job(if paths.len() > 1 {
                                     self.trf("已复制 {} 项路径", &[paths.len().to_string()])
@@ -8395,6 +8596,7 @@ impl App {
                             self.scroll_to_paths = vec![p.clone()];
                             self.scroll_select = true;
                             self.visible_cache = None;
+                            self.visible_cache_right = None;
                             self.refresh_visible_rows();
                             self.sync_status();
                             logln!(
@@ -8512,6 +8714,7 @@ impl App {
             self.state.clipboard_operation = "move".into();
             self.state.cut_paths = paths.into_iter().collect();
             self.visible_cache = None;
+            self.visible_cache_right = None;
             self.refresh_visible_rows();
             self.set_status_job(self.trf(
                 "已剪切 {} 个回收站项目（粘贴即可移动到目标文件夹）",
@@ -8543,6 +8746,7 @@ impl App {
                     self.state.cut_paths.clear();
                 }
                 self.visible_cache = None;
+                self.visible_cache_right = None;
                 self.refresh_visible_rows();
                 self.set_status_job(if is_move {
                     self.trf(
@@ -8583,6 +8787,7 @@ impl App {
                 self.state.clipboard_paths.clear();
                 self.state.cut_paths.clear();
                 self.visible_cache = None;
+                self.visible_cache_right = None;
             }
             return;
         }
@@ -8593,6 +8798,7 @@ impl App {
             self.state.clipboard_from_recycle = false;
             self.state.cut_paths.clear();
             self.visible_cache = None;
+            self.visible_cache_right = None;
 
             let mut restored = Vec::new();
             for p in &paths {
@@ -8770,6 +8976,7 @@ impl App {
             self.state.clipboard_paths.clear();
             self.state.cut_paths.clear();
             self.visible_cache = None;
+            self.visible_cache_right = None;
         }
         // 回收站下暂存盘点「移动」：只有真正删除成功才清空暂存盘，
         // 「删除已取消 / 删除失败」时保留内容，避免一次取消就丢掉整个暂存列表。
@@ -8952,6 +9159,7 @@ impl App {
         let is_search_page = !nav_filter.trim().is_empty();
         self.ui.set_filter_text(nav_filter.clone().into());
         self.visible_cache = None;
+        self.visible_cache_right = None;
 
         // 将内存中正确的 scroll_y 推给 UI，防止 UI 在重绘前乱跳。
         // 真正的“跨帧防污染”保护靠 pane.pending_scroll_restore：异步列表未回来、
@@ -9100,6 +9308,7 @@ impl App {
             }
         }
         self.visible_cache = None;
+        self.visible_cache_right = None;
         self.sync_nav();
         self.sync_status();
         self.sync_tabs();
@@ -9201,6 +9410,7 @@ impl App {
                     tab.selection.insert(p.clone());
                     tab.anchor = Some(p);
                     self.visible_cache = None;
+                    self.visible_cache_right = None;
                     self.refresh_visible_rows();
                     self.sync_status();
                 }
@@ -9244,6 +9454,7 @@ impl App {
                 let target = MenuScope::Selection(self.state.active().active().selected_paths());
                 self.menu_scope = Some(target.clone());
                 self.visible_cache = None;
+                self.visible_cache_right = None;
                 self.refresh_visible_rows();
                 self.sync_status();
                 self.open_menu(target);
@@ -9372,6 +9583,7 @@ impl App {
                     tab.anchor = Some(path);
                 }
                 self.visible_cache = None;
+                self.visible_cache_right = None;
                 self.refresh_visible_rows();
                 self.sync_status();
             }
@@ -9660,6 +9872,7 @@ impl App {
                     tab.selection.clear();
                     tab.anchor = None;
                     self.visible_cache = None;
+                    self.visible_cache_right = None;
                     self.refresh_visible_rows();
                     self.sync_status();
                 }
@@ -9783,6 +9996,7 @@ impl App {
         }
         if changed {
             self.visible_cache = None;
+            self.visible_cache_right = None;
             self.refresh_visible_rows();
             self.sync_status();
         }
@@ -9808,6 +10022,7 @@ impl App {
             logv!("[rubber-band] selection updated, count={}", new_selection.len());
             tab.selection = new_selection;
             self.visible_cache = None;
+            self.visible_cache_right = None;
             self.refresh_visible_rows();
             self.sync_status();
         }
@@ -9833,6 +10048,20 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
 
     // 合并窗口到点则触发索引重建（设置页连续改多项只重建一次）。
     maybe_run_pending_reindex();
+
+    // 搜索框防抖：攒够 150ms 再跑一次全目录匹配。
+    // 用 40ms 轮询判到期，省一个单独的定时器；到期前用户又敲了字会重新计时。
+    let pending_search = app.borrow().pending_search.clone();
+    if let Some((text, at)) = pending_search {
+        if at.elapsed() >= Duration::from_millis(150) {
+            let mut app = app.borrow_mut();
+            app.pending_search = None;
+            // 期间导航/切标签可能已经把搜索框改写掉了：文本对不上就丢弃。
+            if app.ui.get_filter_text() == text {
+                app.apply_search_query(&text);
+            }
+        }
+    }
 
     // 后台线程启动终端 / 自定义动作失败（目录不存在、进程起不来）在这里显示。
     // 逐条借一次 App，避免和下面 `sync_drag_bounds` / `borrow_mut` 抢借用。
@@ -9873,6 +10102,18 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 while let Ok(result) = app.dir_size_rx.try_recv() {
                     app.apply_dir_size_result(result);
                 }
+                loop {
+                    match app.mtime_probe_rx.try_recv() {
+                        Ok(probed) => app.apply_dir_mtime_probe(probed),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        // 探测线程已经没了：解掉「在跑」标记，否则目录自动刷新永久停摆。
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            logln!("!! mtime 探测线程已退出");
+                            app.mtime_probe_busy = false;
+                            break;
+                        }
+                    }
+                }
                 // 地址栏路径校验结果：只认最后一次回车，且用户中途没换过目录。
                 while let Ok(probe) = app.path_probe_rx.try_recv() {
                     if probe.seq != app.path_probe_seq {
@@ -9891,13 +10132,41 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                     }
                 }
 
+                // 侧栏后台探测结果（盘符容量 / 回收站 / 网络位置）：应用到内存并重绘。
+                loop {
+                    match app.sidebar_probe_rx.try_recv() {
+                        Ok(probe) => {
+                            app.sidebar_probe_busy = false;
+                            app.drives = probe.drives;
+                            app.recycle_stats = probe.stats;
+                            app.net_wnet = probe.wnet;
+                            app.net_places = probe.places;
+                            app.sidebar_fingerprint = 0;
+                            app.sync_sidebar();
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        // 探测线程已经没了（理论上不会）：别让「在跑」标记永久卡住。
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            logln!("!! 侧栏探测线程已退出");
+                            app.sidebar_probe_busy = false;
+                            break;
+                        }
+                    }
+                }
+
                 // 核心修复：缩略图批量到达后，统一在主线程刷新一次，避免 653 张
                 // 连续 store 触发 653 次全量行重建导致掉帧。
                 if app.thumb_needs_refresh {
                     app.thumb_needs_refresh = false;
                     app.visible_cache = None;
+                    app.visible_cache_right = None;
                     app.refresh_visible_rows();
-                    // 含侧栏尺寸(32px)的图标更新时也刷新侧边栏（方块→原生图标）。
+                }
+                // 侧栏图标（32px）也走同一条缩略图管道：只有它真的更新了才重绘侧栏。
+                // 以前这里无条件 `sidebar_fingerprint = 0; sync_sidebar()`，
+                // 每批缩略图（最多 25 次/秒）都要跑一遍盘符/回收站/WNet 枚举。
+                if app.sidebar_icon_dirty {
+                    app.sidebar_icon_dirty = false;
                     app.sidebar_fingerprint = 0;
                     app.sync_sidebar();
                 }
@@ -9927,6 +10196,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                         }
                         if resorted {
                             app.visible_cache = None;
+                            app.visible_cache_right = None;
                             app.refresh_visible_rows();
                         }
                     }
@@ -10093,7 +10363,8 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
             .start(TimerMode::Repeated, Duration::from_secs(15), move || {
                 if let Some(app) = timer_app.upgrade() {
                     let mut app = app.borrow_mut();
-                    app.sync_sidebar();
+                    // 探测在线程里跑：有变化才会经 40ms 轮询重绘侧栏。
+                    app.request_sidebar_probe();
                     app.maybe_idle_rescan();
                 }
             });
@@ -10661,6 +10932,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 tab.selection.insert(path.clone());
                 tab.anchor = Some(path);
                 app.visible_cache = None;
+                app.visible_cache_right = None;
                 app.refresh_visible_rows();
                 app.sync_status();
                 return;
@@ -10791,6 +11063,12 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let active_tab = app.state.active_tab;
             if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(0) {
                 pane.scroll_y = offset;
+            }
+            // 像素级滚动（同一行内的微调）不需要重建行模型：行在 Slint 里是按
+            // `index * row-h` 绝对定位的，视口偏移由 Flickable 自己负责。
+            // 只有渲染窗口真的换了（跨过一行 / 内容变了）才重建。
+            if app.visible_cache.is_some() && app.visible_cache == app.pane_window_now(0) {
+                return;
             }
             app.refresh_visible_rows();
         });
@@ -10999,6 +11277,12 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             if let Some(pane) = app.state.tabs[active_tab].panes.get_mut(1) {
                 pane.scroll_y = offset;
             }
+            // 同左栏：窗口没变就不重建。
+            if app.visible_cache_right.is_some()
+                && app.visible_cache_right == app.pane_window_now(1)
+            {
+                return;
+            }
             app.refresh_visible_rows();
         });
     }
@@ -11143,7 +11427,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 if app.ui.get_filter_text() != text {
                     return;
                 }
-                app.apply_search_query(&text);
+                // 清空立即生效：要马上恢复搜索前的滚动位置，不能让用户干等。
+                if text.trim().is_empty() {
+                    app.pending_search = None;
+                    app.apply_search_query(&text);
+                    return;
+                }
+                // 其余情况攒 150ms 再算（逐字触发全目录打分太贵），由 40ms 轮询到点应用。
+                app.pending_search = Some((text.to_string(), std::time::Instant::now()));
             });
         });
     }
@@ -11160,7 +11451,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
             app.user_refresh_active();
-            app.sync_sidebar();
+            app.request_sidebar_probe();
         });
     }
     {
@@ -11849,6 +12140,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.config.save();
             // 核心修复：侧栏宽度改变后必须让可见行缓存失效，重新计算列数排版！
             app.visible_cache = None;
+            app.visible_cache_right = None;
             app.refresh_visible_rows();
         });
     }
@@ -13339,6 +13631,8 @@ fn create_session(
         app.sync_breadcrumbs();
         app.sync_status();
         app.sync_sidebar();
+        // 盘符容量 / 回收站在后台线程取，结果到了再重绘一次侧栏。
+        app.request_sidebar_probe();
         app.sync_staging();
         app.sync_file_list();
         // 「在文件夹中显示」：必须在 reload_active 之前挂上，否则列举结果回来时
