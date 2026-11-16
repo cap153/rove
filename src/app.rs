@@ -1424,7 +1424,12 @@ impl App {
             // 新建文件夹 / 粘贴完成：数据就位后把新条目换算成显示索引，交给
             // refresh_visible_rows 做“最小位移滚进可视区”（否则它们按排序沉到底部，看不到）。
             // 多条时取最靠前的一条，保证粘贴块的起始处可见。
-            if !self.scroll_to_paths.is_empty() && result.pane == tab.active_pane {
+            // 只让「当前可见标签的可见栏」消费这个挂起目标：后台标签的定期刷新
+            // 若恰好也含同一路径，会把 scroll_to_index / 选择集写到别的标签上。
+            if !self.scroll_to_paths.is_empty()
+                && result.pane == tab.active_pane
+                && tab_index == self.state.active_tab
+            {
                 let mut matched: Vec<(usize, PathBuf)> = Vec::new();
                 for (pos, &ei) in pane.display.iter().enumerate() {
                     if let Some(e) = pane.entries.get(ei) {
@@ -8069,9 +8074,21 @@ impl App {
                         .position(|&ei| pane.entries.get(ei).is_some_and(|e| e.path == *path))
                 };
                 // 更新选择/暂存/剪切集合中的旧路径。
-                let tab = self.state.active_mut();
-                if tab.active_mut().selection.remove(path) {
-                    tab.active_mut().selection.insert(new_path.clone());
+                // 若改名前它本来就不在选中集里（新建文件夹流程：条目刚创建，从没被选中过），
+                // 提交后要把它选中 —— 否则重命名框一关列表里没有任何选中项。
+                let was_selected = {
+                    let tab = self.state.active_mut();
+                    let hit = tab.active_mut().selection.remove(path);
+                    if hit {
+                        tab.active_mut().selection.insert(new_path.clone());
+                    }
+                    hit
+                };
+                if !was_selected {
+                    // 复用「新条目就位后滚进可视区并选中」的既有机制
+                    // （见 apply_list_result 里的 scroll_to_paths / scroll_select）。
+                    self.scroll_to_paths = vec![new_path.clone()];
+                    self.scroll_select = true;
                 }
                 self.state.cut_paths.remove(path);
                 if let Some(idx) = pin_index {
@@ -8314,6 +8331,41 @@ impl App {
         self.visible_cache_right = None;
         self.refresh_visible_rows();
         self.sync_status();
+    }
+
+    /// 立刻把某条目设为唯一选中项并滚进可视区（不重载列表）。
+    ///
+    /// 给「Esc 取消新建文件夹的重命名」用：条目已经在列表里，只是从没被选中过。
+    /// 只认**已加载快照**里的路径，绝不碰磁盘（`is_file()` 在掉线的网络盘上会卡界面）。
+    /// 找不到（例如被搜索过滤掉）就返回 false，什么都不做。
+    fn select_path_now(&mut self, path: &Path) -> bool {
+        let pos = {
+            let pane = self.state.active().active();
+            pane.display
+                .iter()
+                .position(|&ei| pane.entries.get(ei).is_some_and(|e| e.path == path))
+        };
+        let Some(pos) = pos else {
+            // 列表还没到位（异步列举竞态）：交给列举结果落地时再选中。
+            self.scroll_to_paths = vec![path.to_path_buf()];
+            self.scroll_select = true;
+            return false;
+        };
+        {
+            let pane = self.state.active_mut().active_mut();
+            pane.selection.clear();
+            pane.selection.insert(path.to_path_buf());
+            pane.anchor = Some(path.to_path_buf());
+        }
+        // 新建文件夹留下的「等旧名字出现」的挂起匹配作废，否则下次列举还会拿它去滚。
+        self.scroll_to_paths.clear();
+        self.scroll_select = false;
+        self.scroll_to_index = Some(pos);
+        self.visible_cache = None;
+        self.visible_cache_right = None;
+        self.refresh_visible_rows();
+        self.sync_status();
+        true
     }
 
     /// 全选当前显示项。
@@ -11349,12 +11401,22 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_file_rename_cancelled(move || {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
+            // 取消只有 Esc 一条路（回车、点别处走的都是提交），先取出目标路径。
+            let cancelled = PathBuf::from(app.ui.get_rename_path().to_string());
             app.ui.set_rename_path(SharedString::default());
             // 退出重命名后，图标视图的展开层回到“只显示名字 / 隐藏”。
             app.sync_expand_targets();
             // 核心修复：取消重命名时也必须解锁，否则锁残留 → 滚轮冻结。
             app.drag_pending = None;
             app.ui.invoke_set_drag_armed(false);
+            // 新建文件夹流程：条目刚创建、从没被选中过 → 退出重命名后把它选中，
+            // 否则（尤其按 Esc 保留默认名时）列表里没有任何选中项。
+            // 普通重命名的目标本来就在选中集里，选择集不动。
+            if !cancelled.as_os_str().is_empty()
+                && !app.state.active().active().selection.contains(&cancelled)
+            {
+                app.select_path_now(&cancelled);
+            }
         });
     }
 
