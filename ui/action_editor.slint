@@ -27,6 +27,25 @@ component StyledInput inherits Rectangle {
         font-size: 12.5px;
         text-color: Theme.text-primary;
         enabled: root.enabled;
+
+        focus-changed(has-focus) => {
+            if (has-focus) {
+                root.ever-focused = true;
+            }
+        }
+    }
+
+    /// 光标 / 选区错点的 UTF-8 字节偏移：给「点按钮把片段插到光标处」用。
+    out property <int> caret-byte: ti.caret-byte;
+    out property <int> anchor-byte: ti.anchor-byte;
+    /// 输入框是否**曾经**拿过焦点。没拿过时“光标”无从谈起（值为 0，
+    /// 直接插进去会跑到开头），调用方据此改成追加到末尾。
+    in-out property <bool> ever-focused: false;
+
+    /// 把光标放到指定字节偏移（会先拿回焦点）。
+    public function put-caret(byte-offset: int) {
+        ti.focus-input();
+        ti.put-caret(byte-offset);
     }
 
     if (root.text == "" && !ti.has-focus && root.placeholder != "") : Text {
@@ -89,11 +108,12 @@ component RadioDot inherits Rectangle {
     }
 }
 
-// 参数模板占位符按钮：点击自动追加双引号包裹的参数
+// 参数模板占位符按钮：点击把双引号包裹的参数**插入到光标处**（有选中则替换选中）。
+// 插入计算放在 Rust 侧（与批量重命名同一套 `insert_at_selection`），
+// 这里只负责把光标位置报上去。
 component TokenChip inherits Rectangle {
     in property <string> token: "";
-    in-out property <string> target-text;
-    callback append-cb();
+    callback insert-cb();
 
     height: 22px;
     border-radius: 4px;
@@ -117,12 +137,7 @@ component TokenChip inherits Rectangle {
         width: 100%;
         height: 100%;
         clicked => {
-            let quoted = "\"" + root.token + "\"";
-            if (root.target-text != "") {
-                root.target-text += " ";
-            }
-            root.target-text += quoted;
-            root.append-cb();
+            root.insert-cb();
         }
     }
 }
@@ -144,9 +159,18 @@ export component ActionEditorDialog inherits Rectangle {
     callback save();
     callback cancel();
     callback browse();
+    /// 点参数模板按钮：把 token 插到 (caret, anchor) 处。
+    callback token-inserted(token: string, caret: int, anchor: int);
 
     // 内部控制层级下拉框展开状态
     property <bool> dropdown-open: false;
+
+    // 每次打开弹窗都重新判断“参数框是否动过光标”，避免上次的位置残留。
+    changed visible => {
+        if (root.visible) {
+            args-input.ever-focused = false;
+        }
+    }
 
     width: 100%;
     height: 100%;
@@ -279,7 +303,7 @@ export component ActionEditorDialog inherits Rectangle {
             VerticalLayout {
                 spacing: 4px;
                 Text { text: I18n.strings[26]; color: Theme.text-secondary; font-size: 12px; }
-                StyledInput {
+                args-input := StyledInput {
                     mouse-pressed: root.mouse-pressed;
                     text <=> root.edit-args;
                     placeholder: I18n.strings[12];
@@ -291,7 +315,15 @@ export component ActionEditorDialog inherits Rectangle {
 
                     for tok in ["{target_path}", "{target_paths}", "{target_dir}", "{name}", "{stem}"] : TokenChip {
                         token: tok;
-                        target-text <=> root.edit-args;
+                        insert-cb => {
+                            // 光标位置只对「自己动过光标」的情况有意义：没拿过焦点时
+                            // 报 (0,0)，直接用会插到开头，所以传 -1 让 Rust 追加到末尾。
+                            root.token-inserted(
+                                tok,
+                                args-input.ever-focused ? args-input.caret-byte : -1,
+                                args-input.ever-focused ? args-input.anchor-byte : -1,
+                            );
+                        }
                     }
                 }
             }
@@ -511,5 +543,10 @@ export component ActionEditorDialog inherits Rectangle {
                 }
             }
         }
+    }
+
+    /// 插完参数模板后把光标放到新位置（同时把焦点还给参数框，方便接着敲）。
+    public function put-caret(byte-offset: int) {
+        args-input.put-caret(byte-offset);
     }
 }

@@ -2325,6 +2325,33 @@ mod tests {
         assert_eq!(text, "名X字");
     }
 
+    /// 参数模板按钮：没点过参数框就追加到末尾并补空格，点过则按光标插。
+    #[test]
+    fn arg_token_appends_when_caret_is_unknown() {
+        // 空文本：直接就是那个参数。
+        assert_eq!(insert_arg_token("", "{name}", -1, -1), ("\"{name}\"".to_string(), 8));
+        // 非空且末尾不是空格：补一个空格再追加。
+        assert_eq!(
+            insert_arg_token("cmd", "{name}", -1, -1),
+            ("cmd \"{name}\"".to_string(), 12)
+        );
+        // 末尾已经是空格：不再重复补。
+        assert_eq!(
+            insert_arg_token("cmd ", "{name}", -1, -1),
+            ("cmd \"{name}\"".to_string(), 12)
+        );
+        // 点过参数框（光标在后面）：插到光标处。
+        assert_eq!(
+            insert_arg_token("ab", "{name}", 1, 1),
+            ("a\"{name}\"b".to_string(), 9)
+        );
+        // 点过且选中了一段：替换选中内容。
+        assert_eq!(
+            insert_arg_token("ab", "{name}", 2, 0),
+            ("\"{name}\"".to_string(), 8)
+        );
+    }
+
     /// 手写窗口化：只推视口附近的行，换个位置要换一批。
     #[test]
     fn visible_range_keeps_buffer_around_viewport() {
@@ -11700,6 +11727,22 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             }
         });
     }
+    {
+        // 参数模板按钮：把 `"{token}"` 插到参数框的光标处（有选中则替换选中），
+        // 再把光标放回插入内容的后面。与批量重命名的正则片段插入同一套算法。
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_editor_token_inserted(move |token, caret, anchor| {
+            let Some(app) = app.upgrade() else { return };
+            // 先算完再写 Slint 属性：写属性会同步派发 changed 回调，
+            // 不能带着 App 的 RefCell 借用进去。
+            let (new_text, new_caret) = {
+                let text = app.borrow().ui.get_settings_editor_args();
+                insert_arg_token(&text, &token, caret, anchor)
+            };
+            app.borrow().ui.set_settings_editor_args(new_text.into());
+            app.borrow().ui.invoke_put_caret(new_caret);
+        });
+    }
 
     // ---- 窗口控制（无边框标题栏：最小化 / 最大化 / 关闭 / 拖拽移动） ----
     // 原生窗口操作仅 Windows 有意义，其他平台整体不注册（无边框标题栏不启用）。
@@ -14252,6 +14295,24 @@ fn insert_at_selection(text: &str, token: &str, caret: i32, anchor: i32) -> (Str
     out.push_str(token);
     out.push_str(&text[end..]);
     (out, (start + token.len()) as i32)
+}
+
+/// 动作编辑器的「参数模板」按钮：把 `"{token}"` 插进参数文本。
+///
+/// `caret < 0` 表示参数框从来没被点过：没动过光标时 Slint 报回来的位置是无意义的 (0, 0)，
+/// 直接用会把参数插到最前面，所以这种情况下追加到末尾（非空时补一个空格分隔）。
+fn insert_arg_token(text: &str, token: &str, caret: i32, anchor: i32) -> (String, i32) {
+    let quoted = format!("\"{token}\"");
+    if caret >= 0 {
+        return insert_at_selection(text, &quoted, caret, anchor);
+    }
+    let mut t = text.to_string();
+    if !t.is_empty() && !t.ends_with(' ') {
+        t.push(' ');
+    }
+    t.push_str(&quoted);
+    let end = t.len() as i32;
+    (t, end)
 }
 
 fn batch_refresh_weak(weak: &slint::Weak<BatchRenameWindow>, state: &Rc<RefCell<BatchSession>>) {

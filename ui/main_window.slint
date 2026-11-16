@@ -515,6 +515,8 @@ out property <length> row-height-out: file-list.row-height-out;
     );
     callback settings_editor_cancel();
     callback settings_editor_browse();
+    /// 参数模板按钮：把 token 插到参数框的 (caret, anchor) 处。
+    callback settings_editor_token_inserted(token: string, caret: int, anchor: int);
     in-out property <bool> can-paste: false;
 
     // ---- 布局常量 ----
@@ -537,6 +539,11 @@ out property <length> row-height-out: file-list.row-height-out;
 
     public function scroll_tabs_to_end() {
         tab-bar.scroll-to-end();
+    }
+
+    /// 动作编辑器：把光标放到参数框的指定字节偏移（插入参数模板后调用）。
+    public function put-caret(byte-offset: int) {
+        action-editor.put-caret(byte-offset);
     }
 
     public function scroll_tabs_to_index(i: int) {
@@ -1676,7 +1683,7 @@ out property <length> row-height-out: file-list.row-height-out;
     }
 
     // 动作编辑器弹窗（新增 / 编辑自定义右键菜单）。
-    ActionEditorDialog {
+    action-editor := ActionEditorDialog {
         mouse-pressed: root.mouse-left-pressed;
         visible: root.settings-editor-open;
         title: root.settings-editor-title;
@@ -1690,6 +1697,9 @@ out property <length> row-height-out: file-list.row-height-out;
         edit-args <=> root.settings-editor-args;
         browse => {
             root.settings_editor_browse();
+        }
+        token-inserted(token, caret, anchor) => {
+            root.settings_editor_token_inserted(token, caret, anchor);
         }
         save => {
             root.settings_editor_save(
