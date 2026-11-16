@@ -2209,6 +2209,55 @@ mod tests {
         assert!(initial_path_opens_new_tab(true));
     }
 
+    /// 正则片段按钮插到光标处：有选中时替换选中内容，返回新光标位置。
+    #[test]
+    fn token_inserts_at_caret_or_replaces_selection() {
+        // 光标在末尾。
+        assert_eq!(insert_at_selection("abc", "\\d", 3, 3), ("abc\\d".to_string(), 5));
+        // 有选中（anchor 在前）：选中 abc 的 bc 被替换。
+        assert_eq!(insert_at_selection("abc", "\\d", 3, 1), ("a\\d".to_string(), 3));
+        // caret 在 anchor 前面时也要正确排序。
+        assert_eq!(insert_at_selection("abc", "X", 1, 3), ("aX".to_string(), 2));
+        // 偏移越界要夹住，不能切在 UTF-8 中间（"名字" 是 6 个字节）。
+        let (text, caret) = insert_at_selection("名字", "\\w", 99, 99);
+        assert_eq!(text, "名字\\w");
+        assert_eq!(caret, 8);
+        let (text, _) = insert_at_selection("名字", "X", 5, 5);
+        assert_eq!(text, "名X字");
+    }
+
+    /// 手写窗口化：只推视口附近的行，换个位置要换一批。
+    #[test]
+    fn visible_range_keeps_buffer_around_viewport() {
+        // 100 行、每行 27px、视口 500px、上下各 300px 缓冲。
+        let rows: Vec<(f32, f32)> = (0..100).map(|i| (i as f32 * 27.0, 27.0)).collect();
+        let yh = |r: &(f32, f32)| *r;
+
+        // 顶部：缓冲够不着上面，从第 0 行开始。
+        let (start, end) = visible_range(&rows, 0.0, 500.0, 300.0, yh);
+        assert_eq!(start, 0);
+        // 0..800px 覆盖到 (800/27)≈29.6，所以是 0..30。
+        assert_eq!(end, 30);
+
+        // 中间：上下都有缓冲，起止都落在视口外 300px 处。
+        let (start, end) = visible_range(&rows, 1350.0, 500.0, 300.0, yh);
+        assert_eq!(start, 38); // 第 38 行底部 1053 > 1050，仍要留一截缓冲
+        assert_eq!(end, 80); // (1350+500+300)/27 = 79.6
+
+        // 滚到底：不会越界。
+        let (_, end) = visible_range(&rows, 2200.0, 500.0, 300.0, yh);
+        assert_eq!(end, 100);
+
+        // 空列表。
+        assert_eq!(visible_range::<(f32, f32)>(&[], 0.0, 500.0, 300.0, yh), (0, 0));
+
+        // 行高不一致（多行名字）：矮行不会把长行截掉。
+        let rows = [(0.0, 27.0), (27.0, 100.0), (127.0, 27.0)];
+        let yh = |r: &(f32, f32)| *r;
+        let (start, end) = visible_range(&rows, 30.0, 100.0, 0.0, yh);
+        assert_eq!((start, end), (1, 3));
+    }
+
     /// 三种视图必须能区分开：普通目录、此电脑（路径 None）、回收站。
     #[test]
     fn view_sort_classifies_paths() {
@@ -5537,7 +5586,11 @@ fn drive_pulse_color(index: usize, drive: &DriveInfo) -> Color {
 // ---------------------------------------------------------------------------
 
 fn apply_theme(ui: &MainWindow, choice: ThemeChoice) {
-    let theme = ui.global::<Theme>();
+    apply_theme_to(&ui.global::<Theme>(), choice);
+}
+
+/// 主题只往传入的 Theme 全局里写，这样主窗口和批量重命名窗口可以共用一套色值。
+fn apply_theme_to(theme: &Theme, choice: ThemeChoice) {
     match choice {
         ThemeChoice::Light => {
             theme.set_bg_main(Color::from_rgb_u8(0xF3, 0xF4, 0xF5));
@@ -5640,6 +5693,13 @@ impl App {
             .iter()
             .find(|e| e.path == path)
             .map(|e| e.is_dir)
+            // 搜索结果里的条目不在 entries 而在 deep_entries，同样带着 is_dir。
+            .or_else(|| {
+                pane.deep_entries
+                    .iter()
+                    .find(|e| e.path == path)
+                    .map(|e| e.is_dir)
+            })
     }
 
     /// 右键菜单里 Rove 自己那一部分（Shell 项之外）——直接产出原生菜单节点。
@@ -5741,7 +5801,13 @@ impl App {
                     // reveal_explorer 由上面的 CMD_REVEAL_EXPLORER 单独渲染，
                     // 这里排除掉，避免一级菜单里出现两个同名项。
                     .filter(|a| a.id != "builtin.reveal_explorer")
-                    .filter(|a| a.enabled && a.matches_selection(paths) && !dup(&a.id))
+                    // 「是不是文件夹」用已加载的条目快照回答：右键时再去
+                    // stat 网络路径会卡住界面线程（整个窗口未响应）。
+                    .filter(|a| {
+                        a.enabled
+                            && a.matches_selection(paths, |p| self.loaded_is_dir(p))
+                            && !dup(&a.id)
+                    })
                 {
                     if !groups.contains_key(&a.group) {
                         order.push(a.group.clone());
@@ -7762,6 +7828,14 @@ impl App {
                             }
                             Err(e) => self.set_status_job(e),
                         }
+                    }
+                    return;
+                }
+                "builtin.batch_rename" => {
+                    // 独立顶层窗口：可同时开多个，各自记住自己的选项。
+                    if let MenuScope::Selection(paths) = &target {
+                        let paths = paths.clone();
+                        self.open_batch_rename(paths);
                     }
                     return;
                 }
@@ -11722,6 +11796,7 @@ fn work_area_logical(_scale: f32) -> Option<(f32, f32)> {
     None
 }
 
+
 /// 屏幕分辨率（逻辑像素），用于首次启动按 75% 计算窗口大小并居中。
 /// 用物理分辨率而不是工作区，避免任务栏把「75%」再缩一次。
 #[cfg(windows)]
@@ -13353,6 +13428,830 @@ fn focus_window_attempt(ui: &MainWindow, attempt: u32) {
             focus_window_attempt(&ui, attempt + 1);
         }
     });
+}
+
+
+// ---------------------------------------------------------------------------
+// 批量重命名窗口
+// ---------------------------------------------------------------------------
+
+/// 一个待改名的条目（窗口打开时拍下的快照）。
+struct BatchItem {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+    checked: bool,
+}
+
+/// 一个批量重命名窗口的全部状态。
+struct BatchSession {
+    items: Vec<BatchItem>,
+    /// 所在目录现有条目名（小写）：判断「目标名已存在」用，避免在界面线程上查盘。
+    existing: HashSet<String>,
+    options: crate::ops::batch_rename::Options,
+    filter: i32,
+    /// 最近一次预览的计算结果（下标与 items 平行），供提交时取新名字。
+    previews: Vec<crate::ops::batch_rename::Preview>,
+    /// 窗口逻辑宽度：决定名字折行的位置。
+    win_w: f32,
+    /// 排好版的可见行（手写窗口化只从这里取视口附近的一小段）。
+    laid: Vec<BatchLaidRow>,
+    /// 内容总高度。
+    laid_h: f32,
+    /// 列表视口高度（Slint 每次变化都报上来）。
+    view_h: f32,
+    /// 滚动偏移，向下为正。
+    scroll: f32,
+    /// 上次推给界面的行区间 `[start, end)`；区间没变就不重建模型。
+    win: (usize, usize),
+    lang: String,
+}
+
+/// 一行排好版的结果：滚动时直接从这儿取，不重新算预览和折行。
+struct BatchLaidRow {
+    /// 对应 `BatchSession::items` 的下标（勾选状态从那儿读）。
+    item: usize,
+    /// 在内容坐标里的顶部位置与高度（绝对定位用）。
+    y: f32,
+    h: f32,
+    /// 折行时用的预算宽度：窗口宽度变了就得重折。
+    budget: f32,
+    orig: ModelRc<ModelRc<RenamePart>>,
+    new: ModelRc<ModelRc<RenamePart>>,
+    /// 折行前的原始片段，用来判断「这一行能不能沿用上一版」。
+    orig_raw: Vec<(String, bool)>,
+    new_raw: Vec<(String, bool)>,
+    state: i32,
+    reason: SharedString,
+}
+
+struct BatchWindowEntry {
+    /// 窗口编号：后台线程回传结果时用它找回来（Rc 不能跨线程）。
+    id: u64,
+    ui: slint::Weak<BatchRenameWindow>,
+    state: Rc<RefCell<BatchSession>>,
+}
+
+thread_local! {
+    /// 所有打开中的批量重命名窗口。可以同时有多个，各自独立。
+    static BATCH_WINDOWS: RefCell<Vec<BatchWindowEntry>> = RefCell::new(Vec::new());
+    static BATCH_NEXT_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
+/// 按编号找回窗口与其状态（只在界面线程里用）。
+fn batch_lookup(id: u64) -> Option<(BatchRenameWindow, Rc<RefCell<BatchSession>>)> {
+    BATCH_WINDOWS.with(|list| {
+        list.borrow()
+            .iter()
+            .find(|e| e.id == id)
+            .and_then(|e| e.ui.upgrade().map(|ui| (ui, e.state.clone())))
+    })
+}
+
+/// 打开一次批量重命名窗口。
+impl App {
+    fn open_batch_rename(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        let pane = self.state.active().active();
+        let dir = pane.path.clone();
+        // 现有条目名：只在该面板正看着「这些项所在目录」时才有意义；
+        // 搜索结果是跨目录的，那种情况下退回空集（提交前还会再查一次磁盘）。
+        let same_dir = dir
+            .as_ref()
+            .is_some_and(|d| paths.iter().all(|p| p.parent() == Some(d.as_path())));
+        let existing: HashSet<String> = if same_dir {
+            pane.entries
+                .iter()
+                .map(|e| e.name.to_lowercase())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let is_dir_of = |p: &PathBuf| -> bool {
+            pane.entries
+                .iter()
+                .find(|e| e.path == *p)
+                .map(|e| e.is_dir)
+                .unwrap_or(false)
+        };
+        let mut items: Vec<BatchItem> = Vec::with_capacity(paths.len());
+        for p in paths {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if name.is_empty() {
+                continue;
+            }
+            let is_dir = is_dir_of(&p);
+            items.push(BatchItem { path: p, name, is_dir, checked: true });
+        }
+        if items.is_empty() {
+            return;
+        }
+
+        // 初始尺寸完全照主窗口首次启动那套：屏的 75%，居中，且不超出工作区。
+        // 主窗口的 scale_factor 此时已是真实值（批量窗口刚建还没显示）。
+        let scale = self.ui.window().scale_factor().max(1.0);
+        let (screen_w, screen_h) = screen_size_logical(scale).unwrap_or((1920.0, 1080.0));
+        let mut start_w = (screen_w * 0.75).max(720.0);
+        let mut start_h = (screen_h * 0.75).max(460.0);
+        if let Some((aw, ah)) = work_area_logical(scale) {
+            start_w = start_w.min(aw).max(720.0);
+            start_h = start_h.min(ah - 60.0).max(460.0); // 留出标题栏
+        }
+        let start_x = ((screen_w - start_w) / 2.0).max(0.0);
+        let start_y = ((screen_h - start_h) / 2.0).max(0.0);
+
+        let session = Rc::new(RefCell::new(BatchSession {
+            previews: vec![Default::default(); items.len()],
+            laid: Vec::new(),
+            laid_h: 0.0,
+            view_h: 0.0,
+            scroll: 0.0,
+            win: (usize::MAX, usize::MAX),
+            items,
+            existing,
+            filter: 0,
+            win_w: start_w,
+            options: crate::ops::batch_rename::Options {
+                search: self.config.batch_rename.search.clone(),
+                replace: self.config.batch_rename.replace.clone(),
+                use_regex: self.config.batch_rename.use_regex,
+                match_all: self.config.batch_rename.match_all,
+                case_sensitive: self.config.batch_rename.case_sensitive,
+                apply_to: crate::ops::batch_rename::ApplyTo::from_index(
+                    self.config.batch_rename.apply_to,
+                ),
+            },
+            lang: self.config.language.clone(),
+        }));
+
+        let ui = match BatchRenameWindow::new() {
+            Ok(u) => u,
+            Err(err) => {
+                logln!("!! [batch-rename] 建窗口失败：{err}");
+                return;
+            }
+        };
+        // 文案与主题：新窗口是独立的组件树，两个全局都要各自下发一次。
+        ui.global::<I18n>()
+            .set_strings(ModelRc::new(VecModel::from(i18n::strings_for(
+                &self.config.language,
+            ))));
+        apply_theme_to(&ui.global::<Theme>(), self.config.theme);
+
+        let id = BATCH_NEXT_ID.with(|c| {
+            let id = c.get();
+            c.set(id + 1);
+            id
+        });
+        batch_push_static(&ui, &self.config.language);
+        {
+            // 上次用过的搜索词/替换词与三个开关也一并恢复。
+            let s = session.borrow();
+            ui.set_search_text(SharedString::from(s.options.search.as_str()));
+            ui.set_replace_text(SharedString::from(s.options.replace.as_str()));
+            ui.set_opt_regex(s.options.use_regex);
+            ui.set_opt_match_all(s.options.match_all);
+            ui.set_opt_case(s.options.case_sensitive);
+            ui.set_opt_apply_to(s.options.apply_to.to_index());
+        }
+        batch_wire(&ui, &session, id);
+        batch_refresh(&ui, &session);
+
+        ui.window().on_close_requested(move || {
+            // 关闭按钮只让窗口隐藏，不留登记（否则关掉的窗口会一直被引用着）。
+            let state = BATCH_WINDOWS.with(|list| {
+                let mut list = list.borrow_mut();
+                let found = list.iter().position(|e| e.id == id);
+                found.map(|i| list.remove(i).state.clone())
+            });
+            if let Some(state) = state {
+                if let Ok(state) = state.try_borrow() {
+                    batch_remember(&state);
+                }
+                batch_save_prefs();
+            }
+            slint::CloseRequestResponse::HideWindow
+        });
+
+        BATCH_WINDOWS.with(|list| {
+            list.borrow_mut().push(BatchWindowEntry {
+                id,
+                ui: ui.as_weak(),
+                state: session.clone(),
+            })
+        });
+        // 尺寸必须在 show() 之后再设：Slint 建窗时会先用组件声明的 preferred-*
+        // 决定初始大小，show 之前设的会被它覆盖。
+        if let Err(err) = ui.show() {
+            logln!("!! [batch-rename] 显示窗口失败：{err}");
+            return;
+        }
+        ui.window()
+            .set_size(WindowSize::Logical(LogicalSize::new(start_w, start_h)));
+        ui.window()
+            .set_position(WindowPosition::Logical(LogicalPosition::new(start_x, start_y)));
+        logln!("[batch-rename] 打开窗口，{} 项", session.borrow().items.len());
+    }
+}
+
+/// 静态文案（窗口标题、各控件标签、正则片段）。
+fn batch_push_static(ui: &BatchRenameWindow, lang: &str) {
+    let tr = |zh: &str| i18n::text(lang, zh);
+    ui.set_window_title(tr("批量重命名"));
+    ui.set_search_label(tr("搜索"));
+    ui.set_replace_label(tr("替换为"));
+    ui.set_apply_to_label(tr("应用于"));
+    ui.set_text_regex(tr("使用正则表达式"));
+    ui.set_text_match_all(tr("匹配所有出现的对象"));
+    ui.set_text_case(tr("区分大小写"));
+    ui.set_text_original(tr("原始"));
+    ui.set_text_renamed(tr("已重命名"));
+    ui.set_text_apply(tr("重命名"));
+    ui.set_text_show_all(tr("显示全部"));
+    ui.set_text_show_renamed(tr("仅显示已重命名"));
+    ui.set_apply_to_options(ModelRc::new(VecModel::from(vec![
+        tr("文件名 + 扩展名"),
+        tr("文件名"),
+        tr("扩展名"),
+    ])));
+    ui.set_regex_tokens(ModelRc::new(VecModel::from(vec![
+        SharedString::from("^"),
+        SharedString::from("$"),
+        SharedString::from("."),
+        SharedString::from("+"),
+        SharedString::from("?"),
+        SharedString::from("*"),
+        SharedString::from(r"\d"),
+        SharedString::from(r"\D"),
+        SharedString::from(r"\w"),
+        SharedString::from(r"\s"),
+        SharedString::from(r"\S"),
+        SharedString::from(r"\b"),
+    ])));
+}
+
+/// 接线：所有控件回调都作用在自己的 session 上，窗口之间互不干扰。
+fn batch_wire(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>, id: u64) {
+    let weak = ui.as_weak();
+
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_search_edited(move |text| {
+            state.borrow_mut().options.search = text.to_string();
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_replace_edited(move |text| {
+            state.borrow_mut().options.replace = text.to_string();
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_regex_toggled(move |on| {
+            state.borrow_mut().options.use_regex = on;
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_match_all_toggled(move |on| {
+            state.borrow_mut().options.match_all = on;
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_case_toggled(move |on| {
+            state.borrow_mut().options.case_sensitive = on;
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_apply_to_changed(move |idx| {
+            state.borrow_mut().options.apply_to = crate::ops::batch_rename::ApplyTo::from_index(idx);
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_row_toggled(move |id, want| {
+            let mut s = state.borrow_mut();
+            if let Some(item) = s.items.get_mut(id as usize) {
+                item.checked = want;
+            }
+            drop(s);
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_all_toggled(move |want| {
+            let mut s = state.borrow_mut();
+            for item in s.items.iter_mut() {
+                item.checked = want;
+            }
+            drop(s);
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_filter_changed(move |f| {
+            state.borrow_mut().filter = f;
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_token_clicked(move |token, caret, anchor| {
+            let token = token.to_string();
+            let mut s = state.borrow_mut();
+            let text = s.options.search.clone();
+            let (new_text, new_caret) = insert_at_selection(&text, &token, caret, anchor);
+            s.options.search = new_text.clone();
+            drop(s);
+            if let Some(ui) = weak.upgrade() {
+                ui.set_search_text(SharedString::from(new_text));
+                ui.invoke_put_caret(new_caret);
+            }
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_apply_clicked(move || {
+            batch_apply(id, &weak, &state);
+        });
+    }
+    {
+        // 滚动位置 / 视口高度变了：只换「看得见的那几十行」，不重算预览。
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_scrolled(move |offset, view_h| {
+            {
+                let mut s = state.borrow_mut();
+                s.scroll = offset.max(0.0);
+                s.view_h = view_h.max(0.0);
+            }
+            if let Some(ui) = weak.upgrade() {
+                batch_window(&ui, &state);
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_resized(move |w| {
+            let w = w as f32;
+            {
+                let mut s = state.borrow_mut();
+                // 拖动边缘时每像素都会回调，宽度没实质变化就不重算。
+                if (s.win_w - w).abs() < 12.0 {
+                    return;
+                }
+                s.win_w = w;
+            }
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+}
+
+/// 把窗口当前的选择抄进内存里的配置（不落盘：编辑器里每敲一个字都会走到这里）。
+fn batch_remember(s: &BatchSession) {
+    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    let Ok(mut app) = app.try_borrow_mut() else {
+        return;
+    };
+    let p = &mut app.config.batch_rename;
+    p.search.clone_from(&s.options.search);
+    p.replace.clone_from(&s.options.replace);
+    p.use_regex = s.options.use_regex;
+    p.match_all = s.options.match_all;
+    p.case_sensitive = s.options.case_sensitive;
+    p.apply_to = s.options.apply_to.to_index();
+}
+
+/// 关窗时把记住的选项写进 config.json。
+fn batch_save_prefs() {
+    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    let cfg = {
+        let Ok(borrowed) = app.try_borrow() else {
+            return;
+        };
+        borrowed.config.clone()
+    };
+    cfg.save();
+}
+
+/// 把 `token` 插到 `[caret, anchor]` 之间（有选中就替换选中内容），返回新的
+/// (文本, 新光标字节偏移)。偏移先夹到字符边界，避免切在 UTF-8 中间。
+fn insert_at_selection(text: &str, token: &str, caret: i32, anchor: i32) -> (String, i32) {
+    let clamp = |v: i32| -> usize {
+        let mut v = v.clamp(0, text.len() as i32) as usize;
+        while v > 0 && !text.is_char_boundary(v) {
+            v -= 1;
+        }
+        v
+    };
+    let a = clamp(caret);
+    let b = clamp(anchor);
+    let (start, end) = if a <= b { (a, b) } else { (b, a) };
+    let mut out = String::with_capacity(text.len() + token.len());
+    out.push_str(&text[..start]);
+    out.push_str(token);
+    out.push_str(&text[end..]);
+    (out, (start + token.len()) as i32)
+}
+
+fn batch_refresh_weak(weak: &slint::Weak<BatchRenameWindow>, state: &Rc<RefCell<BatchSession>>) {
+    if let Some(ui) = weak.upgrade() {
+        batch_refresh(&ui, state);
+    }
+}
+
+/// 重算预览并推给界面。
+fn batch_refresh(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>) {
+    let mut s = state.borrow_mut();
+    use crate::ops::batch_rename as br;
+    let compiled = br::compile(&s.options);
+    let regex_error = compiled.is_err();
+    let re = match &compiled {
+        Ok(r) => r.clone(),
+        Err(_) => None,
+    };
+    let lang = s.lang.clone();
+    let tr = |zh: &str| i18n::text(&lang, zh);
+
+    let mut previews: Vec<br::Preview> = s
+        .items
+        .iter()
+        .map(|it| br::preview(&it.name, it.is_dir, &s.options, re.as_ref(), &s.existing))
+        .collect();
+
+    // 命中项之间互相撞名要单独处理：如果某个「已存在」的名字正好属于本次
+    // 也会被改掉的另一项（它马上就搬走了），那不算冲突。
+    // 例：把 a.txt、b.txt 都选中，搜索 b 换成 c —— a.txt→b.txt 不该被拦。
+    let vacating: HashSet<String> = previews
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| s.items[*i].checked && p.new_name != s.items[*i].name)
+        .map(|(i, _)| s.items[i].name.to_lowercase())
+        .collect();
+    if !vacating.is_empty() {
+        let effective: HashSet<String> =
+            s.existing.iter().filter(|n| !vacating.contains(*n)).cloned().collect();
+        previews = s
+            .items
+            .iter()
+            .map(|it| br::preview(&it.name, it.is_dir, &s.options, re.as_ref(), &effective))
+            .collect();
+    }
+
+    // 两项算出同一个新名字：都标冲突（否则第二次 rename 会把第一项覆盖掉）。
+    let mut targets: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, p) in previews.iter().enumerate() {
+        if s.items[i].checked && p.state == br::RowState::Ready {
+            targets.entry(p.new_name.to_lowercase()).or_default().push(i);
+        }
+    }
+    for idxs in targets.values() {
+        if idxs.len() > 1 {
+            for &i in idxs {
+                previews[i].state = br::RowState::Conflict;
+                previews[i].reason = Some(br::Reason::DuplicateTarget);
+            }
+        }
+    }
+
+    batch_remember(&s);
+
+    // 折行预算只跟窗口宽度与正则侧栏有关，所有行共用。
+    let rail = if s.options.use_regex { 56.0 } else { 0.0 };
+    let col_w = ((s.win_w - rail - 288.0) / 2.0 - 22.0).max(90.0);
+    // grid_display_lines 按 11.5px 字号估算每字宽度，本窗口是 12.5px：
+    // 预算要等比例换算，再留几像素余量，末段才不会被挤成省略号。
+    let budget = col_w / 1.087 - 6.0;
+    let parts = |list: &[(String, bool)]| -> ModelRc<ModelRc<RenamePart>> {
+        // 折行直接复用图标视图那套算法（按字符宽度估、优先在分隔符处断行），
+        // 只是把字号差换算进可用宽度；不截断，名字完整显示。
+        // 12 行只是防御性上限（255 个字符的文件名也到不了）。
+        let wrapped = grid_display_lines(list, budget, 12);
+        ModelRc::new(VecModel::from(
+            wrapped
+                .into_iter()
+                .map(|line| {
+                    ModelRc::new(VecModel::from(
+                        line.into_iter()
+                            .map(|(text, hot)| RenamePart {
+                                text: SharedString::from(text.as_str()),
+                                hot,
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ModelRc<RenamePart>
+                })
+                .collect::<Vec<_>>(),
+        ))
+    };
+
+    // 整批行一次排好版：算出每行的绝对 y 和高度，总高度给滚动区。
+    // 滚动时只需要从这里截一段推给界面，不再重算预览与折行。
+    let mut cache: HashMap<usize, BatchLaidRow> = std::mem::take(&mut s.laid)
+        .into_iter()
+        .map(|r| (r.item, r))
+        .collect();
+    let mut laid: Vec<BatchLaidRow> = Vec::with_capacity(previews.len());
+    let mut y = 0.0f32;
+    for (i, p) in previews.iter().enumerate() {
+        if s.filter != 0 && p.new_name == s.items[i].name {
+            continue;
+        }
+        let (code, reason) = match p.state {
+            br::RowState::Unchanged => (0, SharedString::default()),
+            br::RowState::Ready => (1, SharedString::default()),
+            br::RowState::Invalid => (2, tr(p.reason.map(|r| r.zh_text()).unwrap_or("未更改"))),
+            br::RowState::Conflict => (3, tr(p.reason.map(|r| r.zh_text()).unwrap_or("未更改"))),
+        };
+        // 上一版里同一行的折行结果能沿用就沿用：敲一个字符时绝大多数行
+        // 并没有命中，没必要把几千个名字重新折一遍、重新建模型。
+        let cached = cache.remove(&i);
+        let (orig, new_name, h) = match cached {
+            Some(c)
+                if (c.budget - budget).abs() < 0.5
+                    && c.orig_raw == p.orig_parts
+                    && c.new_raw == p.new_parts =>
+            {
+                (c.orig, c.new, c.h)
+            }
+            _ => {
+                let orig = parts(&p.orig_parts);
+                let new_name = parts(&p.new_parts);
+                // 行高与 ui/batch_rename.slint 的约定一致：行数取两侧较长者，
+                // 17px 行距 + 上下各 5px。Rust 算是因为要靠它累计每行的位置。
+                let lines = orig.row_count().max(new_name.row_count());
+                (orig, new_name, lines as f32 * 17.0 + 10.0)
+            }
+        };
+        laid.push(BatchLaidRow {
+            item: i,
+            y,
+            h,
+            budget,
+            orig,
+            new: new_name,
+            orig_raw: p.orig_parts.clone(),
+            new_raw: p.new_parts.clone(),
+            state: code,
+            reason,
+        });
+        y += h;
+    }
+
+    let orig_count = s.items.len() as i32;
+    let renamed_count = previews
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| p.new_name != s.items[*i].name)
+        .count() as i32;
+    let can_apply = previews
+        .iter()
+        .enumerate()
+        .any(|(i, p)| s.items[i].checked && p.state == br::RowState::Ready);
+    let all_checked = !s.items.is_empty() && s.items.iter().all(|i| i.checked);
+    s.previews = previews;
+    s.laid = laid;
+    s.laid_h = y;
+    // 行集合变了：可见区间要按当前滚动位置重算一次。
+    s.win = (usize::MAX, usize::MAX);
+    drop(s);
+
+    ui.set_orig_count(orig_count);
+    ui.set_renamed_count(renamed_count);
+    ui.set_all_checked(all_checked);
+    ui.set_can_apply(can_apply);
+    ui.set_status_text(if regex_error {
+        tr("无效的正则表达式")
+    } else {
+        SharedString::default()
+    });
+    batch_window(ui, state);
+}
+
+/// 视口对应的行区间 `[start, end)`：上下各留 `buffer` 像素的缓冲。
+///
+/// `rows` 按内容顺序排列，`yh` 给出每行的 (顶部偏移, 高度)。
+fn visible_range<T>(
+    rows: &[T],
+    scroll: f32,
+    view_h: f32,
+    buffer: f32,
+    yh: impl Fn(&T) -> (f32, f32),
+) -> (usize, usize) {
+    let top = (scroll - buffer).max(0.0);
+    let bottom = scroll + view_h.max(0.0) + buffer;
+    let mut start = 0usize;
+    while start < rows.len() {
+        let (y, h) = yh(&rows[start]);
+        if y + h > top {
+            break;
+        }
+        start += 1;
+    }
+    let mut end = start;
+    while end < rows.len() && yh(&rows[end]).0 < bottom {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// 手写窗口化：只把视口上下各 300px 内的行推给界面。
+///
+/// Slint 的 `ListView` 虚拟化但行高必须统一，`ScrollView` 行高随意但要全部
+/// 实例化；一次选几千个文件时后者会卡，所以自己算「谁在视口里」。
+/// 区间没变就直接返回，拖滚动条时不会每像素重建模型。
+fn batch_window(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>) {
+    /// 视口上下各多放这么多，滚动时不至于露出空白。
+    const BUFFER: f32 = 300.0;
+
+    let mut s = state.borrow_mut();
+    // 首帧还没有真实视口高度：先按一个保守值铺，Slint 报上来后会重算。
+    let view_h = if s.view_h > 1.0 { s.view_h } else { 900.0 };
+    // 内容变短（改完名、切换筛选）之后滚动位置可能已经超出底部：先夹住，
+    // 否则会算出一个空区间，列表先白一帧再被 Slint 的越界回弹拉回来。
+    let scroll = s.scroll.clamp(0.0, (s.laid_h - view_h).max(0.0));
+    s.scroll = scroll;
+    let (start, end) = visible_range(&s.laid, scroll, view_h, BUFFER, |r| (r.y, r.h));
+    if s.win == (start, end) {
+        return;
+    }
+    s.win = (start, end);
+
+    let rows: Vec<RenameRow> = s.laid[start..end]
+        .iter()
+        .map(|r| RenameRow {
+            id: r.item as i32,
+            y: r.y,
+            h: r.h,
+            orig: r.orig.clone(),
+            new: r.new.clone(),
+            state: r.state,
+            reason: r.reason.clone(),
+            checked: s.items.get(r.item).map(|i| i.checked).unwrap_or(false),
+        })
+        .collect();
+    let total_h = s.laid_h;
+    // 先放手再碰界面：写属性会同步触发 Slint 回调（可能又回到这里）。
+    drop(s);
+
+    // 先给内容高度再换行：反过来，Slint 会先用旧的（可能更小的）高度去夹
+    // content-y，把正确的滚动位置夹小，回来又把我们的 scroll 改掉。
+    ui.set_content_h(total_h);
+    ui.set_rows(ModelRc::new(VecModel::from(rows)));
+}
+
+/// 提交：把「勾选且合法」的行放到后台线程改名。
+fn batch_apply(
+    id: u64,
+    weak: &slint::Weak<BatchRenameWindow>,
+    state: &Rc<RefCell<BatchSession>>,
+) {
+    let plan: Vec<(usize, crate::ops::batch_rename::PlanItem)> = {
+        let s = state.borrow();
+        let mut plan = Vec::new();
+        for (i, item) in s.items.iter().enumerate() {
+            let Some(p) = s.previews.get(i) else { continue };
+            if !item.checked || p.state != crate::ops::batch_rename::RowState::Ready {
+                continue;
+            }
+            let Some(parent) = item.path.parent() else { continue };
+            plan.push((
+                i,
+                crate::ops::batch_rename::PlanItem {
+                    from: item.path.clone(),
+                    to: parent.join(&p.new_name),
+                },
+            ));
+        }
+        plan
+    };
+    if plan.is_empty() {
+        if let Some(ui) = weak.upgrade() {
+            let lang = state.borrow().lang.clone();
+            ui.set_status_text(i18n::text(&lang, "没有可重命名的项"));
+        }
+        return;
+    }
+
+    let items: Vec<crate::ops::batch_rename::PlanItem> =
+        plan.iter().map(|(_, p)| p.clone()).collect();
+    // 磁盘操作一律离开界面线程：网络盘上一次 rename 就能卡住整个窗口。
+    std::thread::spawn(move || {
+        let summary = crate::ops::batch_rename::execute(&items);
+        let done = summary.renamed_items.clone();
+        let failed = summary.failed.clone();
+        let skipped = summary.skipped_existing.len();
+        // 这里只能捕获能跨线程的值：Rc 状态回界面线程后按 id 再查一次。
+        let _ = slint::invoke_from_event_loop(move || {
+            // 主面板先跟着改名结果走：即使用户在改名过程中关掉了批量窗口
+            // （此时按 id 已经查不到），磁盘上的名字也变了，列表必须刷新，
+            // 否则列表里全是已经不存在的旧名字。
+            batch_sync_pane(&done);
+            let Some((ui, state)) = batch_lookup(id) else { return };
+            let lang = state.borrow().lang.clone();
+            // 1. 把成功的项换成新路径/新名字，并同步「现有名字」快照。
+            {
+                let mut s = state.borrow_mut();
+                for done_item in &done {
+                    let new_name = done_item
+                        .to
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let idx = s.items.iter().position(|i| i.path == done_item.from);
+                    if let Some(idx) = idx {
+                        let old = std::mem::take(&mut s.items[idx].name);
+                        s.existing.remove(&old.to_lowercase());
+                        s.existing.insert(new_name.to_lowercase());
+                        s.items[idx].path = done_item.to.clone();
+                        s.items[idx].name = new_name;
+                    }
+                }
+            }
+            // 2. 状态栏（面板已在上面同步过了）。
+            {
+                let tr = |zh: &str| i18n::text(&lang, zh);
+                let skipped_total = skipped + failed.len();
+                let text = if done.is_empty() && skipped_total > 0 {
+                    tr("重命名失败").to_string()
+                } else {
+                    tr("已重命名 {} 项，跳过 {} 项")
+                        .to_string()
+                        .replacen("{}", &done.len().to_string(), 1)
+                        .replacen("{}", &skipped_total.to_string(), 1)
+                };
+                batch_refresh(&ui, &state);
+                ui.set_status_text(SharedString::from(text));
+            }
+            if let Some((path, err)) = failed.first() {
+                logln!("!! [batch-rename] 改名失败 {:?}: {err}", path);
+            }
+        });
+    });
+}
+
+/// 主面板跟随改名结果：换掉选中集里的旧路径，然后刷新列表。
+fn batch_sync_pane(done: &[crate::ops::batch_rename::PlanItem]) {
+    if done.is_empty() {
+        return;
+    }
+    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+        return;
+    };
+    let refresh_here = {
+        let mut app = app.borrow_mut();
+        let tab = app.state.active_mut();
+        let pane = tab.active_mut();
+        let here = pane.path.clone();
+        let in_place = done
+            .iter()
+            .all(|d| d.from.parent().map(|p| Some(p.to_path_buf())) == Some(here.clone()));
+        for d in done {
+            if pane.selection.remove(&d.from) {
+                pane.selection.insert(d.to.clone());
+            }
+        }
+        // 暂存盘/剪切标记里存的是旧路径，一并跟上。
+        for d in done {
+            app.state.cut_paths.remove(&d.from);
+        }
+        in_place
+    };
+    if refresh_here {
+        app.borrow_mut().reload_active();
+    }
 }
 
 /// 光标（屏幕）位置 → 窗口客户区逻辑坐标。

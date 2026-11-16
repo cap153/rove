@@ -1,0 +1,845 @@
+// 批量重命名窗口（对齐 PowerToys PowerRename 的核心部分）。
+//
+// 每个窗口对应一次「右键 → 批量重命名…」，可以同时开多个，互不影响；
+// 所以这里是一个独立 Window 组件而不是主窗口里的弹层。
+//
+// 关键取舍（与需求确认一致）：
+// - **不绑定任何快捷键**：Enter 不提交、Ctrl+Enter 不存在、Esc 也不关闭。
+//   唯一提交方式是点右上角的「重命名」按钮，避免在搜索框里顺手回车、
+//   替换框还空着就把名字里的命中文本全删掉。
+// - 「已重命名」列是**实时预览**，只有点按钮才真的改磁盘。
+// - 原始列高亮「会被替换掉的片段」，新名列高亮「替换进去的片段」。
+// - 不做文本格式 / 枚举 / 随机 / 文件时间 / EXIF / ${} 变量。
+import { Theme } from "common.slint";
+import { I18n } from "i18n.slint";
+import { SingleLineEdit } from "single_line_edit.slint";
+
+
+/// 名字里的一段：`hot` 为真表示这段要高亮（原始列＝被替换，新名列＝替换进去的）。
+export struct RenamePart {
+    text: string,
+    hot: bool,
+}
+
+/// 一行。`state`：0 未更改 / 1 可改名 / 2 非法 / 3 冲突。
+export struct RenameRow {
+    id: int,
+    // 多行：外层是行、内层是带高亮标记的片段。文件名太长时自动折行。
+    orig: [[RenamePart]],
+    new: [[RenamePart]],
+    state: int,
+    reason: string,
+    checked: bool,
+    // 手写窗口化：Rust 已经算好每行的绝对位置和高度，这里只负责按位置画。
+    y: length,
+    h: length,
+}
+
+component Check inherits Rectangle {
+    in property <bool> checked: false;
+    in property <bool> enabled: true;
+    callback toggled();
+
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    background: root.checked ? Theme.accent : Theme.bg-input;
+    border-width: 1px;
+    border-color: root.checked ? Theme.accent : Theme.border;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    // 对勾用两段斜线画，不依赖字体字形。
+    Path {
+        visible: root.checked;
+        x: 2.5px;
+        y: 2.5px;
+        width: 11px;
+        height: 11px;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        commands: "M 1 6 L 4.5 9.5 L 11 2";
+        stroke: Theme.accent-text;
+        stroke-width: 2px;
+        fill: transparent;
+        stroke-line-cap: round;
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.toggled(); }
+    }
+}
+
+/// 带文字的小复选框（点文字也能切换）。
+component LabelCheck inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> checked: false;
+    callback toggled();
+
+    height: 22px;
+    background: transparent;
+
+    // 垫在最底层的点击区：文字本身不吞鼠标，所以点「文字」落到这里；
+    // 勾选框自己有自己的点击区（在上面），两者不会重复触发。
+    TouchArea {
+        clicked => { root.toggled(); }
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        alignment: start;
+        VerticalLayout {
+            alignment: center;
+            Check {
+                checked: root.checked;
+                toggled => { root.toggled(); }
+            }
+        }
+        Text {
+            text: root.text;
+            color: Theme.text-primary;
+            font-size: 12.5px;
+            vertical-alignment: center;
+        }
+    }
+}
+
+component FlatButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> selected: false;
+    callback clicked();
+
+    height: 24px;
+    min-width: 52px;
+    border-radius: 5px;
+    background: root.selected ? Theme.accent : Theme.bg-input;
+    border-width: 1px;
+    border-color: root.selected ? Theme.accent : Theme.border;
+
+    Text {
+        text: root.text;
+        color: root.selected ? Theme.accent-text : Theme.text-secondary;
+        font-size: 11.5px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component PrimaryButton inherits Rectangle {
+    in property <string> text: "";
+    in property <bool> enabled: true;
+    callback clicked();
+
+    height: 32px;
+    min-width: 96px;
+    border-radius: 6px;
+    background: root.enabled ? Theme.accent : Theme.bg-badge;
+
+    Text {
+        text: root.text;
+        color: root.enabled ? Theme.accent-text : Theme.text-disabled;
+        font-size: 12.5px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+}
+
+/// 正则片段插入按钮：点击把符号插到搜索框光标处。
+component TokenButton inherits Rectangle {
+    in property <string> token: "";
+    callback activated();
+
+    height: 24px;
+    border-radius: 5px;
+    background: ta.has-hover ? Theme.bg-hover : Theme.bg-input;
+    border-width: 1px;
+    border-color: Theme.border;
+
+    Text {
+        text: root.token;
+        color: Theme.text-primary;
+        font-size: 12px;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        clicked => { root.activated(); }
+    }
+}
+
+/// 「应用于」下拉：与设置页 ComboRow 同一套视觉，但更紧凑。
+component Combo inherits Rectangle {
+    in property <[string]> options: [];
+    in-out property <int> selected: 0;
+    in-out property <bool> open: false;
+    callback changed(int);
+
+    height: 30px;
+    border-radius: 6px;
+    background: Theme.bg-input;
+    border-width: 1px;
+    border-color: root.open ? Theme.accent : Theme.border;
+
+    Text {
+        x: 10px;
+        width: parent.width - 34px;
+        height: parent.height;
+        text: root.options[root.selected];
+        color: Theme.text-primary;
+        font-size: 12px;
+        vertical-alignment: center;
+        overflow: elide;
+    }
+    Text {
+        x: parent.width - 20px;
+        width: 14px;
+        height: parent.height;
+        text: root.open ? "▲" : "▼";
+        color: Theme.text-secondary;
+        font-size: 8px;
+        vertical-alignment: center;
+        horizontal-alignment: center;
+    }
+    TouchArea {
+        clicked => { root.open = !root.open; }
+    }
+}
+
+component RowView inherits Rectangle {
+    in property <RenameRow> data;
+    callback toggled(int, bool);
+
+    // 行高跟着名字的行数走：一行就是一行的高度，绝不为了照顾长的把短的撑高。
+    // 具体数值由 Rust 算好（它要据此累计每行的位置），这里只做排版。
+    property <int> lines: max(data.orig.length, data.new.length);
+    property <length> row-height: data.h;
+
+    height: data.h;
+    // 绝对定位：y 由 Rust 按整份清单累计给出，这样模型里只有附近几十行时
+    // 滚动位置也不会错乱。
+    y: data.y;
+    background: bg.has-hover ? Theme.bg-hover : transparent;
+
+    // 整行可点（勾选框在自己那层之上，点它只切换一次）。
+    bg := TouchArea {
+        clicked => { root.toggled(data.id, !data.checked); }
+    }
+
+    HorizontalLayout {
+        padding-left: 6px;
+        padding-right: 6px;
+        spacing: 8px;
+
+        VerticalLayout {
+            alignment: center;
+            Check {
+                checked: data.checked;
+                toggled => { root.toggled(data.id, !data.checked); }
+            }
+        }
+
+        // 原始名：命中片段用强调色，长名字自动折行（行数不限）。
+        Rectangle {
+            horizontal-stretch: 1;
+            clip: true;
+            background: transparent;
+            VerticalLayout {
+                alignment: start;
+                padding-top: (root.row-height - 17px * data.orig.length) / 2;
+                for line in data.orig: HorizontalLayout {
+                    spacing: 0px;
+                    for part[j] in line: Text {
+                        text: part.text;
+                        color: part.hot ? Theme.accent : Theme.text-secondary;
+                        font-size: 12.5px;
+                        vertical-alignment: center;
+                        // 除最后一段外宽度钉死，最后一段吸收整行剩余空间：
+                        // 否则布局会把余量平摊到片段之间，高亮片段左右就出现大缝
+                        //（名字里有括号时最明显）。
+                        min-width: j == line.length - 1 ? 0px : self.preferred-width;
+                        max-width: j == line.length - 1 ? 100000px : self.preferred-width;
+                        horizontal-stretch: j == line.length - 1 ? 1 : 0;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+
+        // 新名字：替换进去的片段用强调色；非法/冲突用危险色并给出原因。
+        Rectangle {
+            horizontal-stretch: 1;
+            clip: true;
+            background: transparent;
+            HorizontalLayout {
+                spacing: 6px;
+                Rectangle {
+                    horizontal-stretch: 1;
+                    clip: true;
+                    background: transparent;
+                    VerticalLayout {
+                        alignment: start;
+                        padding-top: (root.row-height - 17px * data.new.length) / 2;
+                        for line in data.new: HorizontalLayout {
+                            spacing: 0px;
+                            for part[j] in line: Text {
+                                min-width: j == line.length - 1 ? 0px : self.preferred-width;
+                                max-width: j == line.length - 1 ? 100000px : self.preferred-width;
+                                horizontal-stretch: j == line.length - 1 ? 1 : 0;
+                                overflow: elide;
+                                text: part.text;
+                                color: (data.state == 2 || data.state == 3)
+                                    ? Theme.danger
+                                    : (part.hot ? Theme.accent : Theme.text-primary);
+                                font-size: 12.5px;
+                                vertical-alignment: center;
+                                wrap: no-wrap;
+                            }
+                        }
+                    }
+                }
+                Text {
+                    visible: data.reason != "";
+                    text: data.reason;
+                    color: Theme.danger;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                    min-width: 0px;
+                }
+            }
+        }
+    }
+}
+
+export component BatchRenameWindow inherits Window {
+    title: root.window-title;
+    default-font-family: Theme.font-family;
+    // 尺寸必须用 min/preferred 而不是固定 width/height —— 与主窗口同一套写法。
+    // 写成固定 width/height 时 Slint 会把窗口当成"不可调整大小"：最大化按钮变灰、
+    // 边框也拖不动。实际打开尺寸由 Rust 在 show() 之后设置（见 open_batch_rename）。
+    min-width: 720px;
+    min-height: 460px;
+    preferred-width: 1280px;
+    preferred-height: 820px;
+
+    /// 所有行加起来的像素高度（Rust 算好推来）。自绘滚动条与滚动范围都靠它，
+    /// 因为 Flickable 用 `for` 循环填内容时不会自动算内容尺寸。
+    in property <length> content-h: 0px;
+    // 内容变短后（重命名成功、切换筛选）把滚动位置拉回有效范围。
+    changed content-h => {
+        if (root.content-h <= fl.height) {
+            fl.content-y = 0px;
+        }
+    }
+
+    in property <string> window-title: "";
+    in property <string> search-label: "";
+    in property <string> replace-label: "";
+    in property <string> apply-to-label: "";
+    in property <[string]> apply-to-options: [];
+    in property <string> text-regex: "";
+    in property <string> text-match-all: "";
+    in property <string> text-case: "";
+    in property <string> text-original: "";
+    in property <string> text-renamed: "";
+    in property <string> text-apply: "";
+    in property <string> text-show-all: "";
+    in property <string> text-show-renamed: "";
+    in property <[string]> regex-tokens: [];
+
+    in-out property <string> search-text: "";
+    in-out property <string> replace-text: "";
+    in-out property <bool> opt-regex: false;
+    in-out property <bool> opt-match-all: false;
+    in-out property <bool> opt-case: false;
+    in-out property <int> opt-apply-to: 0;
+    in-out property <int> filter: 0;
+    in-out property <[RenameRow]> rows: [];
+    in-out property <int> orig-count: 0;
+    in-out property <int> renamed-count: 0;
+    in-out property <bool> all-checked: false;
+    in-out property <bool> can-apply: false;
+    in-out property <string> status-text: "";
+
+    callback search-edited(string);
+    callback replace-edited(string);
+    callback token-clicked(string, int, int);
+    callback regex-toggled(bool);
+    callback match-all-toggled(bool);
+    callback case-toggled(bool);
+    callback apply-to-changed(int);
+    callback row-toggled(int, bool);
+    callback all-toggled(bool);
+    callback filter-changed(int);
+    callback apply-clicked();
+    callback resized(int);
+    /// 滚动位置（向下为正）与视口高度，单位 px。
+    callback scrolled(length, length);
+
+
+    Rectangle {
+        background: Theme.bg-main;
+
+        VerticalLayout {
+            // 主体：左侧控制区 + 右侧列表。
+            HorizontalLayout {
+                vertical-stretch: 1;
+                spacing: 0px;
+
+                // 正则片段侧栏（只在勾选「使用正则表达式」时出现）。
+                if root.opt-regex: Rectangle {
+                    width: 56px;
+                    background: Theme.bg-sidebar;
+                    border-width: 1px;
+                    border-color: Theme.divider;
+
+                    VerticalLayout {
+                        padding-top: 10px;
+                        padding-bottom: 8px;
+                        padding-left: 8px;
+                        padding-right: 8px;
+                        spacing: 4px;
+                        alignment: start;
+
+                        for idx in 12: TokenButton {
+                            token: root.regex-tokens[idx];
+                            activated => {
+                                // 插入到搜索框当前光标处（有选中则替换选中内容）。
+                                root.token-clicked(
+                                    root.regex-tokens[idx],
+                                    search.caret-byte,
+                                    search.anchor-byte,
+                                );
+                            }
+                        }
+                    }
+
+                }
+
+                // 控制区。
+                Rectangle {
+                    width: 288px;
+                    background: Theme.bg-main;
+
+                    VerticalLayout {
+                        padding-left: 12px;
+                        padding-right: 12px;
+                        padding-top: 12px;
+                        padding-bottom: 10px;
+                        spacing: 8px;
+
+                        Text {
+                            text: root.search-label;
+                            color: Theme.text-secondary;
+                            font-size: 11.5px;
+                        }
+
+                        Rectangle {
+                            height: 32px;
+                            border-radius: 6px;
+                            background: Theme.bg-input;
+                            border-width: 1px;
+                            border-color: search.has-focus ? Theme.accent : Theme.border;
+                            clip: true;
+
+                            search := SingleLineEdit {
+                                x: 8px;
+                                width: parent.width - 16px;
+                                height: parent.height;
+                                text <=> root.search-text;
+                                font-size: 12.5px;
+                                text-color: Theme.text-primary;
+                                selection-background: Theme.accent;
+                                selection-foreground: Theme.accent-text;
+                                edited(t) => { root.search-edited(t); }
+                            }
+                        }
+
+                        LabelCheck {
+                            text: root.text-regex;
+                            checked: root.opt-regex;
+                            toggled => {
+                                root.opt-regex = !root.opt-regex;
+                                root.regex-toggled(root.opt-regex);
+                            }
+                        }
+                        LabelCheck {
+                            text: root.text-match-all;
+                            checked: root.opt-match-all;
+                            toggled => {
+                                root.opt-match-all = !root.opt-match-all;
+                                root.match-all-toggled(root.opt-match-all);
+                            }
+                        }
+                        LabelCheck {
+                            text: root.text-case;
+                            checked: root.opt-case;
+                            toggled => {
+                                root.opt-case = !root.opt-case;
+                                root.case-toggled(root.opt-case);
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: Theme.divider;
+                        }
+
+                        Text {
+                            text: root.replace-label;
+                            color: Theme.text-secondary;
+                            font-size: 11.5px;
+                        }
+
+                        Rectangle {
+                            height: 32px;
+                            border-radius: 6px;
+                            background: Theme.bg-input;
+                            border-width: 1px;
+                            border-color: replace.has-focus ? Theme.accent : Theme.border;
+                            clip: true;
+
+                            replace := SingleLineEdit {
+                                x: 8px;
+                                width: parent.width - 16px;
+                                height: parent.height;
+                                text <=> root.replace-text;
+                                font-size: 12.5px;
+                                text-color: Theme.text-primary;
+                                selection-background: Theme.accent;
+                                selection-foreground: Theme.accent-text;
+                                edited(t) => { root.replace-edited(t); }
+                            }
+                        }
+
+                        Text {
+                            text: root.apply-to-label;
+                            color: Theme.text-secondary;
+                            font-size: 11.5px;
+                        }
+
+                        combo := Combo {
+                            options: root.apply-to-options;
+                            selected: root.opt-apply-to;
+                        }
+
+                        // 下拉展开层：就地展开（叠层绝对定位在布局里不可靠），
+                        // 点条目选中、点外部由再次点下拉收起。
+                        if combo.open: Rectangle {
+                            background: Theme.bg-popup;
+                            border-width: 1px;
+                            border-color: Theme.border;
+                            border-radius: 6px;
+
+                            VerticalLayout {
+                                padding: 3px;
+                                spacing: 0px;
+                                for opt in 3: Rectangle {
+                                    height: 26px;
+                                    border-radius: 4px;
+                                    // 悬停与「当前选中」都要有底色，否则鼠标划过去毫无反馈。
+                                    background: (opt == root.opt-apply-to || opt-ta.has-hover)
+                                        ? Theme.bg-hover
+                                        : transparent;
+                                    opt-ta := TouchArea {
+                                        clicked => {
+                                            combo.open = false;
+                                            root.opt-apply-to = opt;
+                                            root.apply-to-changed(opt);
+                                        }
+                                    }
+                                    Text {
+                                        x: 10px;
+                                        width: parent.width - 20px;
+                                        height: parent.height;
+                                        text: root.apply-to-options[opt];
+                                        color: Theme.text-primary;
+                                        font-size: 12px;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            vertical-stretch: 1;
+                            background: transparent;
+                        }
+
+                        Text {
+                            text: root.status-text;
+                            color: Theme.text-secondary;
+                            font-size: 11.5px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // 列表区。
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: Theme.bg-list;
+
+                    VerticalLayout {
+                        // 过滤条：两个按钮单独一行。
+                        // 之前它们挤在表头里，占掉了表头的宽度，导致「已重命名」
+                        // 标题比下面的名字列整体左移一大截。
+                        Rectangle {
+                            height: 34px;
+                            background: Theme.bg-toolbar;
+
+                            HorizontalLayout {
+                                padding-left: 8px;
+                                padding-right: 10px;
+                                alignment: end;
+                                spacing: 6px;
+                                FlatButton {
+                                    text: root.text-show-all;
+                                    selected: root.filter == 0;
+                                    clicked => {
+                                        root.filter = 0;
+                                        root.filter-changed(0);
+                                    }
+                                }
+                                FlatButton {
+                                    text: root.text-show-renamed;
+                                    selected: root.filter == 1;
+                                    clicked => {
+                                        root.filter = 1;
+                                        root.filter-changed(1);
+                                    }
+                                }
+                            }
+
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: Theme.divider;
+                            }
+                        }
+
+                        // 表头：几何必须与 RowView 完全一致（同样的左边距、间距、
+                        // 复选框宽度、两列各占一半），标题才会正对下面的名字。
+                        // 右侧多留 14px 给滚动条 + 6px 行内边距。
+                        Rectangle {
+                            height: 30px;
+                            background: Theme.bg-toolbar;
+
+                            HorizontalLayout {
+                                padding-left: 6px;
+                                // 6px 行内边距 + 9px 滚动条宽度：名字列与表头对齐。
+                                padding-right: 15px;
+                                spacing: 8px;
+
+                                VerticalLayout {
+                                    alignment: center;
+                                    Check {
+                                        checked: root.all-checked;
+                                        toggled => { root.all-toggled(!root.all-checked); }
+                                    }
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.text-original + " (" + root.orig-count + ")";
+                                    color: Theme.text-primary;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: root.text-renamed + " (" + root.renamed-count + ")";
+                                    color: Theme.text-primary;
+                                    font-size: 12px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    // 直接顶到最右边：不用再去凑和名字列的起始位置。
+                                    horizontal-alignment: right;
+                                }
+                            }
+
+                            Rectangle {
+                                y: parent.height - 1px;
+                                height: 1px;
+                                background: Theme.divider;
+                            }
+                        }
+
+                        // 自绘滚动区：用 Flickable + 自己画的滚动条，
+                        // 不用 std-widgets 的 ScrollView —— 它的滚动条颜色跟随
+                        // 系统配色，系统深色 + Rove 浅色时会在白底上出现黑槽。
+                        Rectangle {
+                            vertical-stretch: 1;
+                            clip: true;
+
+                            // 滚轮兜底：行上的 TouchArea 只管点击，滚轮会冒泡到这里，
+                            // 由这里统一换算成滚动（不依赖 Flickable 自己的交互逻辑）。
+                            TouchArea {
+                                width: parent.width - 9px;
+                                height: parent.height;
+
+                                scroll-event(e) => {
+                                    if (e.delta-y == 0px) {
+                                        return EventResult.reject;
+                                    }
+                                    let max-scroll = max(0px, root.content-h - fl.height);
+                                    fl.content-y = min(0px, max(-max-scroll, fl.content-y + e.delta-y));
+                                    return EventResult.accept;
+                                }
+                            }
+
+                            fl := Flickable {
+                                width: parent.width - 9px;
+                                height: parent.height;
+                                // 用 for 循环填内容时 Flickable 不会自己算内容高度。
+                                content-width: self.width;
+                                content-height: root.content-h;
+                                // 不让 Flickable 自己抢鼠标：行要能点击勾选，滚轮另有人管。
+                                interactive: false;
+                                mouse-drag-pan-enabled: false;
+
+                                // 手写窗口化：滚动位置或视口高度一变就告诉 Rust，
+                                // 由它决定要不要换一批行（区间没变就不换）。
+                                changed content-y => {
+                                    root.scrolled(-fl.content-y, fl.height);
+                                }
+                                changed height => {
+                                    root.scrolled(-fl.content-y, fl.height);
+                                }
+
+                                // 绝对定位：模型里只放视口附近的行，y 是它在整个
+                                // 内容里的真实位置，所以滚动时内容不会错位。
+                                for item in root.rows: RowView {
+                                    data: item;
+                                    toggled(id, want) => { root.row-toggled(id, want); }
+                                }
+                            }
+
+                            // 竖向滚动条（仅内容超出时出现）。
+                            // Flickable 的 content-y 是「负数」的（0 在顶部，向下为负），
+                            // 滑块位置和拖动都必须按这个方向算，否则滑块永远贴在顶部。
+                            scrollbar := Rectangle {
+                                visible: root.content-h > fl.height + 1px;
+                                x: parent.width - self.width;
+                                width: 9px;
+                                height: 100%;
+                                background: transparent;
+
+                                property <length> track-h: self.height;
+                                // 滑块高度按可见比例算：太短不好点，太长会让行程变成负数。
+                                property <length> thumb-h: max(
+                                    28px,
+                                    min(self.track-h, self.track-h * fl.height / max(1px, root.content-h)),
+                                );
+                                property <length> thumb-y: (self.track-h - self.thumb-h)
+                                    * (-fl.content-y / max(1px, root.content-h - fl.height));
+                                // 按下时鼠标离滑块顶部的距离：拖动时保持这个偏移，滑块才不会跳。
+                                property <length> grab: 0px;
+
+                                Rectangle {
+                                    x: 1px;
+                                    width: parent.width - 2px;
+                                    y: min(scrollbar.track-h - scrollbar.thumb-h, max(0px, scrollbar.thumb-y));
+                                    height: scrollbar.thumb-h;
+                                    border-radius: 3px;
+                                    background: sb-ta.pressed
+                                        ? Theme.text-primary.transparentize(0.3)
+                                        : (sb-ta.has-hover
+                                            ? Theme.text-primary.transparentize(0.45)
+                                            : Theme.text-primary.transparentize(0.6));
+                                }
+
+                                sb-ta := TouchArea {
+                                    width: 100%;
+                                    height: 100%;
+
+                                    pointer-event(e) => {
+                                        if (e.kind == PointerEventKind.down
+                                            && e.button == PointerEventButton.left) {
+                                            scrollbar.grab = self.mouse-y
+                                                - min(
+                                                    scrollbar.track-h - scrollbar.thumb-h,
+                                                    max(0px, scrollbar.thumb-y),
+                                                );
+                                        }
+                                    }
+
+                                    moved => {
+                                        if (self.pressed) {
+                                            let travel = max(scrollbar.track-h - scrollbar.thumb-h, 1px);
+                                            let ratio = clamp(
+                                                (self.mouse-y - scrollbar.grab) / travel,
+                                                0.0,
+                                                1.0,
+                                            );
+                                            fl.content-y = -ratio * max(0px, root.content-h - fl.height);
+                                        }
+                                    }
+
+                                    // 指针停在滚动条上时滚轮也要能滚列表。
+                                    scroll-event(e) => {
+                                        if (e.delta-y != 0px) {
+                                            let max-scroll = max(0px, root.content-h - fl.height);
+                                            fl.content-y = min(
+                                                0px,
+                                                max(-max-scroll, fl.content-y + e.delta-y),
+                                            );
+                                            return EventResult.accept;
+                                        }
+                                        return EventResult.reject;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 底部操作条。
+            Rectangle {
+                height: 52px;
+                background: Theme.bg-toolbar;
+                Rectangle {
+                    y: 0px;
+                    height: 1px;
+                    background: Theme.divider;
+                }
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    alignment: end;
+                    VerticalLayout {
+                        alignment: center;
+                        PrimaryButton {
+                            text: root.text-apply;
+                            enabled: root.can-apply;
+                            clicked => { root.apply-clicked(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    changed width => {
+        root.resized(root.width / 1px);
+    }
+
+    public function put-caret(byte-offset: int) {
+        // 点侧栏按钮后把焦点还给搜索框，方便接着敲。
+        search.focus-input();
+        search.put-caret(byte-offset);
+    }
+}

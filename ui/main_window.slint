@@ -18,6 +18,8 @@ export { SettingsDriveItem } from "common.slint";
 // ui.global::<Theme>() 访问，否则其值会被编译期内联。
 export { Theme } from "common.slint";
 export { DialogJumpWindow, JumpResult } from "dialog_jump.slint";
+// 批量重命名：独立顶层窗口（可同时开多个），由 Rust 侧按需创建。
+export { BatchRenameWindow, RenameRow, RenamePart } from "batch_rename.slint";
 
 // 工具栏导航按钮（内部自居中，高度适应工具栏，杜绝偏上问题）
 component nav-btn inherits Rectangle {

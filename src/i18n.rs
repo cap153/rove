@@ -259,6 +259,47 @@ pub const ZH: &[&str] = &[
     "反选",
     // 251：标签栏右键菜单「关闭全部」（追加在末尾，见上方测试里的下标约定）。
     "关闭全部",
+    // ---- 批量重命名（252 起；ui/batch_rename.slint 全部通过属性接收，不硬编码下标）----
+    "批量重命名",             // 252 菜单项
+    "批量重命名",             // 253 窗口标题
+    "搜索",                   // 254
+    "替换为",                 // 255
+    "使用正则表达式",         // 256
+    "匹配所有出现的对象",     // 257
+    "区分大小写",             // 258
+    "应用于",                 // 259
+    "文件名 + 扩展名",        // 260
+    "文件名",                 // 261
+    "扩展名",                 // 262
+    "原始",                   // 263
+    "已重命名",               // 264
+    "重命名",                 // 265
+    "显示全部",               // 266
+    "仅显示已重命名",         // 267
+    "未更改",                 // 268
+    "名称为空",               // 269
+    "名称包含非法字符",       // 270
+    "名称不能以空格或点结尾", // 271
+    "名称是系统保留名",       // 272
+    "名称过长",               // 273
+    "目标名已存在",           // 274
+    "与另一项的新名字重复",   // 275
+    "已重命名 {} 项，跳过 {} 项", // 276
+    "重命名失败",             // 277
+    "没有可重命名的项",       // 278
+    "无效的正则表达式",       // 279
+    "字符串的开头",           // 280
+    "字符串的末尾",           // 281
+    "匹配任何字符",           // 282
+    "匹配前面的一个或多个令牌", // 283
+    "匹配前面的令牌零次或一次", // 284
+    "匹配前面的令牌零次或多次", // 285
+    "任何数字，[0-9] 的缩写",  // 286
+    "[^0-9] 的非数字缩写",     // 287
+    "单词字符，[a-zA-Z_0-9] 缩写", // 288
+    "任何空白字符",            // 289
+    "非空白字符，[^\\s] 的缩写", // 290
+    "匹配单词边界",            // 291
 ];
 
 pub const EN: &[&str] = &[
@@ -514,6 +555,46 @@ pub const EN: &[&str] = &[
     "No folder to open a terminal in",
     "Invert selection",
     "Close all",
+    "Batch rename",
+    "Batch rename",
+    "Search",
+    "Replace with",
+    "Use regular expressions",
+    "Match all occurrences",
+    "Match case",
+    "Apply to",
+    "Filename + extension",
+    "Filename",
+    "Extension",
+    "Original",
+    "Renamed",
+    "Rename",
+    "Show all",
+    "Show renamed only",
+    "Unchanged",
+    "Name is empty",
+    "Name contains invalid characters",
+    "Name cannot end with a space or period",
+    "Name is a reserved device name",
+    "Name is too long",
+    "Target name already exists",
+    "Duplicates another item's new name",
+    "Renamed {}, skipped {}",
+    "Rename failed",
+    "Nothing to rename",
+    "Invalid regular expression",
+    "Start of the string",
+    "End of the string",
+    "Matches any character",
+    "Matches one or more of the preceding token",
+    "Matches the preceding token zero or one time",
+    "Matches the preceding token zero or more times",
+    "Any digit, shorthand for [0-9]",
+    "Any non-digit, shorthand for [^0-9]",
+    "Word character, shorthand for [a-zA-Z_0-9]",
+    "Any whitespace character",
+    "Any non-whitespace character, shorthand for [^\\s]",
+    "Matches a word boundary",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -610,6 +691,15 @@ mod tests {
         // 标签栏右键菜单「关闭全部」。
         assert_eq!(ZH[251], "关闭全部");
         assert_eq!(EN[251], "Close all");
+        // 批量重命名（ui/batch_rename.slint 不硬编码下标，Rust 侧用 tr() 查）。
+        assert_eq!(ZH[252], "批量重命名");
+        assert_eq!(EN[252], "Batch rename");
+        assert_eq!(ZH[263], "原始");
+        assert_eq!(EN[263], "Original");
+        assert_eq!(ZH[276], "已重命名 {} 项，跳过 {} 项");
+        assert_eq!(EN[276], "Renamed {}, skipped {}");
+        assert_eq!(ZH[291], "匹配单词边界");
+        assert_eq!(EN[291], "Matches a word boundary");
     }
 
     #[test]

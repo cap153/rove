@@ -25,6 +25,34 @@ pub struct TabSnapshot {
     pub is_settings: bool,
 }
 
+/// 批量重命名窗口上次用过的输入与选项。
+///
+/// 同时开多个窗口时，记住**最后一个关闭的**那个：用户关窗的动作就是
+/// "这一套设置我下次还要用" 的信号。
+#[derive(Clone, Debug, PartialEq)]
+pub struct BatchRenamePrefs {
+    pub search: String,
+    pub replace: String,
+    pub use_regex: bool,
+    pub match_all: bool,
+    pub case_sensitive: bool,
+    /// 0 = 文件名 + 扩展名，1 = 文件名，2 = 扩展名。
+    pub apply_to: i32,
+}
+
+impl Default for BatchRenamePrefs {
+    fn default() -> Self {
+        Self {
+            search: String::new(),
+            replace: String::new(),
+            use_regex: false,
+            match_all: false,
+            case_sensitive: false,
+            apply_to: 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub theme: ThemeChoice,
@@ -57,6 +85,8 @@ pub struct Config {
     pub language: String,
     /// 启动时打开：last_tabs（上次的标签页，含分屏）| computer（电脑选项）。
     pub startup_tab: String,
+    /// 批量重命名窗口上次的输入与选项。
+    pub batch_rename: BatchRenamePrefs,
     /// 「上次的标签页」快照，关闭时写入。
     pub last_tabs: Vec<TabSnapshot>,
     pub last_active_tab: usize,
@@ -217,6 +247,7 @@ impl Default for Config {
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
             language: "system".to_string(),
+            batch_rename: BatchRenamePrefs::default(),
             startup_tab: "last_tabs".to_string(),
             last_tabs: Vec::new(),
             last_active_tab: 0,
@@ -382,6 +413,27 @@ impl Config {
         if let Some(l) = json.get("language").and_then(|v| v.as_str()) {
             if matches!(l, "system" | "zh-CN" | "en") {
                 config.language = l.to_string();
+            }
+        }
+        if let Some(br) = json.get("batch_rename") {
+            let p = &mut config.batch_rename;
+            if let Some(v) = br.get("search").and_then(|v| v.as_str()) {
+                p.search = v.to_string();
+            }
+            if let Some(v) = br.get("replace").and_then(|v| v.as_str()) {
+                p.replace = v.to_string();
+            }
+            if let Some(v) = br.get("use_regex").and_then(|v| v.as_bool()) {
+                p.use_regex = v;
+            }
+            if let Some(v) = br.get("match_all").and_then(|v| v.as_bool()) {
+                p.match_all = v;
+            }
+            if let Some(v) = br.get("case_sensitive").and_then(|v| v.as_bool()) {
+                p.case_sensitive = v;
+            }
+            if let Some(v) = br.get("apply_to").and_then(|v| v.as_i64()) {
+                p.apply_to = v.clamp(0, 2) as i32;
             }
         }
         if let Some(s) = json.get("startup_tab").and_then(|v| v.as_str()) {
@@ -627,6 +679,14 @@ impl Config {
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
             "language": self.language,
+            "batch_rename": {
+                "search": self.batch_rename.search,
+                "replace": self.batch_rename.replace,
+                "use_regex": self.batch_rename.use_regex,
+                "match_all": self.batch_rename.match_all,
+                "case_sensitive": self.batch_rename.case_sensitive,
+                "apply_to": self.batch_rename.apply_to,
+            },
             "startup_tab": self.startup_tab,
             "last_tabs": self
                 .last_tabs

@@ -102,6 +102,21 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             group: "".into(),
             builtin: true,
         },
+        // 「批量重命名」紧跟在「复制路径」下面：它同样作用于选中项，
+        // 而且是 Rove 自己最容易找不到的一个功能。
+        ActionEntry {
+            id: "builtin.batch_rename".into(),
+            label: "批量重命名".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
         ActionEntry {
             id: "builtin.stage".into(),
             label: "添加到暂存盘".into(),
@@ -163,26 +178,40 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
 
 impl ActionEntry {
     /// 该动作是否适用于当前选中集。
-    pub fn matches_selection(&self, paths: &[PathBuf]) -> bool {
+    /// 「这一项是文件还是文件夹」优先由调用方给的快照回答。
+    ///
+    /// `is_dir_of` 返回 `None` 表示快照里没有这一项（搜索结果、虚拟视图等），
+    /// 这时才退回磁盘查询 —— `is_dir()` / `is_file()` 是真正的磁盘访问，
+    /// 网络路径上可能卡几秒，而右键菜单是在界面线程上构建的。
+    pub fn matches_selection(
+        &self,
+        paths: &[PathBuf],
+        is_dir_of: impl Fn(&Path) -> Option<bool>,
+    ) -> bool {
         let Some(first) = paths.first() else {
             return false;
         };
-        match self.target.as_str() {
-            "file" => {
-                let is_file = first.is_file();
-                if self.extensions.is_empty() {
-                    is_file
-                } else {
-                    let ext = first
-                        .extension()
-                        .map(|e| e.to_string_lossy().to_lowercase())
-                        .unwrap_or_default();
-                    is_file && self.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext))
-                }
-            }
-            "dir" => first.is_dir(),
-            _ => true,
+        let want_dir = match self.target.as_str() {
+            "file" => false,
+            "dir" => true,
+            _ => return true,
+        };
+        // 快照优先，查不到才查盘。
+        let is_dir = is_dir_of(first).unwrap_or_else(|| first.is_dir());
+        if want_dir {
+            return is_dir;
         }
+        if is_dir {
+            return false;
+        }
+        if self.extensions.is_empty() {
+            return true;
+        }
+        let ext = first
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        self.extensions.iter().any(|e| e.eq_ignore_ascii_case(&ext))
     }
 }
 
@@ -676,6 +705,48 @@ mod tests {
         assert_eq!(out, "\"C:/a.txt\" \"C:/b.txt\"");
     }
 
+    /// 右键菜单判断「适用对象」时先用已加载的条目快照，查不到才查盘。
+    #[test]
+    fn target_matching_prefers_loaded_snapshot() {
+        // 用肯定不存在的路径：退回磁盘那一步必须答「不是文件夹」。
+        let dir = PathBuf::from("D:\\rove-no-such-dir-42");
+        let file = PathBuf::from("D:\\rove-no-such-dir-42\\a.txt");
+        // 内置动作里没有 target = file 的项，这里自己造一条最小动作。
+        let pick = |target: &str| ActionEntry {
+            id: "t".into(),
+            label: "t".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: target.into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: false,
+        };
+
+        let mut d = pick("dir");
+        // 快照说是文件夹 → 显示。
+        assert!(d.matches_selection(std::slice::from_ref(&dir), |_| Some(true)));
+        // 快照说是文件 → 不显示（不会再去 stat 一次盘）。
+        assert!(!d.matches_selection(std::slice::from_ref(&dir), |_| Some(false)));
+        // 快照没有这一项 → 退回磁盘：两个路径都不存在，is_dir() = false。
+        assert!(!d.matches_selection(std::slice::from_ref(&dir), |_| None));
+
+        let mut f = pick("file");
+        assert!(!f.matches_selection(std::slice::from_ref(&file), |_| Some(true)));
+        assert!(f.matches_selection(std::slice::from_ref(&file), |_| Some(false)));
+        // 扩展名过滤照旧生效。
+        f.extensions = vec!["txt".into()];
+        assert!(f.matches_selection(std::slice::from_ref(&file), |_| Some(false)));
+        f.extensions = vec!["png".into()];
+        assert!(!f.matches_selection(std::slice::from_ref(&file), |_| Some(false)));
+
+        // 空选中集：任何动作都不匹配。
+        assert!(!f.matches_selection(&[], |_| None));
+    }
+
     /// 「复制路径」紧跟在「剪切」下面（复制 / 剪切 / 复制路径 三项相邻）：
     /// heal_full 会把内置动作按本函数顺序重排，所以只靠这里的顺序就成。
     #[test]
@@ -683,8 +754,14 @@ mod tests {
         let actions = builtin_actions();
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(
-            &ids[..3],
-            &["builtin.copy", "builtin.move", "builtin.copy_path"],
+            &ids[..4],
+            &[
+                "builtin.copy",
+                "builtin.move",
+                "builtin.copy_path",
+                // 批量重命名紧跟「复制路径」：一级菜单里也在这个位置。
+                "builtin.batch_rename",
+            ],
         );
     }
 }

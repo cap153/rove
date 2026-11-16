@@ -25,6 +25,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 bincode = "1.3"
 globset = "0.4"
+# 批量重命名的正则引擎（字面模式也走它，保证两种模式的命中/高亮完全一致）。
+regex = "1"
 trash = "5"
 open = "5"
 raw-window-handle = "0.6"

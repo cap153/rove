@@ -1,6 +1,7 @@
 //! 文件操作子系统：剪贴板互通、任务化复制/移动/删除、终端唤起。
 
 pub mod actions;
+pub mod batch_rename;
 pub mod clipboard;
 pub mod jobs;
 pub mod keymap;
