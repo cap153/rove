@@ -240,17 +240,18 @@ fn list_unc_shares(_host: &str) -> Vec<FileEntry> {
     Vec::new()
 }
 
-/// 枚举目录内容（不递归）。读取失败（权限/不存在）时返回空表。
-/// 此函数运行在工作线程，可以放心阻塞。
-pub fn list_directory(path: &Path) -> Vec<FileEntry> {
+/// 枚举目录内容（不递归）。此函数运行在工作线程，可以放心阻塞。
+///
+/// 返回 `Err` 表示「读不出来」（权限 / 路径已删 / 共享掉线），与「目录是空的」
+/// 严格区分：这个区别在界面上很要紧，一次网络抖动读失败以前也返回空表，
+/// 标签就永久显示「此文件夹为空」，用户以为目录被清空了。
+pub fn try_list_directory(path: &Path) -> Result<Vec<FileEntry>, std::io::Error> {
     // 服务器根不是文件系统路径：用共享枚举代替 read_dir。
     if is_unc_server_root(path) {
         let host = path.to_string_lossy().trim_end_matches('\\').to_string();
-        return list_unc_shares(&host);
+        return Ok(list_unc_shares(&host));
     }
-    let Ok(read_dir) = std::fs::read_dir(path) else {
-        return Vec::new();
-    };
+    let read_dir = std::fs::read_dir(path)?;
     let mut entries = Vec::new();
     let is_network = path.to_string_lossy().starts_with(r"\\");
 
@@ -283,7 +284,7 @@ pub fn list_directory(path: &Path) -> Vec<FileEntry> {
 
         entries.push(FileEntry::from_path(&path, is_dir, size, modified, is_hidden));
     }
-    entries
+    Ok(entries)
 }
 
 /// 排序：目录恒在前，其后按当前键比较。

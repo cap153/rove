@@ -3,7 +3,7 @@
 //!
 //! 线程模型：
 //! - UI 线程：Slint 事件循环；所有回调与状态变更都在这里发生。
-//! - 目录列举线程：`list_directory` / 驱动器枚举在此执行，结果经通道
+//! - 目录列举线程：`try_list_directory` / 驱动器枚举在此执行，结果经通道
 //!   回传，由轮询定时器合并（代号 generation 过期即丢弃）。
 //! - 文件操作线程：复制/移动/删除，进度经共享状态暴露。
 
@@ -225,6 +225,18 @@ macro_rules! logv {
     }};
 }
 
+/// **无条件**写入的异常日志：不需要 `ROVE_LOG`，也不需要 `rove.verbose`。
+///
+/// 只给「复现不了但必须查清」的偶发故障用（目录读失败、标签拖拽状态残留、
+/// 空结果）。正常使用一行都不会产生，所以不会让 `rove.log` 天天长大；
+/// 也正因为它绕过了级别开关，绝不能拿来做常规诊断。
+#[macro_export]
+macro_rules! logal {
+    ($($arg:tt)*) => {{
+        $crate::app::log_write(&format!($($arg)*));
+    }};
+}
+
 
 /// 虚拟列表行高（与 ui/file_list.slint 的 row-h 保持一致）。
 const ROW_HEIGHT: f32 = 30.0;
@@ -283,6 +295,10 @@ struct ListResult {
     pane: usize,
     generation: u64,
     entries: Vec<FileEntry>,
+    /// 列举本身失败了（权限 / 掉线的共享 / 路径已删），`entries` 一定是空的。
+    /// 与「目录真的是空的」必须分开处理：以前两者长得一模一样，「此文件夹为空」
+    /// 就是一次网络抖动留下的假象，而且再也不会自己恢复。
+    failed: bool,
 }
 
 /// 地址栏路径校验的后台结果。
@@ -867,6 +883,11 @@ pub struct App {
     quick_drag: Option<(usize, f32, bool)>,
     /// 顶部标签拖动交换：(起始索引, 按下时的内容 x, 是否已移动)。
     tab_drag: Option<(usize, f32, bool)>,
+    /// 列举读失败后的自动重试：(标签, 面板, 登记时刻, 已重试次数)。
+    ///
+    /// 网络共享慎一下是常事，不该让用户手动刷新。重试 3 次仍失败就收手，
+    /// 标记留在面板上，等切标签时再试（见 retry_failed_panes）。
+    list_retry: Option<(usize, usize, std::time::Instant, u8)>,
     /// 标签拖动松手后那次补发的 clicked 要丢弃，避免误切标签。
     suppress_tab_click: Option<std::time::Instant>,
     /// 拖拽结束后的那次 clicked 要丢弃（否则拖完会顺带导航）。带时间上限，不会误吐下一次点击。
@@ -1145,6 +1166,7 @@ impl App {
             network_drag: None,
             quick_drag: None,
             tab_drag: None,
+            list_retry: None,
             suppress_tab_click: None,
             suppress_sidebar_click: None,
             network_edit_target: None,
@@ -1424,13 +1446,43 @@ impl App {
             .iter()
             .filter_map(|p| p.path.clone())
             .collect();
+        let is_active_tab = tab_index == self.state.active_tab;
         let tab = &mut self.state.tabs[tab_index];
         if tab.panes[result.pane].generation != result.generation {
             return; // 过期结果
         }
+        // 读失败：保留上一次的列表（不能把好好的内容清成「此文件夹为空」），
+        // 记下标记，等用户切回这个标签时 retry_failed_panes 补一次。
+        if result.failed {
+            let pane = &mut tab.panes[result.pane];
+            pane.loading = false;
+            pane.list_failed = true;
+            pane.pending_scroll_restore = false;
+            logal!(
+                "!! [list] read failed: tab={} pane={} path={:?} keeping {} entries",
+                result.tab_id,
+                result.pane,
+                pane.path,
+                pane.entries.len()
+            );
+            if result.pane == tab.active_pane {
+                tab_loading_flag(&self.ui, is_active_tab, false);
+            }
+            // 自动重试登记：同一面板连续失败时累加次数，3 次以后收手。
+            let tries = self
+                .list_retry
+                .as_ref()
+                .filter(|(t, p, _, _)| *t == tab_index && *p == result.pane)
+                .map(|(_, _, _, n)| *n)
+                .unwrap_or(0);
+            self.list_retry = Some((tab_index, result.pane, Instant::now(), tries.saturating_add(1)));
+            return;
+        }
         // 按「显示隐藏文件」开关过滤：关闭时剔除具有隐藏属性的条目。
         let show_hidden = self.config.show_hidden;
         let listed_is_active = result.pane == tab.active_pane;
+        // 原始条数（过滤隐藏项之前）：给「空结果」日志用。
+        let raw_count = result.entries.len();
 
         // 1. 过滤隐藏文件
         let mut entries: Vec<FileEntry> = if show_hidden {
@@ -1535,6 +1587,20 @@ impl App {
                 pane.filter.clear();
             }
             pane.loading = false;
+            pane.list_failed = false;
+            // 列举成功：清掉自动重试的登记，下一次失败重新计数。
+            self.list_retry = None;
+            // 「读成功但一条都没有」也要留证据：如果下次出现的空白不属于读失败，
+            // 这一行就能证明它是一份空结果，指向另一条 bug 路径。
+            if raw_count == 0 && pane.path.is_some() {
+                logal!(
+                    "!! [list] empty result: tab={} pane={} path={:?} raw={}",
+                    result.tab_id,
+                    result.pane,
+                    pane.path,
+                    raw_count
+                );
+            }
             pane.rebuild_display();
             // Shell 系统菜单「新建 → 文本文档」：菜单前的快照 diff 出唯一新增文件。
             // 只在限期内、同一目录、恰好新增 1 个「文件」时生效，避免把粘贴 /
@@ -2455,18 +2521,32 @@ fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
                 let tx = tx.clone();
                 std::thread::spawn(move || {
                     logv!("worker req tab={} path={:?}", req.tab_id, req.path);
-                    let entries = match &req.path {
-                        None => list_drives().iter().map(FileEntry::drive).collect(),
+                    let (entries, failed) = match &req.path {
+                        None => (list_drives().iter().map(FileEntry::drive).collect(), false),
                         Some(path) if *path == fs::drives::recycle_virtual_path() => {
                             // 回收站站内浏览：虚拟目录，条目来自系统回收站。
                             let mut entries = fs::drives::list_recycle_entries();
                             sort_entries(&mut entries, req.sort);
-                            entries
+                            (entries, false)
                         }
                         Some(path) => {
-                            let mut entries = fs::list_directory(path);
-                            sort_entries(&mut entries, req.sort);
-                            entries
+                            let started = std::time::Instant::now();
+                            match fs::dir::try_list_directory(path) {
+                                Ok(mut entries) => {
+                                    sort_entries(&mut entries, req.sort);
+                                    (entries, false)
+                                }
+                                Err(err) => {
+                                    // 失败单独标记，UI 侧保留旧列表而不是清空。
+                                    logal!(
+                                        "!! [list] worker read failed: path={:?} err={} after {}ms",
+                                        path,
+                                        err,
+                                        started.elapsed().as_millis()
+                                    );
+                                    (Vec::new(), true)
+                                }
+                            }
                         }
                     };
                     let _ = tx.send(ListResult {
@@ -2474,6 +2554,7 @@ fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
                         pane: req.pane,
                         generation: req.generation,
                         entries,
+                        failed,
                     });
                 });
             }
@@ -6123,6 +6204,11 @@ impl App {
         // 关闭保护伞
         self.syncing_tab = false;
 
+        // 上一个标签如果因网络抖动/共享掉线读失败了，切回来的这一刻补一次：
+        // 网络路径不在 mtime 轮询范围内（stat 会无限超时），没有任何定时器
+        // 会替它重试，不补就会一直停在失败时的那一份内容上。
+        self.retry_failed_panes();
+
         // 设置标签的导航/标题/分组由 sync_settings 下发：从快照恢复或切标签
         // 回来时也必须补一次，否则左侧子导航是空的。
         if self.state.active().kind == crate::state::TabKind::Settings {
@@ -8910,6 +8996,88 @@ impl App {
         }
     }
 
+    /// 读失败的面板过 3 秒自动重试一次（最多 3 次）。
+    ///
+    /// 网络共享慎一下是最常见的失败原因，用户没理由为它手动 F5。
+    /// 重试仍失败就把标记留着，等切标签时由 retry_failed_panes 再补。
+    fn maybe_retry_failed_listing(&mut self) {
+        let Some((tab_index, pane, at, tries)) = self.list_retry else {
+            return;
+        };
+        if at.elapsed() < Duration::from_millis(3000) {
+            return;
+        }
+        self.list_retry = None;
+        if tries > 3 {
+            logal!(
+                "!! [list] giving up auto retry after {tries} attempts: tab={tab_index} pane={pane}"
+            );
+            return;
+        }
+        let still_failed = self
+            .state
+            .tabs
+            .get(tab_index)
+            .and_then(|t| t.panes.get(pane))
+            .is_some_and(|p| p.list_failed);
+        if !still_failed {
+            return;
+        }
+        self.state.tabs[tab_index].panes[pane].list_failed = false;
+        logal!("[list] auto retry failed read (attempt {tries}): tab={tab_index} pane={pane}");
+        // 登记不清掉、次数不回零：这次重试如果再失败，apply_list_result 会
+        // 在它基础上 +1，才能真正收敛到「放弃」；成功了则由成功分支清空。
+        self.list_retry = Some((tab_index, pane, Instant::now(), tries));
+        self.reload_pane(tab_index, pane);
+    }
+
+    /// 切回某个标签时，给它「上次读失败」的面板补发一次列举。
+    ///
+    /// 只重试带真实路径的面板（此电脑 / 回收站不需要）。标记先清掉再发请求，
+    /// 否则一次失败就会变成每次切标签都重发。
+    fn retry_failed_panes(&mut self) {
+        let tab_index = self.state.active_tab;
+        let panes: Vec<usize> = self.state.tabs[tab_index]
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.list_failed && p.path.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        for pane in panes {
+            self.state.tabs[tab_index].panes[pane].list_failed = false;
+            logal!(
+                "[list] retry after failed read: tab={} pane={}",
+                tab_index, pane
+            );
+            self.reload_pane(tab_index, pane);
+        }
+    }
+
+    /// 兜底清掉标签拖拽状态（正常由 `up` 的 phase 2 收尾）。
+    ///
+    /// 只要那一次 `up` 送不到（按住期间标签模型被重建、指针在窗口外松开、
+    /// 原生菜单或别的窗口抢走鼠标捕获、窗口失焦），Rust 侧就会一直认为“还在拖”，
+    /// 界面上的落点竖线（z: 10）和半透明标签就永远叠在标签上。
+    fn cancel_tab_drag(&mut self, why: &str) {
+        let Some((index, start_x, moved)) = self.tab_drag.take() else {
+            return;
+        };
+        self.ui.set_tab_drop_visible(false);
+        self.ui.set_tab_drag_index(-1);
+        self.ui.set_tab_drop_slot(-1);
+        if moved {
+            // 无条件写入：这是「标签栏上多出一条竖条」的现场证据。
+            logal!(
+                "!! [tab] stuck drag state cleared ({why}): index={index} start_x={start_x:.1} tabs={} left_pressed={}",
+                self.state.tabs.len(),
+                self.ui.get_mouse_left_pressed()
+            );
+        } else {
+            logv!("[tab] dropped stale drag start ({why}): index={index}");
+        }
+    }
+
     /// 顶部标签拖拽插入排序（phase：0 按下 / 1 拖动 / 2 松开，x 为行内局部横坐标）。
     /// 拖动期间只更新 Slint 的视觉状态，不重建 tabs 模型，落点线的滑动、
     /// 被拖标签淡出、目标标签高亮才能连续播放；松手才真正重排。
@@ -11232,6 +11400,19 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     // 采样「前台是不是别人」：给按键处理判「这次按键是不是刚被别的程序扔过来的」。
     note_foreign_foreground();
 
+    // 标签拖拽没人收尾时兜底复位。只在「物理左键已松开」时动手：正常拖拽
+    // 松手时 phase 2 会先把状态取走，这里就不会重复动作；反过来，如果那一次
+    // `up` 根本没送到，界面上会一直留着落点竖线 + 半透明标签。
+    {
+        let mut app = app.borrow_mut();
+        if app.tab_drag.is_some() && !app.ui.get_mouse_left_pressed() {
+            app.cancel_tab_drag("poll");
+        }
+    }
+
+    // 读失败的目录（网络共享慎一下）自动重试，同样搭这趟 40ms 轮询。
+    app.borrow_mut().maybe_retry_failed_listing();
+
     // 搜索框防抖：攒够 150ms 再跑一次全目录匹配。
     // 用 40ms 轮询判到期，省一个单独的定时器；到期前用户又敲了字会重新计时。
     let pending_search = app.borrow().pending_search.clone();
@@ -11632,6 +11813,8 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                     // 窗口失焦时左键的「松开」可能送到别的窗口，这里先清掉按住态，
                     // 否则拖选贴边自动滚动的定时器会在后台一直推进选中范围。
                     app.ui.set_mouse_left_pressed(false);
+                    // 同一原因：标签拖拽也收不到那一次 `up`，状态得一并清掉。
+                    app.cancel_tab_drag("blur");
                 }
             }
             return EventResult::Propagate;
@@ -14344,7 +14527,9 @@ pub fn run() {
     if args.iter().any(|a| {
         a == "--shell-open" || a == "--this-pc" || a.to_ascii_lowercase().starts_with("/select")
     }) || args.iter().any(|a| a.to_ascii_lowercase().starts_with("-select")) {
-        logln!("[takeover] argv={args:?}");
+        // 无条件写入：接管打开（浏览器的「打开所在文件夹」等）是偶发故障的高发入口，
+        // 日志里要有它才能和后面的空白/重试对上时间。
+        logal!("[takeover] argv={args:?}");
     }
     // 「谁接住了这次启动」：出问题时第一件事就是要分清这条请求由哪个 exe、
     // 哪个进程处理 —— 磁盘上的 rove.exe 被换掉，已经在跑的旧进程不会跟着更新，
@@ -14352,7 +14537,9 @@ pub fn run() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    logln!(
+    // 无条件写入：日志文件里必须有「这份日志是谁、什么时候写的」，
+    // 否则拿到一份没有开头的日志就分不清是哪个 exe / 哪个进程。
+    logal!(
         "[boot] pid={} exe={exe} args={args:?}",
         std::process::id()
     );

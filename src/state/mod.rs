@@ -79,6 +79,9 @@ pub struct PaneState {
     pub anchor: Option<PathBuf>,
     /// 滚动偏移（逻辑像素），切换标签时恢复。
     pub scroll_y: f32,
+    /// 上一次列举是「读失败」而不是「空目录」。切回这个标签时会自动重试一次，
+    /// 见 App::retry_failed_panes。
+    pub list_failed: bool,
     pub loading: bool,
     /// 导航代号：用于丢弃过期的异步列表结果。
     pub generation: u64,
@@ -125,6 +128,7 @@ impl PaneState {
             anchor: None,
             scroll_y: 0.0,
             loading: false,
+            list_failed: false,
             generation: 0,
             pinyin_cache: Vec::new(),
             pinyin_seq: 0,

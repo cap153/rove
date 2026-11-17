@@ -8,7 +8,7 @@ pub mod watcher;
 
 pub use watcher::DirWatcher;
 
-pub use dir::{SortKey, SortState, entry_cmp, list_directory, sort_entries};
+pub use dir::{SortKey, SortState, entry_cmp, sort_entries};
 pub use drives::{
     DriveInfo, list_drives, list_network_locations, list_network_places, recycle_bin_stats,
     quick_access_dirs,
