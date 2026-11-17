@@ -45,6 +45,10 @@ When split, `Ctrl+W` closes the right pane first, and a second press closes the 
 
 With many tabs open, put the mouse wheel over the tab bar to scroll it sideways; an address bar whose path is too long scrolls the same way.
 
+Closing the window (the × button) saves the tabs as they are — every tab, its split panes, the folder in each pane and the active one — and they come back on the next launch.
+
+If instead you end the session with **Close all** in the tab bar's right-click menu, or by closing the last tab, the next launch opens a single This PC tab. **Settings → General → Startup with** can make This PC the default instead.
+
 ## 2. Instant whole-disk search: just type on the "This PC" page
 
 Type any name into the search box on the **This PC** page and Rove looks through **all your drives**, without clicking into folders one by one. Chinese names also match by pinyin (`jsq` or `jisuanqi` finds `计算器`).
