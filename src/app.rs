@@ -802,6 +802,9 @@ pub struct App {
     scroll_to_pane: Option<usize>,
     /// diff 命中后待触发的重命名路径（等列表/滚动就绪再执行，避免抢焦点）。
     pending_shell_new_rename: Option<PathBuf>,
+    /// 中/大/超大图标视图「展开名称」浮层的定位缓存：每栏记住上次
+    /// （目标路径 → 显示行号）。先用它验一次，命中就不必扫整个显示列表。
+    expand_row_cache: [Option<(PathBuf, i32)>; 2],
     /// 图标视图鼠标悬停的格子显示索引（分屏各一份，-1 = 无）。
     hover_display_index: [i32; 2],
     /// 鼠标是否压在展开的完整名浮层上（分屏各一份）。
@@ -1086,6 +1089,7 @@ impl App {
             reveal_pane: None,
             scroll_to_pane: None,
             pending_shell_new_rename: None,
+            expand_row_cache: [None, None],
             hover_display_index: [-1, -1],
             overlay_hovered: [false, false],
             cell_hovered: [-1, -1],
@@ -2687,6 +2691,30 @@ mod tests {
         let mut changed = stamps.clone();
         changed[0].selected = true;
         assert_eq!(rows_to_patch(Some(&prev), &c, &changed, 2), Some(vec![0]));
+    }
+
+    /// 图标视图浮层定位：缓存行号只在「那一行还是同一个条目」时复用，
+    /// 顺序真变了就重新定位；目标不在显示列表里时返回 None。
+    #[test]
+    fn expand_locate_reuses_cached_row_until_order_changes() {
+        let mut pane = crate::state::PaneState::new(None, crate::fs::SortState::default());
+        pane.entries = ["a.txt", "b.txt", "c.txt"]
+            .iter()
+            .map(|n| crate::fs::dir::test_entry(n, false, 0))
+            .collect();
+        pane.rebuild_display();
+        let b = std::path::Path::new("b.txt");
+        let mut cache = None;
+        assert_eq!(expand_locate(&pane, b, &mut cache), Some(1));
+        assert_eq!(cache, Some((PathBuf::from("b.txt"), 1)));
+        // 顺序变了（换排序）：缓存行号验证不上 → 重新定位到新位置。
+        pane.display = vec![2, 0, 1];
+        assert_eq!(expand_locate(&pane, b, &mut cache), Some(2));
+        // 目标不在显示列表里（被搜索过滤掉）→ None，不会拿旧行号凑数。
+        assert_eq!(
+            expand_locate(&pane, std::path::Path::new("zzz.txt"), &mut cache),
+            None
+        );
     }
 
     /// 新建会话时初始路径只能顶掉「那个还没列举过的默认此电脑标签」。
@@ -5076,6 +5104,8 @@ impl App {
             (-1, String::new(), Vec::new()),
             (-1, String::new(), Vec::new()),
         ];
+        // 定位缓存取到本地：下面 `p` 借用着 `self.state`，不能再借 `self`。
+        let mut cache = std::mem::take(&mut self.expand_row_cache);
         for pane in 0..2 {
             if pane == 1 && !is_split {
                 break;
@@ -5090,35 +5120,35 @@ impl App {
             } else {
                 None
             };
-            // 悬停层：指针下的格子。与选中项相同时下面会跳过重复绘制。
-            let hover_target: Option<PathBuf> = if hovers[pane] >= 0 {
-                p.display_entry(hovers[pane] as usize)
-                    .map(|e| e.path.clone())
+            // 悬停层：指针下的格子，它的显示下标本来就是已知的（hovers[pane]），
+            // 不必再去显示列表里搜一遍。与选中项相同时下面会跳过重复绘制。
+            let hover_hit = if hovers[pane] >= 0
+                && p.display_entry(hovers[pane] as usize).is_some()
+            {
+                Some(hovers[pane])
             } else {
                 None
             };
+            // 选中 / 重命名层：先用上一帧的行号验一次，对不上才扫整个显示列表。
+            let sel_hit = target
+                .as_ref()
+                .and_then(|w| expand_locate(p, w.as_path(), &mut cache[pane]));
             let rows = if pane == 1 {
                 self.ui.get_file_rows_right()
             } else {
                 self.ui.get_file_rows()
             };
-            let resolve = |want: Option<PathBuf>| -> Option<(i32, String, Vec<(String, bool)>)> {
-                let target = want?;
-                let hit = (0..p.display.len()).find_map(|di| {
-                    let e = p.display_entry(di)?;
-                    (e.path == target).then(|| (di as i32, e.name.clone()))
-                })?;
-                let (di, name) = hit;
+            let resolve = |di: Option<i32>| -> Option<(i32, String, Vec<(String, bool)>)> {
+                let di = di?;
+                let e = p.display_entry(di as usize)?;
+                let name = e.name.clone();
                 // 该条目的完整高亮分段：行模型里存的就是未截断的原始分段，
                 // 直接复用，避免在这里重跑一遍搜索命中计算。
-                let key = p
-                    .display_entry(di as usize)
-                    .map(|e| e.path.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                let key = e.path.to_string_lossy();
                 let mut parts: Vec<(String, bool)> = Vec::new();
                 for i in 0..rows.row_count() {
                     let Some(r) = rows.row_data(i) else { continue };
-                    if r.path.as_str() == key {
+                    if r.path.as_str() == key.as_ref() {
                         parts = (0..r.name_parts.row_count())
                             .filter_map(|k| r.name_parts.row_data(k))
                             .map(|x| (x.text.to_string(), x.hl))
@@ -5131,13 +5161,14 @@ impl App {
                 }
                 Some((di, name, parts))
             };
-            if let Some(t) = resolve(target) {
+            if let Some(t) = resolve(sel_hit) {
                 targets[pane] = t;
             }
-            if let Some(t) = resolve(hover_target) {
+            if let Some(t) = resolve(hover_hit) {
                 hover_targets[pane] = t;
             }
         }
+        self.expand_row_cache = cache;
         // 是否需要浮层（名字超过 3 行）改在 Rust 侧判定：只有需要时才给
         // expand-index，Slint 侧因此不再依赖文本测量决定弹不弹。
         //
@@ -6112,6 +6143,33 @@ impl RowBatch {
     fn empty() -> Self {
         Self { rows: Vec::new(), stamps: Vec::new(), name_w_q: 0 }
     }
+}
+
+/// 在显示列表里定位某个路径的行号。
+///
+/// 先用上一帧的结果验一次：那一行上还是同一个条目就直接返回（一次比较）。
+/// 滚动不会改变显示顺序，所以常态下走的就是这条快路径；只有排序 / 过滤 /
+/// 刷新真的把它挪走了才扫整个显示列表（大目录里那是上万次路径比较）。
+fn expand_locate(
+    pane: &crate::state::PaneState,
+    want: &std::path::Path,
+    cache: &mut Option<(PathBuf, i32)>,
+) -> Option<i32> {
+    if let Some((path, idx)) = cache.as_ref() {
+        if *idx >= 0
+            && path.as_path() == want
+            && pane
+                .display_entry(*idx as usize)
+                .is_some_and(|e| e.path.as_path() == want)
+        {
+            return Some(*idx);
+        }
+    }
+    let pos = (0..pane.display.len())
+        .find(|&di| pane.display_entry(di).is_some_and(|e| e.path.as_path() == want))?
+        as i32;
+    *cache = Some((want.to_path_buf(), pos));
+    Some(pos)
 }
 
 /// 决定这次要怎么写行模型。
