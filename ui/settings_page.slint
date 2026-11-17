@@ -1905,9 +1905,12 @@ export component SettingsPage inherits Rectangle {
                         border-radius: 8px;
                         border-width: 1px;
                         border-color: Theme.border;
-                        height: 42px + group.items.length * 40px;
+                        // 高度必须跟着内部布局自己算：以前写成 42px + n * 40px，
+                        // 而每行实际是 42px —— 每多一组快捷键就矮 2px，加上几个
+                        // 「(备用)」槽位后最后一行就压出圆角边框了。
+                        height: grp-layout.preferred-height;
 
-                        VerticalLayout {
+                        grp-layout := VerticalLayout {
                             padding-left: 16px;
                             padding-right: 16px;
                             padding-top: 10px;
