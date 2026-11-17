@@ -190,6 +190,9 @@ export component MainWindow inherits Window {
     in-out property <bool> file-loading: false;
     /// 图标视图“展开名称”目标（单个选中 / 重命名）：条目绝对索引与完整名称。
     in-out property <int> file-expand-index: -1;
+    /// 正在重命名的条目在本栏行模型里的行号（-1 = 无）。
+    /// 详细信息 / 列表 / 小图标的重命名框是根层固定浮层，靠它定位。
+    in-out property <int> file-rename-row: -1;
     in-out property <string> file-expand-name: "";
     /// 浮层名称的逐行高亮分段与框宽（Rust 与切行同源算出）。
     in-out property <[GridLine]> file-expand-lines: [];
@@ -1265,6 +1268,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         visible: true;
                         rows: root.file-rows;
                     expand-index: root.file-expand-index;
+                    rename-row: root.rename-pane == 0 ? root.file-rename-row : -1;
                     hover-expand-index: root.file-hover-expand-index;
                     hover-expand-lines: root.file-hover-expand-lines;
                     hover-expand-box-w: root.file-hover-expand-box-w;
@@ -1410,6 +1414,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         height: 100%;
                         rows: root.file-rows-right;
                         expand-index: root.file-expand-index-right;
+                        rename-row: root.rename-pane == 1 ? root.file-rename-row : -1;
                         hover-expand-index: root.file-hover-expand-index-right;
                         hover-expand-lines: root.file-hover-expand-lines-right;
                         hover-expand-box-w: root.file-hover-expand-box-w-right;

@@ -499,6 +499,10 @@ fn thumb_want(key: &ThumbKey) {
 /// 否则侧栏图标会被当成过期请求排掉。`build_sidebar` 也用这份常量。
 const SIDEBAR_ICON_PX: u32 = 32;
 
+/// 「Shell 系统菜单新建文件」快照的有效期：菜单从右键弹到点「新建」再落地，
+/// 期间任何一次列举结果都可能把它消化掉，所以给得比一次操作宽一些。
+const SHELL_NEW_WATCH: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// 整体替换「想要」集合（一轮行模型建完时调用）。
 /// 侧栏小图标（`SIDEBAR_ICON_PX`）会保留，其余全部按本轮屏幕内容重建。
 fn publish_thumb_wanted(keys: std::collections::HashSet<ThumbKey>) {
@@ -537,6 +541,9 @@ fn take_thumb_promoted(key: &ThumbKey) -> bool {
 struct CachedThumb {
     img: slint::Image,
     bytes: usize,
+    /// 插入序号（进程内单调递增）。行模型做增量更新时靠它判断
+    /// 「这一行的缩略图到底变没变」——`slint::Image` 本身没法比较相等。
+    epoch: u64,
 }
 
 /// 全局常驻的体积缓存单例（进程级生命周期，窗口关闭不销毁）。
@@ -782,6 +789,17 @@ pub struct App {
         std::collections::HashSet<PathBuf>,
         std::time::Instant,
     )>,
+    /// 原生右键菜单收起后（阻塞调用返回）推迟一拍重载目录，让「新建」出来的
+    /// 文件尽快被上面的快照 diff 认出来，不必等 1 秒的 mtime 轮询。
+    shell_new_reload_at: Option<std::time::Instant>,
+    /// 文件任务刚结束时的一小段“保护期”：这段时间里到达的**不完整**列举
+    /// （任务期间发起、只看到一部分新文件的那些）不消费“待揭示目标”。
+    reveal_grace_until: Option<std::time::Instant>,
+    /// 哪个面板的列举结果可以消费「待揭示目标」（`None` = 用当前聚焦面板）。
+    /// 跨分屏拖放时目标在**另一个**面板里，不能只认聚焦那一栏。
+    reveal_pane: Option<usize>,
+    /// `scroll_to_index` 该滚哪个面板（`None` = 当前聚焦面板）。
+    scroll_to_pane: Option<usize>,
     /// diff 命中后待触发的重命名路径（等列表/滚动就绪再执行，避免抢焦点）。
     pending_shell_new_rename: Option<PathBuf>,
     /// 图标视图鼠标悬停的格子显示索引（分屏各一份，-1 = 无）。
@@ -811,6 +829,11 @@ pub struct App {
     thumb_promoted: HashSet<ThumbKey>,
     /// 已提升的请求数（用于汇总日志）。
     thumb_promote_n: usize,
+    /// 缩略图插入序号发生器（配合 `CachedThumb::epoch` 做行增量更新）。
+    thumb_epoch_next: u64,
+    /// 上一帧写进左/右栏行模型的内容，用于逐行比对。
+    row_diff_left: Option<RowDiffState>,
+    row_diff_right: Option<RowDiffState>,
     /// 双击检测：上次左键按下的 (路径, 时刻)。
     last_click: Option<(PathBuf, std::time::Instant)>,
     /// 侧栏分区拖拽：正在拖动的分区 header 行索引。
@@ -1058,6 +1081,10 @@ impl App {
             menu_anchor_path: None,
             pending_single_click: None,
             shell_new_watch: None,
+            shell_new_reload_at: None,
+            reveal_grace_until: None,
+            reveal_pane: None,
+            scroll_to_pane: None,
             pending_shell_new_rename: None,
             hover_display_index: [-1, -1],
             overlay_hovered: [false, false],
@@ -1072,6 +1099,9 @@ impl App {
             thumb_cancel_t: std::time::Instant::now(),
             thumb_promoted: HashSet::new(),
             thumb_promote_n: 0,
+            thumb_epoch_next: 0,
+            row_diff_left: None,
+            row_diff_right: None,
             last_click: None,
             sidebar_drag: None,
             network_drag: None,
@@ -1173,20 +1203,47 @@ impl App {
         });
     }
 
+    /// 重新列举指定标签的指定面板。
+    ///
+    /// 分屏时两个面板各有一份独立的列举状态（entries / generation / sort），
+    /// 所以刷新必须按**面板**发请求，不能只刷当前聚焦的那一个。
+    fn reload_pane(&self, tab_index: usize, pane_index: usize) {
+        let Some(tab) = self.state.tabs.get(tab_index) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get(pane_index) else {
+            return;
+        };
+        // 只有聚焦面板才点亮标签的“加载中”，否则非聚焦面板的结果不会去清它。
+        if pane_index == tab.active_pane {
+            tab_loading_flag(&self.ui, tab_index == self.state.active_tab, true);
+        }
+        self.request_listing(
+            tab.id,
+            pane_index,
+            pane.generation,
+            pane.path.clone(),
+            pane.sort,
+        );
+    }
+
     /// 重新列举指定标签的当前聚焦面板。
     fn reload_tab(&self, tab_index: usize) {
         let Some(tab) = self.state.tabs.get(tab_index) else {
             return;
         };
-        tab_loading_flag(&self.ui, tab_index == self.state.active_tab, true);
-        let pane = tab.active_pane;
-        self.request_listing(
-            tab.id,
-            pane,
-            tab.panes[pane].generation,
-            tab.panes[pane].path.clone(),
-            tab.panes[pane].sort,
-        );
+        self.reload_pane(tab_index, tab.active_pane);
+    }
+
+    /// 重载所有正看着 `path` 的面板（同一标签的分屏另一半 + 别的标签）。
+    fn reload_panes_viewing(&self, path: &std::path::Path) {
+        for (ti, tab) in self.state.tabs.iter().enumerate() {
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                if pane.path.as_deref() == Some(path) {
+                    self.reload_pane(ti, pi);
+                }
+            }
+        }
     }
 
     /// 任务 3：轮询各打开目录的 mtime，检测外部/内部变更后实时刷新对应标签。
@@ -1200,15 +1257,19 @@ impl App {
         }
         let mut paths: Vec<PathBuf> = Vec::new();
         for tab in &self.state.tabs {
-            let Some(path) = tab.active().path.clone() else {
-                continue;
-            };
-            // 网络路径不轮询 mtime：掉线共享上的 stat 会无限超时。
-            if crate::fs::dir::is_remote_path(&path) {
-                continue;
-            }
-            if !paths.contains(&path) {
-                paths.push(path);
+            // 分屏的每个面板都要看：非聚焦面板以前完全不轮询，它的目录变了
+            // 永远不会自己刷新。
+            for pane in &tab.panes {
+                let Some(path) = pane.path.clone() else {
+                    continue;
+                };
+                // 网络路径不轮询 mtime：掉线共享上的 stat 会无限超时。
+                if crate::fs::dir::is_remote_path(&path) {
+                    continue;
+                }
+                if !paths.contains(&path) {
+                    paths.push(path);
+                }
             }
         }
         if paths.is_empty() {
@@ -1226,7 +1287,7 @@ impl App {
             .state
             .tabs
             .iter()
-            .filter_map(|t| t.active().path.clone())
+            .flat_map(|t| t.panes.iter().filter_map(|p| p.path.clone()))
             .collect();
         let mut to_reload: Vec<PathBuf> = Vec::new();
         for item in probed {
@@ -1247,18 +1308,8 @@ impl App {
             }
         }
         for path in to_reload {
-            // 同一个目录可能被多个标签看着：全部重载，不能只挑第一个。
-            let hits: Vec<usize> = self
-                .state
-                .tabs
-                .iter()
-                .enumerate()
-                .filter(|(_, t)| t.active().path.as_ref() == Some(&path))
-                .map(|(i, _)| i)
-                .collect();
-            for i in hits {
-                self.reload_tab(i);
-            }
+            // 同一个目录可能被多个标签、以及分屏的两个面板看着：全部重载。
+            self.reload_panes_viewing(&path);
         }
     }
 
@@ -1268,7 +1319,26 @@ impl App {
         // 不经过 navigate 的路径，pane.sort 可能是从上一个视图（比如此电脑的盘符）
         // 继承来的，直接发出去会用错排序。这里统一对齐到当前视图自己的状态。
         self.sync_view_sort();
-        self.reload_tab(self.state.active_tab);
+        let tab_index = self.state.active_tab;
+        let Some(tab) = self.state.tabs.get(tab_index) else {
+            return;
+        };
+        let active_path = tab.active().path.clone();
+        // 分屏里另一半可能正看着同一个目录：新建/删除/重命名之后它也得跟着变，
+        // 不能只刷新当前聚焦面板（以前它只能等 mtime 轮询，甚至完全等不到）。
+        let panes: Vec<usize> = match active_path {
+            Some(path) => tab
+                .panes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.path.as_deref() == Some(path.as_path()))
+                .map(|(i, _)| i)
+                .collect(),
+            None => vec![tab.active_pane],
+        };
+        for pi in panes {
+            self.reload_pane(tab_index, pi);
+        }
     }
 
     /// 用户主动刷新（F5 / 工具栏 / 右键菜单）：清理「当前目录下各子文件夹」的
@@ -1304,6 +1374,13 @@ impl App {
             logln!("apply_list_result: tab not found");
             return;
         };
+        // 先快照各面板的目录：下面要按住 `&mut TabState`，那时不能再读 `self.state`。
+        // 用途见「待揭示目标是否已过期」的判定。
+        let pane_dirs: Vec<PathBuf> = self.state.tabs[tab_index]
+            .panes
+            .iter()
+            .filter_map(|p| p.path.clone())
+            .collect();
         let tab = &mut self.state.tabs[tab_index];
         if tab.panes[result.pane].generation != result.generation {
             return; // 过期结果
@@ -1398,34 +1475,64 @@ impl App {
             pane.loading = false;
             pane.rebuild_display();
             // Shell 系统菜单「新建 → 文本文档」：菜单前的快照 diff 出唯一新增文件。
-            // 只在 10 秒内、同一目录、恰好新增 1 个「文件」时生效，避免把粘贴 /
+            // 只在限期内、同一目录、恰好新增 1 个「文件」时生效，避免把粘贴 /
             // 批量新建 / 无关的后台创建误判成一次新建。zsdesk 用 IFileOperation
             // 的 PostNewItem 回调拿路径，Rove 走 Shell 菜单没有该回调，故用列举 diff。
-            if let Some((dir, before, at)) = self.shell_new_watch.take() {
-                if at.elapsed().as_secs() < 10
-                    && pane.path.as_deref() == Some(dir.as_path())
-                    && result.pane == tab.active_pane
-                {
-                    let added: Vec<PathBuf> = pane
-                        .entries
-                        .iter()
-                        .filter(|e| !e.is_dir && !before.contains(&e.path))
-                        .map(|e| e.path.clone())
-                        .collect();
-                    if added.len() == 1 {
-                        logln!(
-                            "[shell-new] detected new file {} (dir={})",
-                            added[0].display(),
-                            dir.display()
-                        );
-                        self.pending_shell_new_rename = Some(added[0].clone());
-                        self.scroll_to_paths = vec![added[0].clone()];
-                        self.scroll_select = true;
-                        self.visible_cache = None;
-                        self.visible_cache_right = None;
-                    } else if !added.is_empty() {
-                        logln!("[shell-new] ignore diff: {} new entries", added.len());
-                    }
+            //
+            // 快照**只在真正命中时才消费**。以前这里无条件 `take()`，于是任何一次
+            // 路过本面板的列举（右键前的在途刷新、别的标签的定时刷新）都会把快照
+            // 吞掉，随后真正带着新文件的那次列举就再也认不出来 —— 表现就是
+            // 「新建 RTF 没进重命名」，而且日志里一行都没有。
+            if let Some((_, _, at)) = &self.shell_new_watch {
+                if at.elapsed() >= SHELL_NEW_WATCH {
+                    // 详细级：这个快照**每一次空白处右键**都会挂上（不论用户
+                    // 有没有点「新建」），所以过期本身不是异常，只是收尾。
+                    // 真没建出文件的情况由上面的 "no new file in listing yet" 记录。
+                    crate::logv!(
+                        "[shell-new] watch expired after {}s (nothing new appeared)",
+                        at.elapsed().as_secs()
+                    );
+                    self.shell_new_watch = None;
+                }
+            }
+            // 只认「Shell 真的新建了一个文件」：自己有没有文件任务在跑也要看，
+            // 任务期间出现的中间列举不能当依据。
+            let watch_hit = !self.shell_op_running
+                && self.shell_new_watch.as_ref().is_some_and(|(dir, _, _)| {
+                    pane.path.as_deref() == Some(dir.as_path())
+                        && result.pane == tab.active_pane
+                        && tab_index == self.state.active_tab
+                });
+            if watch_hit {
+                let (dir, before, at) = self.shell_new_watch.take().unwrap();
+                let added: Vec<PathBuf> = pane
+                    .entries
+                    .iter()
+                    .filter(|e| !e.is_dir && !before.contains(&e.path))
+                    .map(|e| e.path.clone())
+                    .collect();
+                if added.len() == 1 {
+                    logln!(
+                        "[shell-new] detected new file {} (dir={})",
+                        added[0].display(),
+                        dir.display()
+                    );
+                    self.pending_shell_new_rename = Some(added[0].clone());
+                    self.scroll_to_paths = vec![added[0].clone()];
+                    self.scroll_select = true;
+                    self.reveal_pane = Some(result.pane);
+                    self.visible_cache = None;
+                    self.visible_cache_right = None;
+                } else if added.is_empty() {
+                    // 这次列举还不含新文件（Shell 可能还没真正落地 / 这是在途的旧
+                    // 结果）：把快照放回去继续等下一次列举，别把它丢了。
+                    crate::logv!(
+                        "[shell-new] no new file in listing yet (dir={})",
+                        dir.display()
+                    );
+                    self.shell_new_watch = Some((dir, before, at));
+                } else {
+                    logln!("[shell-new] ignore diff: {} new entries", added.len());
                 }
             }
             // 新建文件夹 / 粘贴完成：数据就位后把新条目换算成显示索引，交给
@@ -1433,8 +1540,12 @@ impl App {
             // 多条时取最靠前的一条，保证粘贴块的起始处可见。
             // 只让「当前可见标签的可见栏」消费这个挂起目标：后台标签的定期刷新
             // 若恰好也含同一路径，会把 scroll_to_index / 选择集写到别的标签上。
+            let reveal_pane_ok = match self.reveal_pane {
+                Some(p) => p == result.pane,
+                None => result.pane == tab.active_pane,
+            };
             if !self.scroll_to_paths.is_empty()
-                && result.pane == tab.active_pane
+                && reveal_pane_ok
                 && tab_index == self.state.active_tab
             {
                 let mut matched: Vec<(usize, PathBuf)> = Vec::new();
@@ -1451,8 +1562,25 @@ impl App {
                         }
                     }
                 }
+                // 只有「全部目标都到齐」或「文件任务已经结束」才消费。
+                // 粘贴多文件时复制是逐个落地的：中途的列举只含一部分新文件，
+                // 那时若照旧消费，就只选中了先到的那几个，剩下的永远不选。
+                let all_matched = matched.len() == self.scroll_to_paths.len();
+                let grace = self
+                    .reveal_grace_until
+                    .is_some_and(|t| std::time::Instant::now() < t);
+                if !all_matched && (self.shell_op_running || grace) {
+                    crate::logv!(
+                        "[reveal] waiting for all targets: {}/{} (job running)",
+                        matched.len(),
+                        self.scroll_to_paths.len()
+                    );
+                    matched.clear();
+                }
                 if let Some((pos, first)) = matched.first() {
                     self.scroll_to_index = Some(*pos);
+                    // 滚的是“新文件所在的那一栏”，不是聚焦栏（跨分屏拖放）。
+                    self.scroll_to_pane = Some(result.pane);
                     // 粘贴/还原后选中它们（资源管理器同款）；新建文件夹不选（正在重命名）。
                     if self.scroll_select {
                         pane.anchor = Some(first.clone());
@@ -1469,14 +1597,40 @@ impl App {
                     );
                     self.scroll_to_paths.clear();
                     self.scroll_select = false;
+                    self.reveal_pane = None;
                 } else {
                     // 列举结果里还没出现目标（异步竞态）→ 保留 pending，等下一批。
-                    logln!(
-                        "[new-folder] list MISS: waiting={} total={} rename_path={}",
-                        self.scroll_to_paths.len(),
-                        pane.display.len(),
-                        self.ui.get_rename_path()
-                    );
+                    // 但目标准确地属于别的目录（用户已经导航走 / 取消了那次新建），
+                    // 就再也等不到了：丢掉，免得它一直挂着，直到某次回到那个目录
+                    // 时突然触发一次莫名其妙的滚动+选中。
+                    //
+                    // 判定必须看**所有面板**的目录：分屏时目标是往另一半粘贴进去的，
+                    // 只看结果所属的这个面板会把等待中的目标误判成过期。路径比较
+                    // 也要宽松（大小写 / 分隔符），否则大小写不同就白丢一次揭示。
+                    let stale = pane.filter.trim().is_empty()
+                        && !pane_dirs.is_empty()
+                        && self.scroll_to_paths.iter().all(|t| match t.parent() {
+                            Some(parent) => !pane_dirs
+                                .iter()
+                                .any(|d| crate::fs::dir::same_path_loose(d, parent)),
+                            None => true,
+                        });
+                    if stale {
+                        crate::logv!(
+                            "[reveal] drop pending target (not in any pane): {}",
+                            self.scroll_to_paths.len()
+                        );
+                        self.scroll_to_paths.clear();
+                        self.scroll_select = false;
+                        self.reveal_pane = None;
+                    } else {
+                        crate::logv!(
+                            "[new-folder] list MISS: waiting={} total={} rename_path={}",
+                            self.scroll_to_paths.len(),
+                            pane.display.len(),
+                            self.ui.get_rename_path()
+                        );
+                    }
                 }
             }
         }
@@ -1628,6 +1782,15 @@ impl App {
                     }
                 }
             }
+        }
+
+        // 非聚焦面板的列举结果：条目已经换新，但这里从来没重建行模型
+        // （以前只有滚动/选中才会刷），于是分屏的另一半「始终不刷新」。
+        if !listed_is_active && tab_index == self.state.active_tab {
+            self.visible_cache = None;
+            self.visible_cache_right = None;
+            self.refresh_visible_rows();
+            self.sync_status();
         }
 
         // Shell 系统菜单「新建 → 文本文档」：到这里列表数据、行模型、滚动都已
@@ -2451,6 +2614,80 @@ fn drag_gesture_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stamp(i: i32, thumb: u64) -> RowStamp {
+        RowStamp {
+            index: i,
+            name: format!("row{i}").into(),
+            path_text: format!("C:\\row{i}").into(),
+            type_text: "txt".into(),
+            size_text: "10 B".into(),
+            modified_text: "2024-01-01 00:00".into(),
+            is_dir: false,
+            is_hidden: false,
+            selected: false,
+            cut: false,
+            truncated: false,
+            size: 10,
+            modified: Some(std::time::SystemTime::UNIX_EPOCH),
+            thumb,
+        }
+    }
+
+    fn ctx(path: &str, generation: u64) -> RowCtx {
+        RowCtx {
+            tab: 0,
+            path: Some(PathBuf::from(path)),
+            generation,
+            filter: String::new(),
+            view_mode: "details".into(),
+            name_w_q: 400,
+            total: 2,
+            computer: false,
+            split: false,
+        }
+    }
+
+    fn diff_state(ctx: RowCtx, stamps: Vec<RowStamp>) -> RowDiffState {
+        RowDiffState { ctx, stamps }
+    }
+
+    /// 增量更新只在“同一屏、内容有变”时逐行补；其余情况整表换。
+    #[test]
+    fn rows_to_patch_only_touches_changed_rows() {
+        let c = ctx("C:\\a", 1);
+        let stamps = vec![stamp(0, 0), stamp(1, 0), stamp(2, 0)];
+        // 没有上一帧 → 整表换。
+        assert!(rows_to_patch(None, &c, &stamps, 3).is_none());
+        // 完全相同 → 一行都不用写。
+        let prev = diff_state(c.clone(), stamps.clone());
+        assert_eq!(rows_to_patch(Some(&prev), &c, &stamps, 3), Some(vec![]));
+        // 只有第 1 行来了缩略图 → 只写第 1 行。
+        let mut changed = stamps.clone();
+        changed[1] = stamp(1, 42);
+        assert_eq!(rows_to_patch(Some(&prev), &c, &changed, 3), Some(vec![1]));
+        // 上下文变了（换目录 / 换搜索词 / 换视图）→ 整表换。
+        let other = ctx("C:\\a", 2);
+        assert!(rows_to_patch(Some(&prev), &other, &stamps, 3).is_none());
+        let mut other = c.clone();
+        other.filter = "png".into();
+        assert!(rows_to_patch(Some(&prev), &other, &stamps, 3).is_none());
+        // 行数变了（窗口大小变化）→ 整表换。
+        assert!(rows_to_patch(Some(&prev), &c, &stamps, 5).is_none());
+        let longer = vec![stamp(0, 0), stamp(1, 0), stamp(2, 0), stamp(3, 0)];
+        assert!(rows_to_patch(Some(&prev), &c, &longer, 4).is_none());
+    }
+
+    /// 选中态变化必须触发对应行的重写（否则点击无反馈）。
+    #[test]
+    fn rows_to_patch_reacts_to_selection() {
+        let c = ctx("C:\\a", 1);
+        let stamps = vec![stamp(0, 0), stamp(1, 0)];
+        let prev = diff_state(c.clone(), stamps.clone());
+        let mut changed = stamps.clone();
+        changed[0].selected = true;
+        assert_eq!(rows_to_patch(Some(&prev), &c, &changed, 2), Some(vec![0]));
+    }
 
     /// 新建会话时初始路径只能顶掉「那个还没列举过的默认此电脑标签」。
     ///
@@ -3521,8 +3758,9 @@ impl App {
                 #[cfg(windows)]
                 let icon_img = if is_recycle {
                     self.thumb_for(Path::new("shell:RecycleBinFolder"), None, 0, SIDEBAR_ICON_PX, true)
+                        .0
                 } else {
-                    self.thumb_for(&_path, None, 0, SIDEBAR_ICON_PX, false)
+                    self.thumb_for(&_path, None, 0, SIDEBAR_ICON_PX, false).0
                 };
                 #[cfg(not(windows))]
                 let icon_img = slint::Image::default();
@@ -3591,7 +3829,7 @@ impl App {
                         continue;
                     }
                     #[cfg(windows)]
-                    let icon_img = self.thumb_for(&path, None, 0, SIDEBAR_ICON_PX, false);
+                    let icon_img = self.thumb_for(&path, None, 0, SIDEBAR_ICON_PX, false).0;
                     #[cfg(not(windows))]
                     let icon_img = slint::Image::default();
 
@@ -3948,6 +4186,7 @@ impl App {
             return;
         };
         logln!("[shell-windows] 选中 pos={pos} {path:?}");
+        self.scroll_to_pane = None;
         self.scroll_to_index = Some(pos);
         self.visible_cache = None;
         self.visible_cache_right = None;
@@ -4001,7 +4240,7 @@ impl App {
         file_size: u64,
         size: u32,
         priority: bool,
-    ) -> slint::Image {
+    ) -> (slint::Image, u64) {
         let mtime_ms = mtime
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_millis() as u64)
@@ -4022,9 +4261,10 @@ impl App {
         // 1. 内存 LRU 命中：提升至队尾（真 LRU，非 FIFO）。
         if let Some(entry) = self.thumb_cache.get(&key) {
             let img = entry.img.clone();
+            let epoch = entry.epoch;
             self.thumb_order.retain(|k| k != &key);
             self.thumb_order.push(key);
-            return img;
+            return (img, epoch);
         }
 
         // 2. 负缓存命中：本会话内该图确实取不到，直接空白。
@@ -4034,7 +4274,7 @@ impl App {
                 path.display(),
                 size
             );
-            return slint::Image::default();
+            return (slint::Image::default(), 0);
         }
 
         // 3. 已在 pending：**很可能正是「跳过去后要等好几秒」的病灶**。
@@ -4047,7 +4287,7 @@ impl App {
             if priority {
                 self.promote_thumb(&key);
             }
-            return slint::Image::default();
+            return (slint::Image::default(), 0);
         }
 
         // 4. 未在 pending 中：先查磁盘缓存，查不到再交给后台 Shell 解码。
@@ -4070,8 +4310,8 @@ impl App {
                                 h
                             );
                             self.thumb_pending.remove(&key);
-                            self.insert_thumb_cache(key, img.clone());
-                            return img;
+                            let epoch = self.insert_thumb_cache(key, img.clone());
+                            return (img, epoch);
                         }
                     }
                     Err(e) => {
@@ -4123,7 +4363,7 @@ impl App {
         }
         // 未在 pending 时的收尾：不记日志。此处在热路径上（每行每次刷新都会调用），
         // 1538 张图加载期间可达 6 万行、占日志 79%。
-        slint::Image::default()
+        (slint::Image::default(), 0)
     }
 
     /// 把一条已经在普通池里的任务提到优先池（行从缓冲变成屏幕内时用）。
@@ -4156,7 +4396,7 @@ impl App {
     }
 
     /// 写入 LRU 缓存（内存），按字节预算 + 项数双上限淘汰（队首最久未用）。
-    fn insert_thumb_cache(&mut self, key: ThumbKey, img: slint::Image) {
+    fn insert_thumb_cache(&mut self, key: ThumbKey, img: slint::Image) -> u64 {
         let sz = img.size();
         // RGBA8 估算：每像素 4 字节。
         let bytes = (sz.width * sz.height * 4) as usize;
@@ -4166,7 +4406,10 @@ impl App {
             self.thumb_order.retain(|k| k != &key);
         }
 
-        self.thumb_cache.insert(key.clone(), CachedThumb { img, bytes });
+        self.thumb_epoch_next += 1;
+        let epoch = self.thumb_epoch_next;
+        self.thumb_cache
+            .insert(key.clone(), CachedThumb { img, bytes, epoch });
         self.thumb_order.push(key);
         self.thumb_cache_bytes += bytes;
 
@@ -4181,6 +4424,7 @@ impl App {
                     self.thumb_cache_bytes.saturating_sub(evicted.bytes);
             }
         }
+        epoch
     }
 
     #[cfg(not(windows))]
@@ -4191,8 +4435,8 @@ impl App {
         _file_size: u64,
         _size: u32,
         _priority: bool,
-    ) -> slint::Image {
-        slint::Image::default()
+    ) -> (slint::Image, u64) {
+        (slint::Image::default(), 0)
     }
 
     #[cfg(not(windows))]
@@ -4382,7 +4626,10 @@ impl App {
             let item_bottom = item_top + row_h;
             let pane_idx = {
                 let tab = self.state.active();
-                tab.active_pane.min(tab.panes.len().saturating_sub(1))
+                self.scroll_to_pane
+                    .take()
+                    .unwrap_or(tab.active_pane)
+                    .min(tab.panes.len().saturating_sub(1))
             };
             let current = self.state.active().panes[pane_idx].scroll_y.max(0.0);
             let target = if item_top < current {
@@ -4481,8 +4728,9 @@ impl App {
         // 左栏始终绑定 pane 0
         // 先清空「想要」集合：本轮两个分屏的屏幕内容都进去，最后一起发布。
         self.prio_wanted.clear();
-        let rows0 =
+        let batch0 =
             self.build_rows_for_pane(self.state.active_tab, 0, first0, count0, list_height);
+        let rows0 = &batch0.rows;
         // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
         // 只在真的有空图时输出，正常滚动不吵。
         // 启动期“盘符空白”排查：可视窗口内有图片为空的行就是病灶。
@@ -4572,8 +4820,10 @@ impl App {
             );
             let hit = rows0.iter().any(|r| r.path.as_str() == rp.as_str());
             if !hit {
-                logln!(
-                    "[rename] !! no visible row matches rename-path={} rows={} first={} count={} total={}",
+                // 良性：重命名框在根层固定浮层里（不受行窗口影响），用户把目标
+                // 条目滚出可视窗口是正常操作，不需要把它当成故障。
+                logv!(
+                    "[rename] rename row outside visible window rename-path={} rows={} first={} count={} total={}",
                     rp, rows0.len(), first0, count0, total0
                 );
             } else {
@@ -4590,15 +4840,67 @@ impl App {
             logv!("[rename] keep row model (sig={:?})", sig);
         } else {
             if renaming {
-                // 异常：重命名期间还在换行模型。换模型会销毁行内 TextInput，
-                // 造成失焦/输入丢失。看到这条就说明 rows_sig 没拦住。
-                logln!(
-                    "[rename] !! row model rebuilt during rename sig={:?} prev={:?}",
-                    sig, self.rows_sig
-                );
+                // 重命名期间行模型被改写时，把“重命名行换了槽位 / 离开了窗口”记一笔。
+                // 这只是排查线索：重命名框已搬到根层固定浮层（详见 file_list.slint
+                // 的「固定重命名浮层」），行怎么滚都不会销毁输入框，所以这些情况
+                // 全部是良性的，只放详细级。
+                let rp = self.ui.get_rename_path();
+                let slot_of = |rows: &[FileRow]| {
+                    rows.iter()
+                        .position(|r| r.path.as_str() == rp.as_str())
+                        .map(|i| i as i32)
+                        .unwrap_or(-1)
+                };
+                let new_slot = slot_of(rows0);
+                let old_slot = self
+                    .row_diff_left
+                    .as_ref()
+                    .map(|st| {
+                        st.stamps
+                            .iter()
+                            .position(|s| s.path_text.as_str() == rp.as_str())
+                            .map(|i| i as i32)
+                            .unwrap_or(-1)
+                    })
+                    .unwrap_or(-1);
+                let prev_total = self.rows_sig.map(|s| s.3).unwrap_or(0);
+                if new_slot < 0 {
+                    // 良性：目标行滚出了窗口（浮层按绝对行号定位，仍在原位）。
+                    logv!(
+                        "[rename] rename row left window (old_slot={} total={}->{}) sig={:?} prev={:?}",
+                        old_slot,
+                        prev_total,
+                        total0,
+                        sig,
+                        self.rows_sig
+                    );
+                } else if old_slot < 0 && total0 > prev_total {
+                    // 良性：新建/粘贴刚把这一行加进来，它以前不存在，没有输入框可销毁。
+                    crate::logv!(
+                        "[rename] new row appeared at slot {} during rename (input created) sig={:?}",
+                        new_slot,
+                        sig
+                    );
+                } else if old_slot != new_slot {
+                    logv!(
+                        "[rename] rename row moved slot {} -> {} (list scrolled) sig={:?} prev={:?}",
+                        old_slot,
+                        new_slot,
+                        sig,
+                        self.rows_sig
+                    );
+                } else {
+                    crate::logv!(
+                        "[rename] rows rewritten but rename row kept slot {} (input kept) sig={:?} prev={:?}",
+                        new_slot,
+                        sig,
+                        self.rows_sig
+                    );
+                }
             }
-            // 重建可见行（重命名中重建会得到新输入框实例，必须重新抢焦点）。
-            self.ui.set_file_rows(ModelRc::new(VecModel::from(rows0)));
+            // 写可见行：内容没变的行原地更新，只有变了的行才通知 Slint，
+            // 因此即便这里“重建”了，行内 TextInput 也不会被销毁（见 write_rows）。
+            self.write_rows(0, batch0);
             self.rows_sig = Some(sig);
             if renaming {
                 // 新实例获得焦点时 Slint 又会自动 reveal 一次，重新锁住当前位置。
@@ -4617,7 +4919,7 @@ impl App {
                 }
             };
             let (first1, count1) = pane_view_range(total1, cells_per_row, row_h, rows_visible, scroll1);
-            let rows1 =
+            let batch1 =
                 self.build_rows_for_pane(self.state.active_tab, 1, first1, count1, list_height);
             self.ui.set_file_total_right(total1 as i32);
             // 与左栏同理：右栏重命名期间，可见窗口没变就不要重建行模型，
@@ -4636,8 +4938,7 @@ impl App {
             let reuse_right =
                 renaming && rename_pane == 1 && self.rows_sig_right == Some(sig_right);
             if !reuse_right {
-                self.ui
-                    .set_file_rows_right(ModelRc::new(VecModel::from(rows1)));
+                self.write_rows(1, batch1);
                 self.rows_sig_right = Some(sig_right);
                 if renaming && rename_pane == 1 {
                     self.arm_rename_scroll_guard();
@@ -4645,8 +4946,11 @@ impl App {
             }
         } else {
             self.ui.set_file_total_right(0);
-            self.ui
-                .set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
+            self.row_diff_right = None;
+            if self.ui.get_file_rows_right().row_count() != 0 {
+                self.ui
+                    .set_file_rows_right(ModelRc::new(VecModel::from(Vec::<FileRow>::new())));
+            }
             self.rows_sig_right = None;
         }
 
@@ -4668,11 +4972,44 @@ impl App {
         self.sync_expand_targets();
     }
 
+    /// 下发给 Slint：正在重命名的条目在当前栏行模型里的行号（-1 = 无）。
+    ///
+    /// 详细信息 / 列表 / 小图标的行是虚拟化的，重命名输入框必须放在根层
+    /// 唯一实例里才不会随滚动被销毁（否则表现为“浮层还在却打不进字”）。
+    /// 那层浮层要按行号定位，所以要这个索引；坐标系与 `FileRow.index` 一致
+    /// （= `display_entry` 的索引，见 `build_rows_for_pane`）。
+    fn sync_rename_row(&mut self) {
+        let rename = self.ui.get_rename_path().to_string();
+        let rename_pane = self.ui.get_rename_pane() as usize;
+        let mut row = -1i32;
+        if !rename.is_empty() {
+            let want = std::path::PathBuf::from(&rename);
+            let tab = self.state.active();
+            if let Some(pane) = tab.panes.get(rename_pane) {
+                if let Some(pos) = (0..pane.display.len())
+                    .find(|&di| pane.display_entry(di).is_some_and(|e| e.path == want))
+                {
+                    row = pos as i32;
+                } else if self.ui.get_file_rename_row() >= 0 {
+                    // 找不到就保留上一次的行号：宁可能差一行，也不能把输入框
+                    // 整个撤掉——撤掉就等于没法继续输入，也没法回车/Esc 退出。
+                    row = self.ui.get_file_rename_row();
+                }
+            }
+        }
+        if self.ui.get_file_rename_row() != row {
+            self.ui.set_file_rename_row(row);
+            crate::logv!("[rename] fixed box row={}", row);
+        }
+    }
+
     /// 算出图标视图“展开名称层”的目标：正在重命名的条目，或本栏只选中一个条目时。
     ///
     /// 给出的是**绝对显示索引**（与 `FileRow.index` 同一坐标系）。
     /// 只在中/大/超大图标视图生效——小图标视图是横排单行，保持原样。
+    /// 另外顺带下发“重命名行号”（详细信息 / 列表 / 小图标的固定浮层要用）。
     fn sync_expand_targets(&mut self) {
+        self.sync_rename_row();
         let icons_big = is_grid_icons_view(&self.config.view_mode);
         if !icons_big {
             self.ui.set_file_expand_index(-1);
@@ -4932,6 +5269,81 @@ impl App {
         text
     }
 
+    /// 把一屏行写进 Slint 行模型，能原地更新就原地更新。
+    ///
+    /// `set_file_rows(ModelRc::new(..))` 是整表换模型：Slint 会把 `for` 里每一行
+    /// 元素销毁重建，行内 TextInput、悬停态、动画全部重来。缩略图连片到达时
+    /// 40ms 轮询一路都在换表，代价很大。
+    ///
+    /// 这里改成：上下文没变、行数没变时，只对内容真的变了的行调 `set_row_data`。
+    /// Slint 收到 RowDataChanged 只是更新那一行元素的属性，元素本身保留
+    /// （`RepeaterTracker::row_changed` → `comp.update`）。
+    fn write_rows(&mut self, pane: usize, batch: RowBatch) {
+        let ctx = {
+            let tab = self.state.active();
+            let Some(p) = tab.panes.get(pane) else { return };
+            RowCtx {
+                tab: self.state.active_tab,
+                path: p.path.clone(),
+                generation: p.generation,
+                filter: p.filter.clone(),
+                view_mode: self.config.view_mode.clone(),
+                name_w_q: batch.name_w_q,
+                total: p.display.len(),
+                computer: p.path.is_none(),
+                split: tab.panes.len() > 1,
+            }
+        };
+        let prev = if pane == 0 {
+            self.row_diff_left.take()
+        } else {
+            self.row_diff_right.take()
+        };
+        let model = if pane == 0 {
+            self.ui.get_file_rows()
+        } else {
+            self.ui.get_file_rows_right()
+        };
+        // 此电脑视图不做增量：只有几行盘符，而且行内容会随剩余容量等外部
+        // 信息变化，直接换表最省心。
+        let patch = if ctx.computer {
+            None
+        } else {
+            rows_to_patch(prev.as_ref(), &ctx, &batch.stamps, model.row_count())
+        };
+        let RowBatch { rows, stamps, .. } = batch;
+        let mut patched = 0usize;
+        match patch {
+            Some(idx) => {
+                patched = idx.len();
+                for i in idx {
+                    if let Some(row) = rows.get(i) {
+                        model.set_row_data(i, row.clone());
+                    }
+                }
+            }
+            None => {
+                let model_rc = ModelRc::new(VecModel::from(rows));
+                if pane == 0 {
+                    self.ui.set_file_rows(model_rc);
+                } else {
+                    self.ui.set_file_rows_right(model_rc);
+                }
+            }
+        }
+        // 诊断（ROVE_LOG=1）：一行一行补更新时打一行，便于确认「缩略图到达只动
+        // 那一行」，而不是整屏重写。
+        if patched > 0 {
+            crate::logv!("[rows] patched {patched}/{} rows (pane={pane})", stamps.len());
+        }
+        let state = RowDiffState { ctx, stamps };
+        if pane == 0 {
+            self.row_diff_left = Some(state);
+        } else {
+            self.row_diff_right = Some(state);
+        }
+    }
+
     /// 两遍构建：第一遍在 `self.state` 的不可变借用下收集条目/选择/高亮/文本，
     /// 第二遍释放借用后再调 `self.thumb_for` 填缩略图（可能需要 &mut self）。
     fn build_rows_for_pane(
@@ -4941,11 +5353,14 @@ impl App {
         first: usize,
         count: usize,
         list_height: f32,
-    ) -> Vec<FileRow> {
+    ) -> RowBatch {
+        // 名称区宽度（量化到 0.5px）供增量更新判断“排版口径有没有变”。
+        // 下面阶段一必定会赋值（早退分支不会走到这里）。
+        let name_w_q: i32;
         let collected: Vec<PreRow> = {
             let tab = &self.state.tabs[tab_index];
             let Some(pane) = tab.panes.get(pane_index) else {
-                return Vec::new();
+                return RowBatch::empty();
             };
             let computer_view = pane.path.is_none();
             // 小图标视图（横排单行）名称区宽 = item-w - 50px，item-w = cell-w - 8px。
@@ -4962,6 +5377,7 @@ impl App {
                 self.ui.get_file_name_area_w_right()
             } as f32;
             let name_area_w = name_area_w.max(24.0);
+            name_w_q = (name_area_w * 2.0).round() as i32;
             // 小图标视图：HorizontalLayout 里的名称 Text 宽度 = item-w - 58px
             // （导出值已按视图算好，这里只在导出为 0 时退回按格宽估算）。
             let small_name_w = if name_area_w > 24.0 {
@@ -5247,12 +5663,34 @@ impl App {
                 head,
             );
         }
-        ordered
+        let mut stamps: Vec<RowStamp> = Vec::with_capacity(ordered.len());
+        let rows: Vec<FileRow> = ordered
             .into_iter()
             .map(|p| {
                 let in_core = p.index >= core_first as i32 && (p.index as usize) < core_last;
-                let thumb =
+                let (thumb, thumb_epoch) =
                     self.thumb_for(&p.thumb_path, p.modified, p.size, thumb_px, in_core);
+                // 同一批条目每次重建都会重新格式化一遍（`format_local` 里有
+                // Win32 的时区换算），走记忆表；指纹复用同一份结果，避免第二次格式化。
+                let modified_text = self.time_text(p.modified);
+                // 指纹只留判等需要的字段：文案类多克隆一次 SharedString
+                // （短名是内联存储，长名只是引用计数 +1），比重建整行便宜得多。
+                stamps.push(RowStamp {
+                    index: p.index,
+                    name: p.name.clone(),
+                    path_text: p.path_text.clone(),
+                    type_text: p.type_text.clone(),
+                    size_text: p.size_text.clone(),
+                    modified_text: modified_text.clone(),
+                    is_dir: p.is_dir,
+                    is_hidden: p.is_hidden,
+                    selected: p.selected,
+                    cut: p.cut,
+                    truncated: p.name_truncated,
+                    size: p.size,
+                    modified: p.modified,
+                    thumb: thumb_epoch,
+                });
                 FileRow {
                     index: p.index,
                     name: p.name,
@@ -5283,9 +5721,7 @@ impl App {
                     is_dir: p.is_dir,
                     is_hidden: p.is_hidden,
                     size_text: p.size_text,
-                    // 同一批条目每次重建都会重新格式化一遍（`format_local` 里有
-                    // Win32 的时区换算），走记忆表。
-                    modified_text: self.time_text(p.modified),
+                    modified_text,
                     type_text: p.type_text,
                     icon_color: p.icon_color,
                     icon_text: p.icon_text,
@@ -5307,7 +5743,8 @@ impl App {
                     name_truncated: p.name_truncated,
                 }
             })
-            .collect()
+            .collect();
+        RowBatch { rows, stamps, name_w_q }
     }
 
     /// 切换标签后的完整同步。
@@ -5593,6 +6030,97 @@ type GridLines = Vec<Vec<(String, bool)>>;
 /// details/list 是单行 elide，都不读这个字段，也就不用算。
 fn is_grid_icons_view(view_mode: &str) -> bool {
     matches!(view_mode, "icons-medium" | "icons-large" | "icons-xl")
+}
+
+/// 一行「内容指纹」：只包含行模型里其余字段的真正输入。
+///
+/// 增量更新时逐个比对：完全相同的行不必重写（Slint 那边连属性都不会重算）。
+/// 不追求“冗余”，关键是**任何会让行外观变化的输入都在里面**：
+/// - `index` / `name` / `path_text`：条目本身（重命名、排序、回收站原始路径）
+/// - `type_text` / `size_text` / `modified_text`：文案（语言切换、目录体积统计陆续到达）
+/// - `is_dir` / `is_hidden`：图标、角标、隐藏态（同名条目被删掉后换成别的类型）
+/// - `selected` / `cut` / `truncated`：用户操作与省略号状态
+/// - `size` / `modified`：条目自身的体积与 mtime
+/// - `thumb`：缩略图版本号（0 = 还没图）
+///
+/// 漏掉任何一个输入，都会表现为「那一行的变化永远不刷新」。
+#[derive(Clone, Debug, PartialEq)]
+struct RowStamp {
+    index: i32,
+    name: SharedString,
+    path_text: SharedString,
+    type_text: SharedString,
+    size_text: SharedString,
+    modified_text: SharedString,
+    is_dir: bool,
+    is_hidden: bool,
+    selected: bool,
+    cut: bool,
+    truncated: bool,
+    size: u64,
+    modified: Option<SystemTime>,
+    thumb: u64,
+}
+
+/// 一屏行的「公共上下文」：这些一变，整屏内容都得重算，不做增量。
+///
+/// `filter` 单独放进来是因为搜索词变化时条目和名字可能完全没变（同一条命中的
+/// 高亮分段不同），只看 `RowStamp` 会漏掉高亮更新。
+#[derive(Clone, Debug, PartialEq)]
+struct RowCtx {
+    tab: usize,
+    path: Option<PathBuf>,
+    generation: u64,
+    filter: String,
+    view_mode: String,
+    name_w_q: i32,
+    total: usize,
+    computer: bool,
+    split: bool,
+}
+
+/// 上一帧写进行模型的内容（用于下一次增量更新）。
+struct RowDiffState {
+    ctx: RowCtx,
+    stamps: Vec<RowStamp>,
+}
+
+/// `build_rows_for_pane` 的产物：行、指纹、以及算指纹用的名称区宽度。
+struct RowBatch {
+    rows: Vec<FileRow>,
+    stamps: Vec<RowStamp>,
+    name_w_q: i32,
+}
+
+impl RowBatch {
+    fn empty() -> Self {
+        Self { rows: Vec::new(), stamps: Vec::new(), name_w_q: 0 }
+    }
+}
+
+/// 决定这次要怎么写行模型。
+///
+/// 返回 `None` = 整表换掉（上下文变了 / 行数变了）；返回 `Some(下标)` = 只重写
+/// 这几行。整表换掉会让 Slint 销毁重建每一个行元素（行内 TextInput 一起没），
+/// 所以能不换就不换。
+fn rows_to_patch(
+    prev: Option<&RowDiffState>,
+    ctx: &RowCtx,
+    stamps: &[RowStamp],
+    model_len: usize,
+) -> Option<Vec<usize>> {
+    let prev = prev?;
+    if prev.ctx != *ctx || prev.stamps.len() != stamps.len() || model_len != stamps.len() {
+        return None;
+    }
+    Some(
+        stamps
+            .iter()
+            .enumerate()
+            .filter(|(i, stamp)| prev.stamps[*i] != **stamp)
+            .map(|(i, _)| i)
+            .collect(),
+    )
 }
 
 /// `build_rows_for_pane` 第一阶段的产物：与条目相关的文本 / 标志一次算好。
@@ -5958,7 +6486,8 @@ fn drop_into_crumb(app: &mut App, paths: &[std::path::PathBuf], target: &std::pa
         app.set_status_job(app.tr("无法将文件夹移动到自身或其子文件夹中"));
         return;
     }
-    app.expect_new_entries(paths, target);
+    let pane = app.state.active().active_pane;
+    app.expect_new_entries(paths, target, pane);
     let sources = paths.to_vec();
     let dest_dir = target.to_path_buf();
     let kind = if paths.iter().all(|p| same_volume(p, target)) {
@@ -8162,6 +8691,7 @@ impl App {
                     // （见 apply_list_result 里的 scroll_to_paths / scroll_select）。
                     self.scroll_to_paths = vec![new_path.clone()];
                     self.scroll_select = true;
+                    self.reveal_pane = Some(self.state.active().active_pane);
                 }
                 self.state.cut_paths.remove(path);
                 if let Some(idx) = pin_index {
@@ -8181,7 +8711,10 @@ impl App {
 
     /// 预测复制/移动完成后在目标目录里出现的新路径，让列表把它们滚进可视区。
     /// Shell 的同名冲突可能改名，预测不准时列举结果里找不到 → 不会滚动，不会误滚。
-    fn expect_new_entries(&mut self, sources: &[PathBuf], dest_dir: &Path) {
+    fn expect_new_entries(&mut self, sources: &[PathBuf], dest_dir: &Path, pane: usize) {
+        // 揭示只在**这个面板**的列举结果上生效：跨分屏拖放时目标栏不是聚焦栏，
+        // 而揭示的消费条件以前写死成“聚焦栏”，于是新文件既不滚进视野也不选中。
+        self.reveal_pane = Some(pane);
         self.scroll_to_paths = sources
             .iter()
             .filter_map(|s| s.file_name().map(|n| dest_dir.join(n)))
@@ -8221,7 +8754,8 @@ impl App {
         }
 
         let sources: Vec<PathBuf> = entries.iter().map(|e| e.path.clone()).collect();
-        self.expect_new_entries(&sources, &dest);
+        let pane = self.state.active().active_pane;
+        self.expect_new_entries(&sources, &dest, pane);
         let kind = if is_move {
             JobKind::Move {
                 sources,
@@ -8422,6 +8956,7 @@ impl App {
             // 列表还没到位（异步列举竞态）：交给列举结果落地时再选中。
             self.scroll_to_paths = vec![path.to_path_buf()];
             self.scroll_select = true;
+            self.reveal_pane = Some(self.state.active().active_pane);
             return false;
         };
         {
@@ -8433,6 +8968,9 @@ impl App {
         // 新建文件夹留下的「等旧名字出现」的挂起匹配作废，否则下次列举还会拿它去滚。
         self.scroll_to_paths.clear();
         self.scroll_select = false;
+        // 这里滚的是聚焦面板，不能留着上一次（可能是另一栏）的记录。
+        self.reveal_pane = None;
+        self.scroll_to_pane = None;
         self.scroll_to_index = Some(pos);
         self.visible_cache = None;
         self.visible_cache_right = None;
@@ -8720,6 +9258,7 @@ impl App {
                             // 并换算成显示索引做最小位移滚动。
                             self.scroll_to_paths = vec![p.clone()];
                             self.scroll_select = true;
+                            self.reveal_pane = Some(self.state.active().active_pane);
                             self.visible_cache = None;
                             self.visible_cache_right = None;
                             self.refresh_visible_rows();
@@ -8949,7 +9488,8 @@ impl App {
                 .collect();
 
             if !to_move.is_empty() {
-                self.expect_new_entries(&to_move, &dest);
+                let pane = self.state.active().active_pane;
+                self.expect_new_entries(&to_move, &dest, pane);
                 self.submit_job(JobKind::Move {
                     sources: to_move,
                     dest_dir: dest,
@@ -8961,6 +9501,7 @@ impl App {
                 ));
                 self.scroll_to_paths = restored_paths;
                 self.scroll_select = true;
+                self.reveal_pane = Some(self.state.active().active_pane);
                 self.reload_active();
             }
             self.sidebar_fingerprint = 0;
@@ -8974,7 +9515,8 @@ impl App {
         }
         self.state.clipboard_paths = paths.clone();
         self.state.clipboard_operation = if is_move { "move".into() } else { "copy".into() };
-        self.expect_new_entries(&paths, &dest);
+        let pane = self.state.active().active_pane;
+        self.expect_new_entries(&paths, &dest, pane);
         let kind = if is_move {
             JobKind::Move {
                 sources: paths,
@@ -9008,6 +9550,9 @@ impl App {
                 // Flickable 的 interactive 滚动被关，必须等下次目录刷新才重置）。
                 self.drag_pending = None;
                 self.ui.invoke_set_drag_armed(false);
+                // 这是应用自己建的，不是 Shell 新建动词的结果：作废那份快照，
+                // 否则随后到达的列举会对着旧快照做 diff。
+                self.shell_new_watch = None;
 
                 // 关键诊断（ROVE_LOG=1）：用户反馈「新建文件夹有概率没默认选中，
                 // 但名称框可以编辑」。这条链路跨异步列举 + 行模型重建，逐环打点，
@@ -9026,6 +9571,7 @@ impl App {
                 // 别处、看起来「没选中」或「选中错行」。
                 self.scroll_to_paths = vec![path.clone()];
                 self.scroll_select = false;
+                self.reveal_pane = Some(self.state.active().active_pane);
                 self.reload_active();
                 let new_path = path.clone();
                 self.begin_rename(&new_path);
@@ -9042,6 +9588,10 @@ impl App {
 
     /// 提交后台文件任务；返回是否真的提交成功（已有任务在进行时为 false）。
     fn submit_job(&mut self, kind: JobKind) -> bool {
+        // 作废「Shell 系统菜单新建」快照：我们自己发起的复制/移动/删除同样会
+        // 往目录里放新条目，而粘贴多文件时中间的列举可能刚好只看到 1 个新文件，
+        // 于是被 diff 当成「用 Shell 新建了一个文件」→ 把刚粘贴的文件抢进重命名。
+        self.shell_new_watch = None;
         self.shell_op_running = true;
         self.shell_key_suppressed_logged = false;
         let ok = self.jobs.submit(kind);
@@ -9061,6 +9611,10 @@ impl App {
     /// 任务完成后的处理：刷新受影响目录。
     fn on_job_finished(&mut self, summary: JobSummary) {
         self.shell_op_running = false;
+        // 复制/移动是逐个落地的：任务期间发起的列举可能只含一部分新文件，
+        // 它们的结果可能在这个函数之后才到。给一小段保护期，只拦“不完整”的
+        // 列举；完整的那次（本函数稍后发起的重载）照常立即消费。
+        self.reveal_grace_until = Some(std::time::Instant::now() + std::time::Duration::from_millis(400));
         self.set_status_job(summary.message.clone());
         let affected = &summary.affected_dirs;
         let mut requests = Vec::new();
@@ -9262,6 +9816,8 @@ impl App {
         logv!("[reveal] 选中 {:?}", target);
         self.scroll_to_paths = vec![target];
         self.scroll_select = true;
+        // 这类揭示都由聚焦面板发起；写死面板，免得沿用上一次跨栏拖放留下的记录。
+        self.reveal_pane = Some(self.state.active().active_pane);
     }
 
     fn sync_after_navigate(&mut self) {
@@ -9861,6 +10417,16 @@ impl App {
             }
         }
 
+        // 「松开左键」那条消息被 OLE 的模态循环吃掉了（DoDragDrop 自己捕获鼠标直到
+        // 松手），Slint 收不到 up，按下状态就一直卡着：拖完之后点哪儿，那一次点击都
+        // 被当成「上一下的释放」——焦点切不过去，而且拖出前的多选会被塌缩成拖的
+        // 那一行。补一条合成的 up 把状态复位（不影响拖放结果，up 里也不改选择集）。
+        #[cfg(windows)]
+        {
+            reset_pointer_press(&self.ui);
+            logv!("[drag] 合成 up 复位按下状态");
+        }
+
         // 拖到面包屑松手：无 IDropTarget 的区域只会返回 CANCEL，用「松手结束」
         // 标志 + 拖动前快照的几何判断落点，命中就直接移动。
         #[cfg(windows)]
@@ -9963,7 +10529,8 @@ impl App {
             same_volume(&paths[0], &target_dir)
         };
         // 预测粘贴后的新路径，供列举就位后滚进可视区（预测不准也不会误滚）。
-        self.expect_new_entries(&paths, &target_dir);
+        // 拖放的目标栏由光标位置决定（见上面的 target_pane），揭示必须跟着它。
+        self.expect_new_entries(&paths, &target_dir, target_pane);
         let kind = if is_move {
             JobKind::Move { sources: paths, dest_dir: target_dir }
         } else {
@@ -10021,7 +10588,15 @@ impl App {
                 }
                 let target = MenuScope::Background;
                 self.menu_scope = Some(target.clone());
+                // 原生菜单是阻塞调用：返回即「菜单已收起」，此时 Shell 的新建动词
+                // 多半已经执行（或即将通过事件循环执行），所以推迟 250ms 主动
+                // 重载一次目录 —— 比等 1 秒的 mtime 轮询更快，也不依赖目录 mtime
+                // 是否被 Windows 及时更新。
                 self.open_menu(target);
+                if self.shell_new_watch.is_some() {
+                    self.shell_new_reload_at =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
+                }
             }
             _ => {}
         }
@@ -10217,6 +10792,14 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                     );
                     app.list_geom = geom;
                     app.refresh_visible_rows();
+                }
+                // 右键菜单收起后主动重载一次目录（见 shell_new_reload_at）：
+                // 「新建 → 文本文档」是 Shell 自己执行的，Rove 只能靠列举 diff 认出它。
+                if let Some(at) = app.shell_new_reload_at {
+                    if std::time::Instant::now() >= at {
+                        app.shell_new_reload_at = None;
+                        app.reload_active();
+                    }
                 }
                 while let Ok(result) = app.list_rx.try_recv() {
                     app.apply_list_result(result);
@@ -12299,6 +12882,36 @@ fn close_and_destroy(_app_weak: &std::rc::Weak<RefCell<App>>) {
     schedule_destroy();
 }
 
+/// 补一条合成的「松开左键」消息，复位卡住的按下状态。
+///
+/// OLE 的 `DoDragDrop` 会捕获鼠标并吃掉松手消息，Slint 永远收不到 up。之后第一次
+/// 点击会被当成上一下的释放：焦点不切换、多选塌缩成被拖的那一行。winit 收到
+/// `WM_LBUTTONUP` 就会派发一个正常的 MouseInput(Released)，按下状态随之复位。
+#[cfg(windows)]
+fn reset_pointer_press(ui: &MainWindow) {
+    use windows_sys::Win32::Foundation::POINT;
+    // ScreenToClient 在 windows-sys 里挂在 Gdi 模块下（虽属 user32）。
+    use windows_sys::Win32::Graphics::Gdi::ScreenToClient;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, PostMessageW, WM_LBUTTONUP,
+    };
+    let Some(hwnd) = get_window_hwnd(ui) else {
+        return;
+    };
+    if hwnd == 0 {
+        return;
+    }
+    let mut pt = POINT { x: 0, y: 0 };
+    let mut lparam = 0isize;
+    unsafe {
+        // 用真实光标位置构造 lparam：Slint 会把释放事件的坐标当作当前鼠标位置。
+        if GetCursorPos(&mut pt) != 0 && ScreenToClient(hwnd as _, &mut pt) != 0 {
+            lparam = ((pt.y as isize) << 16) | (pt.x as isize & 0xFFFF);
+        }
+        PostMessageW(hwnd as _, WM_LBUTTONUP, 0, lparam);
+    }
+}
+
 /// 取窗口的原生 Win32 HWND（仅 Windows）。用于无边框标题栏的
 /// 最小化 / 最大化 / 拖拽移动等原生窗口操作。
 #[cfg(windows)]
@@ -14033,11 +14646,15 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
 /// 销毁当前会话：丢弃窗口（释放 GPU 资源与组件树）与全部状态，
 /// 仅保留管道守护线程，常驻内存降到守护水位。
 pub fn destroy_session() {
-    logln!("destroy_session running");
+    // 幂等守门：会话只能被销毁一次。窗口关闭按钮、托盘退出、系统关闭请求
+    // 可能各自排定一次销毁，重复那次必须在这里直接吞掉——否则会再打一条
+    // “destroy_session running” 的假日志，看起来像销毁了两遍。
     let app = SESSION.with(|slot| slot.borrow_mut().take());
     let Some(app) = app else {
+        crate::logv!("[session] destroy ignored (already destroyed)");
         return;
     };
+    logln!("destroy_session running");
     // 退出存档：窗口几何（逻辑像素）+ 最大化状态 + 上次标签页快照。
     // 统一在销毁出口完成，保证「窗口 X」与「托盘退出」两条路径都能落盘。
     {
