@@ -544,6 +544,12 @@ struct CachedThumb {
     /// 插入序号（进程内单调递增）。行模型做增量更新时靠它判断
     /// 「这一行的缩略图到底变没变」——`slint::Image` 本身没法比较相等。
     epoch: u64,
+    /// 最近一次被用到的序号（进程内单调递增，LRU 淘汰依据）。
+    ///
+    /// 以前用一条 `Vec<ThumbKey>` 维护 LRU 顺序，**每次命中**都要线性扫描
+    /// 整个顺序表（上限 4096 条，每行每帧都命中）才能把它挪到队尾。
+    /// 改成记一个序号：命中只写一个 u64，淘汰时才扫一遍找最久未用的。
+    last_used: u64,
 }
 
 /// 全局常驻的体积缓存单例（进程级生命周期，窗口关闭不销毁）。
@@ -925,8 +931,8 @@ pub struct App {
     actions: Vec<crate::ops::actions::ActionEntry>,
     /// 缩略图 LRU 缓存（Key 包含 mtime/size，防止旧图）。
     thumb_cache: HashMap<ThumbKey, CachedThumb>,
-    /// LRU 顺序（队首最久未用，命中时移到队尾）。
-    thumb_order: Vec<ThumbKey>,
+    /// LRU 用的单调递增序号（每次命中 / 插入都 +1）。
+    thumb_use_seq: u64,
     /// 当前缓存的估算总字节数（用于字节预算淘汰）。
     thumb_cache_bytes: usize,
     /// 已请求未完成的缩略图（防重复提交）。
@@ -1151,7 +1157,7 @@ impl App {
             last_rescan_times: HashMap::new(),
             actions: Vec::new(),
             thumb_cache: HashMap::new(),
-            thumb_order: Vec::new(),
+            thumb_use_seq: 0,
             thumb_cache_bytes: 0,
             thumb_pending: HashSet::new(),
             thumb_queued: Vec::new(),
@@ -2691,6 +2697,23 @@ mod tests {
         let mut changed = stamps.clone();
         changed[0].selected = true;
         assert_eq!(rows_to_patch(Some(&prev), &c, &changed, 2), Some(vec![0]));
+    }
+
+    /// 缩略图缓存淘汰：挑最久未用的那条（命中路径不再维护顺序表）。
+    #[test]
+    fn lru_victim_picks_least_recently_used() {
+        let mut m: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        m.insert(1, 30);
+        m.insert(2, 10);
+        m.insert(3, 20);
+        assert_eq!(lru_victim(&m, |v| *v), Some(2));
+        // 用过 2 之后，它不再是牺牲对象。
+        m.insert(2, 40);
+        assert_eq!(lru_victim(&m, |v| *v), Some(3));
+        assert_eq!(
+            lru_victim(&std::collections::HashMap::<u32, u64>::new(), |v| *v),
+            None
+        );
     }
 
     /// 图标视图浮层定位：缓存行号只在「那一行还是同一个条目」时复用，
@@ -4279,20 +4302,25 @@ impl App {
             file_size,
             px_size: size,
         };
-        // 优先池的「想要」注册：屏幕内的 key 立刻进集合（worker 可能瞬间就取到任务，
-        // 不能等到本轮行模型全部建完才发布），同时留给本轮结束时整体替换。
+        // 1. 内存 LRU 命中：只更新「最近使用序号」（一次哈希查找 + 写一个 u64）。
+        //
+        // 已缓存的行不需要再登记「想要」：它没有在途请求，登记了也只是让
+        // worker 多比较一次。所以这里直接返回，连 ThumbKey 的克隆都省掉。
+        if let Some(entry) = self.thumb_cache.get_mut(&key) {
+            let img = entry.img.clone();
+            let epoch = entry.epoch;
+            self.thumb_use_seq += 1;
+            entry.last_used = self.thumb_use_seq;
+            return (img, epoch);
+        }
+
+        // 从现在起真的要发请求了，才登记「想要」：屏幕内的 key 立刻进集合
+        // （worker 可能瞬间就取到任务，不能等到本轮行模型全部建完才发布），
+        // 同时留给本轮结束时整体替换。放在缓存命中之后是为了省掉已缓存行的
+        // 每帧两次 ThumbKey 克隆（各含一次 PathBuf 堆分配）和一次全局锁。
         if priority {
             self.prio_wanted.insert(key.clone());
             thumb_want(&key);
-        }
-
-        // 1. 内存 LRU 命中：提升至队尾（真 LRU，非 FIFO）。
-        if let Some(entry) = self.thumb_cache.get(&key) {
-            let img = entry.img.clone();
-            let epoch = entry.epoch;
-            self.thumb_order.retain(|k| k != &key);
-            self.thumb_order.push(key);
-            return (img, epoch);
         }
 
         // 2. 负缓存命中：本会话内该图确实取不到，直接空白。
@@ -4423,7 +4451,11 @@ impl App {
         }
     }
 
-    /// 写入 LRU 缓存（内存），按字节预算 + 项数双上限淘汰（队首最久未用）。
+    /// 写入 LRU 缓存（内存），按字节预算 + 项数双上限淘汰。
+    ///
+    /// 淘汰依据是每项自己的 `last_used` 序号，不再维护一条顺序表：
+    /// 命中路径因此是 O(1)，只有真正要淘汰时才扫一遍找最久未用的那条
+    /// （每次插入最多触发一次）。
     fn insert_thumb_cache(&mut self, key: ThumbKey, img: slint::Image) -> u64 {
         let sz = img.size();
         // RGBA8 估算：每像素 4 字节。
@@ -4431,25 +4463,31 @@ impl App {
 
         if let Some(old) = self.thumb_cache.remove(&key) {
             self.thumb_cache_bytes = self.thumb_cache_bytes.saturating_sub(old.bytes);
-            self.thumb_order.retain(|k| k != &key);
         }
 
         self.thumb_epoch_next += 1;
         let epoch = self.thumb_epoch_next;
-        self.thumb_cache
-            .insert(key.clone(), CachedThumb { img, bytes, epoch });
-        self.thumb_order.push(key);
+        self.thumb_use_seq += 1;
+        self.thumb_cache.insert(
+            key,
+            CachedThumb {
+                img,
+                bytes,
+                epoch,
+                last_used: self.thumb_use_seq,
+            },
+        );
         self.thumb_cache_bytes += bytes;
 
-        // 淘汰：从头部（最久未用）移除，直到符合双上限。
-        while (self.thumb_cache.len() > THUMB_CACHE_MAX_ITEMS
-            || self.thumb_cache_bytes > THUMB_CACHE_MAX_BYTES)
-            && !self.thumb_order.is_empty()
+        // 淘汰：每次挑一条最久未用的，直到符合双上限。
+        while self.thumb_cache.len() > THUMB_CACHE_MAX_ITEMS
+            || self.thumb_cache_bytes > THUMB_CACHE_MAX_BYTES
         {
-            let oldest = self.thumb_order.remove(0);
-            if let Some(evicted) = self.thumb_cache.remove(&oldest) {
-                self.thumb_cache_bytes =
-                    self.thumb_cache_bytes.saturating_sub(evicted.bytes);
+            let Some(victim) = lru_victim(&self.thumb_cache, |v| v.last_used) else {
+                break;
+            };
+            if let Some(evicted) = self.thumb_cache.remove(&victim) {
+                self.thumb_cache_bytes = self.thumb_cache_bytes.saturating_sub(evicted.bytes);
             }
         }
         epoch
@@ -6143,6 +6181,19 @@ impl RowBatch {
     fn empty() -> Self {
         Self { rows: Vec::new(), stamps: Vec::new(), name_w_q: 0 }
     }
+}
+
+/// 挑出最久未用的缓存项（LRU 淘汰用）。
+///
+/// 命中路径不再维护顺序表，所以「谁最久没用」只能淘汰时现算一次。
+/// 抽成独立函数是为了能脱离 UI 单测。
+fn lru_victim<K: Clone, V>(
+    map: &std::collections::HashMap<K, V>,
+    last_used: impl Fn(&V) -> u64,
+) -> Option<K> {
+    map.iter()
+        .min_by_key(|(_, v)| last_used(v))
+        .map(|(k, _)| k.clone())
 }
 
 /// 在显示列表里定位某个路径的行号。
