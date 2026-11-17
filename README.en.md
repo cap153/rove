@@ -43,6 +43,8 @@ Tabs work like a browser. Any tab can be split into two panes showing two differ
 
 When split, `Ctrl+W` closes the right pane first, and a second press closes the tab.
 
+With many tabs open, put the mouse wheel over the tab bar to scroll it sideways; an address bar whose path is too long scrolls the same way.
+
 ## 2. Instant whole-disk search: just type on the "This PC" page
 
 Type any name into the search box on the **This PC** page and Rove looks through **all your drives**, without clicking into folders one by one. Chinese names also match by pinyin (`jsq` or `jisuanqi` finds `计算器`).
@@ -133,9 +135,23 @@ The result is a single `rove.exe` that runs from anywhere.
 
 - Only tested on Windows 10, 64-bit.
 - Global search matches **file and folder names** only, not file contents.
+- Dragging files to copy them onto the desktop blocks the UI; for large files use `Ctrl+C` / `Ctrl+V` instead.
 - The index covers local fixed drives by default; network and removable drives are read on demand and are not indexed (you can enable them on the settings page).
 - Explorer takeover only changes the current user's settings, so it may fight with other tools of the same kind.
 
 ## License
 
 MIT
+
+## References & Credits
+
+Ideas for the interface and interactions were borrowed from these projects — thanks to their authors:
+
+| Project | What was referenced |
+| --- | --- |
+| [PowerToys](https://github.com/microsoft/PowerToys) | Layout and interaction of the batch-rename window (PowerRename) |
+| [pulse](https://github.com/jimmgreen/pulse) | Taking over Explorer via `IShellWindows` self-registration, the docked dialog search bar, and the sidebar drive-capacity display |
+| [zsdesk](https://github.com/qiu7824/zsdesk) | System context menu, and research into a multi-tab Win32/COM implementation (Rove does not use its DLL-injection Explorer takeover) |
+| [sigma-file-manager](https://github.com/aleksey-hoffman/sigma-file-manager) | Interface organisation, how information is presented, and the search index |
+| [disktree](https://github.com/tobi/disktree) | Ideas for visualising disk capacity |
+| [stools](https://github.com/cap153/stools) | A launcher by the same author; practical experience with pinyin search, Slint windows and shortcut handling |
