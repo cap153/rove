@@ -233,6 +233,9 @@ const OVERSCAN: usize = 4;
 /// 单条索引记录的粗估内存占用（路径 + 名称 + 拼音字段）。
 const INDEX_ENTRY_BYTES: usize = 80;
 
+/// 后台预建拼音缓存的条目数上限：比这更大的目录只在真的有搜索词时才算
+/// （否则每进一个大目录就白烧一个后台核）。
+const PINYIN_EAGER_MAX: usize = 20000;
 /// 缩略图缓存最大项数（宽松限制，主要受字节预算约束）。
 const THUMB_CACHE_MAX_ITEMS: usize = 4096;
 /// 缩略图缓存字节预算（192 MB）。Rove 的 Image 常驻 CPU 侧 RGBA，
@@ -316,6 +319,17 @@ struct DeepResult {
     deep_generation: u64,
     query: String,
     items: Vec<crate::search::index::DeepItem>,
+}
+
+/// 拼音缓存的后台计算结果（大目录里同步算要十几到几十毫秒）。
+///
+/// `seq` 对不上（期间条目换了 / 又被重新排序）就整批丢弃：缓存与 `entries`
+/// 逐项平行，用错位的数据去匹配会命中错误的文件。
+struct PinyinJobResult {
+    tab_id: u32,
+    pane: usize,
+    seq: u64,
+    fields: Vec<crate::search::PinyinFields>,
 }
 
 /// 文件夹体积统计请求（一批 = 当前列表中的全部子文件夹 + 各自的修改时间）。
@@ -957,6 +971,9 @@ pub struct App {
     /// 深度搜索通道（文件夹视图子树搜索，独立线程执行）。
     deep_tx: Sender<DeepRequest>,
     deep_rx: Receiver<DeepResult>,
+    /// 拼音缓存后台计算通道（大目录避免 UI 线程卡顿）。
+    pinyin_tx: Sender<PinyinJobResult>,
+    pinyin_rx: Receiver<PinyinJobResult>,
     /// 地址栏路径校验通道（后台 stat，避免网络路径卡住界面线程）。
     path_probe_tx: Sender<PathProbe>,
     path_probe_rx: Receiver<PathProbe>,
@@ -1042,6 +1059,8 @@ impl App {
             },
             ascending: config.sort_ascending,
         };
+        // 拼音缓存的后台通道：只有"有搜索词且缓存还没算好"时才用得上。
+        let (pinyin_tx, pinyin_rx) = mpsc::channel();
         let state = AppState::new(None, sort);
         let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
         let (path_probe_tx, path_probe_rx) = mpsc::channel::<PathProbe>();
@@ -1181,6 +1200,8 @@ impl App {
             list_tx,
             list_rx,
             deep_tx,
+            pinyin_tx,
+            pinyin_rx,
             deep_rx,
             poll_timer: Timer::default(),
             sidebar_timer: Timer::default(),
@@ -1473,9 +1494,28 @@ impl App {
                 let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
                 crate::logv!("[list] this-pc drives n={} {:?}", names.len(), names);
             }
+            // 拼音缓存与 entries 逐项平行：只有「名字序列一模一样」时才能留用。
+            // 后退回搜索页会顺带重新列举同一目录（内容没变），此时保留缓存才有
+            // 拼音结果——否则中文名的搜索页会先闪一下「此文件夹为空」。
+            let keep_pinyin = !pane.pinyin_cache.is_empty()
+                && pane.pinyin_cache.len() == entries.len()
+                && pane.entries.len() == entries.len()
+                && pane
+                    .entries
+                    .iter()
+                    .zip(entries.iter())
+                    .all(|(a, b)| a.name == b.name);
             pane.entries = entries;
-            // 拼音缓存随 entries 失效（惰性重建）。
-            pane.pinyin_cache.clear();
+            if keep_pinyin {
+                crate::logv!(
+                    "[pinyin] keep cache across re-list pane={} n={}",
+                    result.pane,
+                    pane.entries.len()
+                );
+            } else {
+                // 拼音缓存随 entries 失效（后台重算，见 request_pinyin_jobs）。
+                pane.invalidate_pinyin();
+            }
             // 新列表到达即失效全局搜索的截断提示。
             pane.search_total = None;
             // 「此电脑」重载 = 回到驱动器列表，残留的全局搜索词会误过滤空表。
@@ -1811,6 +1851,27 @@ impl App {
         }
     }
 
+    /// 立刻结算还没到期的搜索防抖。
+    ///
+    /// 搜索框输入要攒 150ms 才生效，但导航/切标签/切分屏会把这个挂起的词丢掉：
+    /// 敲完 `xiyou` 马上点文件夹，真正生效并记进历史页的仍是上一个结算过的词
+    /// （比如 `xi`），后退回搜索页时就只剩那个词的结果。离开前先结算一次。
+    fn flush_pending_search(&mut self) {
+        self.pending_search = None;
+        // 设置页没有搜索框：那上面的文本不属于任何面板，别拿它去搜索。
+        if self.state.active().kind != crate::state::TabKind::Explorer {
+            return;
+        }
+        // 以输入框的文本为准：防抖里那个词可能还没落地（甚至已经被 40ms 轮询
+        // 当成过期丢弃），而输入框里始终是最新的。
+        let text = self.ui.get_filter_text().to_string();
+        if self.state.active().active().filter == text {
+            return;
+        }
+        logv!("[search] 离开前先结算搜索词 {:?}", text);
+        self.apply_search_query(&text);
+    }
+
     /// 统一应用搜索词（搜索框编辑 / 外部唤起预填共用）：
     /// 「此电脑」= 全局索引秒搜；目录视图 = 本地过滤 + 异步深度搜索。
     fn apply_search_query(&mut self, text: &str) {
@@ -1847,7 +1908,13 @@ impl App {
             };
             push_scroll(&self.ui, pane_index, scroll);
         } else {
-            self.ui.invoke_scroll_list_to_top();
+            // 只在聚焦面板内滚动：以前固定滚左栏，右分屏搜索时滚动条留在原处
+            // （甚至因为内容变矮被夹到底部），新结果一出来就看不到开头。
+            let pane = self.state.active().active_pane;
+            if let Some(p) = self.state.active_mut().panes.get_mut(pane) {
+                p.scroll_y = 0.0;
+            }
+            push_scroll(&self.ui, pane, 0.0);
         }
     }
 
@@ -1882,6 +1949,139 @@ impl App {
             query,
         });
         self.state.active_mut().active_mut().deep_searching = true;
+    }
+
+    /// 给「有搜索词但拼音缓存还没算好」的面板派一次后台计算。
+    ///
+    /// 拼音字段（含多音字表）对每个条目都要算一遍，上万条时在 UI 线程上
+    /// 是十几到几十毫秒的卡顿，正好落在「刚敲下第一个字符」那一刻。
+    /// 现在改由后台线程算，算好前用纯文本匹配兜底（见 `rebuild_display`）。
+    fn request_pinyin_jobs(&mut self) {
+        struct Job {
+            tab_id: u32,
+            pane: usize,
+            seq: u64,
+            names: Vec<String>,
+        }
+        let mut jobs: Vec<Job> = Vec::new();
+        for tab in self.state.tabs.iter_mut() {
+            if tab.kind != crate::state::TabKind::Explorer {
+                continue;
+            }
+            for (pi, pane) in tab.panes.iter_mut().enumerate() {
+                if pane.pinyin_pending.is_some()
+                    || pane.pinyin_cache.len() == pane.entries.len()
+                    || pane.entries.is_empty()
+                {
+                    continue;
+                }
+                // 中小目录：列举一到就在后台预建，用户几秒后再搜时缓存已经在手，
+                // 不会出现「先按纯文本过滤、拼音结果晚半拍补上」的空档。
+                // 超大目录不预建（白烧 CPU），等真的有搜索词再算。
+                if pane.filter.trim().is_empty() && pane.entries.len() > PINYIN_EAGER_MAX {
+                    continue;
+                }
+                pane.pinyin_pending = Some(pane.pinyin_seq);
+                jobs.push(Job {
+                    tab_id: tab.id,
+                    pane: pi,
+                    seq: pane.pinyin_seq,
+                    names: pane.entries.iter().map(|e| e.name.clone()).collect(),
+                });
+            }
+        }
+        for job in jobs {
+            let tx = self.pinyin_tx.clone();
+            let tab_id = job.tab_id;
+            let pane = job.pane;
+            let seq = job.seq;
+            let spawned = std::thread::Builder::new()
+                .name("rove-pinyin".into())
+                .spawn(move || {
+                    let fields: Vec<crate::search::PinyinFields> = job
+                        .names
+                        .iter()
+                        .map(|n| crate::search::pinyin_fields(n))
+                        .collect();
+                    let _ = tx.send(PinyinJobResult {
+                        tab_id,
+                        pane,
+                        seq,
+                        fields,
+                    });
+                });
+            if let Err(e) = spawned {
+                // 起不了线程：清掉标记，下一轮还会再试；这期间照常按纯文本过滤。
+                crate::logln!("!! 拼音后台线程启动失败: {e}");
+                if let Some(tab) = self.state.tabs.iter_mut().find(|t| t.id == tab_id) {
+                    if let Some(p) = tab.panes.get_mut(pane) {
+                        p.pinyin_pending = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// 拼音缓存算好了：写回并重新过滤一次（期间是纯文本兜底，可能少一些拼音命中）。
+    fn apply_pinyin_result(&mut self, result: PinyinJobResult) {
+        let Some(ti) = self
+            .state
+            .tabs
+            .iter()
+            .position(|t| t.id == result.tab_id)
+        else {
+            return;
+        };
+        let active = ti == self.state.active_tab;
+        let mut n = 0usize;
+        let mut filtered = false;
+        let ok = {
+            let Some(pane) = self.state.tabs[ti].panes.get_mut(result.pane) else {
+                return;
+            };
+            // 只有"同一世代的结算"才清标记：过期结果不能把新一轮的标记清掉。
+            if pane.pinyin_pending == Some(result.seq) {
+                pane.pinyin_pending = None;
+            }
+            // 过期（期间换了目录 / 重新排序 / 又失效了一次）就整批丢弃。
+            if pane.pinyin_seq != result.seq || result.fields.len() != pane.entries.len() {
+                crate::logv!(
+                    "[pinyin] drop stale result tab={} pane={} seq={} (now {})",
+                    result.tab_id,
+                    result.pane,
+                    result.seq,
+                    pane.pinyin_seq
+                );
+                false
+            } else {
+                n = result.fields.len();
+                pane.pinyin_cache = result.fields;
+                // 没有搜索词时 display 是恒等映射，重算没有意义。
+                if !pane.filter.trim().is_empty() {
+                    pane.rebuild_display();
+                    filtered = true;
+                }
+                true
+            }
+        };
+        if !ok {
+            return;
+        }
+        if !filtered {
+            return;
+        }
+        crate::logv!(
+            "[pinyin] cache ready tab={} pane={} n={}",
+            result.tab_id,
+            result.pane,
+            n
+        );
+        if active {
+            self.visible_cache = None;
+            self.visible_cache_right = None;
+            self.refresh_visible_rows();
+            self.sync_status();
+        }
     }
 
     /// 深度搜索结果到达：标签存在、代号与查询都匹配才应用。
@@ -3490,7 +3690,8 @@ impl App {
                 }
                 pane.sort.key = key;
                 pane.sort.ascending = ascending;
-                crate::fs::sort_entries(&mut pane.entries, pane.sort);
+                // 重排时把拼音缓存一起搬过去，不用重算。
+                pane.resort();
                 pane.rebuild_display();
             }
         }
@@ -3539,7 +3740,7 @@ impl App {
                 pane.sort = s;
                 // 列表结果还没到（loading 中）时不动旧数据：worker 会用新排序重算。
                 if !pane.loading && !pane.entries.is_empty() {
-                    crate::fs::sort_entries(&mut pane.entries, pane.sort);
+                    pane.resort();
                     pane.rebuild_display();
                 }
                 changed = true;
@@ -3564,7 +3765,7 @@ impl App {
             let n = entries.len();
             let tab = self.state.active_mut();
             tab.active_mut().entries = entries;
-            tab.active_mut().pinyin_cache.clear();
+            tab.active_mut().invalidate_pinyin();
             tab.active_mut().filter.clear();
             tab.active_mut().search_total = None;
             tab.active_mut().display = (0..n).collect();
@@ -3585,7 +3786,7 @@ impl App {
         let shown = entries.len();
         let tab = self.state.active_mut();
         tab.active_mut().entries = entries;
-        tab.active_mut().pinyin_cache.clear();
+        tab.active_mut().invalidate_pinyin();
         tab.active_mut().filter = query.to_string();
         // 命中数超过展示上限时记录总数，供状态栏提示截断。
         tab.active_mut().search_total = (shown < total).then_some(total);
@@ -5895,6 +6096,8 @@ impl App {
     ///   聚焦切到新面板并立刻发起列举；
     /// - 关闭：丢弃第二个面板，聚焦回到面板 0。
     fn toggle_split(&mut self) {
+        // 搜索框马上要被改写成新面板的值：先把旧面板挂起的搜索词结算掉。
+        self.flush_pending_search();
         let mut request = None;
         {
             let tab = self.state.active_mut();
@@ -5949,13 +6152,21 @@ impl App {
 
     /// 聚焦某一分屏面板（0 / 1），顶部地址栏与工具栏随之切换数据源。
     fn focus_pane(&mut self, index: usize) {
+        // 搜索框跟着聚焦面板走：切走之前先把旧面板挂起的搜索词结算掉。
+        self.flush_pending_search();
         let active_tab = self.state.active_tab;
         let mut request = None;
         {
             let Some(tab) = self.state.tabs.get_mut(active_tab) else {
                 return;
             };
-            if index >= tab.panes.len() || tab.active_pane == index {
+            if index >= tab.panes.len() {
+                return;
+            }
+            if tab.active_pane == index {
+                // 状态已经在这一栏，但界面可能还停在旧值上（某条路径漏了同步）：
+                // 用户点这一栏时顺手纠正一次，代价只有两次属性写。
+                self.sync_split_state();
                 return;
             }
             tab.active_pane = index;
@@ -5994,6 +6205,11 @@ impl App {
     /// 把分屏状态同步到 UI（开关 / 当前聚焦面板）。
     fn sync_split_state(&self) {
         let tab = self.state.active();
+        logv!(
+            "[split] sync 聚焦栏={} is_split={}",
+            tab.active_pane,
+            tab.is_split
+        );
         self.ui.set_is_split(tab.is_split);
         self.ui.set_active_pane(tab.active_pane as i32);
     }
@@ -9854,6 +10070,7 @@ impl App {
 
     /// 同上，顺便记下加载完要选中的条目（「在文件夹中显示」）。
     fn navigate_active_reveal(&mut self, path: Option<PathBuf>, select: Option<PathBuf>) {
+        self.flush_pending_search();
         self.state.active_mut().active_mut().navigate(path);
         self.sync_after_navigate();
         self.arm_reveal(select);
@@ -10006,6 +10223,7 @@ impl App {
     }
 
     fn nav_back(&mut self) {
+        self.flush_pending_search();
         let tab = self.state.active();
         if !tab.active().can_go_back() {
             return;
@@ -10017,6 +10235,7 @@ impl App {
     }
 
     fn nav_forward(&mut self) {
+        self.flush_pending_search();
         let tab = self.state.active();
         if !tab.active().can_go_forward() {
             return;
@@ -10932,6 +11151,16 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 while let Ok(result) = app.deep_rx.try_recv() {
                     app.apply_deep_result(result);
                 }
+                // 拼音缓存：先收后台结果，再给还没算好的面板派活。
+                // 每 40ms 只做几次标志位判断，不需要时才不产生任何开销。
+                loop {
+                    match app.pinyin_rx.try_recv() {
+                        Ok(result) => app.apply_pinyin_result(result),
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+                app.request_pinyin_jobs();
                 while let Ok(result) = app.dir_size_rx.try_recv() {
                     app.apply_dir_size_result(result);
                 }
@@ -11021,7 +11250,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                             let tab = app.state.active_mut();
                             for pane in &mut tab.panes {
                                 if pane.sort.key == SortKey::Size {
-                                    crate::fs::sort_entries(&mut pane.entries, pane.sort);
+                                    pane.resort();
                                     pane.rebuild_display();
                                     resorted = true;
                                 }
@@ -11493,6 +11722,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         upgrade().on_new_tab_requested(move || {
             let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().flush_pending_search();
             let (current, sort) = {
                 let app = app.borrow();
                 (app.state.active().active().path.clone(), app.state.active().active().sort)
@@ -11529,6 +11759,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 app.state.active_tab
             );
             if let Some(index) = app.state.tab_by_id(id as u32) {
+                // 切标签会换掉搜索框的内容：旧标签挂起的搜索词先结算。
+                app.flush_pending_search();
                 app.state.active_tab = index;
                 app.sync_active_tab();
                 // 标签内容已在状态中，直接展示；若正在加载则保持 loading。
@@ -14500,6 +14732,11 @@ fn create_session(
         // 不能沿用普通目录的全局排序。
         app.sync_view_sort();
         app.sync_tabs();
+        // 冷启动恢复出来的分屏标签自带 active_pane（快照里的聚焦栏）。
+        // 漏了这一次同步，顶部的聚焦条会一直停在第 0 栏：视觉在左、
+        // 键盘/前进后退却作用在右栏。sync_file_list 只写 is-split，
+        // 不写 active-pane，所以必须单独同步一次。
+        app.sync_split_state();
         app.sync_nav();
         app.sync_breadcrumbs();
         app.sync_status();

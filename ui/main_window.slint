@@ -526,11 +526,6 @@ out property <length> row-height-out: file-list.row-height-out;
     private property <length> topbar-h: 82px; // 标签栏 38 + 工具栏 44
     private property <length> statusbar-h: 28px;
 
-    /// 文件列表滚动到顶端（Rust 调用）。
-    public function scroll-list-to-top() {
-        file-list.scroll-to-top();
-    }
-
     // 供 Rust 强制对齐滚动条（直接操作底层 Flickable，不依赖属性 changed 事件）。
     public function set-file-scroll-y(pane: int, v: length) {
         if (pane == 0) {

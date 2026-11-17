@@ -85,6 +85,13 @@ pub struct PaneState {
     /// 与 entries 平行的拼音预计算缓存（Phase 5 拼音过滤）。
     /// 长度与 entries 不一致时惰性重建。
     pub pinyin_cache: Vec<crate::search::PinyinFields>,
+    /// 拼音缓存的请求号：每次让缓存失效、以及每次发起后台计算都 +1。
+    /// 后台结果回来时对不上就丢弃（条目已经换了，缓存会错位）。
+    pub pinyin_seq: u64,
+    /// 正在后台计算的那批拼音对应的请求号（`None` = 没有在算）。
+    /// 用请求号而不是布尔：只有"同一世代的结算"才算数，过期结果不能把
+    /// 新一轮的"在算"标记清掉，否则会重复派活。
+    pub pinyin_pending: Option<u64>,
     /// 深度搜索（子树）附加结果：仅 filter 非空时存在。
     /// 显示下标空间 = 本地条目 [0, entries.len()) ⊕ 深度结果 [len, len+deep)。
     pub deep_entries: Vec<FileEntry>,
@@ -120,6 +127,8 @@ impl PaneState {
             loading: false,
             generation: 0,
             pinyin_cache: Vec::new(),
+            pinyin_seq: 0,
+            pinyin_pending: None,
             deep_entries: Vec::new(),
             deep_pinyin: Vec::new(),
             deep_generation: 0,
@@ -263,6 +272,40 @@ impl PaneState {
         }
     }
 
+    /// 让拼音缓存失效（条目被替换 / 被重新排序时都必须调用）。
+    ///
+    /// 缓存与 `entries` **逐项平行**，`entries` 一变（哪怕只是原地重新排序、
+    /// 长度没变）就会错位，所以不能只靠"长度不同才重建"来判断。
+    pub fn invalidate_pinyin(&mut self) {
+        self.pinyin_cache.clear();
+        self.pinyin_seq += 1;
+        self.pinyin_pending = None;
+    }
+
+    /// 按当前排序键重排条目，并把拼音缓存一起搬到新位置。
+    ///
+    /// 不能直接 `sort_entries` + 清缓存：那样每次点列头（以及目录体积算完后
+    /// 按大小重排）都要重算一遍拼音，中文名的搜索结果会有几百毫秒「先不过滤」。
+    pub fn resort(&mut self) {
+        let sort = self.sort;
+        if self.pinyin_cache.len() != self.entries.len() {
+            crate::fs::sort_entries(&mut self.entries, sort);
+            return;
+        }
+        // 缓存与条目逐项平行：配对后整体排序再拆开，位置关系不会错。
+        let fields = std::mem::take(&mut self.pinyin_cache);
+        let mut pairs: Vec<(FileEntry, crate::search::PinyinFields)> =
+            std::mem::take(&mut self.entries).into_iter().zip(fields).collect();
+        pairs.sort_by(|(a, _), (b, _)| crate::fs::entry_cmp(a, b, sort));
+        let (entries, fields): (Vec<_>, Vec<_>) = pairs.into_iter().unzip();
+        self.entries = entries;
+        self.pinyin_cache = fields;
+        // 顺序变了：还在算的那批结果按旧顺序生成，回来时必须丢弃（否则会用
+        // 错位的拼音去匹配）。缓存本身是对的，所以不清它、也不重算。
+        self.pinyin_seq += 1;
+        self.pinyin_pending = None;
+    }
+
     /// 重建过滤后的可见下标表（拼音模糊匹配 + 打分排序）。
     /// 下标空间 = 本地条目 [0, entries.len()) ⊕ 深度结果（深度条目已由
     /// 后台按同一查询过滤，直接并入统一打分排序）。
@@ -274,26 +317,19 @@ impl PaneState {
             self.display = (0..self.entries.len()).collect();
             return;
         }
-        self.ensure_pinyin_cache();
+        // 拼音缓存由后台线程算（大目录里同步算要十几到几十毫秒，会在输入
+        // 第一个字符时明显卡一下）。还没算好就先用纯文本匹配兜底 ——
+        // `matches_query` 对空的拼音字段会退化成只匹配文件名；算好后
+        // App 那边会再调一次本函数，拼音命中与高亮随之补上。
+        let no_pinyin = crate::search::PinyinFields::default();
         let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
         let mut bufs = (Vec::new(), Vec::new(), Vec::new());
         let mut scored: Vec<(usize, u16)> = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
-            if crate::search::matches_query(
-                &e.name,
-                &self.pinyin_cache[i],
-                &query,
-                &mut matcher,
-                &mut bufs,
-            ) {
-                let s = crate::search::score(
-                    &e.name,
-                    &self.pinyin_cache[i],
-                    &query,
-                    &mut matcher,
-                    &mut bufs,
-                )
-                .unwrap_or(0);
+            let fields = self.pinyin_cache.get(i).unwrap_or(&no_pinyin);
+            if crate::search::matches_query(&e.name, fields, &query, &mut matcher, &mut bufs) {
+                let s = crate::search::score(&e.name, fields, &query, &mut matcher, &mut bufs)
+                    .unwrap_or(0);
                 scored.push((i, s));
             }
         }
@@ -306,19 +342,15 @@ impl PaneState {
                 .unwrap_or(0);
             scored.push((local_len + j, s));
         }
+        // 拼音缓存还没算好时，纯文本匹配为空并不代表真的没有结果（中文名要靠
+        // 拼音命中）。此时绝不能把列表清空 —— 那会让界面闪一下「此文件夹为空」。
+        // 先退回「全部条目」给用户看，缓存到手后 App 会再调一次本函数把结果收窄。
+        if self.pinyin_cache.len() != self.entries.len() && scored.is_empty() {
+            self.display = (0..self.entries.len() + self.deep_entries.len()).collect();
+            return;
+        }
         scored.sort_by(|a, b| b.1.cmp(&a.1));
         self.display = scored.into_iter().map(|(i, _)| i).collect();
-    }
-
-    /// 惰性构建拼音缓存（entries 变化后首次过滤时执行）。
-    fn ensure_pinyin_cache(&mut self) {
-        if self.pinyin_cache.len() != self.entries.len() {
-            self.pinyin_cache = self
-                .entries
-                .iter()
-                .map(|e| crate::search::pinyin_fields(&e.name))
-                .collect();
-        }
     }
 
     /// 显示下标 → 条目。不依赖拼音缓存（普通导航时缓存可能未构建）。
@@ -650,6 +682,70 @@ mod tests {
 
     fn pane() -> PaneState {
         PaneState::new(Some(PathBuf::from("C:\\work")), SortState::default())
+    }
+
+    /// 拼音缓存没算好时用纯文本兜底，算好后拼音命中随之补上。
+    #[test]
+    fn display_falls_back_to_text_then_upgrades_to_pinyin() {
+        let mut p = pane();
+        p.entries = vec![
+            crate::fs::dir::test_entry("测试文件.txt", false, 0),
+            crate::fs::dir::test_entry("readme.txt", false, 0),
+        ];
+        p.filter = "ceshi".into();
+        // 缓存还没算好：纯文本匹配不到中文名的拼音，此时不能清空列表
+        // （会让界面闪「此文件夹为空」），而是先显示全部条目。
+        p.rebuild_display();
+        assert_eq!(p.display, vec![0, 1]);
+        // 后台算好写回后，同一条查询就能命中。
+        p.invalidate_pinyin();
+        let seq = p.pinyin_seq;
+        p.pinyin_cache = p
+            .entries
+            .iter()
+            .map(|e| crate::search::pinyin_fields(&e.name))
+            .collect();
+        p.rebuild_display();
+        assert_eq!(p.display, vec![0]);
+        assert_eq!(p.pinyin_seq, seq, "填缓存本身不该再让缓存失效");
+        // 原地重排必须让缓存失效（否则缓存与 entries 错位）。
+        p.invalidate_pinyin();
+        assert_eq!(p.pinyin_seq, seq + 1);
+        assert!(p.pinyin_cache.is_empty());
+        assert!(p.pinyin_pending.is_none());
+    }
+
+    /// 重排条目时拼音缓存必须跟着走，不能只是"排完再清缓存"。
+    #[test]
+    fn resort_keeps_pinyin_aligned() {
+        let mut p = pane();
+        p.entries = vec![
+            crate::fs::dir::test_entry("b.txt", false, 0),
+            crate::fs::dir::test_entry("测试.txt", false, 0),
+        ];
+        p.pinyin_cache = p
+            .entries
+            .iter()
+            .map(|e| crate::search::pinyin_fields(&e.name))
+            .collect();
+        p.sort = SortState {
+            key: crate::fs::SortKey::Name,
+            ascending: true,
+        };
+        let seq = p.pinyin_seq;
+        p.resort();
+        // 名称升序：b.txt 排在中文名之后（自然序按字符比较）。
+        let idx = p
+            .entries
+            .iter()
+            .position(|e| e.name == "b.txt")
+            .expect("b.txt 还在");
+        assert_eq!(p.pinyin_cache.len(), p.entries.len());
+        assert_eq!(p.pinyin_cache[idx].full.as_ref(), "b.txt");
+        // 缓存本身留着（不用重算），但请求号要前进：万一有后台结果正按旧顺序
+        // 往回送，必须让它对不上号而被丢弃，否则会用错位的拼音去匹配。
+        assert_eq!(p.pinyin_seq, seq + 1, "重排要让在途结果作废");
+        assert!(p.pinyin_pending.is_none());
     }
 
     /// 搜索页 ↔ 目录页要能前进/后退，且清空搜索时回到搜索前的滚动位置。

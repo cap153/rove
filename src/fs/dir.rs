@@ -288,43 +288,47 @@ pub fn list_directory(path: &Path) -> Vec<FileEntry> {
 
 /// 排序：目录恒在前，其后按当前键比较。
 pub fn sort_entries(entries: &mut [FileEntry], sort: SortState) {
-    entries.sort_by(|a, b| {
-        // 目录优先。
-        match (a.is_dir, b.is_dir) {
-            (true, false) => return std::cmp::Ordering::Less,
-            (false, true) => return std::cmp::Ordering::Greater,
-            _ => {}
-        }
+    entries.sort_by(|a, b| entry_cmp(a, b, sort));
+}
 
-        let ord = match sort.key {
-            SortKey::Name => natural_cmp(&a.name, &b.name),
-            SortKey::Size => {
-                // 核心修复 1：未知大小视为沉底（不论升序降序都在最后）
-                let a_known = a.dir_size_loaded;
-                let b_known = b.dir_size_loaded;
-                if a_known != b_known {
-                    // 已知的排在前，未知的排在后
-                    return b_known.cmp(&a_known);
-                } else {
-                    a.size.cmp(&b.size)
-                }
+/// 单对条目的比较规则（与 [`sort_entries`] 完全同源）。
+///
+/// 单独暴露出来是给「条目 + 与条目逐项平行的辅助数据」一起排序用的：
+/// 拼音缓存不能只排条目、留着自己不动（会错位），必须用同一套比较规则。
+pub fn entry_cmp(a: &FileEntry, b: &FileEntry, sort: SortState) -> std::cmp::Ordering {
+    // 目录优先。
+    match (a.is_dir, b.is_dir) {
+        (true, false) => return std::cmp::Ordering::Less,
+        (false, true) => return std::cmp::Ordering::Greater,
+        _ => {}
+    }
+
+    let ord = match sort.key {
+        SortKey::Name => natural_cmp(&a.name, &b.name),
+        SortKey::Size => {
+            // 核心修复 1：未知大小视为沉底（不论升序降序都在最后）
+            let a_known = a.dir_size_loaded;
+            let b_known = b.dir_size_loaded;
+            if a_known != b_known {
+                // 已知的排在前，未知的排在后
+                return b_known.cmp(&a_known);
+            } else {
+                a.size.cmp(&b.size)
             }
-            SortKey::Modified => {
-                a.modified.cmp(&b.modified)
-            }
-            SortKey::Type => a.type_text.cmp(&b.type_text),
-            SortKey::Path => a.path.cmp(&b.path),
-            // 盘符：驱动器路径形如 `C:\`，按路径字典序即 C、D、E…
-            SortKey::Drive => a.path.cmp(&b.path),
-        };
-
-        if ord == std::cmp::Ordering::Equal && sort.key != SortKey::Name {
-            // 核心修复 2：非名称排序时，如果大小或时间相等（包括都是未知），用名称兜底，保证稳定不乱
-            return natural_cmp(&a.name, &b.name);
         }
+        SortKey::Modified => a.modified.cmp(&b.modified),
+        SortKey::Type => a.type_text.cmp(&b.type_text),
+        SortKey::Path => a.path.cmp(&b.path),
+        // 盘符：驱动器路径形如 `C:\`，按路径字典序即 C、D、E…
+        SortKey::Drive => a.path.cmp(&b.path),
+    };
 
-        if sort.ascending { ord } else { ord.reverse() }
-    });
+    if ord == std::cmp::Ordering::Equal && sort.key != SortKey::Name {
+        // 核心修复 2：非名称排序时，如果大小或时间相等（包括都是未知），用名称兜底，保证稳定不乱
+        return natural_cmp(&a.name, &b.name);
+    }
+
+    if sort.ascending { ord } else { ord.reverse() }
 }
 
 /// 自然序比较：数字段按数值比较（"file2" < "file10"），大小写不敏感。

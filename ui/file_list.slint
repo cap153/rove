@@ -370,11 +370,6 @@ export component FileList inherits Rectangle {
         && root.hv-cell-top < flick.y + flick.height - 2px;
     private property <length> hv-box-y: max(4px, min(root.hv-natural-y, root.height - 4px - root.hv-box-h));
 
-    /// 滚动到顶端（导航/过滤变化时由 Rust 调用）。
-    public function scroll-to-top() {
-        flick.content-y = 0px;
-    }
-
     /// 命中测试：接收相对于 FileList 自身的局部坐标 (lx, ly)
     public function row-hit-test(lx: length, ly: length) -> int {
         let header-h = root.view-mode == "details" ? 30px : 0px;
