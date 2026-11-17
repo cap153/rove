@@ -300,6 +300,8 @@ pub const ZH: &[&str] = &[
     "任何空白字符",            // 289
     "非空白字符，[^\\s] 的缩写", // 290
     "匹配单词边界",            // 291
+    "标签页",                  // 292
+    "关闭当前标签",            // 293
 ];
 
 pub const EN: &[&str] = &[
@@ -595,6 +597,8 @@ pub const EN: &[&str] = &[
     "Any whitespace character",
     "Any non-whitespace character, shorthand for [^\\s]",
     "Matches a word boundary",
+    "Tabs",
+    "Close current tab",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -718,6 +722,11 @@ mod tests {
         assert_eq!(EN[276], "Renamed {}, skipped {}");
         assert_eq!(ZH[291], "匹配单词边界");
         assert_eq!(EN[291], "Matches a word boundary");
+        // 快捷键「标签页」分组 + Ctrl+W（追加在末尾）。
+        assert_eq!(ZH[292], "标签页");
+        assert_eq!(EN[292], "Tabs");
+        assert_eq!(ZH[293], "关闭当前标签");
+        assert_eq!(EN[293], "Close current tab");
     }
 
     /// 索引表必须与旧的线性扫描语义一致：每个中文键都命中它**首次出现**的下标。

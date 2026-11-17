@@ -1998,11 +1998,18 @@ impl App {
             let spawned = std::thread::Builder::new()
                 .name("rove-pinyin".into())
                 .spawn(move || {
-                    let fields: Vec<crate::search::PinyinFields> = job
-                        .names
-                        .iter()
-                        .map(|n| crate::search::pinyin_fields(n))
-                        .collect();
+                    let n = job.names.len();
+                    // 兜底：万一某个名字让转换 panic，线程带着"正在算"的标记一起死掉，
+                    // 这个面板就再也等不到结果 —— 表现为"搜索词怎么敲都显示全部条目"。
+                    // 这里的失败只退化成"没有拼音"，纯文本匹配照旧可用。
+                    let fields: Vec<crate::search::PinyinFields> =
+                        std::panic::catch_unwind(move || {
+                            job.names
+                                .iter()
+                                .map(|s| crate::search::pinyin_fields(s))
+                                .collect()
+                        })
+                        .unwrap_or_else(|_| vec![crate::search::PinyinFields::default(); n]);
                     let _ = tx.send(PinyinJobResult {
                         tab_id,
                         pane,
@@ -6150,6 +6157,42 @@ impl App {
         }
     }
 
+    /// 关闭当前标签；当前标签正处于分屏时只退出分屏（与资源管理器一致）。
+    ///
+    /// 这是 Ctrl+W 的动作：分屏时按一次先收回第二栏，再按一次才关整个标签。
+    /// 关掉最后一个标签 = 结束会话，与点标签上的 × 完全同一条路。
+    fn close_tab_or_unsplit(&mut self) {
+        let (kind, is_split, id) = {
+            let tab = self.state.active();
+            (tab.kind, tab.is_split, tab.id)
+        };
+        // 这一栏马上要没了：挂起的"延迟重命名"必须取消，否则它到点后会按
+        // 「依然只有一个同路径选中项」的旧条件误进改名。
+        self.cancel_rename_defer();
+        if kind == crate::state::TabKind::Explorer && is_split {
+            logv!("[tab] close_tab: 分屏中，先退出分屏");
+            self.toggle_split();
+            return;
+        }
+        self.close_tab_by_id(id);
+    }
+
+    /// 关闭指定标签（标签 × 与 Ctrl+W 共用这一个出口）。
+    ///
+    /// 关得掉就同步新标签；关不掉（只剩最后一个）则结束会话、仅保留守护进程，
+    /// 并丢弃标签快照 —— 下次启动只开一个「此电脑」，不把这一轮捞回来。
+    fn close_tab_by_id(&mut self, id: u32) {
+        logv!("[tab] close tab id={} tabs={}", id, self.state.tabs.len());
+        if self.state.close_tab(id) {
+            self.sync_active_tab();
+            return;
+        }
+        if self.state.tabs.len() == 1 {
+            self.discard_tab_snapshot();
+            schedule_destroy();
+        }
+    }
+
     /// 聚焦某一分屏面板（0 / 1），顶部地址栏与工具栏随之切换数据源。
     fn focus_pane(&mut self, index: usize) {
         // 搜索框跟着聚焦面板走：切走之前先把旧面板挂起的搜索词结算掉。
@@ -7863,7 +7906,8 @@ impl App {
                     groups_map.entry(meta.group).or_default().push(item);
                 }
             }
-            let groups: Vec<SettingsShortcutGroup> = ["文件操作", "导航与查看", "编辑与选择"]
+            let groups: Vec<SettingsShortcutGroup> =
+                ["文件操作", "导航与查看", "编辑与选择", "标签页"]
                 .into_iter()
                 .filter_map(|g| {
                     groups_map.remove(g).map(|items| SettingsShortcutGroup {
@@ -11651,6 +11695,7 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             "cut" => app.copy_selection(true),
             "paste" => app.paste_clipboard(),
             "select_all" => app.select_all(),
+            "close_tab" => app.close_tab_or_unsplit(),
             _ => return EventResult::Propagate,
         }
 
@@ -11775,16 +11820,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_tab_closed(move |id| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
-            if app.state.close_tab(id as u32) {
-                app.sync_active_tab();
-            } else if app.state.tabs.len() == 1 {
-                // 关闭最后一个标签：销毁 UI，仅保留守护（Phase 2）。
-                // 与「关闭全部」同样处理：下次启动只开一个「此电脑」，
-                // 不把这一轮的标签从「上次的标签页」里捞回来。
-                app.discard_tab_snapshot();
-                drop(app);
-                schedule_destroy();
-            }
+            // 与 Ctrl+W 同一条路：最后一个标签 = 结束会话（仅保留守护进程）。
+            app.close_tab_by_id(id as u32);
         });
     }
 

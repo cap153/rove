@@ -30,6 +30,8 @@ pub const DEFAULT_SHORTCUTS: &[ShortcutMeta] = &[
     ShortcutMeta { id: "cut", name: "剪切", group: "编辑与选择", default_chord: "Ctrl+X", is_readonly: false },
     ShortcutMeta { id: "paste", name: "粘贴", group: "编辑与选择", default_chord: "Ctrl+V", is_readonly: false },
     ShortcutMeta { id: "select_all", name: "全选", group: "编辑与选择", default_chord: "Ctrl+A", is_readonly: false },
+    // 标签页
+    ShortcutMeta { id: "close_tab", name: "关闭当前标签", group: "标签页", default_chord: "Ctrl+W", is_readonly: false },
 ];
 
 /// 快捷键运行期映射表（差量合并后，支持多槽位备用键）
@@ -133,4 +135,24 @@ fn build_chord_string(key: &str, ctrl: bool, shift: bool, alt: bool) -> String {
     }
     parts.push(key);
     parts.join("+")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 默认键位不能撞车：每个默认组合键必须解析到它自己那个动作。
+    /// 以前只有十来条、肉眼能扫，加 Ctrl+W 这种常用键时很容易和别处重复。
+    #[test]
+    fn default_chords_are_unique() {
+        let map = Keymap::new(&HashMap::new());
+        for meta in DEFAULT_SHORTCUTS {
+            assert_eq!(
+                map.resolve(meta.default_chord),
+                Some(meta.id),
+                "默认键位 {} 已经被别的动作占用",
+                meta.default_chord
+            );
+        }
+    }
 }
