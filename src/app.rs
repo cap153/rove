@@ -933,6 +933,12 @@ pub struct App {
     /// 设置页点过「重新扫描驱动器」：状态栏已挂上「正在重新扫描…」，
     /// 等索引线程回报就绪后补发一条完成信息，避免那句话永久留在右下角。
     index_rescan_status: bool,
+    /// 激活后的按键屏障截止时刻（见 `setup_keyboard` 里的说明）。
+    /// 窗口刚被外部激活时，手上还按着的键往往属于上一个窗口的那次操作，
+    /// 必须丢掉；`None` = 不拦。
+    keys_block_until: Option<std::time::Instant>,
+    /// 屏障期的「已记过一笔」标记：按住不放的键会以 30Hz 重复到，不能每次刷一行日志。
+    keys_block_logged: bool,
     /// 本轮操作里是否已经记过“按键被拦”的日志（避免长按回车刷屏）。
     shell_key_suppressed_logged: bool,
     /// 回收站下暂存盘点「移动」：等删除任务成功后才清空暂存盘。
@@ -1196,6 +1202,8 @@ impl App {
             scroll_select: false,
             shell_op_running: false,
             index_rescan_status: false,
+            keys_block_until: None,
+            keys_block_logged: false,
             shell_key_suppressed_logged: false,
             clear_staging_on_delete_success: false,
             scroll_to_index: None,
@@ -10484,9 +10492,68 @@ fn key_down(_vk: i32) -> bool {
     false
 }
 
+/// 全局物理按键状态（不管那个按键消息进了哪个窗口的队列）。
+///
+/// `key_down`（GetKeyState）只能看到本线程队列里的键；窗口刚被别的程序把
+/// 焦点扔回来时，刚才那次按下是别人消费的，只能靠这个函数判断「键还按着没」。
+#[cfg(windows)]
+fn async_key_down(vk: i32) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+    (unsafe { GetAsyncKeyState(vk) } as u16) & 0x8000 != 0
+}
+
+#[cfg(not(windows))]
+fn async_key_down(_vk: i32) -> bool {
+    false
+}
+
+/// 进程级时间基准（毫秒计数用）。
+fn uptime_ms() -> u64 {
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    EPOCH
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+}
+
+/// 最近一次「前台不是本进程」的时刻（ms，见 [`note_foreign_foreground`]）。
+static LAST_FOREIGN_FG_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 记一笔：此刻前台是别人的窗口。
+///
+/// 键盘事件的先后顺序不能信：启动器（stools）里按回车启动程序，它 `hide()`
+/// 自己，Windows 把前台还给 Rove——但那次回车的**重复键**比 WM_ACTIVATE 更早
+/// 进到我们的事件队列（实测日志：导航 19:48:01.492，Focused 却 19:48:01.493），
+/// 屏障来不及挂上。所以改成看「刚刚前台还是别人吗」：40ms 轮询一直在采样，
+/// 判断时序就与现实一致了。
+#[cfg(windows)]
+fn note_foreign_foreground() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    let hwnd = unsafe { GetForegroundWindow() };
+    if hwnd.is_null() {
+        return;
+    }
+    let mut pid: u32 = 0;
+    unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+    if pid != std::process::id() {
+        LAST_FOREIGN_FG_MS.store(uptime_ms(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+#[cfg(not(windows))]
+fn note_foreign_foreground() {}
+
+/// 距上一次「前台是别人」是不是在 `ms` 毫秒之内。
+fn foreign_foreground_within(ms: u64) -> bool {
+    let last = LAST_FOREIGN_FG_MS.load(std::sync::atomic::Ordering::Relaxed);
+    last != 0 && uptime_ms().saturating_sub(last) <= ms
+}
+
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
+/// 「提交键」：按下去就会触发动作的那几个（启动器/对话框里确认用）。
+const VK_COMMIT: [i32; 4] = [0x0D, 0x20, 0x1B, 0x09];
 
 impl App {
     fn row_pointer_event(&mut self, index: usize, event: &PointerEvent, x: f32, y: f32, on_name: bool) {
@@ -11162,6 +11229,9 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     // 合并窗口到点则触发索引重建（设置页连续改多项只重建一次）。
     maybe_run_pending_reindex();
 
+    // 采样「前台是不是别人」：给按键处理判「这次按键是不是刚被别的程序扔过来的」。
+    note_foreign_foreground();
+
     // 搜索框防抖：攒够 150ms 再跑一次全目录匹配。
     // 用 40ms 轮询判到期，省一个单独的定时器；到期前用户又敲了字会重新计时。
     let pending_search = app.borrow().pending_search.clone();
@@ -11523,30 +11593,72 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             return EventResult::Propagate;
         }
 
-        // 窗口失焦：取消挂起的延迟重命名，否则切到别的应用后后台突然弹出 rename 输入框。
-        if matches!(event, WindowEvent::Focused(false)) {
+        // 窗口焦点变化。
+        //
+        // 获得焦点时，键盘上可能还按着「提交键」：启动器里按回车启动程序、
+        // 资源管理器里双击后回车、别程序的窗口把自己藏起来把焦点还回来……
+        // 那次按下属于上一个窗口，不能让 Rove 当成自己的命令。
+        // 实测：启动器（stools）里按回车启动程序，焦点回到 Rove，
+        // 那次回车直接把之前选中的文件夹打开了。
+        //
+        // 只在「焦点回来的一瞬确实有提交键还按着」时才上锁：否则会无端
+        // 吞掉关对话框后立刻敲下的第一个键。解锁靠那一次松键（或 400ms 兜底），
+        // 鼠标点进来也立即解锁。
+        if let WindowEvent::Focused(focused) = event {
             if let Some(focus_app) = key_app.upgrade() {
-                focus_app.borrow_mut().cancel_rename_defer();
-                // 窗口失焦时左键的「松开」可能送到别的窗口，这里先清掉按住态，
-                // 否则拖选贴边自动滚动的定时器会在后台一直推进选中范围。
-                focus_app.borrow().ui.set_mouse_left_pressed(false);
+                let mut app = focus_app.borrow_mut();
+                if *focused {
+                    let held: Vec<i32> = VK_COMMIT
+                        .iter()
+                        .copied()
+                        .filter(|vk| async_key_down(*vk))
+                        .collect();
+                    // 提交键还按着 —— 典型现场。没按着也给 120ms 的短屏障：
+                    // 人从点鼠标到敲下一个键至少也要 200ms，短屏障不会误伤，
+                    // 却能拦住“焦点刚回来紧跟一个按键”的任何变体。
+                    let ms = if held.is_empty() { 120 } else { 400 };
+                    app.keys_block_until =
+                        Some(std::time::Instant::now() + std::time::Duration::from_millis(ms));
+                    app.keys_block_logged = false;
+                    if !held.is_empty() {
+                        logln!(
+                            "[keys] focused with commit key held (vk={:?}), block keys until release",
+                            held
+                        );
+                    }
+                } else {
+                    // 失焦：取消挂起的延迟重命名，否则切到别的应用后后台突然弹出 rename 输入框。
+                    app.cancel_rename_defer();
+                    // 窗口失焦时左键的「松开」可能送到别的窗口，这里先清掉按住态，
+                    // 否则拖选贴边自动滚动的定时器会在后台一直推进选中范围。
+                    app.ui.set_mouse_left_pressed(false);
+                }
             }
+            return EventResult::Propagate;
         }
 
         // 鼠标左键按住状态回填给 UI：Slint 的 TextInput 拖选期间抓住鼠标，
         // 任何 TouchArea 都收不到事件，重命名输入框的「拖选贴边自动滚动」
         // 定时器只能从这里判断拖选是否仍在进行（松开即停）。
+        // 同时：用户用鼠标点进来就是主动接管键盘，立刻解除激活屏障。
         if let WindowEvent::MouseInput {
             state,
-            button: MouseButton::Left,
+            button,
             ..
         } = event
         {
             if let Some(btn_app) = key_app.upgrade() {
-                btn_app
-                    .borrow()
-                    .ui
-                    .set_mouse_left_pressed(matches!(state, ElementState::Pressed));
+                let mut app = btn_app.borrow_mut();
+                if matches!(state, ElementState::Pressed) {
+                    app.keys_block_until = None;
+                    // 鼠标点进窗口 = 用户亲自在用这台窗口，此后敲的键都是给它的：
+                    // 清掉「前台刚是别人」的标记，免得紧接着的回车被当成上一家的尾巴。
+                    LAST_FOREIGN_FG_MS.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                if *button == MouseButton::Left {
+                    app.ui
+                        .set_mouse_left_pressed(matches!(state, ElementState::Pressed));
+                }
             }
             return EventResult::Propagate;
         }
@@ -11598,6 +11710,26 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             return EventResult::Propagate;
         }
 
+        // 松键：屏障靠这一次松键解除（用户按住的那个键终于抬起来了）。
+        if let WindowEvent::KeyboardInput {
+            event: KeyEvent {
+                state: ElementState::Released,
+                ..
+            },
+            ..
+        } = event
+        {
+            if let Some(up_app) = key_app.upgrade() {
+                let mut app = up_app.borrow_mut();
+                if app.keys_block_until.is_some() {
+                    app.keys_block_until = None;
+                    app.keys_block_logged = false;
+                    logv!("[keys] key released, block lifted");
+                }
+            }
+            return EventResult::Propagate;
+        }
+
         let WindowEvent::KeyboardInput {
             event:
                 KeyEvent {
@@ -11615,6 +11747,33 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             return EventResult::Propagate;
         };
         let mut app = key_app.borrow_mut();
+        // 主屏障：焦点刚从别的程序手里回来（≤250ms）时，回车 / 空格不算我们的。
+        //
+        // 用 40ms 轮询采到的前台信息判定，而不是 winit 的 Focused 事件：
+        // 实测（stools 里按回车启动程序）那次回车的重复键比 Focused 更早进队列，
+        // 屏障根本来不及挂上，文件夹就被打开了。
+        if matches!(
+            logical_key,
+            Key::Named(slint::winit_030::winit::keyboard::NamedKey::Enter)
+                | Key::Named(slint::winit_030::winit::keyboard::NamedKey::Space)
+        ) && foreign_foreground_within(150)
+        {
+            logln!("!! [keys] swallow commit key released by another app's foreground");
+            return EventResult::PreventDefault;
+        }
+        // 激活屏障期内（刚被外部程序把焦点扔过来）不接受任何按键：
+        // 这个回车/空格属于上一个窗口那次操作，不是给 Rove 的。
+        if let Some(until) = app.keys_block_until {
+            if std::time::Instant::now() < until {
+                if !app.keys_block_logged {
+                    app.keys_block_logged = true;
+                    logln!("!! [keys] swallow key right after focus gain");
+                }
+                return EventResult::PreventDefault;
+            }
+            app.keys_block_until = None;
+            app.keys_block_logged = false;
+        }
         // 焦点在过滤框 / 重命名输入框 / 地址栏编辑框 / 设置页文本框时，按键归输入框所有。
         // 关键：设置页文本框若不在此放行，全局 keymap 会先把 Enter 等按键 PreventDefault 掉，
         // 导致 TextInput 的 accepted 永远不触发（表现为“回车无效、点按钮却可以”）。

@@ -723,11 +723,65 @@ mod imp {
     ///
     /// 解决的是「对话框刚打开时子控件（SHELLDLL_DefView / DirectUI）尚未创建，
     /// 该次 FOREGROUND 探测失败且之后不再触发」导致吸附条迟迟不出现的问题。
+    /// 吸附目标是否已经不在了（被关掉 / 被隐藏）。
+    ///
+    /// 纯句柄判定，不发消息、不读文本，可以在 500ms 轮询里随意调；
+    /// 没有吸附目标时返回 false（无事可做）。
+    fn target_gone() -> bool {
+        let cur = CURRENT_DIALOG.load(Ordering::SeqCst) as HWND;
+        if cur.is_null() {
+            return false;
+        }
+        unsafe {
+            if IsWindow(cur) == 0 || IsWindowVisible(cur) == 0 {
+                return true;
+            }
+            // 有些对话框「关掉」其实是搵到屏幕外藏起来（-32000 坐标）或缩成 0 尺寸，
+            // WS_VISIBLE 还在；只看可见标志会漏判（改文件夹图标的图标选择框就是怀疑对象）。
+            let mut r: RECT = std::mem::zeroed();
+            if GetWindowRect(cur, &mut r) != 0
+                && (r.right - r.left <= 0
+                    || r.bottom - r.top <= 0
+                    || r.left <= -10000
+                    || r.top <= -10000)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 目标已关掉 / 已隐藏：立即收起吸附条。
+    ///
+    /// 必须在「前台换成一个我们要忽略的窗口」那条早退分支**之前**调：
+    /// 改文件夹图标时，图标选择框关掉后前台会落到属性页（`#32770` +
+    /// “xxx Properties” 标题）——那正是 `is_system_ui_window` 要忽略的窗口，
+    /// 旧代码在这里直接 return，吸附条就永远留在了屏幕上。
+    /// 另存为框关掉后前台是资源管理器（不在忽略列表），所以看起来没这个问题。
+    fn drop_gone_target(why: &str) {
+        if !target_gone() {
+            return;
+        }
+        let prev = CURRENT_DIALOG.swap(0, Ordering::SeqCst);
+        if prev != 0 {
+            logln!(
+                "[rove:dialog_jump] detach({why}): target {:#x} gone -> hiding",
+                prev as usize
+            );
+            let _ = slint::invoke_from_event_loop(|| {
+                crate::app::hide_dialog_jump();
+            });
+        }
+    }
+
     pub fn poll_foreground() {
         let hwnd = unsafe { GetForegroundWindow() };
         if hwnd.is_null() {
             return;
         }
+        // 先确认原来的吸附目标还活着：下面几条早退分支（自己的窗口、系统 UI、
+        // 跳转中）都不应该让一条已死目标的吸附条留在屏幕上。
+        drop_gone_target("poll");
         // 豁免自身窗口：用户点击吸附条后它就是前台窗口，绝不能据此判定对话框失焦
         if is_own_window(hwnd) {
             return;
@@ -849,6 +903,9 @@ mod imp {
 
         match event {
             EVENT_SYSTEM_FOREGROUND => {
+                // 前台已经换人了：先看旧目标是不是已经关掉/隐藏了（见
+                // drop_gone_target 的注释：属性页会挡在早退分支里）。
+                drop_gone_target("hook-foreground");
                 if probe_file_dialog(hwnd) {
                     // 核心修复 2：同窗口防抖。仅当这是一个新对话框或从外部切回时才呼出并抢焦点；
                     // 若只是吸附窗与该对话框之间互点，prev == hwnd，静默保持，不抢焦点。
@@ -879,6 +936,14 @@ mod imp {
                 } else {
                     // 核心修复：忽略系统 UI 窗口
                     if is_system_ui_window(hwnd) {
+                        // 属性页（“xxx Properties”）就落在这里：它关掉后留下的吸附条
+                        // 就是被这条早退藏住的。降到详细级，排查时把日志开到 2 级即可看到。
+                        logv!(
+                            "[rove:dialog_jump] ignore system-ui foreground {:#x} class={:?} title={:?}",
+                            hwnd as usize,
+                            get_class_name(hwnd),
+                            get_window_text(hwnd)
+                        );
                         return;
                     }
 
