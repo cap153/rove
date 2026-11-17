@@ -1,12 +1,25 @@
+<div align="center">
+
+<img src="assets/icon-256.png" width="128" alt="Rove" />
+
 # Rove
 
-A Windows file manager written in Rust with [Slint](https://slint.dev). One executable, no installer — just run it.
+**A Windows file manager: one executable, no installer — just run it.**
 
 It does everything Explorer does, so this README only covers **what is different**.
 
 [中文](README.md)
 
-![preview.png](preview.png)
+<p>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584.svg" alt="Built with Rust"></a>
+  <a href="https://slint.dev/"><img src="https://img.shields.io/badge/built_with-Slint-2379F4.svg" alt="Built with Slint"></a>
+</p>
+
+</div>
+
+---
+
+<p align="center"><img src="preview.png" alt="preview" /></p>
 
 ## Sponsor
 

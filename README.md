@@ -1,12 +1,25 @@
+<div align="center">
+
+<img src="assets/icon-256.png" width="128" alt="Rove" />
+
 # Rove
 
-一个 Windows 文件管理器，Rust + [Slint](https://slint.dev) 写的。单文件、绿色免安装，双击就能用。
+**一个 Windows 文件管理器：单文件、绿色免安装，双击就能用。**
 
 资源管理器能干的活它都能干，所以这份说明只讲**不一样的地方**。
 
 [English](README.en.md)
 
-![preview.png](preview.png) 
+<p>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/built_with-Rust-dea584.svg" alt="Built with Rust"></a>
+  <a href="https://slint.dev/"><img src="https://img.shields.io/badge/built_with-Slint-2379F4.svg" alt="Built with Slint"></a>
+</p>
+
+</div>
+
+---
+
+<p align="center"><img src="preview.png" alt="preview" /></p>
 
 ## 赞助
 
