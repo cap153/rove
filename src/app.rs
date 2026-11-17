@@ -4981,23 +4981,39 @@ impl App {
     fn sync_rename_row(&mut self) {
         let rename = self.ui.get_rename_path().to_string();
         let rename_pane = self.ui.get_rename_pane() as usize;
+        let prev = self.ui.get_file_rename_row();
         let mut row = -1i32;
         if !rename.is_empty() {
             let want = std::path::PathBuf::from(&rename);
             let tab = self.state.active();
             if let Some(pane) = tab.panes.get(rename_pane) {
-                if let Some(pos) = (0..pane.display.len())
+                // 先用上次的行号验一下：这一行上还是同一个条目，就说明排序 / 过滤
+                // 都没把它挪走（滚动不改变显示顺序），直接沿用 —— 一次比较搞定。
+                // 大目录里这是常态：以前每帧都要把整个显示列表扫一遍（上万条路径
+                // 比对），现在只剩第一次。
+                let cached_ok = prev >= 0
+                    && pane
+                        .display_entry(prev as usize)
+                        .is_some_and(|e| e.path == want);
+                if cached_ok {
+                    row = prev;
+                } else if let Some(pos) = (0..pane.display.len())
                     .find(|&di| pane.display_entry(di).is_some_and(|e| e.path == want))
                 {
                     row = pos as i32;
-                } else if self.ui.get_file_rename_row() >= 0 {
+                    crate::logv!(
+                        "[rename] rescan row: scanned {} entries -> {}",
+                        pane.display.len(),
+                        pos
+                    );
+                } else if prev >= 0 {
                     // 找不到就保留上一次的行号：宁可能差一行，也不能把输入框
                     // 整个撤掉——撤掉就等于没法继续输入，也没法回车/Esc 退出。
-                    row = self.ui.get_file_rename_row();
+                    row = prev;
                 }
             }
         }
-        if self.ui.get_file_rename_row() != row {
+        if prev != row {
             self.ui.set_file_rename_row(row);
             crate::logv!("[rename] fixed box row={}", row);
         }
