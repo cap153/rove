@@ -1843,7 +1843,12 @@ export component FileList inherits Rectangle {
                         width: 100%;
                         height: root.cell-thumb;
                         border-radius: 6px;
-                        background: Theme.bg-input;
+                        // 选中 / 悬停 / 拖拽悬停时让格子自己的底色透上来：以前这里恒为
+                        // bg-input（白），铺在选中色上面，图标区域就把底色盖住了，
+                        // 只看得到格子四周一圈颜色（像只「框选」了一块）。
+                        background: (row.selected
+                            || ta-icons.has-hover
+                            || row.index == root.drop-hover-index) ? transparent : Theme.bg-input;
                         clip: true;
 
                         if (row.thumb.width > 0) : Image {

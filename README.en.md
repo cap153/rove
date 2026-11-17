@@ -4,9 +4,9 @@
 
 # Rove
 
-**A Windows file manager: one executable, no installer — just run it.**
+A Windows file manager. 
 
-It does everything Explorer does, so this README only covers **what is different**.
+**one executable, no installer — just run it.**
 
 [中文](README.md)
 
