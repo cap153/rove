@@ -109,6 +109,19 @@ slint-build = "1.11"
 # 写入 exe 图标与版本信息（见 build.rs）。
 winresource = "0.1"
 
+# 日常开发用的 debug 构建：不生成 DWARF 调试信息。
+#
+# 之前 debug/rove.exe 有 421 MB、target/debug 目录 29 GB —— 全是调试信息。
+# Rove 排查问题靠的是 rove.log 与日志级别开关，panic 里记的 `文件:行:列`
+# 来自编译期元数据（`PanicInfo::location()`），不依赖 DWARF；运行时性能
+# 也与调试信息无关。所以关掉它只是缩小产物，不影响排查和速度。
+# 需要单步调试时临时改成 `debug = 2` 即可。
+[profile.dev]
+debug = 0
+# 符号表也不要：debug exe 里它占 35 MB（103 → 68 MB）。
+# Windows GUI exe 不靠符号表运行，panic 的 `文件:行:列` 也不受影响。
+strip = "symbols"
+
 [profile.release]
 opt-level = "z"
 lto = "fat"
