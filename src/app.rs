@@ -930,6 +930,9 @@ pub struct App {
     /// 是否有原生 Shell 文件操作正在进行（复制/移动/删除）。
     /// 这类操作会弹 Shell 自己的确认/进度对话框，期间必须拒绝文件类按键。
     shell_op_running: bool,
+    /// 设置页点过「重新扫描驱动器」：状态栏已挂上「正在重新扫描…」，
+    /// 等索引线程回报就绪后补发一条完成信息，避免那句话永久留在右下角。
+    index_rescan_status: bool,
     /// 本轮操作里是否已经记过“按键被拦”的日志（避免长按回车刷屏）。
     shell_key_suppressed_logged: bool,
     /// 回收站下暂存盘点「移动」：等删除任务成功后才清空暂存盘。
@@ -1192,6 +1195,7 @@ impl App {
             scroll_to_paths: Vec::new(),
             scroll_select: false,
             shell_op_running: false,
+            index_rescan_status: false,
             shell_key_suppressed_logged: false,
             clear_staging_on_delete_success: false,
             scroll_to_index: None,
@@ -3422,6 +3426,8 @@ pub(crate) fn on_index_ready() {
     app.refresh_after_index_ready();
     // 无论是否重查都同步一次状态栏：把「全盘索引构建中...」摘掉。
     app.sync_status();
+    // 设置页「重新扫描驱动器」留下的「正在重新扫描…」在此换成完成信息。
+    app.finish_index_rescan();
     // 设置页「搜索与索引」正在前台：立即刷新看板，无需等下一次轮询。
     let on_search_settings = {
         let tab = app.state.active();
@@ -3833,6 +3839,25 @@ impl App {
     /// 代价仅是偶尔少一行状态文案，远优于卡死主线程。
     fn index_build_state() -> Option<bool> {
         crate::search::index::try_shared().and_then(|i| i.try_read().ok().map(|g| g.ready))
+    }
+
+    /// 手动「重新扫描驱动器」扫完后的收尾：把状态栏那句「正在重新扫描…」换成结果。
+    ///
+    /// 只在状态栏仍然挂着那句提示时才覆盖：扫描期间用户可能已做过别的操作，
+    /// 那些结果比这条通知更该留在右下角。
+    fn finish_index_rescan(&mut self) {
+        if !std::mem::take(&mut self.index_rescan_status) {
+            return;
+        }
+        let scanning = self.tr("正在重新扫描驱动器并构建索引...");
+        if self.ui.get_status_job() != scanning {
+            return;
+        }
+        let count = crate::search::index::try_shared()
+            .and_then(|i| i.try_read().ok().map(|g| g.entries.len()))
+            .unwrap_or(0);
+        logln!("index: manual rescan finished, {count} entries");
+        self.set_status_job(self.trf("索引重建完成：{} 项", &[count.to_string()]));
     }
 
     fn sync_status(&self) {
@@ -12612,7 +12637,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_search_rescan_clicked(move || {
             let Some(app) = app.upgrade() else { return };
             crate::search::index::rebuild();
-            let app = app.borrow();
+            let mut app = app.borrow_mut();
+            // 登记一次：扫完由 finish_index_rescan 把这句话换成完成信息。
+            app.index_rescan_status = true;
             app.sync_settings();
             app.set_status_job(app.tr("正在重新扫描驱动器并构建索引..."));
         });

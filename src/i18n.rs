@@ -302,6 +302,7 @@ pub const ZH: &[&str] = &[
     "匹配单词边界",            // 291
     "标签页",                  // 292
     "关闭当前标签",            // 293
+    "索引重建完成：{} 项",     // 294
 ];
 
 pub const EN: &[&str] = &[
@@ -599,6 +600,7 @@ pub const EN: &[&str] = &[
     "Matches a word boundary",
     "Tabs",
     "Close current tab",
+    "Index rebuilt: {} entries",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -727,6 +729,8 @@ mod tests {
         assert_eq!(EN[292], "Tabs");
         assert_eq!(ZH[293], "关闭当前标签");
         assert_eq!(EN[293], "Close current tab");
+        assert_eq!(ZH[294], "索引重建完成：{} 项");
+        assert_eq!(EN[294], "Index rebuilt: {} entries");
     }
 
     /// 索引表必须与旧的线性扫描语义一致：每个中文键都命中它**首次出现**的下标。
