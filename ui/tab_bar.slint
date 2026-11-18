@@ -135,6 +135,14 @@ export component TabBar inherits Rectangle {
     // 导出空白拖拽区的起止位置（供后端 WM_NCHITTEST 判定，见 app.rs drag_hittest）
     out property <length> drag-x: drag-spacer.x;
     out property <length> drag-w: drag-spacer.width;
+    /// 最后一个标签的右边界（窗口坐标）。
+    ///
+    /// WM_NCHITTEST 用它兜一道：标题栏拖拽区**绝不允许**从标签右边界左边开始。
+    /// 拖拽区的 x/width 是 40ms 轮询下发的，窗口刚最大化/刚换标签时可能还是旧值，
+    /// 一旦偏小就会把标签上的点击判成 HTCAPTION —— 表现为“点标签没切换，
+    /// 窗口反而从最大化还原了”（Windows 对最大化窗口的标题栏拖动就是这个行为）。
+    out property <length> tabs-right: min(root.width,
+        max(0px, tabs-flick.x - tabs-flick.content-x + tabs-layout.preferred-width));
 
     height: 38px;
     background: Theme.bg-tabstrip;

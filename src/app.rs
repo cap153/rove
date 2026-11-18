@@ -9205,6 +9205,7 @@ impl App {
 
         match phase {
             0 => {
+                logv!("[tab] down index={index} x_in_row={x_in_row:.1} pointer_x={pointer_x:.1}");
                 self.tab_drag = Some((index, pointer_x, false));
             }
             1 => {
@@ -9214,19 +9215,28 @@ impl App {
                 if from != index {
                     return;
                 }
-                let moved = moved || (pointer_x - start_x).abs() > 4.0;
+                // 抖动不算拖动：4px 太敏感（手抖 / 高 DPI / 触摸板轻扫都会越过），
+                // 于是一次普通点击会先把标签画成「拖起」状态，看着像误触发拖动。
+                let moved = moved || (pointer_x - start_x).abs() > 10.0;
+                let was_moved = moved && self.tab_drag.is_some_and(|(_, _, m)| !m);
                 self.tab_drag = Some((from, start_x, moved));
                 if !moved {
                     return;
                 }
-                // 松手补发的 clicked 有可能早于 up，一移动就置位。
-                self.suppress_tab_click = Some(std::time::Instant::now());
+                if was_moved {
+                    logv!(
+                        "[tab] drag armed from={from} travel={:.1} pointer_x={pointer_x:.1}",
+                        pointer_x - start_x
+                    );
+                }
+                // 这里只切"视觉拖动态"。**不要**在这里丢弃 clicked：
+                // 松手时位移可能仍然不足（见 phase 2 的距离门槛），那时用户其实只想点标签。
                 self.ui.set_tab_drag_index(from as i32);
                 self.ui.set_tab_drop_slot(slot_of(pointer_x) as i32);
                 self.ui.set_tab_drop_visible(true);
             }
             2 => {
-                let Some((from, _, moved)) = self.tab_drag.take() else {
+                let Some((from, start_x, moved)) = self.tab_drag.take() else {
                     return;
                 };
                 self.ui.set_tab_drop_visible(false);
@@ -9235,8 +9245,24 @@ impl App {
                 if from != index || !moved {
                     return;
                 }
+                // 真正重排需要明显位移（约 1/4 个标签宽）：落点用 floor 划槽，
+                // 点在标签右边缘时左边一点抖动就会跨到下一槽，于是"点一下就换了位置"。
+                // 位移不足时按点击处理：不重排，也不抑制 clicked。
+                if (pointer_x - start_x).abs() < 40.0 {
+                    logv!(
+                        "[tab] drag ignored: travel={:.1}px < 40px from={}",
+                        pointer_x - start_x,
+                        from
+                    );
+                    return;
+                }
                 self.suppress_tab_click = Some(std::time::Instant::now());
                 let to = slot_of(pointer_x);
+                logv!(
+                    "[tab] drag release from={from} to={to} travel={:.1} tabs={}",
+                    pointer_x - start_x,
+                    self.state.tabs.len()
+                );
                 if to == from || to >= self.state.tabs.len() {
                     return;
                 }
@@ -12319,6 +12345,11 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             // 拖动交换松手会补发一次 clicked，丢弃它（400ms 上限，不误伤下次点击）。
             if let Some(at) = app.suppress_tab_click.take() {
                 if at.elapsed() < std::time::Duration::from_millis(400) {
+                    logv!(
+                        "[tab] click id={} dropped ({}ms after drag)",
+                        id,
+                        at.elapsed().as_millis()
+                    );
                     return;
                 }
             }
@@ -13900,6 +13931,12 @@ mod drag_hittest {
     static DRAG_X: AtomicU32 = AtomicU32::new(0);
     /// 拖拽区宽度（逻辑像素，f32 位模式）。
     static DRAG_W: AtomicU32 = AtomicU32::new(0);
+    /// 最后一个标签的右边界（逻辑像素，f32 位模式）。
+    ///
+    /// 标题栏拖拽判定必须从它右边开始：拖拽区的 x/width 是 40ms 轮询写入的，
+    /// 窗口刚最大化 / 刚增删标签时可能仍是旧值，x 偏小时就会把「点标签」
+    /// 判成 HTCAPTION —— 最大化窗口被拖动即还原。
+    static TABS_R: AtomicU32 = AtomicU32::new(0);
     /// 窗口缩放系数（物理像素 / 逻辑像素）。
     static DRAG_SCALE: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
     /// 标签栏高度（逻辑像素）：仅纵向落在此范围内才可能是标题栏拖拽区。
@@ -13913,22 +13950,26 @@ mod drag_hittest {
 
     /// 更新拖拽区边界；值未变化则跳过写入。返回本次是否真的改变，
     /// 供调用方只在变化时打日志（poll_timer 每 40ms 都会来一次）。
-    pub fn update(x: f32, w: f32, scale: f32) -> bool {
-        let (xb, wb, sb) = (x.to_bits(), w.to_bits(), scale.to_bits());
+    pub fn update(x: f32, w: f32, tabs_r: f32, scale: f32) -> bool {
+        let (xb, wb, tb, sb) = (x.to_bits(), w.to_bits(), tabs_r.to_bits(), scale.to_bits());
         if DRAG_X.load(Ordering::Relaxed) == xb
             && DRAG_W.load(Ordering::Relaxed) == wb
+            && TABS_R.load(Ordering::Relaxed) == tb
             && DRAG_SCALE.load(Ordering::Relaxed) == sb
         {
             return false;
         }
         DRAG_X.store(xb, Ordering::Relaxed);
         DRAG_W.store(wb, Ordering::Relaxed);
+        TABS_R.store(tb, Ordering::Relaxed);
         DRAG_SCALE.store(sb, Ordering::Relaxed);
         true
     }
 
-    /// 标题栏命中诊断（ROVE_LOG=2）：标签被判成 HTCAPTION 时会直接留下坐标证据。
-    /// 高频逐次命中只在详细级输出，且距上一条 200ms 以上才写一行。
+    /// 标题栏命中诊断（详细级）。
+    ///
+    /// 正常的 `HTCAPTION` / `HTCLIENT` 命中和鼠标移动一样频繁，只在 `ROVE_LOG=2`
+    /// 时输出；「兜底生效」那种异常命中由 [`log_guarded`] 无条件写一行。
     fn log_hit(
         reason: &str,
         lx: f32,
@@ -13939,17 +13980,29 @@ mod drag_hittest {
         w: f32,
         zoomed: bool,
     ) {
-        if ly < 0.0 || ly > TAB_BAR_H || !crate::app::log_enabled(2) {
+        if ly < 0.0 || ly > TAB_BAR_H {
             return;
         }
+        logv!(
+            "[nc-hit] {reason} lx={lx:.1} ly={ly:.1} scale={scale:.2} win_w={win_w:.1} x={x:.1} w={w:.1} tabs_r={:.1} zoomed={zoomed}",
+            bits(&TABS_R)
+        );
+    }
+
+    /// 兜底拦截：这次命中本来会被判成标题栏（拖拽区几何压到了标签上）。
+    ///
+    /// 这属于「本不该发生」，正常使用一行都不会写；真出现了就是我们要的证据：
+    /// 说明 40ms 轮询下发的拖拽区 x 曾经偏小（窗口刚最大化 / 刚增删标签）。
+    /// 保留 200ms 节流：真踩上时鼠标每动一下都会命中，不要刷屏。
+    fn log_guarded(lx: f32, ly: f32, x: f32, w: f32, tabs_r: f32, zoomed: bool) {
         let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
         let last = LAST_HIT_LOG_MS.load(Ordering::Relaxed);
         if now.saturating_sub(last) < 200 {
             return;
         }
         LAST_HIT_LOG_MS.store(now, Ordering::Relaxed);
-        logv!(
-            "[nc-hit] {reason} lx={lx:.1} ly={ly:.1} scale={scale:.2} win_w={win_w:.1} x={x:.1} w={w:.1} zoomed={zoomed}"
+        logal!(
+            "[nc-hit] caption-guard lx={lx:.1} ly={ly:.1} x={x:.1} w={w:.1} tabs_r={tabs_r:.1} zoomed={zoomed}"
         );
     }
 
@@ -14013,6 +14066,7 @@ mod drag_hittest {
 
             let scale = bits(&DRAG_SCALE);
             let (x, w) = (bits(&DRAG_X), bits(&DRAG_W));
+            let tabs_r = bits(&TABS_R);
             let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
             let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
             let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
@@ -14064,10 +14118,20 @@ mod drag_hittest {
             }
 
             // 非缩放边缘：判断是否在标题栏空白拖拽区（坐标已在上面转换好）。
+            //
+            // 起点取 max(拖拽区 x, 最后一个标签的右边界)：拖拽区几何是 40ms
+            // 轮询下发的，窗口刚最大化或刚增删标签时可能偏小，一旦偏小就会把
+            // 标签上的点击判成 HTCAPTION —— 最大化窗口被拖动即还原。
+            let caption_x = x.max(tabs_r);
             if w > 0.0 {
-                if (0.0..=TAB_BAR_H).contains(&ly) && lx >= x && lx <= x + w {
+                if (0.0..=TAB_BAR_H).contains(&ly) && lx >= caption_x && lx <= x + w {
                     log_hit("CAPTION", lx, ly, scale, win_w, x, w, is_maximized);
                     return HTCAPTION as isize;
+                }
+                // 落在拖拽区范围里，但被标签右边界挡住了：几何曾经偏小。
+                if (0.0..=TAB_BAR_H).contains(&ly) && lx >= x && lx < caption_x {
+                    log_guarded(lx, ly, x, w, tabs_r, is_maximized);
+                    return HTCLIENT as isize;
                 }
             }
             log_hit("CLIENT", lx, ly, scale, win_w, x, w, is_maximized);
@@ -14153,18 +14217,26 @@ fn sync_drag_bounds(app: &App, reason: &str) {
     // Slint 真实布局几何（`tab_bar.slint` 导出的 drag-x / drag-w）。
     let slint_x = app.ui.get_drag_area_x() as f32;
     let slint_w = app.ui.get_drag_area_w() as f32;
+    let slint_tabs_r = app.ui.get_tabs_right() as f32;
     let (x, w, source) = if slint_w > 0.0 && slint_x > 0.0 {
         (slint_x, slint_w, "slint")
     } else {
         (rust_x, rust_w, "rust-estimate")
     };
 
-    // 只在边界真的变化时输出（poll_timer 每 40ms 都会来一次），诊断细节放详细级。
-    if drag_hittest::update(x, w, scale) {
-        logv!(
-            "[drag-bounds] {reason} -> {source} x={x:.1} w={w:.1} | rust x={rust_x:.1} w={rust_w:.1} | slint x={slint_x:.1} w={slint_w:.1} | scale={scale:.2} physical_w={physical_w:.1} win_w={window_w:.1} tabs={}",
+    // 只在边界真的变化时输出（poll_timer 每 40ms 都会来一次）。
+    // 退回 rust-estimate 说明 Slint 几何拿不到，属于可疑状态 -> 无条件写一行；
+    // 正常走 Slint 几何的只是常规布局变化，留在详细级。
+    if drag_hittest::update(x, w, slint_tabs_r, scale) {
+        let line = format!(
+            "[drag-bounds] {reason} -> {source} x={x:.1} w={w:.1} tabs_r={slint_tabs_r:.1} | rust x={rust_x:.1} w={rust_w:.1} | slint x={slint_x:.1} w={slint_w:.1} | scale={scale:.2} physical_w={physical_w:.1} win_w={window_w:.1} tabs={}",
             app.state.tabs.len()
         );
+        if source == "rust-estimate" {
+            logal!("{line}");
+        } else {
+            logv!("{line}");
+        }
     }
 }
 

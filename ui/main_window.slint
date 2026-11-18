@@ -625,6 +625,8 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 标题栏空白拖拽区的起止坐标（供 Win32 WM_NCHITTEST 判定，见 app.rs drag_hittest）。
     out property <length> drag-area-x: tab-bar.drag-x;
     out property <length> drag-area-w: tab-bar.drag-w;
+    /// 最后一个标签的右边界（窗口坐标），见 tab_bar.slint 的说明。
+    out property <length> tabs-right: tab-bar.tabs-right;
 
     /// 窗口是否处于最大化（Rust 经 IsZoomed 实时同步）。
     ///
