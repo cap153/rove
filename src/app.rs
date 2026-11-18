@@ -14190,6 +14190,56 @@ fn with_current_dir_pin(hits: &mut Vec<crate::search::jump::JumpHit>, language: 
     hits.truncate(6); // 允许比平时多展示一个
 }
 
+/// 重算吸附窗候选列表，并按结果数重新锚定窗口位置。
+///
+/// 铁律：**持着 JUMP 借用时绝不回调进 Slint**。set_results / show / hide /
+/// invoke_clear_query 都可能同步派发 Slint 回调（例如 clear-query 立刻触发
+/// text-changed），那时再借 JUMP 就是 RefCell 二次借用 → 进程 abort。
+/// 所以先算出结果、释放借用，再动 UI。
+///
+/// 搜索根目录**每次都从对话框重新提取**：用户完全可能自己换过目录（点侧栏、
+/// 敲地址栏、退回上级），缓存旧根目录会让结果继续停在旧范围内。
+fn jump_refresh() {
+    let snapshot = with_jump(|state| {
+        #[cfg(windows)]
+        let root = state.target.as_ref().and_then(|(hwnd, _)| {
+            crate::sys::dialog_jump::extract_current_folder(*hwnd as _)
+        });
+        #[cfg(not(windows))]
+        let root: Option<PathBuf> = None;
+        let hits = if state.window.get_query().is_empty() {
+            let mut hits = crate::search::jump::search("", None);
+            with_current_dir_pin(&mut hits, &state.language);
+            Some(hits)
+        } else {
+            logv!(
+                "[rove:dialog_jump] refresh q={:?} root={:?}",
+                state.window.get_query(),
+                root
+            );
+            Some(crate::search::jump::search(
+                &state.window.get_query(),
+                root.as_deref(),
+            ))
+        };
+        hits.map(jump_results_model)
+    })
+    .flatten();
+    if let Some(model) = snapshot {
+        with_jump(|state| state.window.set_results(model));
+    }
+    // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
+    // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行。
+    #[cfg(windows)]
+    if let Some((gx, gy, gw, gplacement)) = with_jump(|state| state.geom.clone()).flatten() {
+        if gplacement == "bottom" {
+            reposition_bottom_next_tick(gx, gy, gw, gplacement);
+        } else {
+            with_jump(|state| position_jump_window(&state.window, gx, gy, gw, &gplacement));
+        }
+    }
+}
+
 /// 建好吸附窗并接线。进程内只做一次（见 `run()`），与主窗口生命周期无关。
 pub(crate) fn init_dialog_jump(language: &str) {
     let window = DialogJumpWindow::new().unwrap();
@@ -14203,57 +14253,20 @@ pub(crate) fn init_dialog_jump(language: &str) {
         });
     });
 
-    // 所有回调都遵循同一条铁律：**持有 JUMP 借用时绝不回调进 Slint**。
-    // set_results / show / hide / invoke_clear_query 都可能同步派发 Slint 回调
-    // （例如 clear-query 立刻触发 text-changed），那时再借 JUMP 就是 RefCell
-    // 二次借用 → 进程 abort。所以先算出结果、释放借用，再动 UI。
-    let refresh = move |empty_only: bool| {
-        let snapshot = with_jump(|state| {
-            let hits = if empty_only && !state.window.get_query().is_empty() {
-                None
-            } else if state.window.get_query().is_empty() {
-                let mut hits = crate::search::jump::search("", None);
-                with_current_dir_pin(&mut hits, &state.language);
-                Some(hits)
-            } else {
-                // 每次输入实时从对话框提取最新路径，避免跳转后目录滞后。
-                #[cfg(windows)]
-                let latest_dir = state
-                    .target
-                    .as_ref()
-                    .and_then(|(hwnd, _)| crate::sys::dialog_jump::extract_current_folder(*hwnd as _));
-                #[cfg(not(windows))]
-                let latest_dir: Option<PathBuf> = None;
-                Some(crate::search::jump::search(
-                    &state.window.get_query(),
-                    latest_dir.as_deref(),
-                ))
-            };
-            hits.map(jump_results_model)
-        })
-        .flatten();
-        if let Some(model) = snapshot {
-            with_jump(|state| state.window.set_results(model));
-        }
-        // bottom 吸附时窗口高度随结果数变化，需重新锚定底边：
-        // bottom 延迟一轮（等 Slint 完成 height 重算后原子锚定），top 立即执行。
-        #[cfg(windows)]
-        if let Some((gx, gy, gw, gplacement)) = with_jump(|state| state.geom.clone()).flatten() {
-            if gplacement == "bottom" {
-                reposition_bottom_next_tick(gx, gy, gw, gplacement);
-            } else {
-                with_jump(|state| position_jump_window(&state.window, gx, gy, gw, &gplacement));
-            }
-        }
-    };
-
     // 输入变化（含程序化清空）：重算候选。
-    let refresh_input = refresh.clone();
-    window.on_text_changed(move |_query| refresh_input(false));
+    window.on_text_changed(move |_query| jump_refresh());
 
-    // 聚焦：输入为空时主动拉一次历史，并按新的高度重新锚定。
-    let refresh_focus = refresh.clone();
-    window.on_focus_changed(move || refresh_focus(true));
+    // 聚焦：一律按对话框的**最新路径**重算。
+    //
+    // 以前这里只在输入框为空时才刷新，于是「搜了一半、又去对话框里自己换了个
+    // 目录、再点吸附窗」时，框里还留着上次的文本，结果却还是旧目录下算出来的。
+    //
+    // 推迟一拍执行：聚焦与「点中某一条」是同一次鼠标事件里的两件事，
+    // 同步重建结果模型会把按下时那个条目实例拆掉，松手的激活就没了
+    // （表现为「要点两次才生效」）。
+    window.on_focus_changed(|| {
+        slint::Timer::single_shot(std::time::Duration::from_millis(0), jump_refresh);
+    });
 
     // 选中一条：把路径写进原生对话框并确认（不依赖会话）。
     window.on_item_activated(|path| {
@@ -14471,6 +14484,10 @@ pub(crate) fn show_dialog_jump(
             crate::sys::dialog_jump::register_jump_window(slint_hwnd as isize);
         }
     }
+
+    // 按这个对话框的当前目录重算一次候选：吸附窗里可能还留着上次搜的关键词
+    // （清空只发生在「选中一条」之后），不重算就会拿旧对话框的旧目录当搜索范围。
+    jump_refresh();
 }
 
 /// 对话框移动时实时跟随更新吸附窗位置与吸附方向。
