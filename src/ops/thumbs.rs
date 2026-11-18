@@ -168,6 +168,23 @@ fn get_thumbnail_impl(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), Str
         DeleteObject, GetDC, GetDIBits, ReleaseDC, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS,
     };
 
+    // 图标类文件（快捷方式/可执行）先走系统图列表（Pulse 的做法）：
+    // `GetImage` 对它们返回的是**不透明整帧**，画稿小也没法裁。
+    // 文件夹只有「设了自定义图标」才走这条，其余保留 `GetImage` 的封面缩略图。
+    let use_image_list = if path.is_dir() {
+        folder_has_custom_icon(path)
+    } else {
+        is_icon_like(path)
+    };
+    if use_image_list {
+        if let Some((w, h, rgba)) = icon_from_image_list(path, size) {
+            let art = art_bounds(w, h, &rgba);
+            let (cw, ch, cbuf) = crop_undersized_icon(w, h, rgba, false);
+            icon_diag_log(path, 0, w, h, art, cw != w || ch != h);
+            return Ok((cw, ch, cbuf));
+        }
+    }
+
     let wide: Vec<u16> = path
         .as_os_str()
         .to_string_lossy()
@@ -235,8 +252,442 @@ fn get_thumbnail_impl(path: &Path, size: u32) -> Result<(u32, u32, Vec<u8>), Str
             px.swap(0, 2);
         }
         drop(item);
-        Ok((bw, bh, buf))
+        let art = art_bounds(bw, bh, &buf);
+        let matte = is_icon_like(path);
+        let (cw, ch, cbuf) = crop_undersized_icon(bw, bh, buf, matte);
+        icon_diag_log(path, size, bw, bh, art, cw != bw || ch != bh);
+        Ok((cw, ch, cbuf))
     }
+}
+
+/// 裁掉「小图塞在大透明画布」多出来的空白。
+///
+/// Shell 的图列表对**没有大图**的图标（很多 `.lnk`、老程序）不会放大，而是把它
+/// 最大的一张图原尺寸放进一块大透明画布（左上角或居中）。整帧按单元格拉伸绘制
+/// 时，真正有像素的部分只占一小块，别的图标铺满格子，它却小一圈——「图标偏小」
+/// 就是这么来的。思路抄 Pulse 的 `ui/icon_artwork_bounds.h`：量出实际画稿的
+/// 包围盒，明显小于画布（< 55%）就裁到包围盒本身；比例接近满格的原样返回。
+///
+/// 裁到**包围盒**而不是正方形：绘制端是 `image-fit: contain`，包围盒能保证
+/// 同等比例下画稿尽量大，且不会切掉偏移绘制（居中）的图形。
+///
+/// 返回新的 (宽, 高, 像素)；不需要裁时原样返回。
+/// alpha 低于此值视为透明。
+///
+/// 不能只认 `== 0`：Shell 给小图铺的那层衬底 alpha 常常是 1–4（肉眼不可见，
+/// 但按"非零即有像素"量出来就是整帧），于是画稿包围盒 = 整帧、裁切失效。
+const ALPHA_MIN: u8 = 8;
+
+/// 量实际画稿的包围盒（像素，右下为开区间）。全透明返回 None。
+fn art_bounds(w: u32, h: u32, buf: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    if w == 0 || h == 0 || buf.len() < (w as usize) * (h as usize) * 4 {
+        return None;
+    }
+    let (mut left, mut top, mut right, mut bottom) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        let row = (y as usize) * (w as usize) * 4;
+        for x in 0..w {
+            if buf[row + (x as usize) * 4 + 3] < ALPHA_MIN {
+                continue;
+            }
+            if x < left {
+                left = x;
+            }
+            if y < top {
+                top = y;
+            }
+            if x + 1 > right {
+                right = x + 1;
+            }
+            if y + 1 > bottom {
+                bottom = y + 1;
+            }
+        }
+    }
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some((left, top, right, bottom))
+}
+
+/// 按「主色衬底」量画稿包围盒。
+///
+/// 有些图标（无 256px 版本的 .lnk/.exe）Shell 交回来的是**不透明整帧**：真正的
+/// 画稿只占中间一小块，四周被填成一种均匀底色（通常是白色，肉眼在白色单元格里
+/// 看不出来）。这种帧按 alpha 量就是整帧，只能按颜色找：取占比最大的量化色当
+/// 衬底，再量「与衬底明显不同」的像素包围盒。
+///
+/// 只在图标类文件上调用。照片/视频封面/文件夹封面不走这里——照片里大片同色
+/// 天空、电影上下黑边都会被误裁。
+fn matte_bounds(w: u32, h: u32, buf: &[u8]) -> Option<(u32, u32, u32, u32)> {
+    let (wus, hus) = (w as usize, h as usize);
+    if wus == 0 || hus == 0 || buf.len() < wus * hus * 4 {
+        return None;
+    }
+    // 5 位/通道量化直方图（32³ 桶）：找占比最大的底色。
+    let mut hist = vec![0u32; 32 * 32 * 32];
+    for px in buf.chunks_exact(4) {
+        hist[((px[0] as usize >> 3) << 10) | ((px[1] as usize >> 3) << 5) | (px[2] as usize >> 3)] += 1;
+    }
+    let (best, count) = hist
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, &n)| n)
+        .map(|(i, &n)| (i, n))
+        .unwrap_or((0, 0));
+    // 底色不足 30%：这不是"衬底 + 小画稿"，而是本来就铺满的图案，别动它。
+    if (count as usize) * 10 < wus * hus * 3 {
+        return None;
+    }
+    let bg = [
+        ((best >> 10) as u8 & 0x1F) << 3,
+        ((best >> 5) as u8 & 0x1F) << 3,
+        (best as u8 & 0x1F) << 3,
+    ];
+    let differs = |px: &[u8]| -> bool {
+        let d = |a: u8, b: u8| (a as i32 - b as i32).abs();
+        // 量化会把颜色截到桶左下角，容差取 24 才能覆盖整个桶 + 抗锯齿边。
+        d(px[0], bg[0]).max(d(px[1], bg[1])).max(d(px[2], bg[2])) > 24
+    };
+    let (mut left, mut top, mut right, mut bottom) = (w, h, 0u32, 0u32);
+    for y in 0..h {
+        let row = (y as usize) * (w as usize) * 4;
+        for x in 0..w {
+            if !differs(&buf[row + (x as usize) * 4..row + (x as usize) * 4 + 4]) {
+                continue;
+            }
+            if x < left {
+                left = x;
+            }
+            if y < top {
+                top = y;
+            }
+            if x + 1 > right {
+                right = x + 1;
+            }
+            if y + 1 > bottom {
+                bottom = y + 1;
+            }
+        }
+    }
+    if right <= left || bottom <= top {
+        return None;
+    }
+    Some((left, top, right, bottom))
+}
+
+/// 图标帧诊断（详细级，`ROVE_LOG=2`）。
+///
+/// 记「Shell 到底给了什么」：帧多大、画稿多小、裁没裁。`ROVE_LOG` 未开启时
+/// 第一行就返回，正常运行连扫描都不做。
+fn icon_diag_log(path: &Path, req: u32, w: u32, h: u32, art: Option<(u32, u32, u32, u32)>, cropped: bool) {
+    if !crate::app::log_enabled(2) {
+        return;
+    }
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let Some((l, t, r, b)) = art else { return };
+    let (aw, ah) = (r - l, b - t);
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    // 图标类（快捷方式/可执行）一律记录——「显小」的抱怨全部落在这一类里，
+    // 而且它们数量少。其他格式只在画稿明显小（<80%）时记，避免图库刷屏。
+    let icon_class = matches!(
+        ext.as_str(),
+        "lnk" | "exe" | "url" | "msi" | "bat" | "cmd" | "com" | "scr"
+    );
+    if w == 0 || h == 0 || (!icon_class && aw * 10 >= w * 8 && ah * 10 >= h * 8) {
+        return;
+    }
+    let key = path.to_string_lossy().to_string();
+    {
+        let Ok(mut guard) = SEEN.lock() else { return };
+        let set = guard.get_or_insert_with(Default::default);
+        if set.len() >= 200 || !set.insert(key.clone()) {
+            return;
+        }
+    }
+    crate::logv!(
+        "[icon] req={req}{} frame={w}x{h} art={aw}x{ah} box={l},{t} fill={:.2} cropped={cropped} alpha_full={} {}",
+        if req == 0 { " src=imagelist" } else { "" },
+        (aw as f32 / w.max(1) as f32).min(ah as f32 / h.max(1) as f32),
+        aw * 100 > w * 98 && ah * 100 > h * 98,
+        key
+    );
+}
+
+fn crop_undersized_icon(w: u32, h: u32, buf: Vec<u8>, matte: bool) -> (u32, u32, Vec<u8>) {
+    // 下限 32px：再小的帧里画稿不可能有明显留白，裁了只会放大噪点。
+    // 不要求正方形：绘制端是 `image-fit: contain`，裁到包围盒不会变形。
+    if w < 32 || h < 32 || buf.len() < (w as usize) * (h as usize) * 4 {
+        return (w, h, buf);
+    }
+    let alpha_box = art_bounds(w, h, &buf);
+    let full = |(l, t, r, b): (u32, u32, u32, u32)| -> bool {
+        (r - l) * 100 > w * 98 && (b - t) * 100 > h * 98
+    };
+    // 1. 透明留白：照片/封面/大多数图标走这条（画稿 = 不透明区域）。
+    // 2. 不透明衬底：alpha 铺满整帧时才考虑，且只对图标类文件
+    //    （照片里的大片同色、影片上下黑边都不能按颜色裁）。
+    let box_ = match alpha_box {
+        Some(b) if !full(b) => Some(b),
+        _ if matte => matte_bounds(w, h, &buf).filter(|&b| {
+            // 衬底色块本身占满整帧（纯色图标）时没必要裁，也别把纯色图裁成一条线。
+            let (l, t, r, b2) = b;
+            (r - l) >= 8
+                && (b2 - t) >= 8
+                && ((r - l) * 100 < w * 96 || (b2 - t) * 100 < h * 96)
+        }),
+        _ => None,
+    };
+    let Some((left, top, right, bottom)) = box_ else {
+        return (w, h, buf); // 没有可裁的留白（或全透明，交给 UI 画占位色块）
+    };
+    let (aw, ah) = (right - left, bottom - top);
+    if aw < 8 || ah < 8 {
+        return (w, h, buf);
+    }
+    let stride = (w as usize) * 4;
+    let mut out = Vec::with_capacity((aw as usize) * (ah as usize) * 4);
+    for y in top..bottom {
+        let start = (y as usize) * stride + (left as usize) * 4;
+        out.extend_from_slice(&buf[start..start + (aw as usize) * 4]);
+    }
+    crate::logv!(
+        "[thumb] icon cropped {}x{} -> {}x{} box={},{} matte={}",
+        w,
+        h,
+        aw,
+        ah,
+        left,
+        top,
+        matte
+    );
+    (aw, ah, out)
+}
+
+/// HICON → RGBA（已反预乘）。成功后销毁图标句柄。
+#[cfg(windows)]
+fn hicon_to_rgba(
+    hicon: windows::Win32::UI::WindowsAndMessaging::HICON,
+) -> Option<(u32, u32, Vec<u8>)> {
+    use windows::Win32::Graphics::Gdi::{
+        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
+        BITMAPINFOHEADER, DIB_RGB_COLORS,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
+
+    unsafe {
+        let mut ii = ICONINFO::default();
+        if GetIconInfo(hicon, &mut ii).is_err() {
+            let _ = DestroyIcon(hicon);
+            return None;
+        }
+        let hbm = ii.hbmColor;
+        if hbm.is_invalid() {
+            let _ = DestroyIcon(hicon);
+            let _ = DeleteObject(ii.hbmMask.into());
+            return None;
+        }
+        // 高 DPI / 带大图标的 exe 上颜色位图未必等于请求尺寸，先查真实尺寸。
+        let mut bmp = BITMAP::default();
+        let got = GetObjectW(
+            hbm.into(),
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bmp as *mut _ as *mut _),
+        );
+        if got == 0 || bmp.bmWidth <= 0 || bmp.bmHeight <= 0 {
+            let _ = DeleteObject(hbm.into());
+            let _ = DeleteObject(ii.hbmMask.into());
+            let _ = DestroyIcon(hicon);
+            return None;
+        }
+        let (bw, bh) = (bmp.bmWidth as u32, bmp.bmHeight as u32);
+        let mut bmi = BITMAPINFO::default();
+        bmi.bmiHeader = BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: bw as i32,
+            biHeight: -(bh as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: 0,
+            ..Default::default()
+        };
+        let mut buf = vec![0u8; (bw * bh * 4) as usize];
+        let hdc = GetDC(None);
+        let lines = GetDIBits(
+            hdc,
+            hbm,
+            0,
+            bh,
+            Some(buf.as_mut_ptr().cast()),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(None, hdc);
+        let _ = DeleteObject(hbm.into());
+        let _ = DeleteObject(ii.hbmMask.into());
+        let _ = DestroyIcon(hicon);
+        if lines == 0 {
+            return None;
+        }
+        // 老式图标只有 AND 掩码、没有 alpha 通道，GetDIBits 读回来整幅 alpha=0。
+        // 不补这一步，图标会被当成"全透明"画成空白（裁切也会因为找不到画稿而失效）。
+        let any_alpha = buf.chunks_exact(4).any(|px| px[3] != 0);
+        // BGRA→RGBA + 反预乘（HICON 位图为预乘 alpha）。
+        for px in buf.chunks_exact_mut(4) {
+            let a = px[3] as u32;
+            if !any_alpha {
+                px[3] = 255;
+            } else if a > 0 && a < 255 {
+                px[0] = ((px[0] as u32 * 255) / a).min(255) as u8;
+                px[1] = ((px[1] as u32 * 255) / a).min(255) as u8;
+                px[2] = ((px[2] as u32 * 255) / a).min(255) as u8;
+            }
+            px.swap(0, 2);
+        }
+        Some((bw, bh, buf))
+    }
+}
+
+/// 取图标本体：走系统图列表（Pulse 的做法），不是让 Shell 渲染整帧。
+///
+/// `IShellItemImageFactory` 对没有大图的图标（很多 `.lnk` / 老程序）会返回
+/// **不透明整帧**（`[icon]` 日志里的 `alpha_full=true`、`fill=1.00`）：真正画稿
+/// 只占中间一小块，四周被衬底填满，按 alpha 裁切无从下手 → 图标显小。
+/// 系统图列表给的是图标自己的位图（透明留白 + 画稿原尺寸摆放），裁切才有效。
+/// 文件夹是否设了自定义图标（desktop.ini 的 IconResource 之类）。
+///
+/// 判定办法：同一个路径查两次系统图标索引——
+/// - 带 `SHGFI_USEFILEATTRIBUTES` 时 Shell 不读 desktop.ini，给的是**通用文件夹图标**；
+/// - 不带时读真实属性，给的是**这个文件夹实际显示的图标**。
+/// 两者索引不同 ⇒ 有自定义图标。这样不必猜「有封面还是没封面」。
+///
+/// 自定义图标的文件夹同样会被 Shell 渲染成不透明整帧（画稿小、衬底填满），
+/// 只能改走系统图列表；没有自定义图标的文件夹继续走 `GetImage` 保留封面缩略图。
+#[cfg(windows)]
+fn folder_has_custom_icon(path: &Path) -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY;
+    use windows::Win32::UI::Shell::{
+        SHGetFileInfoW, SHFILEINFOW, SHGFI_FLAGS, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    let index_of = |extra: SHGFI_FLAGS| -> Option<i32> {
+        let mut info = SHFILEINFOW::default();
+        let ok = unsafe {
+            SHGetFileInfoW(
+                PCWSTR(wide.as_ptr()),
+                FILE_ATTRIBUTE_DIRECTORY,
+                Some(&mut info),
+                std::mem::size_of::<SHFILEINFOW>() as u32,
+                SHGFI_SYSICONINDEX | extra,
+            )
+        };
+        (ok != 0 && info.iIcon >= 0).then_some(info.iIcon)
+    };
+    // 差异只在 USEFILEATTRIBUTES：带它 = 不读 desktop.ini（通用文件夹图标）。
+    let generic = index_of(SHGFI_USEFILEATTRIBUTES);
+    let real = index_of(SHGFI_FLAGS(0));
+    match (generic, real) {
+        (Some(g), Some(r)) => {
+            let custom = g != r;
+            if custom {
+                crate::logv!(
+                    "[icon] folder custom icon idx={r} (generic {g}) {}",
+                    path.display()
+                );
+            }
+            custom
+        }
+        // 查不到就当作没有自定义图标：宁可显示封面/默认图标，也不要乱换。
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn icon_from_image_list(path: &Path, want_px: u32) -> Option<(u32, u32, Vec<u8>)> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL;
+    use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+    use windows::Win32::UI::Shell::{
+        SHGetFileInfoW, SHGetImageList, SHFILEINFOW, SHGFI_SYSICONINDEX, SHIL_EXTRALARGE,
+        SHIL_JUMBO, SHIL_LARGE, SHIL_SMALL,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain([0])
+        .collect();
+    unsafe {
+        let mut info = SHFILEINFOW::default();
+        let ok = SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_ATTRIBUTE_NORMAL,
+            Some(&mut info),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_SYSICONINDEX,
+        );
+        if ok == 0 || info.iIcon < 0 {
+            return None;
+        }
+        // 要多大就先要多大，不够再往上退（Pulse 的 `ImageListId` 同思路）。
+        // 别一律取 JUMBO：详情/列表视图只要 24 逻辑像素，256² 的图标
+        // 一张就是 262KB，几百行滚动下来会把缩略图 LRU 挤掉。
+        // 列表名义边长：SMALL 16 / LARGE 32 / EXTRALARGE 48 / JUMBO 256。
+        let order: [u32; 4] = if want_px <= 20 {
+            [SHIL_SMALL, SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO]
+        } else if want_px <= 40 {
+            [SHIL_LARGE, SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_SMALL]
+        } else if want_px <= 96 {
+            [SHIL_EXTRALARGE, SHIL_JUMBO, SHIL_LARGE, SHIL_SMALL]
+        } else {
+            [SHIL_JUMBO, SHIL_EXTRALARGE, SHIL_LARGE, SHIL_SMALL]
+        };
+        for shil in order {
+            let Ok(list) = SHGetImageList::<IImageList>(shil as i32) else {
+                continue;
+            };
+            let Ok(hicon) = list.GetIcon(info.iIcon, ILD_TRANSPARENT.0) else {
+                continue;
+            };
+            if hicon.is_invalid() {
+                continue;
+            }
+            if let Some(rgba) = hicon_to_rgba(hicon) {
+                crate::logv!(
+                    "[icon] image-list shil={shil} {}x{} {}",
+                    rgba.0,
+                    rgba.1,
+                    path.display()
+                );
+                return Some(rgba);
+            }
+        }
+        None
+    }
+}
+
+/// 图标类扩展名：只有这些文件允许用「主色衬底」裁切。
+fn is_icon_like(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    matches!(
+        ext.as_str(),
+        "lnk" | "exe" | "url" | "msi" | "bat" | "cmd" | "com" | "scr" | "ico" | "dll"
+    )
 }
 
 /// 系统图标兜底：`SHGetFileInfoW`（不打开文件，受保护路径也能拿到图标）。
@@ -254,14 +705,9 @@ pub fn get_system_icon(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
 #[cfg(windows)]
 fn get_system_icon_timed(path: &Path) -> (Option<(u32, u32, Vec<u8>)>, u128) {
     use windows::core::PCWSTR;
-    use windows::Win32::Graphics::Gdi::{
-        DeleteObject, GetDC, GetDIBits, GetObjectW, ReleaseDC, BITMAP, BITMAPINFO,
-        BITMAPINFOHEADER, DIB_RGB_COLORS,
-    };
     use windows::Win32::UI::Shell::{
         SHGetFileInfoW, SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_USEFILEATTRIBUTES,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{DestroyIcon, GetIconInfo, ICONINFO};
 
     let mut pure_ms: u128 = 0;
     if ensure_com().is_err() {
@@ -272,7 +718,6 @@ fn get_system_icon_timed(path: &Path) -> (Option<(u32, u32, Vec<u8>)>, u128) {
         .encode_utf16()
         .chain([0])
         .collect();
-    let size = 32u32;
     // 目录 / 盘根：不要传 FILE_ATTRIBUTE_NORMAL（那是“普通文件”），
     // 用真实属性 + SHGFI_USEFILEATTRIBUTES，才能拿到文件夹/驱动器图标；
     // 并且 SHGetFileInfoW 在 Shell 初始化早期也可能瞬时失败，做限次重试。
@@ -321,75 +766,8 @@ fn get_system_icon_timed(path: &Path) -> (Option<(u32, u32, Vec<u8>)>, u128) {
         let hicon = info.hIcon;
         let t_tail = std::time::Instant::now();
         let tail_ms = || t_tail.elapsed().as_millis();
-
-        let mut ii = ICONINFO::default();
-        if GetIconInfo(hicon, &mut ii).is_err() {
-            let _ = DestroyIcon(hicon);
-            return (None, pure_ms + tail_ms());
-        }
-        let hbm = ii.hbmColor;
-        if hbm.is_invalid() {
-            let _ = DestroyIcon(hicon);
-            let _ = DeleteObject(ii.hbmMask.into());
-            return (None, pure_ms + tail_ms());
-        }
-
-        let hdc = GetDC(None);
-        // SHGFI_LARGEICON 返回的 HICON 颜色位图在高 DPI / 带大图标的 exe 上
-        // 未必是 32×32。硬按 32 调 GetDIBits 只会取到左上角一角，正是拖拽图
-        // 「缺一块」的来源；先查真实尺寸再按它读取。
-        let mut bmp = BITMAP::default();
-        let got = GetObjectW(
-            hbm.into(),
-            std::mem::size_of::<BITMAP>() as i32,
-            Some(&mut bmp as *mut _ as *mut _),
-        );
-        let (bw, bh) = if got > 0 && bmp.bmWidth > 0 && bmp.bmHeight > 0 {
-            (bmp.bmWidth as u32, bmp.bmHeight as u32)
-        } else {
-            (size, size)
-        };
-        let mut bmi = BITMAPINFO::default();
-        bmi.bmiHeader = BITMAPINFOHEADER {
-            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: bw as i32,
-            biHeight: -(bh as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: 0,
-            ..Default::default()
-        };
-        let mut buf = vec![0u8; (bw * bh * 4) as usize];
-        let lines = GetDIBits(
-            hdc,
-            hbm,
-            0,
-            bh,
-            Some(buf.as_mut_ptr().cast()),
-            &mut bmi,
-            DIB_RGB_COLORS,
-        );
-        ReleaseDC(None, hdc);
-        let _ = DeleteObject(hbm.into());
-        let _ = DeleteObject(ii.hbmMask.into());
-        let _ = DestroyIcon(hicon);
-        if lines == 0 {
-            return (None, pure_ms + tail_ms());
-        }
-        // BGRA→RGBA + 反预乘（HICON 位图为预乘 alpha）。
-        for px in buf.chunks_exact_mut(4) {
-            let a = px[3] as u32;
-            if a > 0 && a < 255 {
-                px[0] = ((px[0] as u32 * 255) / a).min(255) as u8;
-                px[1] = ((px[1] as u32 * 255) / a).min(255) as u8;
-                px[2] = ((px[2] as u32 * 255) / a).min(255) as u8;
-            }
-            px.swap(0, 2);
-        }
-        (
-            Some((bw, bh, buf)),
-            pure_ms + tail_ms(),
-        )
+        let out = hicon_to_rgba(hicon);
+        (out, pure_ms + tail_ms())
     }
 }
 
@@ -644,4 +1022,93 @@ pub fn encode_wic_to_file(
 #[cfg(not(windows))]
 pub fn decode_wic_from_file(_path: &Path) -> Result<(u32, u32, Vec<u8>), String> {
     Err("WIC decoding is Windows-only".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crop_undersized_icon;
+
+    /// 造一张 `frame` 见方的透明画布，在 (x, y) 画一块 `art` 见方的实心像素。
+    fn frame_with_art(frame: u32, x: u32, y: u32, art: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; (frame * frame * 4) as usize];
+        for yy in y..(y + art) {
+            for xx in x..(x + art) {
+                let i = ((yy * frame + xx) * 4) as usize;
+                buf[i..i + 4].copy_from_slice(&[0x40, 0x80, 0xC0, 0xFF]);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn crops_artwork_with_padding() {
+        // 132 帧、画稿 97×116（实测 data 文件夹那类）——留白要被裁掉，
+        // 否则它比别人小一圈。
+        let (w, h, out) = crop_undersized_icon(132, 132, frame_with_art(132, 22, 13, 97), false);
+        assert_eq!((w, h), (97, 97));
+        assert_eq!(out.len(), 97 * 97 * 4);
+    }
+
+    #[test]
+    fn crops_artwork_off_center() {
+        let (w, h, _) = crop_undersized_icon(264, 264, frame_with_art(264, 57, 9, 191), false);
+        assert_eq!((w, h), (191, 191));
+    }
+
+    #[test]
+    fn keeps_artwork_that_fills_the_frame() {
+        // 照片/封面类：铺满整帧，不做任何裁切。
+        let (w, h, out) = crop_undersized_icon(256, 256, frame_with_art(256, 0, 0, 256), false);
+        assert_eq!((w, h), (256, 256));
+        assert_eq!(out.len(), 256 * 256 * 4);
+        // 只差 1px 的边缘也视为铺满。
+        let (w, h, _) = crop_undersized_icon(256, 256, frame_with_art(256, 1, 1, 254), false);
+        assert_eq!((w, h), (256, 256));
+    }
+
+    #[test]
+    fn keeps_tiny_frames_and_wide_images() {
+        // 32px 以下不裁：画稿不可能有明显留白。
+        let (w, h, _) = crop_undersized_icon(24, 24, frame_with_art(24, 0, 0, 12), false);
+        assert_eq!((w, h), (24, 24));
+        // 不透明宽幅图（视频封面等）：不裁。
+        let wide = vec![0xFFu8; 200 * 100 * 4];
+        let (w, h, _) = crop_undersized_icon(200, 100, wide, false);
+        assert_eq!((w, h), (200, 100));
+    }
+
+    /// 不透明白色衬底 + 中间一小块图案：这是 Shell 给「没有 256 图」的
+    /// .lnk/.exe 的样子（alpha 铺满整帧，画稿只占中间）。
+    fn white_matte_frame(frame: u32, x: u32, y: u32, art: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; (frame * frame * 4) as usize];
+        for px in buf.chunks_exact_mut(4) {
+            px.copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+        for yy in y..(y + art) {
+            for xx in x..(x + art) {
+                let i = ((yy * frame + xx) * 4) as usize;
+                buf[i..i + 4].copy_from_slice(&[0x20, 0x60, 0xC0, 0xFF]);
+            }
+        }
+        buf
+    }
+
+    #[test]
+    fn crops_opaque_matte_for_icon_files() {
+        let (w, h, _) = crop_undersized_icon(264, 264, white_matte_frame(264, 90, 90, 80), true);
+        assert_eq!((w, h), (80, 80));
+    }
+
+    #[test]
+    fn keeps_opaque_matte_for_other_files() {
+        // 同一帧但路径不是图标类（例如一张照片）：绝不能按颜色裁。
+        let (w, h, _) = crop_undersized_icon(264, 264, white_matte_frame(264, 90, 90, 80), false);
+        assert_eq!((w, h), (264, 264));
+    }
+
+    #[test]
+    fn keeps_fully_transparent_frame() {
+        let (w, h, _) = crop_undersized_icon(256, 256, vec![0u8; 256 * 256 * 4], false);
+        assert_eq!((w, h), (256, 256));
+    }
 }

@@ -900,6 +900,8 @@ pub struct App {
     list_retry: Option<(usize, usize, std::time::Instant, u8)>,
     /// 标签拖动松手后那次补发的 clicked 要丢弃，避免误切标签。
     suppress_tab_click: Option<std::time::Instant>,
+    /// 会话内见过的最大的窗口缩放系数（取图尺寸用，见 `ui_scale()`）。
+    ui_scale: f32,
     /// 拖拽结束后的那次 clicked 要丢弃（否则拖完会顺带导航）。带时间上限，不会误吐下一次点击。
     suppress_sidebar_click: Option<std::time::Instant>,
     /// 正在编辑的网络位置（旧地址）；None 表示“添加”。
@@ -1182,6 +1184,7 @@ impl App {
             tab_drag: None,
             list_retry: None,
             suppress_tab_click: None,
+            ui_scale: 1.0,
             suppress_sidebar_click: None,
             network_edit_target: None,
             drop_buffer: Vec::new(),
@@ -2427,9 +2430,14 @@ fn rove_data_dir() -> PathBuf {
     dir
 }
 
+/// 缩略图磁盘缓存版本：绘图管线一变（如「小图大盘子」裁切上线）就要 +1，
+/// 否则旧缓存里的旧位图会原样继续显示，看着像修复没生效。
+const THUMB_CACHE_VERSION: u32 = 6;
+
 /// 缩略图磁盘缓存路径，使用两级哈希子目录避免单目录文件过多。
 fn thumb_disk_path(key: &ThumbKey) -> PathBuf {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    THUMB_CACHE_VERSION.hash(&mut hasher);
     key.hash(&mut hasher);
     let hash = format!("{:016x}", hasher.finish());
     rove_data_dir()
@@ -4589,9 +4597,13 @@ impl App {
     /// （去重），返回空图（UI 显示占位色块，加载完成后经事件循环刷新）。
     /// 当前视图对应的缩略图边长。
     #[cfg(windows)]
-    fn thumb_size_for_view(&self) -> u32 {
+    fn thumb_size_for_view(&mut self) -> u32 {
         // 获取当前窗口的真实物理缩放比例（如 125% -> 1.25, 150% -> 1.5）
-        let scale = self.ui.window().scale_factor() as f32;
+        //
+        // 必须用 `ui_scale()`（会话内只增不减）：`show()` 之后、窗口真正落到显示器
+        // 之前 `scale_factor()` 是 1.0，同一批行里先建的按 132 取图、后建的按 264，
+        // 结果一半图标是低分辨率放大出来的（日志里 `req=132` / `req=264` 混着出现）。
+        let scale = self.ui_scale();
 
         let logical_size = match self.config.view_mode.as_str() {
             "icons-xl" => 132.0,
@@ -4610,8 +4622,8 @@ impl App {
     /// 与 `thumb_size_for_view` 的区别是 details/list —— 取图会超采样到 44，
     /// 但列表里只显示 24 逻辑像素，拖拽图应跟显示尺寸而不是取图尺寸。
     #[cfg(windows)]
-    fn drag_icon_px(&self) -> u32 {
-        let scale = self.ui.window().scale_factor() as f32;
+    fn drag_icon_px(&mut self) -> u32 {
+        let scale = self.ui_scale();
         let logical = match self.config.view_mode.as_str() {
             "details" | "list" => 24.0,
             "icons-xl" => 132.0,
@@ -4845,8 +4857,24 @@ impl App {
     }
 
     #[cfg(not(windows))]
-    fn thumb_size_for_view(&self) -> u32 {
+    fn thumb_size_for_view(&mut self) -> u32 {
         44
+    }
+
+    /// 取图/拖拽图用的缩放系数：**会话内只增不减**。
+    ///
+    /// `window().scale_factor()` 在 `show()` 之后、窗口真正落到显示器之前仍是 1.0，
+    /// 同一批行里先建的会按 132 取图、后建的按 264，日志里就是 `req=132` 与
+    /// `req=264` 混着出现——那一半图标是低分辨率放大出来的（发虚）。
+    /// 单调取最大值保证「第一次取图就取到够用的分辨率」；把窗口拖到更低 DPI 的
+    /// 显示器上只是多留几像素，没有副作用。
+    #[cfg(windows)]
+    fn ui_scale(&mut self) -> f32 {
+        let now = self.ui.window().scale_factor() as f32;
+        if now > self.ui_scale {
+            self.ui_scale = now;
+        }
+        self.ui_scale.max(1.0)
     }
 
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
@@ -5158,6 +5186,7 @@ impl App {
             if self.thumb_blank_sig != Some(sig) {
                 self.thumb_blank_sig = Some(sig);
                 // 详细级：滚动/加载期间每 0.5s 一行，只用于排查“哪几行没出图”。
+                let expect_px = self.thumb_size_for_view();
                 crate::logv!(
                     "[rows] EMPTY THUMBS {}/{} blank={:?} | geom list_h={} (raw={}) cells={} row_h={} win_rows={} | total={} first={} count={} scroll={:.1} mode={} is_split={} expect_px={} cache_len={} pending={} failed={}",
                     empty_thumbs,
@@ -5174,7 +5203,7 @@ impl App {
                     scroll0,
                     self.config.view_mode,
                     is_split,
-                    self.thumb_size_for_view(),
+                    expect_px,
                     self.thumb_cache.len(),
                     self.thumb_pending.len(),
                     self.thumb_failed.len()
