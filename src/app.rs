@@ -10590,7 +10590,14 @@ impl App {
         let Some(parent) = self.state.active().active().parent_path() else {
             return;
         };
-        self.navigate_active(parent);
+        // 回到上级后，把「刚才所在的那个文件夹 / 盘符」单选出来并滚进可视区：
+        // 连按向上键时视点不会丢，也顺手告诉用户自己是从哪儿上来的。
+        // 列举是异步的，这里只挂目标（arm_reveal），由 apply_list_result 消费。
+        let child = self.state.active().active().path.clone();
+        if let Some(child) = child.as_ref() {
+            logv!("[nav] up: select {:?}", child);
+        }
+        self.navigate_active_reveal(parent, child);
     }
 }
 
@@ -15537,14 +15544,49 @@ pub fn destroy_session() {
     // 显式隐藏后整体 drop：回调均为 Weak，无强引用环，
     // Slint 组件树与 winit 窗口（GPU 纹理、表面）随之释放。
     let ui = app.borrow().ui.as_weak();
+    // 先记下 HWND：Slint 的 hide() 是往事件循环里排的一次请求，如果这之后
+    // 组件被 drop（或被漏出去的强引用留在内存里），那次 hide 可能压根没执行到，
+    // 窗口就会变成「桌面上看不见、却仍占着那块区域吃点击」的透明窗口，
+    // 任务栏里还留着能最小化/还原的条目。所以下面既同步 ShowWindow 一次，
+    // drop 之后再审计一遍。
+    #[cfg(windows)]
+    let close_hwnd = get_window_hwnd(&app.borrow().ui);
     if let Some(w) = ui.upgrade() {
         let _ = w.hide();
+    }
+    #[cfg(windows)]
+    if let Some(hwnd) = close_hwnd {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+        unsafe {
+            ShowWindow(hwnd as _, SW_HIDE);
+        }
+        logv!("[close] hide requested + ShowWindow(SW_HIDE) hwnd={:#x}", hwnd);
     }
     // 会话销毁时，将累计的目录容量缓存刷写到系统 Temp 目录（重启不丢）。
     if let Ok(mut store) = global_dir_sizes().lock() {
         store.save_to_temp();
     }
     drop(app);
+    // 审计：组件 drop 之后主窗口应该已经不在了（IsWindow 返回 0）。
+    // 如果它还在且仍可见，就说明某个强引用把窗口留在了内存里——这正是
+    // 「窗口消失了但还盖着一层透明窗口」的成因，强制藏起来并留证据。
+    #[cfg(windows)]
+    if let Some(hwnd) = close_hwnd {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            IsWindow, IsWindowVisible, ShowWindow, SW_HIDE,
+        };
+        unsafe {
+            if IsWindow(hwnd as _) != 0 && IsWindowVisible(hwnd as _) != 0 {
+                logal!(
+                    "!! [close] ghost window still visible after session drop: hwnd={:#x} -> hiding",
+                    hwnd
+                );
+                ShowWindow(hwnd as _, SW_HIDE);
+            } else {
+                logv!("[close] window gone after drop (hwnd {:#x})", hwnd);
+            }
+        }
+    }
     logln!("session destroyed; daemon resident");
 }
 
