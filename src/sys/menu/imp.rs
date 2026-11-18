@@ -7,9 +7,10 @@ use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 
 use super::{MenuAction, MenuNode, Options, Sink, Target};
 
@@ -29,10 +30,11 @@ use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, AllowSetForegroundWindow, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DeleteMenu, DestroyMenu, DispatchMessageW, GetCursorPos, GetForegroundWindow,
     GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu,
-    IsWindow, PostMessageW, RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow,
+    IsWindow, PostMessageW, RegisterClassW, SendMessageTimeoutW, SetForegroundWindow,
+    SetWindowPos, ShowWindow,
     TranslateMessage, TrackPopupMenuEx, HMENU, MSG, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP,
     MF_SEPARATOR, MF_STRING, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_APP, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSW,
+    SMTO_ABORTIFHUNG, SMTO_BLOCK, TPM_RIGHTBUTTON, WM_APP, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -49,11 +51,24 @@ const CMIC_MASK_UNICODE: u32 = 0x4000;
 
 /// 菜单线程的宿主窗口消息：有新的菜单请求。
 const WM_APP_OPEN_MENU: u32 = WM_APP + 0x51;
+/// 宿主窗口消息：存活探测。宿主窗口过程直接回 1，用来区分「忙」和「死了」。
+const WM_APP_PING: u32 = WM_APP + 0x52;
+/// 上一份菜单挂着超过这么久，才值得去探测一次（正常操作菜单不会超过它）。
+const MENU_STALL_MS: u64 = 1_500;
+/// 构建阶段（菜单还没弹出来）的判死时限。
+///
+/// 网络盘上第三方扩展慢是常态，用 1.5 秒会误杀；卡死则远超这个数。
+const MENU_BUILD_STALL_MS: u64 = 20_000;
+/// 探测超时：正常线程几毫秒就回，等 400ms 还没回就是真卡死了。
+const PING_TIMEOUT_MS: u32 = 400;
 
 // ---------------------------------------------------------------------------
 // 菜单请求
 // ---------------------------------------------------------------------------
 struct Job {
+    /// 投递这次请求时 BUSY 的代数。宿主线程被放弃重建后，老线程恢复也不许
+    /// 复位新线程的 BUSY。
+    gen: u64,
     target: Target,
     nodes: Vec<MenuNode>,
     options: Options,
@@ -70,7 +85,80 @@ static HOST: AtomicIsize = AtomicIsize::new(0);
 static START_LOCK: Mutex<()> = Mutex::new(());
 /// 是否已经有菜单在 Track 中。第二轮右键不能排队——否则用户点外面关掉菜单后，
 /// 排着的那份会迟一步跳出来。
-static BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// 本轮 BUSY 是哪一代菜单线程持有的。被放弃的那条老线程恢复后不许再改 BUSY，
+/// 否则它会把新线程正在用的标记清掉（右键就会叠出第二个菜单）。
+static BUSY_GEN: AtomicU64 = AtomicU64::new(0);
+/// BUSY 是什么时候置上的（毫秒，进程启动起算）。用来判断「忙」还是「死了」。
+static BUSY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+/// 菜单线程代数：老线程恢复时不许覆盖 `HOST`。
+static HOST_GEN: AtomicU64 = AtomicU64::new(0);
+/// 已经放弃过多少条卡死的宿主线程。
+///
+/// 卡在第三方扩展里的线程**无法回收**（没有 API 能安全杀掉一个卡在原生调用里
+/// 的线程），它会一直挂着：一根栈（保留 2MB 虚拟空间）+ 一个隐藏窗口 + 扩展
+/// 自己持有的对象。CPU 占用为 0（它在等待），所以代价是内存不是速度。
+/// 但也不能无限重建，否则反复右键会把它们攒起来 —— 超过上限就彻底停手，
+/// 让用户重启 Rove。
+static ABANDONED: AtomicU32 = AtomicU32::new(0);
+/// 最多放弃几条卡死的宿主线程。
+const MAX_ABANDONED: u32 = 3;
+/// 菜单是否已经**弹到屏幕上**（`TrackPopupMenuEx` 已进入）。
+///
+/// 用来区分两种「没回应」：构建阶段被第三方扩展拖住（还没弹出来，稍后可能自己好）
+/// 和菜单真的在屏幕上（这时线程在跑消息循环，探测一定能回）。判活/放弃前者要看
+/// 更长的时限，否则会把「慢」当成「死」，然后把一个稍后自己弹出来的菜单丢掉。
+static SHOWN: AtomicBool = AtomicBool::new(false);
+/// 已经彻底停手（右键菜单不再可用）。UI 侧据此决定要不要找个时机静默重启进程。
+static GAVE_UP: AtomicBool = AtomicBool::new(false);
+
+/// 进程启动起的毫秒数。
+fn now_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+/// 菜单线程当前是否还活着（挡住第三方菜单扩展把宿主线程拖死的情况）。
+fn host_responsive(host: isize) -> bool {
+    if host == 0 {
+        return false;
+    }
+    let mut result = 0usize;
+    let ok = unsafe {
+        SendMessageTimeoutW(
+            HWND(host as *mut _),
+            WM_APP_PING,
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG | SMTO_BLOCK,
+            PING_TIMEOUT_MS,
+            Some(&mut result),
+        )
+    };
+    ok.0 != 0
+}
+
+/// 只复位自己那一代：被放弃的老线程恢复后不许动新线程的标记。
+fn end_busy(gen: u64) {
+    if BUSY_GEN.load(Ordering::Acquire) == gen {
+        BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// 右键菜单是不是已经彻底放弃了（卡死线程到上限）。只有这时才值得换个进程。
+pub(crate) fn exhausted() -> bool {
+    GAVE_UP.load(Ordering::Acquire)
+}
+
+/// UI 线程侧只读诊断：菜单挂着多久了（毫秒）。给看门狗用。
+pub(crate) fn busy_for_ms() -> Option<u64> {
+    BUSY.load(Ordering::Acquire)
+        .then(|| now_ms().saturating_sub(BUSY_SINCE_MS.load(Ordering::Acquire)))
+}
 
 thread_local! {
     /// 当前这个线程上正在 Track 的菜单：四条菜单消息要转发给它。
@@ -98,26 +186,68 @@ pub(crate) fn open(
     owner: isize,
     sink: Sink,
 ) -> bool {
+    // 上一份菜单还在 Track 中？正常情况直接忽略这次右键（连点两下不能叠出两个菜单）。
+    // 但第三方菜单扩展（网盘 / 同步 / 杀毒）有时会在 `QueryContextMenu` 或子菜单
+    // 展开里卡死，把整个宿主线程拖住——那时 BUSY 永远不会复位，右键从此打不开。
+    // 所以挂得太久的要探测一次：没回应就放弃这条线程，换一条新的。
+    if BUSY.load(Ordering::Acquire) {
+        let age = now_ms().saturating_sub(BUSY_SINCE_MS.load(Ordering::Acquire));
+        // 构建阶段（还没弹出来）被拖住是常见的「慢」，要更长的沉默才算死；
+        // 有菜单在屏幕上时线程在跑消息循环，探测能回，根本走不到这里。
+        let limit = if SHOWN.load(Ordering::Acquire) {
+            MENU_STALL_MS
+        } else {
+            MENU_BUILD_STALL_MS
+        };
+        if age > limit && !host_responsive(HOST.load(Ordering::Acquire)) {
+            let abandoned = ABANDONED.fetch_add(1, Ordering::AcqRel) + 1;
+            HOST.store(0, Ordering::Release);
+            BUSY.store(false, Ordering::Release);
+            if abandoned > MAX_ABANDONED {
+                // 卡死的线程回收不了，攒多了只会白占内存：彻底停手，别再造新的。
+                GAVE_UP.store(true, Ordering::Release);
+                crate::logal!(
+                    "[menu] 已放弃 {abandoned} 条卡死的菜单线程，不再重建（右键菜单暂停，关窗时自动重启可恢复）"
+                );
+                return false;
+            }
+            crate::logal!(
+                "[menu] 菜单线程无响应 {age}ms（多半是第三方菜单扩展卡死），重建线程（第 {abandoned} 条）"
+            );
+        } else {
+            return true;
+        }
+    }
     // 必须在 UI 线程就把 BUSY 置上：否则连点两次右键会在菜单线程开工前
     // 排进去两个请求，关掉第一个后第二个又自己跳出来。
     if BUSY.swap(true, Ordering::AcqRel) {
         return true;
     }
+    let gen = BUSY_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    BUSY_SINCE_MS.store(now_ms(), Ordering::Release);
     let Some(host) = ensure_host() else {
         crate::logln!("[menu] 原生菜单线程不可用，本次右键被忽略");
-        BUSY.store(false, Ordering::Release);
+        end_busy(gen);
         return false;
     };
     JOBS.lock().unwrap_or_else(|e| e.into_inner()).push(Job {
+        gen,
         target,
         nodes,
         options,
         owner,
         sink,
     });
-    let ok = unsafe { PostMessageW(Some(HWND(host as *mut _)), WM_APP_OPEN_MENU, WPARAM(0), LPARAM(0)) };
+    let ok = unsafe {
+        PostMessageW(
+            Some(HWND(host as *mut _)),
+            WM_APP_OPEN_MENU,
+            WPARAM(0),
+            LPARAM(0),
+        )
+    };
     if ok.is_err() {
-        BUSY.store(false, Ordering::Release);
+        end_busy(gen);
         return false;
     }
     true
@@ -373,9 +503,10 @@ fn ensure_host() -> Option<isize> {
         return Some(existing);
     }
     let (tx, rx) = std::sync::mpsc::channel();
+    let gen = HOST_GEN.fetch_add(1, Ordering::AcqRel) + 1;
     std::thread::Builder::new()
         .name("rove-menu".into())
-        .spawn(move || host_thread(tx))
+        .spawn(move || host_thread(tx, gen))
         .ok()?;
     rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
 }
@@ -384,7 +515,7 @@ fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
-fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>) {
+fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>, gen: u64) {
     unsafe {
         // OleInitialize = STA COM + OLE（剪贴板延迟渲染靠它）。
         let _ = OleInitialize(None);
@@ -394,8 +525,13 @@ fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>) {
             lpszClassName: class_name,
             ..Default::default()
         };
+        // 重建线程的情况：类名已被（卡死的那条）老线程注册过，注册会失败，
+        // 但类是全进程有效的，照样能 CreateWindowExW。
         let atom = RegisterClassW(&wc);
-        let hwnd = if atom != 0 {
+        let class_ok = atom != 0
+            || windows::Win32::Foundation::GetLastError()
+                == windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
+        let hwnd = if class_ok {
             CreateWindowExW(
                 // 注意：不能加 WS_EX_NOACTIVATE —— 激活不了就拿不到键盘焦点，
                 // 菜单的方向键 / 回车 / Esc 全会失效。零面积弹出窗 + 菜单
@@ -421,7 +557,9 @@ fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>) {
             let _ = ready.send(None);
             return;
         };
-        HOST.store(hwnd.0 as isize, Ordering::Release);
+        if HOST_GEN.load(Ordering::Acquire) == gen {
+            HOST.store(hwnd.0 as isize, Ordering::Release);
+        }
         let _ = ready.send(Some(hwnd.0 as isize));
 
         let mut msg = MSG::default();
@@ -440,6 +578,10 @@ unsafe extern "system" fn host_proc(
 ) -> LRESULT {
     if let Some(result) = forward_menu_message(msg, wp, lp) {
         return result;
+    }
+    if msg == WM_APP_PING {
+        // 回非 0：`SendMessageTimeoutW` 靠这个区分「活着但忙」和「超时没回」。
+        return LRESULT(1);
     }
     if msg == WM_APP_OPEN_MENU {
         // 一次性取走全部入队请求，只执行最新那一条（旧的在 BUSY 竞态下
@@ -763,7 +905,7 @@ fn invoke_shell(
 }
 
 fn run_menu(host: HWND, job: Job) {
-    let _busy = BusyGuard;
+    let _busy = BusyGuard(job.gen);
     // `owner`（Rove 主窗口）只用来在菜单关闭后归还前台权。
     // Shell 菜单本身的 hwnd 一律用宿主窗口：Shell 弹的属性/确认框都归属于它，
     // 而宿主窗口被摆到鼠标位置，对话框就落在鼠标附近而不是屏幕左上角。
@@ -865,7 +1007,9 @@ fn run_menu(host: HWND, job: Job) {
     ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = Some(job.options.clone()));
     ACTIVE_ROOT.with(|root| *root.borrow_mut() = hmenu.0 as isize);
     let flags = TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0;
+    SHOWN.store(true, Ordering::Release);
     let chosen = unsafe { TrackPopupMenuEx(hmenu, flags, point.x, point.y, host, None) }.0 as u32;
+    SHOWN.store(false, Ordering::Release);
     ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = None);
     ACTIVE.with(|active| *active.borrow_mut() = None);
     ACTIVE_VIEW.with(|slot| *slot.borrow_mut() = None);
@@ -952,9 +1096,9 @@ fn run_menu(host: HWND, job: Job) {
 }
 
 /// `BUSY` 标记的守卫：任何返回路径都会复位。
-struct BusyGuard;
+struct BusyGuard(u64);
 impl Drop for BusyGuard {
     fn drop(&mut self) {
-        BUSY.store(false, Ordering::Release);
+        end_busy(self.0);
     }
 }

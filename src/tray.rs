@@ -67,6 +67,8 @@ fn start_event_forwarder() {
                     ID_QUIT => {
                         logv!("[tray] 菜单退出");
                         let _ = slint::invoke_from_event_loop(|| {
+                            // 退出是最终决定：先打标记，免得销毁会话时又拉起接班进程。
+                            crate::app::note_quitting();
                             destroy_session_public();
                             let _ = slint::quit_event_loop();
                         });

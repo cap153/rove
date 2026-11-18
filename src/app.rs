@@ -10094,6 +10094,28 @@ impl App {
 
     /// 打开文件/目录。
     fn open_path(&mut self, path: &Path) {
+        // 网络 / WSL 共享上的 stat 能卡十几秒，而这里跑在 UI 线程上：
+        // 一卡就整条消息循环停住（连托盘图标都会「未响应」）。
+        // 远端路径一律丢后台问，回来再投递；本地盘 stat 是微秒级，保持同步。
+        if crate::fs::dir::is_remote_path(path) {
+            let path = path.to_path_buf();
+            std::thread::spawn(move || {
+                let is_dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+                        return;
+                    };
+                    let mut app = app.borrow_mut();
+                    if is_dir {
+                        app.navigate_active(Some(path));
+                    } else if let Err(e) = open::that_detached(&path) {
+                        let msg = app.trf("打开失败：{}", &[e.to_string()]);
+                        app.set_status_job(msg);
+                    }
+                });
+            });
+            return;
+        }
         let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
         if is_dir {
             self.navigate_active(Some(path.to_path_buf()));
@@ -14325,6 +14347,164 @@ thread_local! {
     static START_HIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// 绑定 IPC 管道服务。每次都是全新的闭包（`spawn_server` 只接一次）。
+fn bind_ipc_server() -> bool {
+    crate::daemon::spawn_server(move |request| {
+        // 闭包只捕获 request（Send），会话槽在事件循环线程的 thread_local 里。
+        let _ = slint::invoke_from_event_loop(move || {
+            wake_session(request);
+        });
+    })
+}
+
+/// 等某个进程结束（最多 `timeout`）。进程已经不在了就立即返回。
+#[cfg(windows)]
+fn wait_for_pid_exit(pid: u32, timeout: Duration) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle.is_null() {
+            return;
+        }
+        WaitForSingleObject(handle, timeout.as_millis().min(u32::MAX as u128) as u32);
+        CloseHandle(handle);
+    }
+}
+
+#[cfg(not(windows))]
+fn wait_for_pid_exit(_pid: u32, _timeout: Duration) {}
+
+/// 静默重启的交接标记文件（`%LOCALAPPDATA%\Rove\restart.ok`）。
+fn restart_marker_path() -> PathBuf {
+    rove_data_dir().join("restart.ok")
+}
+
+/// 菜单线程卡到上限后，借「用户关窗口」这个安全时刻换一个新进程。
+///
+/// 卡死在第三方菜单扩展里的宿主线程回收不了，只能靠换进程一次性清干净。
+/// 顺序必须是「先起新进程 → 新进程绑上管道并落标记 → 旧进程才退出」：
+/// 管道是单实例的，反过来就会两边都绑不上，托盘图标直接消失。
+/// 握手拿不到标记就把子进程杀掉，继续用旧进程 —— 宁可不重启，也不能把守护弄丢。
+fn restart_handoff() {
+    let Ok(exe) = std::env::current_exe() else {
+        logal!("[restart] 拿不到自身路径，放弃重启");
+        return;
+    };
+    let marker = restart_marker_path();
+    let _ = std::fs::remove_file(&marker);
+    let child = std::process::Command::new(&exe)
+        .arg("--background")
+        .arg("--await-pipe")
+        .arg("--await-pid")
+        .arg(std::process::id().to_string())
+        .spawn();
+    let Ok(mut child) = child else {
+        logal!("[restart] 子进程启动失败，继续用旧进程");
+        return;
+    };
+    for _ in 0..80 {
+        std::thread::sleep(Duration::from_millis(100));
+        if marker.exists() {
+            // 此刻只知道「子进程起来并走到交接点」，真正绑上管道要等本进程退出之后
+            // （管道单实例），所以这里说的是「就位」而不是「已接管」。
+            logal!("[restart] 新进程已就位，退出旧进程以释放 IPC（回收卡死的菜单线程）");
+            std::process::exit(0);
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&marker);
+    logal!("[restart] 新进程没能接管 IPC，继续用旧进程");
+}
+
+/// 用户主动「退出」时置上：这条路径绝不能再拉起接班进程，否则退出会把应用又拖回来。
+static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 会话是否存在。给看门狗用：`SESSION` 是 thread_local，从别的线程读永远是空。
+static SESSION_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 托盘「退出」在销毁会话前调用。
+pub fn note_quitting() {
+    QUITTING.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// UI 线程心跳（毫秒，进程启动起算）。由 UI 线程上的 500ms 定时器更新。
+static UI_BEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 进程启动起的毫秒数。
+fn proc_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+/// UI 线程心跳定时器：窗口活着就每 500ms 跳一次。
+///
+/// 这不是为了性能，是为了**留证据**：消息循环卡住时它自然就停了，
+/// 看门狗据此判断「窗口多久没动」，并在日志里写清当时的菜单/会话状态。
+pub(crate) fn install_ui_heartbeat() {
+    let timer = slint::Timer::default();
+    timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(500),
+        || {
+            UI_BEAT_MS.store(proc_ms(), std::sync::atomic::Ordering::Release);
+        },
+    );
+    // 定时器必须活得和进程一样久，否则一 drop 就停。
+    std::mem::forget(timer);
+}
+
+/// 卡死看门狗：UI 线程超过 5 秒没心跳就写一条无条件日志。
+///
+/// 消息循环本身**不能**设超时（阻塞在哪一行，就只能等那一行返回），
+/// 所以这里只做两件事：判死 + 记录现场，方便下次直接定位是哪个环节。
+pub fn start_ui_watchdog() {
+    std::thread::Builder::new()
+        .name("rove-watchdog".into())
+        .spawn(|| {
+            let mut stalled_for = 0u64;
+            let mut reported = false;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let beat = UI_BEAT_MS.load(std::sync::atomic::Ordering::Acquire);
+                if beat == 0 {
+                    // 心跳还没装（会话未创建），不算卡。
+                    continue;
+                }
+                let lag = proc_ms().saturating_sub(beat);
+                if lag > 5000 {
+                    // 每多卡 30 秒再记一条：`reported` 只表示「上一档已经记过」。
+                    let next_step = lag / 30_000 > stalled_for / 30_000;
+                    stalled_for = lag;
+                    if !reported || next_step {
+                        reported = true;
+                        let menu = crate::sys::menu::busy_for_ms();
+                        crate::logal!(
+                            "[watchdog] UI 线程无响应 {}ms menu_busy={:?} session={}",
+                            lag,
+                            menu,
+                            SESSION_ALIVE.load(std::sync::atomic::Ordering::Acquire)
+                        );
+                    }
+                } else if reported && lag < 1500 {
+                    crate::logal!("[watchdog] UI 线程恢复（最长卡顿 {}ms）", stalled_for);
+                    reported = false;
+                    stalled_for = 0;
+                }
+            }
+        })
+        .ok();
+}
+
 /// 原生菜单的结果回投（由菜单线程经 `invoke_from_event_loop` 调回 UI 线程）。
 ///
 /// 这里**不能**在刚拿到结果时就同步执行——它会从后台线程被调度过来，
@@ -14822,6 +15002,16 @@ pub fn run() {
     crate::sys::dialog_jump::start_daemon();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // 静默重启的接班进程标记：老进程释放管道后本进程接管，见 run() 的绑定段。
+    let await_pipe = args.iter().any(|a| a == "--await-pipe");
+    // 交接时老进程的 pid：接班进程要等它真的消失，管道（单实例）才抢得到。
+    let await_pid: Option<u32> = args
+        .iter()
+        .position(|a| a == "--await-pid")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse().ok());
+    // 注意：不在这里清理 `restart.ok`。清理只由发起交接的那一方在 spawn 之前做，
+    // 否则「交接进行中恰好又启动一次 rove」会把标记删掉，害得老进程误判失败。
     // 接管资源管理器拉起的这一次进程没有继承用户的 ROVE_LOG（父进程是浏览器/
     // 下载器），命令行就成了盲区 —— 排查这类场景要靠 exe 同目录的 `rove.verbose`
     // 标记文件（见 `log_level`）。顺带记下有没有程序往命令行里塞 `/select`。
@@ -14881,13 +15071,35 @@ pub fn run() {
     }
 
     // ---- 守护模式：管道服务线程（唤醒请求投递到事件循环） ----
-    let bound = crate::daemon::spawn_server(move |request| {
-        // 闭包只捕获 request（Send），会话槽在事件循环线程的 thread_local 里。
-        let _ = slint::invoke_from_event_loop(move || {
-            wake_session(request);
-        });
-    });
-    if !bound && background {
+    // 静默重启的接班进程，顺序不能反：
+    //   1. 先喊一声「我起来了」（老进程看到标记才退出，它退出才会放开管道）；
+    //   2. 等老进程真的消失；
+    //   3. 才去抢管道（单实例管道，老进程不退出永远抢不到 —— 反过来就是互等）。
+    let mut bound = false;
+    if await_pipe {
+        if let Err(e) = std::fs::write(restart_marker_path(), std::process::id().to_string()) {
+            logal!("--await-pipe: 写交接标记失败 {e}");
+        }
+        if let Some(pid) = await_pid {
+            wait_for_pid_exit(pid, Duration::from_secs(15));
+        }
+        for _ in 0..100 {
+            bound = bind_ipc_server();
+            if bound {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if bound {
+            logln!("--await-pipe: 已接管 IPC (pid={})", std::process::id());
+        } else {
+            // 抢不到就退回单进程模式：托盘和窗口照常，只是「再开一次 rove」找不到本进程。
+            logal!("--await-pipe: 管道一直没抢到，退回单进程模式（IPC 不可用）");
+        }
+    } else {
+        bound = bind_ipc_server();
+    }
+    if !bound && background && !await_pipe {
         // 后台启动时已有实例在跑：什么都不做，直接退出（正是期望行为）。
         logln!("--background: another instance owns the ipc pipe, exiting");
         return;
@@ -14924,6 +15136,10 @@ pub fn run() {
     // 托盘句柄保活至进程结束，drop 即移除图标。
     #[cfg(windows)]
     let _tray = crate::tray::create();
+
+    // UI 卡死留证据：心跳 + 看门狗（先装定时器再装看门狗）。
+    install_ui_heartbeat();
+    start_ui_watchdog();
 
     // 事件循环常驻：窗口全部销毁后保持空闲（0% CPU），
     // 等待管道唤醒/托盘点击重建 UI；退出由托盘菜单触发。
@@ -15501,6 +15717,7 @@ fn create_session(
         }
         app.window_pending_show = true;
         logln!("session created hidden (--background); tray + dialog hook are live");
+        SESSION_ALIVE.store(true, std::sync::atomic::Ordering::Release);
         return;
     }
 
@@ -15533,6 +15750,7 @@ fn create_session(
     app.borrow().publish_shell_windows();
 
     logln!("session created");
+    SESSION_ALIVE.store(true, std::sync::atomic::Ordering::Release);
 }
 
 /// Shell 通过 `IShellView::SelectItem` 发来的「选中这个条目」请求。
@@ -15728,6 +15946,7 @@ pub fn destroy_session() {
         return;
     };
     logln!("destroy_session running");
+    SESSION_ALIVE.store(false, std::sync::atomic::Ordering::Release);
     // 退出存档：窗口几何（逻辑像素）+ 最大化状态 + 上次标签页快照。
     // 统一在销毁出口完成，保证「窗口 X」与「托盘退出」两条路径都能落盘。
     {
@@ -15860,6 +16079,12 @@ pub fn destroy_session() {
     if let Ok(mut store) = global_dir_sizes().lock() {
         store.save_to_temp();
     }
+    // 菜单线程卡到上限（右键已经不可用）时，趁这个安全时刻换一个新进程。
+    // 有任务在跑就不动：重启会杀掉进行中的复制 / 移动。
+    // `ROVE_FORCE_RESTART=1` 只为验证交接流程用（正常人碰不到「卡满 4 次」）。
+    let restart_wanted = !QUITTING.load(std::sync::atomic::Ordering::Acquire)
+        && (crate::sys::menu::exhausted() || std::env::var_os("ROVE_FORCE_RESTART").is_some())
+        && !app.borrow().jobs.is_running();
     drop(app);
     // 审计：组件 drop 之后主窗口应该已经不在了（IsWindow 返回 0）。
     // 如果它还在且仍可见，就说明某个强引用把窗口留在了内存里——这正是
@@ -15880,6 +16105,13 @@ pub fn destroy_session() {
                 logv!("[close] window gone after drop (hwnd {:#x})", hwnd);
             }
         }
+    }
+    if restart_wanted {
+        logln!("[restart] 菜单线程已达上限，关窗后静默换进程");
+        std::thread::Builder::new()
+            .name("rove-restart".into())
+            .spawn(restart_handoff)
+            .ok();
     }
     logln!("session destroyed; daemon resident");
 }

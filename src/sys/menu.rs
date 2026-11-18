@@ -109,7 +109,19 @@ pub struct Options {
 /// 菜单本身由内部专用线程的零面积窗口持有。
 /// 返回 false 表示菜单线程不可用（调用方记日志并放弃本次菜单）。
 #[cfg(windows)]
-pub(crate) use imp::open;
+pub(crate) use imp::{busy_for_ms, exhausted, open};
+
+/// 非 Windows：没有菜单线程，永远不忙。
+#[cfg(not(windows))]
+pub(crate) fn busy_for_ms() -> Option<u64> {
+    None
+}
+
+/// 非 Windows：没有菜单线程，永远不需要换进程。
+#[cfg(not(windows))]
+pub(crate) fn exhausted() -> bool {
+    false
+}
 
 #[cfg(not(windows))]
 pub fn open(_: Target, _: Vec<MenuNode>, _: Options, _: isize, _: Sink) -> bool {
