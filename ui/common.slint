@@ -45,6 +45,9 @@ export struct FileRow {
     // 该行名称在当前视图下确实被截断（由 Rust 按视图预算判定）。
     // 浮层出现条件统一用它，避免 Slint 测量阈值与实际名称区宽度不一致。
     name-truncated: bool,
+    // 图标视图逐行文字宽度（与 grid-lines 一一对应）。多行名字里后面几行往往
+    // 短很多，只看「最宽一行」会把那些行右侧的空白也当成文字。
+    name-line-ws: [length],
 }
 
 export struct TabInfo {

@@ -197,10 +197,13 @@ export component MainWindow inherits Window {
     /// 浮层名称的逐行高亮分段与框宽（Rust 与切行同源算出）。
     in-out property <[GridLine]> file-expand-lines: [];
     in-out property <length> file-expand-box-w: 0px;
+    /// 逐行文字估算宽度：把「再次点名称进重命名」限制在文字上。
+    in-out property <[length]> file-expand-line-ws: [];
     /// 悬停浮层（与选中/重命名浮层独立）：影响条目索引、逐行分段与框宽。
     in-out property <int> file-hover-expand-index: -1;
     in-out property <[GridLine]> file-hover-expand-lines: [];
     in-out property <length> file-hover-expand-box-w: 0px;
+    in-out property <[length]> file-hover-expand-line-ws: [];
     // 分屏右栏数据源（分屏关闭时不使用）。
     in-out property <[FileRow]> file-rows-right: [];
     in-out property <int> file-total-right: 0;
@@ -209,9 +212,11 @@ export component MainWindow inherits Window {
     in-out property <string> file-expand-name-right: "";
     in-out property <[GridLine]> file-expand-lines-right: [];
     in-out property <length> file-expand-box-w-right: 0px;
+    in-out property <[length]> file-expand-line-ws-right: [];
     in-out property <int> file-hover-expand-index-right: -1;
     in-out property <[GridLine]> file-hover-expand-lines-right: [];
     in-out property <length> file-hover-expand-box-w-right: 0px;
+    in-out property <[length]> file-hover-expand-line-ws-right: [];
     /// 左右栏各自是否「恰好单选一个文件」：多选时禁止名称浮层。
     in-out property <bool> file-single-selection: false;
     in-out property <bool> file-single-selection-right: false;
@@ -456,6 +461,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback sidebar_width_changed(float);
     callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length, on_name: bool);
     callback file_name_overlay_clicked();
+    callback file_name_overlay_right_clicked();
     callback file_overlay_hover(pane: int, inside: bool);
     /// 图标格子悬停（pane, 显示索引；index=-1 表示离开格子）。
     callback file_hover_row(pane: int, index: int);
@@ -1267,9 +1273,11 @@ out property <length> row-height-out: file-list.row-height-out;
                     hover-expand-index: root.file-hover-expand-index;
                     hover-expand-lines: root.file-hover-expand-lines;
                     hover-expand-box-w: root.file-hover-expand-box-w;
+                    hover-expand-line-ws: root.file-hover-expand-line-ws;
                     expand-name: root.file-expand-name;
                     expand-lines: root.file-expand-lines;
                     expand-box-w: root.file-expand-box-w;
+                    expand-line-ws: root.file-expand-line-ws;
                     total-count: root.file-total;
                     sort-key: root.sort-key;
                     sort-ascending: root.sort-ascending;
@@ -1285,6 +1293,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         root.file_row_pointer_event(index, event, x, y, on_name);
                     }
                     name_overlay_clicked() => { root.file_name_overlay_clicked(); }
+                    name_overlay_right_clicked() => { root.file_name_overlay_right_clicked(); }
                     overlay-hover(inside) => { root.file_overlay_hover(0, inside); }
                     hover_row(index) => { root.file_hover_row(0, index); }
                     row_double_clicked(index) => {
@@ -1413,9 +1422,11 @@ out property <length> row-height-out: file-list.row-height-out;
                         hover-expand-index: root.file-hover-expand-index-right;
                         hover-expand-lines: root.file-hover-expand-lines-right;
                         hover-expand-box-w: root.file-hover-expand-box-w-right;
+                        hover-expand-line-ws: root.file-hover-expand-line-ws-right;
                         expand-name: root.file-expand-name-right;
                         expand-lines: root.file-expand-lines-right;
                         expand-box-w: root.file-expand-box-w-right;
+                        expand-line-ws: root.file-expand-line-ws-right;
                         total-count: root.file-total-right;
                         sort-key: root.sort-key-right;
                         sort-ascending: root.sort-ascending-right;
@@ -1436,6 +1447,7 @@ out property <length> row-height-out: file-list.row-height-out;
                             }
                         }
                         name_overlay_clicked() => { root.file_name_overlay_clicked(); }
+                        name_overlay_right_clicked() => { root.file_name_overlay_right_clicked(); }
                         overlay-hover(inside) => { root.file_overlay_hover(1, inside); }
                         hover_row(index) => { root.file_hover_row(1, index); }
                         row_double_clicked(index) => {

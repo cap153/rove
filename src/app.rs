@@ -812,6 +812,16 @@ pub struct App {
     /// 本次右键按下所在行的路径（多选时「打开文件所在位置」/「在资源管理器中显示」
     /// 优先作用于它，而不是选中集的第一项）。
     menu_anchor_path: Option<PathBuf>,
+    /// 上一次左键按下的行。
+    ///
+    /// 「点名称进入重命名」要求这是**同一行的连续第二次按下**（资源管理器就是
+    /// 这个手感：先选中，再点名称才开始改名）。这样右键菜单之后随手点一下文字
+    /// 永远不会变成改名——那一次只是「第一次按下」。
+    ///
+    /// 之所以不用「菜单开过就抑制下一次点击」那套：菜单在独立线程上弹，关掉菜单
+    /// 的那一下点击会直接落到列表上，而且可能落在名称以外的位置，标志很容易被
+    /// 提前吃掉或过期，日志里表现为「偶尔触发 / 要点两下才灵」。
+    last_left_press_row: Option<PathBuf>,
     /// 多选状态下按下某个「已选中行」时，先保留多选以便批量拖出；
     /// 若直到 Up 都没发生拖动，才把选择集塌缩成该行单选（资源管理器语义）。
     pending_single_click: Option<PathBuf>,
@@ -1038,8 +1048,11 @@ pub struct App {
     /// 不能与 `refresh_timer`（1s 目录轮询）共用：Slint Timer 重复 start
     /// 会以后一次为准，共用会把 1s 轮询错降为 15s。
     sidebar_periodic_timer: Timer,
-    /// 单击文件名重命名的延迟定时器：按下先不起重命名，留出双击窗口；
-    /// 窗口内再来一次按下即判定为双击打开（取消本定时器），否则到点才重命名。
+    /// 单击文件名进入重命名的延迟定时器：留下一个双击窗口。
+    ///
+    /// 不能一按下就弹输入框——「选中某行后双击它的名称打开」是最常见的动作，
+    /// 立刻弹框会把第二下点击吃进输入框（表现为「双击打不开文件」）。
+    /// 所以按下后等一个有效双击间隔，窗口内没有第二下按下才真正改名。
     rename_defer_timer: Timer,
     /// 接管资源管理器转来的「新标签打开」：先释放 App 借用，下一轮事件循环再执行。
     /// 直接在管道回调里导航会与 Slint 布局期触发的其它 UI 回调形成 RefCell 嵌套
@@ -1055,7 +1068,7 @@ pub struct App {
     /// `last_tabs`，否则选了「启动时打开上次的标签页」时，下次又把这些标签
     /// 原样拉回来（用户预期是只开一个「此电脑」）。
     tabs_discarded: bool,
-    /// 自身弱引用：供 rename_defer_timer 等定时器回调里升级回 App。
+    /// 自身弱引用：供定时器回调 / 事件钩子升级回 App。
     self_weak: Option<Weak<RefCell<App>>>,
     }
 
@@ -1137,6 +1150,7 @@ impl App {
             )),
             menu_scope: None,
             menu_anchor_path: None,
+            last_left_press_row: None,
             pending_single_click: None,
             shell_new_watch: None,
             shell_new_reload_at: None,
@@ -1435,6 +1449,9 @@ impl App {
     /// 列举结果到达：代号匹配才应用。
     fn apply_list_result(&mut self, result: ListResult) {
         logv!("list_result tab={} gen={} n={}", result.tab_id, result.generation, result.entries.len());
+        // 新内容到了：连续按下链断掉（否则「上一目录点过 A，进来点同名 A 的名称」
+        // 会被当成第二次按下直接进重命名）。
+        self.last_left_press_row = None;
         let Some(tab_index) = self.state.tab_by_id(result.tab_id) else {
             logln!("apply_list_result: tab not found");
             return;
@@ -5419,11 +5436,13 @@ impl App {
             self.ui.set_file_expand_index(-1);
             self.ui.set_file_expand_name(SharedString::default());
             self.ui.set_file_expand_box_w(0.0);
+            self.ui.set_file_expand_line_ws(empty_lengths());
             self.ui
                 .set_file_expand_lines(ModelRc::new(VecModel::from(Vec::<GridLine>::new())));
             self.ui.set_file_expand_index_right(-1);
             self.ui.set_file_expand_name_right(SharedString::default());
             self.ui.set_file_expand_box_w_right(0.0);
+            self.ui.set_file_expand_line_ws_right(empty_lengths());
             self.ui.set_file_expand_lines_right(ModelRc::new(VecModel::from(
                 Vec::<GridLine>::new(),
             )));
@@ -5438,11 +5457,13 @@ impl App {
             self.ui
                 .set_file_hover_expand_lines(ModelRc::new(VecModel::from(Vec::<GridLine>::new())));
             self.ui.set_file_hover_expand_box_w(0.0);
+            self.ui.set_file_hover_expand_line_ws(empty_lengths());
             self.ui.set_file_hover_expand_index_right(-1);
             self.ui.set_file_hover_expand_lines_right(ModelRc::new(VecModel::from(
                 Vec::<GridLine>::new(),
             )));
             self.ui.set_file_hover_expand_box_w_right(0.0);
+            self.ui.set_file_hover_expand_line_ws_right(empty_lengths());
             // 切回图标视图时需要能重新下发，签名必须清空。
             self.expand_sig = None;
             return;
@@ -5557,22 +5578,34 @@ impl App {
         };
 
         let mut sigs: [ExpandSig; 2] = [(-1, 0, 0, 0, -1, 0, 0); 2];
-        let mut plans: [Option<(f32, GridLines, SharedString, f32, GridLines)>; 2] = [None, None];
+        // 每项：(框宽, 逐行分段, 逐行文字宽, 名称, 悬停框宽, 悬停逐行分段, 悬停逐行文字宽)
+        #[allow(clippy::type_complexity)]
+        let mut plans: [Option<(f32, GridLines, Vec<f32>, SharedString, f32, GridLines, Vec<f32>)>;
+            2] = [None, None];
         for (pane, t) in targets.iter().enumerate() {
             let ht = &hover_targets[pane];
             // 悬停项与选中/重命名项是同一个格子：不重复画（Slint 侧也会跳过）。
             let hover_same = ht.0 < 0 || ht.0 == t.0;
             let mut hover_sig = (-1i32, 0u32, 0u64);
-            let mut hover_plan = (0.0f32, GridLines::new());
+            let mut hover_plan = (0.0f32, GridLines::new(), Vec::new());
             if !hover_same {
                 let (needs, box_w, lines) = expand_layout(&self.ui, &ht.2);
                 let index = if needs { ht.0 } else { -1 };
                 hover_sig = (index, box_w.to_bits(), hash_lines(&lines));
-                hover_plan = (box_w, lines);
+                let ws = line_widths(&lines);
+                hover_plan = (box_w, lines, ws);
             }
             if t.0 < 0 {
                 sigs[pane] = (-1, 0, 0, 0, hover_sig.0, hover_sig.1, hover_sig.2);
-                plans[pane] = Some((0.0, Vec::new(), SharedString::default(), hover_plan.0, hover_plan.1));
+                plans[pane] = Some((
+                    0.0,
+                    Vec::new(),
+                    Vec::new(),
+                    SharedString::default(),
+                    hover_plan.0,
+                    hover_plan.1,
+                    hover_plan.2,
+                ));
                 continue;
             }
             // 重命名中输入框的实时文本才是浮层该显示的内容；否则每帧都会用
@@ -5597,7 +5630,16 @@ impl App {
                 hover_sig.1,
                 hover_sig.2,
             );
-            plans[pane] = Some((box_w, lines, t.1.as_str().into(), hover_plan.0, hover_plan.1));
+            let line_ws = line_widths(&lines);
+            plans[pane] = Some((
+                box_w,
+                lines,
+                line_ws,
+                t.1.as_str().into(),
+                hover_plan.0,
+                hover_plan.1,
+                hover_plan.2,
+            ));
         }
         if self.expand_sig.as_ref() == Some(&sigs) {
             return;
@@ -5605,9 +5647,17 @@ impl App {
         self.expand_sig = Some(sigs);
 
         for (pane, plan) in plans.into_iter().enumerate() {
-            let (box_w, lines, name, hv_box_w, hv_lines) = match plan {
+            let (box_w, lines, line_ws, name, hv_box_w, hv_lines, hv_line_ws) = match plan {
                 Some(v) => v,
-                None => (0.0f32, Vec::new(), SharedString::default(), 0.0f32, Vec::new()),
+                None => (
+                    0.0f32,
+                    Vec::new(),
+                    Vec::new(),
+                    SharedString::default(),
+                    0.0f32,
+                    Vec::new(),
+                    Vec::new(),
+                ),
             };
             let index = sigs[pane].0;
             let hv_index = sigs[pane].4;
@@ -5645,17 +5695,25 @@ impl App {
                 self.ui.set_file_expand_index(index);
                 self.ui.set_file_expand_name(name);
                 self.ui.set_file_expand_box_w(box_w);
+                self.ui
+                    .set_file_expand_line_ws(ModelRc::new(VecModel::from(line_ws)));
                 self.ui.set_file_expand_lines(model);
                 self.ui.set_file_hover_expand_index(hv_index);
                 self.ui.set_file_hover_expand_box_w(hv_box_w);
+                self.ui
+                    .set_file_hover_expand_line_ws(ModelRc::new(VecModel::from(hv_line_ws)));
                 self.ui.set_file_hover_expand_lines(hv_model);
             } else {
                 self.ui.set_file_expand_index_right(index);
                 self.ui.set_file_expand_name_right(name);
                 self.ui.set_file_expand_box_w_right(box_w);
+                self.ui
+                    .set_file_expand_line_ws_right(ModelRc::new(VecModel::from(line_ws)));
                 self.ui.set_file_expand_lines_right(model);
                 self.ui.set_file_hover_expand_index_right(hv_index);
                 self.ui.set_file_hover_expand_box_w_right(hv_box_w);
+                self.ui
+                    .set_file_hover_expand_line_ws_right(ModelRc::new(VecModel::from(hv_line_ws)));
                 self.ui.set_file_hover_expand_lines_right(hv_model);
             }
         }
@@ -5876,7 +5934,25 @@ impl App {
                         } else if computer_view {
                             grid_display_lines(&[(display_name.to_string(), false)], grid_name_w, 3)
                         } else {
-                            layout
+                            layout.clone()
+                        };
+                        // 文字宽度按该视图的字号换算：估算表是按图标视图的 11.5px
+                        // 定的，详细信息/列表用 13px、小图标用 12px。
+                        let name_font_scale = if small_icons {
+                            12.0 / 11.5
+                        } else if view_mode == "details" || view_mode == "list" {
+                            13.0 / 11.5
+                        } else {
+                            1.0
+                        };
+                        // 必须用**实际渲染出来的那一行**（`layout` / `grid_lines`）来量宽，
+                        // 不能用 `name_parts`：没有搜索高亮时 `tip_parts` 是空的，
+                        // `name_parts` 也就空 → 宽度算成 0 → 详细信息 / 列表 / 小图标
+                        // 里「单选后再点名字」整片都判不进重命名。
+                        let name_line_ws: Vec<f32> = if grid_lines.is_empty() {
+                            layout.iter().map(|l| est_text_w(l) * name_font_scale).collect()
+                        } else {
+                            grid_lines.iter().map(|l| est_text_w(l)).collect()
                         };
                         Some(PreRow {
                             index: di as i32,
@@ -5916,6 +5992,7 @@ impl App {
                             name_parts,
                             tip_parts,
                             name_truncated,
+                            name_line_ws,
                         })
                     })
                     .collect();
@@ -6148,6 +6225,7 @@ impl App {
                             .collect::<Vec<_>>(),
                     )),
                     name_truncated: p.name_truncated,
+                    name_line_ws: ModelRc::new(VecModel::from(p.name_line_ws)),
                 }
             })
             .collect();
@@ -6162,7 +6240,7 @@ impl App {
         self.syncing_tab = true;
 
         // 切换标签时取消挂起的延迟重命名：否则切走再切回原标签，原标签选择集可能
-        // 仍满足「唯一选中该路径」，导致 400ms 后跨标签冒出重命名输入框。
+        // 仍满足「唯一选中该路径」，导致几百毫秒后跨标签冒出重命名输入框。
         self.cancel_rename_defer();
 
         // 切换标签后退出地址栏编辑态。
@@ -6654,6 +6732,45 @@ struct PreRow {
     name_parts: Vec<(String, bool)>,
     tip_parts: Vec<(String, bool)>,
     name_truncated: bool,
+    /// 图标视图逐行文字宽度（与 `grid_lines` 一一对应）；其余视图只有一个元素。
+    /// 用来把「再次点击名称进入重命名」限定在文字上：名称区是整格宽，
+    /// 点在文字旁边的空白不该算「点击名称」。
+    name_line_ws: Vec<f32>,
+}
+
+/// 单个字符的估算像素宽（与 file_list.slint 的 11.5px 字号对齐）。
+///
+/// ASCII 不能再统一按 6px 估：大写与数字明显更宽（「EXID-Up&Down.mp4」这类
+/// 名字会被低估，行宽超出容器后 HorizontalLayout 会压缩末段，把 `.mp4` 的
+/// 尾部裁掉）。这里按字宽细分，宁可估宽一点也不裁字。
+fn est_char_w(c: char) -> f32 {
+    const WIDE_W: f32 = 11.5; // 与 file_list.slint 的 font-size 一致
+    // 符号/emoji 按更保守的 14px 估：连续多个装饰字符（❀♡❤▶）各自回退到
+    // 符号字体时，若仍按 11.5px 计就会累积超宽，整行被水平裁掉两端。
+    const SYMBOL_W: f32 = 14.0;
+    if c.is_ascii() {
+        match c {
+            ' ' | '\t' => 3.6,
+            'a'..='z' => 5.9,
+            'A'..='Z' => 7.4,
+            '0'..='9' => 6.6,
+            '.' | ',' | ':' | ';' | '\'' | '|' | '!' => 3.6,
+            _ => 6.6,
+        }
+    } else if is_wide_cjk(c) {
+        WIDE_W
+    } else {
+        SYMBOL_W
+    }
+}
+
+/// 一段（可能拆成多段的）文字的估算像素宽。
+fn est_text_w(parts: &[(String, bool)]) -> f32 {
+    parts
+        .iter()
+        .flat_map(|(t, _)| t.chars())
+        .map(est_char_w)
+        .sum()
 }
 
 /// 把「带高亮分段的名字」按可用宽度预切成最多 `max_lines` 行，超出时末行以
@@ -6664,31 +6781,9 @@ struct PreRow {
 /// 装饰符号会触发字体回退多断一行，elide 按完整文本高度定位就会把首行整行
 /// 裁掉。行数由 Rust 定死后，多行、首行完整、末行省略号、命中高亮可以同时成立。
 fn grid_display_lines(parts: &[(String, bool)], width_px: f32, max_lines: usize) -> GridLines {
-    const WIDE_W: f32 = 11.5; // 与 file_list.slint 的 font-size 一致
-    // 符号/emoji 按更保守的 14px 估：连续多个装饰字符（❀♡❤▶）各自回退到
-    // 符号字体时，若仍按 11.5px 计就会累积超宽，整行被水平裁掉两端。
-    const SYMBOL_W: f32 = 14.0;
     // 留整整一个宽字符余量：估算与真实 shaping 总有偏差，留一格缓冲。
-    let budget = (width_px - WIDE_W).max(WIDE_W * 2.0);
-    // ASCII 不能再统一按 6px 估：大写与数字明显更宽（「EXID-Up&Down.mp4」这类
-    // 名字会被低估，行宽超出容器后 HorizontalLayout 会压缩末段，把 `.mp4` 的
-    // 尾部裁掉）。这里按字宽细分，宁可估宽一点也不裁字。
-    let width_of = |c: char| -> f32 {
-        if c.is_ascii() {
-            match c {
-                ' ' | '\t' => 3.6,
-                'a'..='z' => 5.9,
-                'A'..='Z' => 7.4,
-                '0'..='9' => 6.6,
-                '.' | ',' | ':' | ';' | '\'' | '|' | '!' => 3.6,
-                _ => 6.6,
-            }
-        } else if is_wide_cjk(c) {
-            WIDE_W
-        } else {
-            SYMBOL_W
-        }
-    };
+    let budget = (width_px - 11.5).max(11.5 * 2.0);
+    let width_of = est_char_w;
 
     // 可在该字符**之后**换行的位置：空白与常见分隔符；非 ASCII（CJK / 全角
     // 符号）本身逐字可断，与资源管理器的中文换行一致。
@@ -6783,7 +6878,7 @@ fn grid_display_lines(parts: &[(String, bool)], width_px: f32, max_lines: usize)
 
     // 超出：保留前 max_lines 行，末行腾出省略号宽度后补 `…`（不继承高亮色）。
     lines.truncate(max_lines);
-    let limit = (budget - WIDE_W).max(WIDE_W);
+    let limit = (budget - 11.5).max(11.5);
     let last = lines.last_mut().unwrap();
     let mut kept: Vec<(String, bool)> = Vec::new();
     let mut w = 0.0f32;
@@ -6846,6 +6941,20 @@ fn expand_layout(ui: &MainWindow, parts: &[(String, bool)]) -> (bool, f32, GridL
     let wide = (base_box * 1.05).min(cap);
     let lines = grid_display_lines(parts, (wide - 8.0).max(20.0), 64);
     (needs, wide, lines)
+}
+
+/// 逐行文字宽度（与 `grid_display_lines` 的切行一一对应）。
+///
+/// 用来把「再次点击名称进入重命名」限制在**每一行**的文字上：浮层框固定
+/// 1.05 倍格宽、格子的名称区是整格宽，名字折行后后面几行往往短很多，
+/// 只按「最宽一行」算，那些行右侧的空白就会被当成文字。
+fn line_widths(lines: &GridLines) -> Vec<f32> {
+    lines.iter().map(|line| est_text_w(line)).collect()
+}
+
+/// 空的「逐行文字宽」模型（`ModelRc::default()` 是 null 模型，不能当空表用）。
+fn empty_lengths() -> ModelRc<f32> {
+    ModelRc::new(VecModel::from(Vec::<f32>::new()))
 }
 
 /// 状态栏文案是否属于「危险 / 强提醒」：这类提示用红色，普通提示保持主题色。
@@ -7656,7 +7765,7 @@ impl App {
     }
 
     /// 打开右键菜单：Shell 菜单（系统项）+ Rove 自己的项。
-    fn open_menu(&self, target: MenuScope) {
+    fn open_menu(&mut self, target: MenuScope) {
         #[cfg(windows)]
         {
             let native_target = self.shell_menu_target(&target);
@@ -9445,12 +9554,12 @@ impl App {
         }
     }
 
-    /// 延迟触发重命名：单击文件名先不起重命名，留出双击窗口。
-    /// 若窗口内再来一次按下（判定为双击打开），`cancel_rename_defer` 会取消本定时器；
-    /// 否则到点才真正进入重命名——这样「单击选中后双击名称」不再被抢成重命名。
-    fn schedule_rename(&mut self, path: PathBuf) {
+    /// 延迟进入重命名：先起定时器留出双击窗口。
+    ///
+    /// 窗口内若来第二下按下（双击打开），调用方会 `cancel_rename_defer` 取消它。
+    fn schedule_rename(&mut self, path: PathBuf, from: &str) {
+        logv!("[rename] schedule via {} path={}", from, path.display());
         let Some(weak) = self.self_weak.clone() else {
-            // 兜底：弱引用未就绪时直接重命名（不应发生）。
             self.begin_rename(&path);
             return;
         };
@@ -9460,10 +9569,13 @@ impl App {
             Duration::from_millis(effective_double_click_ms() + 50),
             move || {
                 let Some(app) = weak.upgrade() else { return };
-                // try_borrow_mut：避免与同在主线程的其它 UI 回调形成 RefCell 嵌套借入而 panic；
-                // 借不到就放弃本次重命名（用户再点一次即可），绝不 panic。
                 let Ok(mut app) = app.try_borrow_mut() else { return };
-                // 仅当该路径仍是唯一选中项时才重命名，避免窗口期内切换了选择导致重命名错对象。
+                // 已经有一个重命名输入框打开（F2 / 右键菜单 / 另一行的挂起改名）：
+                // 不要再抢一次，否则会把用户正在编辑的文本重置成原名。
+                if !app.ui.get_rename_path().is_empty() {
+                    logv!("[rename] deferred rename skipped: already renaming");
+                    return;
+                }
                 let sel = app.state.active().active().selected_paths();
                 if sel.len() == 1 && sel[0] == path {
                     logv!("[rename] deferred rename firing for {:?}", path);
@@ -9473,9 +9585,39 @@ impl App {
         );
     }
 
-    /// 取消挂起的延迟重命名（双击打开时调用）。
+    /// 取消挂起的延迟重命名（双击打开、点空白、切目录时调用）。
     fn cancel_rename_defer(&mut self) {
         self.rename_defer_timer.stop();
+    }
+
+    /// 名称浮层当前指向的（栏号, 条目路径）。
+    ///
+    /// 选中/重命名层与悬停层是两套属性，只有 `hover-expand-index` 或
+    /// `expand-index` 有值时才有浮层；悬停优先（鼠标下的那一层才是用户看的那层）。
+    fn expand_overlay_target(&self) -> Option<(usize, usize, PathBuf)> {
+        let hv0 = self.ui.get_file_hover_expand_index();
+        let hv1 = self.ui.get_file_hover_expand_index_right();
+        let ex0 = self.ui.get_file_expand_index();
+        let ex1 = self.ui.get_file_expand_index_right();
+        let (pane, target) = if hv0 >= 0 {
+            (0usize, hv0)
+        } else if hv1 >= 0 {
+            (1usize, hv1)
+        } else if ex0 >= 0 {
+            (0usize, ex0)
+        } else if ex1 >= 0 {
+            (1usize, ex1)
+        } else {
+            return None;
+        };
+        let path = self
+            .state
+            .active()
+            .panes
+            .get(pane)
+            .and_then(|p| p.display_entry(target as usize))
+            .map(|e| e.path.clone())?;
+        Some((pane, target as usize, path))
     }
 
     /// 打开选中项。
@@ -10409,7 +10551,7 @@ impl App {
 
     fn sync_after_navigate(&mut self) {
         // 导航时取消挂起的延迟重命名：导航会换目录/选择集，原路径可能不再有效，
-        // 否则 400ms 后会在新页面里误弹出重命名。
+        // 否则几百毫秒后会在新页面里误弹出重命名。
         self.cancel_rename_defer();
         // 进出「此电脑」/「回收站」时，把该视图自己的排序状态装回面板，
         // 普通目录则用全局排序。必须在下发列举请求（reload_active）之前做。
@@ -10757,7 +10899,7 @@ impl App {
                 // 否则首次微小移动就会清空 drag_pending 导致永远拖不出（见 #2 缺陷）。
                 if let Some(paths) = drag_gesture_paths(&self.drag_pending, x, y) {
                     self.drag_pending = None;
-                    // 已经真正开始拖出：不要再塌缩选择集，也不要在 400ms 后弹重命名。
+                    // 已经真正开始拖出：不要再塌缩选择集，也不要事后弹重命名。
                     self.pending_single_click = None;
                     self.cancel_rename_defer();
                     self.ui.invoke_set_drag_armed(false);
@@ -10774,9 +10916,9 @@ impl App {
         };
         match event.button {
             PointerEventButton::Right => {
-                // 右键（不走 Left 分支）也要取消挂起的延迟重命名，否则 400ms 后
-                // rename 输入框会与右键菜单共存/抢占焦点。
-                self.cancel_rename_defer();
+                // 右键打断「同一行连续按下」链条：菜单之后随手点一下名称只算第一次
+                // 按下，不会直接进重命名。
+                self.last_left_press_row = None;
                 // 未选中则先选中它，再弹菜单。
                 if !self.state.active().active().selection.contains(&path) {
                     let tab = self.state.active_mut().active_mut();
@@ -10796,22 +10938,21 @@ impl App {
                 self.open_menu(target);
             }
             PointerEventButton::Left => {
-                // 每次左键按下先取消挂起的延迟重命名，避免旧的 timer 在条件偶然重新
-                // 满足时提前触发（单击 A→点 B→再点 A：t=200 点的 A 只过 200ms 却弹出 rename）。
-                self.cancel_rename_defer();
+                // 这一下是不是「同一行的连续第二次按下」（见 `last_left_press_row`）。
+                let second_press_on_row =
+                    self.last_left_press_row.as_deref() == Some(path.as_path());
+                self.last_left_press_row = Some(path.clone());
                 // 新的一次按下：丢掉上一次未完成的「延迟塌缩单选」。
                 self.pending_single_click = None;
                 // 双击检测在 Rust 侧做（有效双击间隔内同一路径二次按下）：
                 // 不依赖 Slint 的 double-clicked，行模型重建也不会打断判定。
-                // 注意：这个窗口必须 ≤ 下方延迟重命名（有效双击间隔 + 50ms），否则
-                // 「慢双击」会先触发重命名再打开。
                 let now = std::time::Instant::now();
                 if self.last_click.as_ref().is_some_and(|(p, t)| {
                     *p == path && t.elapsed().as_millis() < effective_double_click_ms() as u128
                 }) {
-                    // 第二次按下 = 双击 → 打开，并取消挂起的延迟重命名。
-                    self.cancel_rename_defer();
+                    // 第二次按下 = 双击 → 打开（并撤掉可能已挂起的延迟改名）。
                     self.last_click = None;
+                    self.cancel_rename_defer();
                     self.activate_row(index);
                     return;
                 }
@@ -10840,10 +10981,12 @@ impl App {
                     self.ui.invoke_set_drag_armed(true);
                     logv!("[drag] armed=true for row {}", index);
                 }
-                // 单选后（非双击、非 Ctrl/Shift）点击文件名 → 延迟进入重命名：
-                // 先不起重命名，留出双击窗口；若再来一次按下（有效双击间隔内）则被判定为
-                // 双击打开（见上方 cancel_rename_defer），否则（有效双击间隔 + 50ms）后到
-                // 点才重命名。这样「单击选中后双击名称」不会被抢成重命名。
+                // 单选后（非双击、非 Ctrl/Shift）点击文件名 → 进入重命名，但要求这是
+                // **同一行的连续第二次按下**（见 `last_left_press_row`）：
+                // 第一次按下只是「选中并记下这一行」，双击打开在上面的双击判定里已经返回，
+                // 所以走到这里的第二次按下才是改名意图，但仍要等一个双击间隔
+                // （`schedule_rename`），否则快速双击名称会被抢成改名而打不开文件。
+                // 因此「右键菜单之后随手点一下名称」永远是安全的。
                 // 由 Slint 判定是否落在名称列，避免点图标/类型/大小列误触发。
                 if on_name {
                     logv!(
@@ -10854,8 +10997,14 @@ impl App {
                     );
                 }
                 if on_name && !ctrl && !shift && !multi && row_selected {
-                    self.schedule_rename(path.clone());
-                    return;
+                    if second_press_on_row {
+                        self.schedule_rename(path.clone(), "cell-row");
+                        return;
+                    }
+                    logv!(
+                        "[rename] name press without previous press on this row, select only: {}",
+                        path.display()
+                    );
                 }
                 // 多选下按在某个「已选中行」：保留整个选择集，把「塌缩成单选」推迟
                 // 到 Up（且全程未拖动）时才做。这里不重建行模型，保持按下时的
@@ -11198,6 +11347,9 @@ impl App {
         if event.kind != PointerEventKind::Down {
             return;
         }
+        // 点了空白：连续按下链断了，下次点名称只算第一次按下；挂起的改名也撤掉。
+        self.last_left_press_row = None;
+        self.cancel_rename_defer();
         match event.button {
             PointerEventButton::Left => {
                 // 资源管理器语义：按住 Ctrl/Shift 起手时保留已有选择，
@@ -12055,8 +12207,8 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             "delete_perm" => app.delete_selection(false),
             "refresh" => app.user_refresh_active(),
             "focus_search" => {
-                // 进入搜索框前取消挂起的延迟重命名，否则 400ms 后 rename 输入框
-                // 弹出、抢走搜索框焦点。
+                // 进入搜索框前取消挂起的延迟重命名，否则 rename 输入框稍后弹出、
+                // 抢走搜索框焦点。
                 app.cancel_rename_defer();
                 app.ui.invoke_focus_search_box();
             }
@@ -12332,12 +12484,42 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         let app = Rc::downgrade(app);
         // 图标视图里单选后的文件名浮层：再次点击同样进入重命名。
         let overlay_app = app.clone();
+        let overlay_right_app = app.clone();
         let hover_app = app.clone();
         let overlay_hover_app = app.clone();
         upgrade().on_file_row_pointer_event(move |index, event, x, y, on_name| {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut()
                 .row_pointer_event(index as usize, &event, x, y, on_name);
+        });
+        upgrade().on_file_name_overlay_right_clicked(move || {
+            let Some(app) = overlay_right_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            // 名称浮层比格子宽、还常伸出到邻居/空白上：那里没有行元素，
+            // 右键落到浮层上原本什么都不会发生。这里等价于「右键那一行」。
+            let Some((pane, _, path)) = app.expand_overlay_target() else {
+                return;
+            };
+            // 菜单的操作对象是「活动栏的选中集」，所以先把浮层所在的栏切过去。
+            if app.state.active().active_pane != pane {
+                app.focus_pane(pane);
+            }
+            // 右键打断「同一行连续按下」链条（与行内右键一致）。
+            app.last_left_press_row = None;
+            if !app.state.active().active().selection.contains(&path) {
+                let tab = app.state.active_mut().active_mut();
+                tab.selection.clear();
+                tab.selection.insert(path.clone());
+                tab.anchor = Some(path.clone());
+            }
+            app.menu_anchor_path = Some(path.clone());
+            let target = MenuScope::Selection(app.state.active().active().selected_paths());
+            app.menu_scope = Some(target.clone());
+            app.visible_cache = None;
+            app.visible_cache_right = None;
+            app.refresh_visible_rows();
+            app.sync_status();
+            app.open_menu(target);
         });
         upgrade().on_file_name_overlay_clicked(move || {
             let Some(app) = overlay_app.upgrade() else { return };
@@ -12348,33 +12530,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             // 不做这一步的话，仅因悬停而弹出的浮层被单击后会毫无反应。
             //
             // 选中/重命名层和悬停层是两套属性：悬停弹出来的那一层只有
-            // hover-expand-index 有值，所以两者都要看。悬停优先。
-            let hv0 = app.ui.get_file_hover_expand_index();
-            let hv1 = app.ui.get_file_hover_expand_index_right();
-            let ex0 = app.ui.get_file_expand_index();
-            let ex1 = app.ui.get_file_expand_index_right();
-            let (pane, target) = if hv0 >= 0 {
-                (0usize, hv0)
-            } else if hv1 >= 0 {
-                (1usize, hv1)
-            } else if ex0 >= 0 {
-                (0usize, ex0)
-            } else if ex1 >= 0 {
-                (1usize, ex1)
-            } else {
+            // hover-expand-index 有值，所以两者都看（悬停优先）——这里统一走
+            // `expand_overlay_target()`，与右键那条共用同一份解析。
+            let Some((pane, target, path)) = app.expand_overlay_target() else {
                 return;
             };
             if app.state.active().active_pane != pane {
                 app.focus_pane(pane);
             }
-            let path = app
-                .state
-                .active()
-                .panes
-                .get(pane)
-                .and_then(|p| p.display_entry(target as usize))
-                .map(|e| e.path.clone());
-            let Some(path) = path else { return };
             // 双击检测：浮层盖在名称区上，格子自己的 TouchArea 收不到这些点击，
             // 所以双击打开必须在这里自己判（与 row_pointer_event 同一套机制：
             // 有效双击间隔内同一路径第二次点击 = 打开）。
@@ -12384,7 +12547,6 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             if app.last_click.as_ref().is_some_and(|(p, t)| {
                 *p == path && t.elapsed().as_millis() < effective_double_click_ms() as u128
             }) {
-                app.cancel_rename_defer();
                 app.last_click = None;
                 if app.state.active().active().selection.len() != 1
                     || !app.state.active().active().selection.contains(&path)
@@ -12394,6 +12556,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                     tab.selection.insert(path.clone());
                     tab.anchor = Some(path.clone());
                 }
+                app.cancel_rename_defer();
                 app.activate_row(target as usize);
                 return;
             }
@@ -12406,7 +12569,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 let tab = app.state.active_mut().active_mut();
                 tab.selection.clear();
                 tab.selection.insert(path.clone());
-                tab.anchor = Some(path);
+                tab.anchor = Some(path.clone());
+                // 这一下也算「在本行按下」：否则浮层上的第一次点击不记帐，
+                // 下一次点击仍被判成第一次按下，要点三下才进重命名。
+                app.last_left_press_row = Some(path.clone());
                 app.visible_cache = None;
                 app.visible_cache_right = None;
                 app.refresh_visible_rows();
@@ -12418,7 +12584,17 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             // 已处理），否则窗口过后才进重命名。
             // 当场 start-rename 的话，重命名输入框会立刻顶掉浮层，
             // 第二次点击落到输入框上，双击打开就永远做不到。
-            app.schedule_rename(path);
+            // 与行内点击同一规则：只认「同一行的连续第二次按下」。
+            let second_press = app.last_left_press_row.as_deref() == Some(path.as_path());
+            app.last_left_press_row = Some(path.clone());
+            if second_press {
+                app.schedule_rename(path, "name-overlay");
+            } else {
+                logv!(
+                    "[rename] overlay press without previous press on this row, select only: {}",
+                    path.display()
+                );
+            }
         });
         upgrade().on_file_overlay_hover(move |pane, inside| {
             let Some(app) = overlay_hover_app.upgrade() else { return };

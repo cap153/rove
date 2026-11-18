@@ -121,6 +121,46 @@ export component FileList inherits Rectangle {
         return false;
     }
     callback name-overlay-clicked();
+    /// 在名称浮层上点右键：浮层盖住的格子可能压根不在浮层范围内（浮层比格子宽，
+    /// 还常常伸出到邻居/空白上），所以右键也要由浮层自己转发给 Rust 开菜单。
+    callback name-overlay-right-clicked();
+    /// 「点的是文字本身，还是浮层里的空白」判定。
+    ///
+    /// 浮层框固定 1.05 倍格宽，短名字周围留着一大片白；以前整块都算「再次点击
+    /// 名称」，于是「右键某个文件后随手点一下空白」就会莫名其妙进入重命名。
+    /// 只认文字所在的竖直行带 + 水平居中、宽度等于文字的区域。
+    /// 详情/列表视图里「点在名称文字上」判定。
+    ///
+    /// 名称列是整列宽，以前整列都算「点击名称」，于是右键某个文件后随手点一下
+    /// 它右侧的空白也会进入重命名。现在要求落点不超出该行文字宽度（截断的名字
+    /// 文字本来就会顶满整列，不受影响）。
+    function name-col-text-hit(x: length, row-text-w: length, overlay-shown: bool) -> bool {
+        // 整名浮层正显示时，浮层盖到哪儿就算点名称：
+        //  · 浮层可能从名称列往右伸，盖住「修改时间」「类型」等列；
+        //  · 浮层的出现条件是 Slint **实测**宽度超列宽，而 row-text-w 是 Rust
+        //    的字符宽估算，估窄时浮层比它宽 —— 只按估算宽度判，浮层右侧一大片
+        //    点了没反应（用户视角：浮层明明在那儿却不认）。
+        if (overlay-shown) {
+            return true;
+        }
+        return root.name-hit(x)
+            && x <= root.col-name-x + min(row-text-w, root.col-name-w) + 4px;
+    }
+    function name-text-hit(x: length, y: length, w: length, ws: [length]) -> bool {
+        // 末行可能因符号/emoji 字体回退比 line-h 略高，底边留 1px 余量。
+        if (y < 0px || y > ws.length * root.line-h + 1px) {
+            return false;
+        }
+        // 按**落点所在那一行**的宽度判定：名字折行后后面几行往往短很多，
+        // 只看最宽一行的话，那些行右侧的空白也会被当成文字。
+        let i = floor(y / root.line-h);
+        if (i < 0 || i >= ws.length) {
+            return false;
+        }
+        // 估算本身已经偏宽，这里只留 2px 抗取整：贴着文字的空白不该算「点在名称上」。
+        let half = ws[i] / 2 + 2px;
+        return x >= w / 2 - half && x <= w / 2 + half;
+    }
     /// 浮层自身是否被鼠标压住（true = 指针在展开的完整名浮层上）。
     /// 浮层盖住名称区，鼠标下移到文件名时格子自己的 hover 会变 false，
     /// Rust 靠这个标志把悬停保持住，避免浮层反复出现/消失。
@@ -266,6 +306,9 @@ export component FileList inherits Rectangle {
     /// 「实际换行位置」严格同源（Slint 侧测量无法与 Rust 的切行一致）。
     in-out property <[GridLine]> expand-lines: [];
     in-out property <length> expand-box-w: 0px;
+    /// 逐行文字估算宽度（Rust 与切行同源算出）。浮层框固定 1.05 倍格宽，
+    /// 短名字周围会留出一大片白 —— 只有落在文字上的点击才算「再次点击名称」。
+    in-out property <[length]> expand-line-ws: [];
 
     /// 只在中/大/超大图标视图生效；小图标视图（横排单行）保持原样。
     /// 是否需要浮层（名字超过 3 行）由 Rust 判定：只有那时才会给 expand-index。
@@ -282,6 +325,7 @@ export component FileList inherits Rectangle {
     in-out property <int> hover-expand-index: -1;
     in-out property <[GridLine]> hover-expand-lines: [];
     in-out property <length> hover-expand-box-w: 0px;
+    in-out property <[length]> hover-expand-line-ws: [];
     /// 悬停项与选中项是同一个格子时不再重复画（否则两个浮层叠在一起）。
     private property <bool> hover-expand-active: root.is-icons-view
         && root.view-mode != "icons-small"
@@ -303,6 +347,12 @@ export component FileList inherits Rectangle {
     private property <int> ex-renaming: root.rename-path == "" ? 0 : 1;
     /// 高度按行数：短名字就矮，长名字继续往下长（至少 30px）。
     private property <length> ex-box-h: max(root.expand-lines.length * root.line-h + 14px, 30px);
+
+    /// 按下点落在文字上才置真，抬手时位移过大就作废：
+    /// 按住名字往外拖 = 想拖文件，不该 0.4 秒后弹重命名。
+    private property <bool> ex-press-armed: false;
+    private property <length> ex-press-x: 0px;
+    private property <length> ex-press-y: 0px;
 
     /// 排查用：把“为什么截断 / 浮层为什么这样”的全部数字拼成一行。
     public function name-debug-info() -> string {
@@ -328,7 +378,13 @@ export component FileList inherits Rectangle {
             root.name-debug(root.name-debug-info(), root.expand-name);
         }
     }
-    changed rename-path => { root.name-debug(root.name-debug-info(), root.expand-name); }
+    changed rename-path => {
+        root.name-debug(root.name-debug-info(), root.expand-name);
+        // 进出重命名时浮层里的 TouchArea 会被销毁/重建，残留的「已按住」必须清掉，
+        // 否则之后一次没有 down 的 up 也会触发点击回调（表现为莫名重进改名）。
+        root.ex-press-armed = false;
+        root.hv-press-armed = false;
+    }
     /// 相对格子**居中**（含最左/最右列）。
     /// 浮层宽 1.1 倍格宽，居中后每侧只向外伸出 0.05 × item-w；而网格的
     /// min-gap 是 16px，三档视图 item-w 分别 88 / 124 / 188，伸出量最多
@@ -358,6 +414,10 @@ export component FileList inherits Rectangle {
     private property <length> hv-item-x: root.cell-x(root.hv-col);
     private property <length> hv-box-w: max(root.hover-expand-box-w, 1px);
     private property <length> hv-box-h: max(root.hover-expand-lines.length * root.line-h + 14px, 30px);
+
+    private property <bool> hv-press-armed: false;
+    private property <length> hv-press-x: 0px;
+    private property <length> hv-press-y: 0px;
     private property <length> hv-want-x: hv-item-x + (root.item-w - hv-box-w) / 2;
     private property <length> hv-box-x: max(4px, min(hv-want-x, root.width - 4px - hv-box-w));
     /// 悬停浮层的向上让位规则与选中浮层完全一致（见 ex-box-y）。
@@ -1079,6 +1139,7 @@ export component FileList inherits Rectangle {
                     && (ta.has-hover || (row.selected && root.single-selection))
                     && (row.name-truncated
                         || name-measure-details.preferred-width > root.col-name-w);
+
                 y: row.index * root.row-h;
                 x: 0px;
                 // 行元素（含点击区）只铺到最后一列右边界：右侧留白里不存在行，
@@ -1123,7 +1184,10 @@ export component FileList inherits Rectangle {
                             // flick.content-y 是负值（向下滚动为负），加它等于减去滚动偏移。
                             let header-h = root.view-mode == "details" ? 30px : 0px;
                             let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
-                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x) || name-overlay-shown);
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y,
+                                root.name-col-text-hit(self.mouse-x,
+                                    min(name-measure-details.preferred-width, root.col-name-w),
+                                    name-overlay-shown));
                             return EventResult.accept;
                         }
                         // 拖拽手势：move/up 继续转发给按下时捕获的行 TouchArea。
@@ -1134,7 +1198,10 @@ export component FileList inherits Rectangle {
                             || event.kind == PointerEventKind.cancel) {
                             let header-h = root.view-mode == "details" ? 30px : 0px;
                             let viewport_y = row.index * root.row-h + self.mouse-y + flick.content-y + header-h;
-                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y, root.name-hit(self.mouse-x) || name-overlay-shown);
+                            root.row-pointer-event(row.index, event, self.mouse-x, viewport_y,
+                                root.name-col-text-hit(self.mouse-x,
+                                    min(name-measure-details.preferred-width, root.col-name-w),
+                                    name-overlay-shown));
                             return EventResult.accept;
                         }
                         return EventResult.reject;
@@ -1610,8 +1677,31 @@ export component FileList inherits Rectangle {
                         // 小图标横排（图标左、名右）：x 越过 50px 即名称区。
                         // 注意：不能像详情视图那样再发一次 clicked，否则一次点击会触发两次 down，
                         // 后一次被 Rust 当成双击直接打开文件。
+                        // 「点在名称文字上」才算点击名称。
+                        // 名称区是整格宽（缩略图下面那条），以前整条都算名称区：
+                        // 右键某个文件后随手点一下它名字旁边的空白，就会进入重命名。
+                        // 这里用 Rust 算好的文字宽度（与切行同源）做精确命中。
                         let is_small = root.view-mode == "icons-small";
-                        let on_name = is_small ? self.mouse-x >= 50px : self.mouse-y >= root.cell-thumb;
+                        // 多行名字按**落点所在那一行**的宽度判定：名字折行后后面几行
+                        // 往往短很多，只按「最宽一行」算，那些行右侧的空白也会被当成
+                        // 文字，于是「右键文件后点空白」又进了重命名。
+                        let rel-y = self.mouse-y - root.cell-thumb - 3px;
+                        let line = floor(rel-y / root.line-h);
+                        let line-w = (line >= 0 && line < row.name-line-ws.length)
+                            ? row.name-line-ws[line]
+                            : 0px;
+                        // 小图标横排：名称文字从 x=54px 开始（4 内边距 + 44 图标 + 6 间距），
+                        // 可用宽度 = 行宽 - 50px（见下面对应 HighlightName 的 width）。
+                        // 用 Slint **实测**的完整名宽而不是 Rust 的字符宽估算：估算偏窄时
+                        // 名字右半边点了没反应（实测宽度见 name-measure-small）。
+                        let small_name_w = min(name-measure-small.preferred-width,
+                            max(0px, self.width - 58px));
+                        let on_name = is_small
+                            ? self.mouse-x >= 50px
+                                && self.mouse-x <= 54px + small_name_w + 6px
+                            : (rel-y >= 0px
+                                && rel-y <= min(root.name-h, row.name-line-ws.length * root.line-h) + 1px
+                                && abs(self.mouse-x - self.width / 2) <= line-w / 2 + 2px);
                         root.row-pointer-event(row.index, event,
                             root.cell-x(Math.mod(row.index, root.cells-per-row)) + self.mouse-x,
                             viewport_y, on_name);
@@ -2226,6 +2316,8 @@ export component FileList inherits Rectangle {
             }
 
             // 单选后再次点击这个文件名浮层 → 进入重命名（Rust 侧复核仍为单选）。
+            // 只认文字上的点击：框里的空白处返回 reject，让事件继续落到下面的
+            // 格子/背景（等同点空白），不再误触发重命名。
             TouchArea {
                 width: 100%;
                 height: 100%;
@@ -2237,7 +2329,37 @@ export component FileList inherits Rectangle {
                 changed has-hover => {
                     root.overlay-hover(self.has-hover);
                 }
-                clicked => { root.name-overlay-clicked(); }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                        if (root.name-text-hit(self.mouse-x, self.mouse-y, self.width,
+                                root.expand-line-ws)) {
+                            root.ex-press-armed = true;
+                            root.ex-press-x = self.mouse-x;
+                            root.ex-press-y = self.mouse-y;
+                            return EventResult.accept;
+                        }
+                        root.ex-press-armed = false;
+                        return EventResult.reject;
+                    }
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left
+                        && root.ex-press-armed) {
+                        root.ex-press-armed = false;
+                        let moved = abs(self.mouse-x - root.ex-press-x)
+                            + abs(self.mouse-y - root.ex-press-y);
+                        if (moved <= 6px) {
+                            root.name-overlay-clicked();
+                        }
+                        return EventResult.accept;
+                    }
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                        root.name-overlay-right-clicked();
+                        return EventResult.accept;
+                    }
+                    if (e.kind == PointerEventKind.cancel) {
+                        root.ex-press-armed = false;
+                    }
+                    return EventResult.reject;
+                }
             }
         }
     }
@@ -2353,14 +2475,44 @@ export component FileList inherits Rectangle {
                 }
             }
 
-            // 悬停浮层同样可以被点击：单击选中该文件。
+            // 悬停浮层同样可以被点击：单击选中该文件（同样只认文字上的点击）。
             TouchArea {
                 width: 100%;
                 height: 100%;
                 changed has-hover => {
                     root.overlay-hover(self.has-hover);
                 }
-                clicked => { root.name-overlay-clicked(); }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                        if (root.name-text-hit(self.mouse-x, self.mouse-y, self.width,
+                                root.hover-expand-line-ws)) {
+                            root.hv-press-armed = true;
+                            root.hv-press-x = self.mouse-x;
+                            root.hv-press-y = self.mouse-y;
+                            return EventResult.accept;
+                        }
+                        root.hv-press-armed = false;
+                        return EventResult.reject;
+                    }
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left
+                        && root.hv-press-armed) {
+                        root.hv-press-armed = false;
+                        let moved = abs(self.mouse-x - root.hv-press-x)
+                            + abs(self.mouse-y - root.hv-press-y);
+                        if (moved <= 6px) {
+                            root.name-overlay-clicked();
+                        }
+                        return EventResult.accept;
+                    }
+                    if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
+                        root.name-overlay-right-clicked();
+                        return EventResult.accept;
+                    }
+                    if (e.kind == PointerEventKind.cancel) {
+                        root.hv-press-armed = false;
+                    }
+                    return EventResult.reject;
+                }
             }
         }
     }
