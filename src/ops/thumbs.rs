@@ -39,22 +39,23 @@ pub fn is_thumbnail_candidate(path: &Path) -> bool {
 
 /// 是否为「慢格式」：解码开销明显大于普通图片（视频海报 / 这类媒体）。
 ///
-/// 用于主池调度隔离：慢格式最多只占 `lanes-1` 条 worker，永远给普通图片
-/// 留 1 条空闲线程，避免滚到「图片+视频混排」文件夹时图片被视频卡死
-/// （抄 Pulse 的 `slow_cap = lanes-1` 思路）。纯视频文件夹本身解码就慢，
-/// 调度救不了（那是解码速度的物理上限），此隔离主要救混排场景。
+/// 用于调度隔离：慢格式的在途数有上限（线程数 >2 时只占 `n-1` 条 worker，
+/// 给普通图片永远留 1 条空闲线程，避免「图片+视频混排」时图片被视频卡死）。
+/// 纯视频文件夹本身解码就慢，调度救不了（那是解码速度的物理上限），
+/// 此隔离主要救混排场景。
+///
+/// **绝不碰文件系统**：曾经的 `path.is_dir()` 是一次真实 stat，网络盘上实测
+/// 25–30 ms/次，而它被派发线程和每条 worker 各调用一次 —— 派发是单线程的，
+/// 等于整个缩略图管道被限速到「一个请求 / 60 ms」，大幅滚动后新窗口那 117 行
+/// 要 7 秒才派发完，用户看到的就是「滚过去之后整屏空白」。
+///
+/// 目录没有视频扩展名，所以按扩展名判和原来等价（目录封面照旧走快格式）。
 pub fn is_slow_thumbnail(path: &Path) -> bool {
-    if path.is_dir() {
-        return false; // 文件夹封面不按“慢”处理，保持原优先逻辑
-    }
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    matches!(
-        ext.as_str(),
-        "mp4" | "mkv" | "avi" | "mov" | "webm" | "wmv" | "m4v"
-    )
+    const SLOW: [&str; 7] = ["mp4", "mkv", "avi", "mov", "webm", "wmv", "m4v"];
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    SLOW.iter().any(|s| ext.eq_ignore_ascii_case(s))
 }
 
 /// 每线程一次的 COM 初始化（CoInitializeEx 幂等：已初始化返回 S_FALSE 也算成功）。
@@ -1026,7 +1027,22 @@ pub fn decode_wic_from_file(_path: &Path) -> Result<(u32, u32, Vec<u8>), String>
 
 #[cfg(test)]
 mod tests {
-    use super::crop_undersized_icon;
+    use super::{crop_undersized_icon, is_slow_thumbnail};
+    use std::path::Path;
+
+    /// 慢格式判定只看扩展名，**不许碰文件系统**：一次网络 stat 是 25–30 ms，
+    /// 而派发线程是单线程的，一屏 117 行就会被限速成 3 秒以上。
+    #[test]
+    fn slow_thumbnail_is_decided_by_extension_only() {
+        assert!(is_slow_thumbnail(Path::new("C:/x/clip.MP4")));
+        assert!(is_slow_thumbnail(Path::new(r"\\nas\share\clip.mkv")));
+        assert!(is_slow_thumbnail(Path::new("C:/x/无后缀也能判.m4v")));
+        assert!(!is_slow_thumbnail(Path::new("C:/x/photo.jpg")));
+        assert!(!is_slow_thumbnail(Path::new("C:/x/noext")));
+        // 目录名恰好带视频后缀也按「慢」处理：宁可多限一个目录，
+        // 也不要在判定里加一次 stat。
+        assert!(is_slow_thumbnail(Path::new("C:/x/folder.mp4")));
+    }
 
     /// 造一张 `frame` 见方的透明画布，在 (x, y) 画一块 `art` 见方的实心像素。
     fn frame_with_art(frame: u32, x: u32, y: u32, art: u32) -> Vec<u8> {

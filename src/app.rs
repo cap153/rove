@@ -507,17 +507,18 @@ struct ThumbKey {
     px_size: u32,
 }
 
-/// 优先池的「想要」集合：当前可视屏幕（不含缓冲行）的缩略图 key。
+/// 「想要」集合：当前窗口（可见行 + 上下缓冲行）的缩略图 key。
 ///
-/// 每次重建可视行模型时由 UI 线程**整体替换**。优先池线程每取到一个任务先查这里：
+/// 每次重建可视行模型时由 UI 线程**整体替换**。worker 每取到一个任务先查这里：
 /// 不在集合里说明用户已经滚走 / 跳走，直接丢弃不浪费解码时间——连续快速跳转时，
-/// 新屏幕的请求不会排在上一个屏幕剩下的几十条后面。
+/// 新窗口的请求不会排在上一个窗口剩下的几十条后面（那些会被瞬间跳过）。
+/// 集合里装的是**整个窗口**（可见行 + 上下缓冲行）的 key，不只是可见行。
 fn thumb_wanted() -> &'static Mutex<std::collections::HashSet<ThumbKey>> {
     static WANTED: OnceLock<Mutex<std::collections::HashSet<ThumbKey>>> = OnceLock::new();
     WANTED.get_or_init(|| Mutex::new(Default::default()))
 }
 
-/// 把一条 key 加入「想要」集合（发出优先请求时立刻加，避免 worker 抢在整轮发布之前跳过它）。
+/// 把一条 key 加入「想要」集合（发请求时立刻加，避免 worker 抢在整轮发布之前跳过它）。
 fn thumb_want(key: &ThumbKey) {
     if let Ok(mut w) = thumb_wanted().lock() {
         w.insert(key.clone());
@@ -546,25 +547,39 @@ fn thumb_is_wanted(key: &ThumbKey) -> bool {
     thumb_wanted().lock().map(|w| w.contains(key)).unwrap_or(true)
 }
 
-/// 已「从普通池提到优先池」、但普通池那边还压着一份任务的 key。
-/// 普通池 worker 取到它时直接跳过：同一张图不重复解码。
-fn thumb_promoted() -> &'static Mutex<std::collections::HashSet<ThumbKey>> {
-    static PROMOTED: OnceLock<Mutex<std::collections::HashSet<ThumbKey>>> = OnceLock::new();
-    PROMOTED.get_or_init(|| Mutex::new(Default::default()))
+/// worker 判定为「已过期」而跳过的请求，攒在这里由 UI 线程统一清理。
+///
+/// 一条一跳 `invoke_from_event_loop` 会把事件循环灌满：大幅滚动一次就作废
+/// 上百条排队请求，每条都要借一次 App、置一次刷新标记——重绘反而被拖慢，
+/// 而它们本来就只是「从 pending 里摘掉」。
+fn thumb_skipped() -> &'static Mutex<Vec<ThumbKey>> {
+    static SKIPPED: OnceLock<Mutex<Vec<ThumbKey>>> = OnceLock::new();
+    SKIPPED.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-fn mark_thumb_promoted(key: &ThumbKey) {
-    if let Ok(mut p) = thumb_promoted().lock() {
-        // 防泄漏：提升集合最多几百条，超过直接清空（最坏只是一次多余的解码）。
-        if p.len() > 512 {
-            p.clear();
+/// 跳过批次溢出（UI 线程太久没来取）：标记一下，让 UI 用「不在当前窗口就不算在解」
+/// 兜底清理一遍。直接丢掉批次会让那些 key 永远留在 `thumb_pending` 里，
+/// 滚回去时那一行就再也不会发请求（永久空白）。
+static THUMB_SKIP_OVERFLOW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 记下一条被跳过的请求（worker 线程调用，多生产者）。
+fn note_thumb_skipped(key: ThumbKey) {
+    if let Ok(mut v) = thumb_skipped().lock() {
+        if v.len() > 4096 {
+            v.clear();
+            THUMB_SKIP_OVERFLOW.store(true, std::sync::atomic::Ordering::Release);
         }
-        p.insert(key.clone());
+        v.push(key);
     }
 }
 
-fn take_thumb_promoted(key: &ThumbKey) -> bool {
-    thumb_promoted().lock().map(|mut p| p.remove(key)).unwrap_or(false)
+/// 取走当前批次（UI 线程调用，单消费者）。
+fn take_thumb_skipped() -> Vec<ThumbKey> {
+    thumb_skipped()
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
 }
 
 /// 缓存项：原图 + 估算字节数（用于字节预算淘汰）。
@@ -869,15 +884,11 @@ pub struct App {
     thumb_diag_got: u32,
     /// 可见窗口内「还没出图」的首个条目下标 + 空白数，变化时才打印。
     thumb_blank_sig: Option<(i32, usize)>,
-    /// 本帧可视屏幕（优先池）的 key 集合：一轮行模型建完时整体发布给优先池。
-    prio_wanted: HashSet<ThumbKey>,
-    /// 被优先池丢弃的过期请求计数 + 上次汇总时刻（避免逐条刷屏）。
+    /// 本帧窗口（可见行 + 上下缓冲行）的 key 集合：一轮行模型建完时整体发布。
+    window_wanted: HashSet<ThumbKey>,
+    /// 被 worker 丢弃的过期请求计数 + 上次汇总时刻（避免逐条刷屏）。
     thumb_cancel_n: usize,
     thumb_cancel_t: std::time::Instant,
-    /// 已从普通池提升到优先池的 key（避免同一行每帧重复提升）。
-    thumb_promoted: HashSet<ThumbKey>,
-    /// 已提升的请求数（用于汇总日志）。
-    thumb_promote_n: usize,
     /// 缩略图插入序号发生器（配合 `CachedThumb::epoch` 做行增量更新）。
     thumb_epoch_next: u64,
     /// 上一帧写进左/右栏行模型的内容，用于逐行比对。
@@ -993,21 +1004,17 @@ pub struct App {
     thumb_cache_bytes: usize,
     /// 已请求未完成的缩略图（防重复提交）。
     thumb_pending: HashSet<ThumbKey>,
-    /// 普通池请求的排队时间（按发出先后）。用于队列积压时把最早、
-    /// 已滑出可视区域的请求作废——否则滚过的每个位置都会往里塞请求，
-    /// 越滚越长，用户突然滚到中间时要排在一大堆已作废请求后面。
-    thumb_queued: Vec<ThumbKey>,
     /// 失败负缓存（本会话内不再重试）。
     thumb_failed: HashSet<ThumbKey>,
     /// 批量刷新标记：后台有缩略图到达时置位，由 poll_timer 统一刷新。
     thumb_needs_refresh: bool,
-    #[allow(dead_code)]
+    /// 缩略图请求通道：**全部**请求走同一条队列，顺序即渲染顺序。
+    ///
+    /// 曾经分成「优先池 / 主池」两套（可见行 2 条线程、缓冲行 6 条），
+    /// 结果是排队顺序不重要、并发度最重要：网络盘上 6 条线程会先把看不见的
+    /// 缓冲行啃完，可见行还在 2 条线程上慢慢排。现在只有一条队列，
+    /// 请求按 `thumb_order_key` 的三段式顺序入队，所有 worker 按同一顺序取活。
     thumb_tx: Sender<ThumbKey>,
-    /// 优先通道：可见窗口内的缩略图请求。
-    /// 与 `thumb_tx` 分开，避免「先慢后快」渲染——轮转到的预览区把 4096 个文件
-    /// 全部占入 worker 队列后，用户突然滚到中间，新发出的请求会排在几千个
-    /// 已作废的请求后面。优先通道有自己的 worker（`PRIORITY_THREADS` 个）。
-    thumb_prio_tx: Sender<ThumbKey>,
     list_tx: Sender<ListRequest>,
     list_rx: Receiver<ListResult>,
     /// 深度搜索通道（文件夹视图子树搜索，独立线程执行）。
@@ -1088,7 +1095,6 @@ impl App {
         deep_tx: Sender<DeepRequest>,
         deep_rx: Receiver<DeepResult>,
         thumb_tx: Sender<ThumbKey>,
-        thumb_prio_tx: Sender<ThumbKey>,
         dir_size_tx: Sender<DirSizeRequest>,
         dir_size_rx: Receiver<DirSizeResult>,
         watch_tx: Sender<PathBuf>,
@@ -1169,11 +1175,9 @@ impl App {
             thumb_diag_left: 0,
             thumb_diag_got: 0,
             thumb_blank_sig: None,
-            prio_wanted: HashSet::new(),
+            window_wanted: HashSet::new(),
             thumb_cancel_n: 0,
             thumb_cancel_t: std::time::Instant::now(),
-            thumb_promoted: HashSet::new(),
-            thumb_promote_n: 0,
             thumb_epoch_next: 0,
             row_diff_left: None,
             row_diff_right: None,
@@ -1227,7 +1231,6 @@ impl App {
             thumb_use_seq: 0,
             thumb_cache_bytes: 0,
             thumb_pending: HashSet::new(),
-            thumb_queued: Vec::new(),
             thumb_failed: HashSet::new(),
             thumb_needs_refresh: false,
             syncing_tab: false,
@@ -1247,7 +1250,6 @@ impl App {
             clear_staging_on_delete_success: false,
             scroll_to_index: None,
             thumb_tx,
-            thumb_prio_tx,
             list_tx,
             list_rx,
             deep_tx,
@@ -2655,96 +2657,62 @@ fn spawn_dir_size_worker(rx: Receiver<DirSizeRequest>, tx: Sender<DirSizeResult>
 /// 缩略图工作线程：COM 初始化一次，循环取路径生成缩略图，
 /// 经事件循环回写缓存（线程安全：Image 可跨线程发送）。
 ///
-/// 缩略图工作线程分发器。两个池：
-/// - 主池（`主池（自适应，见下）`）：当前目录的全量缩略图，轮询分发；
-/// - 优先池（`PRIORITY_THREADS`）：只装**当前可见窗口**的请求，
-///   抢在主池积压任务之前完成，解决“滚到中段却从顶部一个个加载”。
+/// 只有**一条**队列，所有线程从同一条队列按序取活：队列里的顺序就是渲染
+/// 顺序（`thumb_order_key`：可见自上而下 → 下方自上而下 → 上方自下而上）。
+///
+/// 曾经分成「可见行走优先池 2 条线程 / 缓冲行走主池 6 条线程」，两个池同时
+/// 开工 —— 网络盘上 6 条线程会把看不见的缓冲行先啃完，用户看到的是
+/// 「眼前这一屏还没出来，下面那些行一个个亮了」。单队列没有这个问题，
+/// 也不牺牲并发：所有线程都在同一条队列上全力工作。
 #[cfg(windows)]
-fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>, prio_rx: mpsc::Receiver<ThumbKey>) {
+fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>) {
     // 启动时初始化磁盘字节统计（仅计数，超预算才异步裁剪）。
     std::thread::spawn(init_thumb_disk_cache);
 
     std::thread::Builder::new()
         .name("rove-thumbs-dispatcher".into())
         .spawn(move || {
-            // 主池线程数随 CPU 核数自适应：留 2 核给 UI + 系统，
-            // 夹在 [2, 6] 之间。下限 2 = 至少 1 条图片专用 + 1 条视频；
-            // 上限 6 避免抢光多核机的算力。优先池固定 2 条，
-            // 故总线程 = num_threads + 2，范围 [4, 8]。
+            // 线程数随 CPU 核数自适应：留 2 核给 UI + 系统，夹在 [2, 6] 之间。
+            // 下限 2 = 至少 1 条图片专用 + 1 条视频；上限 6 避免抢光多核机的算力。
             let cores = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
             let num_threads = (cores.saturating_sub(2)).clamp(2, 6);
-            const PRIORITY_THREADS: usize = 2;
-            crate::logln!(
-                "[thumb] pool: cores={} main={} (1 fast + {} slow) prio={} total={}",
-                cores,
-                num_threads,
-                num_threads - 1,
-                PRIORITY_THREADS,
-                num_threads + PRIORITY_THREADS
-            );
             let mut worker_txs = Vec::with_capacity(num_threads);
-
-            // 0. 优先池：只服务当前可见窗口。独立线程，不抢主池队列。
-            {
-                let mut prio_txs = Vec::with_capacity(PRIORITY_THREADS);
-                for i in 0..PRIORITY_THREADS {
-                    let (tx, worker_rx) = mpsc::channel::<ThumbKey>();
-                    prio_txs.push(tx);
-                    let spawned = std::thread::Builder::new()
-                        .name(format!("rove-thumb-prio-{i}"))
-                        .spawn(move || {
-                            crate::logv!("[thumb] prio-{i} started");
-                            while let Ok(key) = worker_rx.recv() {
-                                thumb_decode_one("prio", i, key);
-                            }
-                            crate::logv!("[thumb] prio-{i} channel closed");
-                        });
-                    match spawned {
-                        Ok(_) => crate::logv!("[thumb] prio-{i} spawned"),
-                        Err(e) => crate::logln!("[thumb] prio-{i} SPAWN FAILED: {e}"),
-                    }
-                }
-                std::thread::Builder::new()
-                    .name("rove-thumbs-prio-dispatch".into())
-                    .spawn(move || {
-                        let n = prio_txs.len().max(1);
-                        let mut rr = 0usize;
-                        let mut logged = 0usize;
-                        while let Ok(req) = prio_rx.recv() {
-                            if logged < 64 {
-                                crate::logv!(
-                                    "[thumb] prio dispatch {} size={}",
-                                    req.path.display(),
-                                    req.px_size
-                                );
-                                logged += 1;
-                            }
-                            let lane = rr % n;
-                            if let Err(e) = prio_txs[lane].send(req) {
-                                crate::logln!("[thumb] !! prio lane={lane} send FAILED: {e}");
-                            }
-                            rr += 1;
-                        }
-                        crate::logv!("[thumb] prio dispatcher loop ended");
-                    })
-                    .ok();
-            }
 
             // 1. 启动后台工作线程（数量自适应，见上方 num_threads 计算）。
             // 慢格式隔离（抄 Pulse 的 slow_cap=lanes-1）：
-            //   lane 0 永远只接「快格式」（图片/文件夹），作为图片的专属通道；
-            //   lane 1..n 承接「慢格式」（视频海报等），且慢格式在途数上限
-            //   slow_cap = num_threads-1，永远给图片留 1 条空闲线程，
-            //   避免滚到「图片+视频混排」文件夹时图片被视频卡死。
-            const FAST_LANE: usize = 0;
-            let slow_cap = num_threads - 1; // 始终 ≥ 1
-            let (slow_done_tx, slow_done_rx) = mpsc::channel::<()>();
+            //   慢格式（视频海报）在途数上限 slow_cap = num_threads-1，
+            //   且只派到 1..n 号车道 —— 0 号车道永远没有视频，
+            //   视频再多的文件夹也卡不住图片。
+            // 线程够多（>2）才给图片留一条专用车道；只有 2 条时留不起 ——
+            // 留了就等于「视频永远只有 1 条线程在解」（4 核机上实测就是这样，
+            // 一个视频文件夹变成一条线程单干）。
+            let reserved_fast = num_threads > 2;
+            let slow_cap = if reserved_fast {
+                num_threads - 1
+            } else {
+                num_threads
+            };
+            crate::logln!(
+                "[thumb] pool: cores={} threads={} slow_cap={} reserved_fast={}",
+                cores,
+                num_threads,
+                slow_cap,
+                reserved_fast,
+            );
+            // 车道负载：每条线程手上还有几个任务、其中几个是视频。
+            // 派发时挑**最闲**的一条：一屏图片会同时铺到所有线程上（以前快格式
+            // 固定走 0 号车道，一条线程单干、其余全闲着）。图片优先挑没有视频
+            // 压着的车道，避免排在一张视频后面；视频只在 1..n 里挑，
+            // 0 号车道因此永远没有视频，图片总有一条通道不被视频卡住。
+            let mut lane_load = vec![0usize; num_threads];
+            let mut lane_slow = vec![0usize; num_threads];
+            let (done_tx, done_rx) = mpsc::channel::<(usize, bool)>();
             for i in 0..num_threads {
                 let (tx, worker_rx) = mpsc::channel::<ThumbKey>();
                 worker_txs.push(tx);
-                let slow_done_tx = slow_done_tx.clone();
+                let done_tx = done_tx.clone();
                 let spawned = std::thread::Builder::new()
                     .name(format!("rove-thumb-worker-{i}"))
                     .spawn(move || {
@@ -2752,8 +2720,8 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>, prio_rx: mpsc::Receiver<Thum
                         while let Ok(key) = worker_rx.recv() {
                             let slow = crate::ops::thumbs::is_slow_thumbnail(&key.path);
                             thumb_decode_one("worker", i, key);
-                            if slow {
-                                let _ = slow_done_tx.send(());
+                            if done_tx.send((i, slow)).is_err() {
+                                break;
                             }
                         }
                         crate::logv!("[thumb] worker-{i} channel closed");
@@ -2763,46 +2731,123 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>, prio_rx: mpsc::Receiver<Thum
                     Err(e) => crate::logln!("[thumb] worker-{i} SPAWN FAILED: {e} (requests on this lane will be LOST)"),
                 }
             }
+            drop(done_tx);
 
-            // 2. 主分发循环：慢格式隔离 + 快格式优先 lane 0。
-            let mut rr = 0;
+            // 图片：打分 = 手上还有几个任务 + 其中几个是视频（视频慢，排在它后面
+            // 等于再等一张海报）。空车道总是先被填满，不会像以前那样全挤在 0 号；
+            // 但只要还有一条车道没在解视频，图片就不会去排视频的队。
+            let pick_fast = |load: &[usize], slow: &[usize]| -> usize {
+                load.iter()
+                    .enumerate()
+                    .min_by_key(|(l, n)| **n + slow[*l])
+                    .map_or(0, |(l, _)| l)
+            };
+            // 视频：有专用图片车道时只在 1..n 里挑，否则全线参与。
+            let pick_slow = |load: &[usize]| -> usize {
+                let skip = usize::from(reserved_fast);
+                load.iter()
+                    .enumerate()
+                    .skip(skip)
+                    .min_by_key(|(_, n)| **n)
+                    .map_or(skip, |(l, _)| l)
+            };
+            // 车道通道断了（该线程已死）时，把这条请求登记为失败：
+            // 留在 pending 里会让那一行永久空白且不再重试。
+            let report_lost = |key: ThumbKey| {
+                let _ = slint::invoke_from_event_loop(move || {
+                    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+                        return;
+                    };
+                    app.borrow_mut().fail_thumbnail(key);
+                });
+            };
+
+            // 2. 分发循环：队列里的顺序就是渲染顺序（见 `thumb_order_key`），
+            //    所有线程从同一条队列按序取活，谁闲谁上。
             let mut slow_in_flight = 0usize;
             // 慢格式在途已满时的暂存区（避免阻塞分发线程、饿死快格式）。
             let mut slow_stash: std::collections::VecDeque<ThumbKey> = Default::default();
             loop {
-                // 回收已完成的慢请求，腾出慢格式名额。
-                while let Ok(()) = slow_done_rx.try_recv() {
-                    slow_in_flight = slow_in_flight.saturating_sub(1);
+                // 回收已完成的任务：腾出慢格式名额、更新车道负载。
+                while let Ok((lane, slow)) = done_rx.try_recv() {
+                    retire_thumb_task(
+                        &mut lane_load,
+                        &mut lane_slow,
+                        &mut slow_in_flight,
+                        lane,
+                        slow,
+                    );
                 }
-                // 有空位就排空暂存。
+                // 有空位就排空暂存的视频任务。
                 while slow_in_flight < slow_cap {
-                    let Some(k) = slow_stash.pop_front() else { break };
-                    let lane = FAST_LANE + 1 + (rr % (num_threads - 1));
-                    rr += 1;
-                    let _ = worker_txs[lane].send(k);
-                    slow_in_flight += 1;
+                    let Some(k) = slow_stash.pop_front() else {
+                        break;
+                    };
+                    let lane = pick_slow(&lane_load);
+                    match worker_txs[lane].send(k) {
+                        Ok(()) => {
+                            lane_load[lane] += 1;
+                            lane_slow[lane] += 1;
+                            slow_in_flight += 1;
+                        }
+                        Err(e) => {
+                            crate::logln!("[thumb] !! slow lane={lane} send FAILED (worker dead)");
+                            report_lost(e.0);
+                        }
+                    }
+                }
+                // 视频名额已满、手上还压着排不进队的视频：此刻**不能**在 `rx`
+                // 上空等 50ms。该等的是「哪条线程空出来了」，而 `rx` 里往往没有
+                // 新请求（用户已停手，只剩队列里的存活）。空等的结果是每 50ms
+                // 才放进一条视频，一屏 117 个视频光派发就要 3.6s —— 表现就是
+                // 「跳过去先干等一两秒，然后一行行慢慢亮」。
+                if !slow_stash.is_empty() && slow_in_flight >= slow_cap {
+                    match done_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                        Ok((lane, slow)) => {
+                            retire_thumb_task(
+                                &mut lane_load,
+                                &mut lane_slow,
+                                &mut slow_in_flight,
+                                lane,
+                                slow,
+                            );
+                            continue;
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        // 所有 worker 都没了：退回下面的正常路径（派发会失败并登记）。
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+                    }
                 }
                 let req = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
                     Ok(r) => r,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 };
-                let slow = crate::ops::thumbs::is_slow_thumbnail(&req.path);
-                if slow {
+                if crate::ops::thumbs::is_slow_thumbnail(&req.path) {
                     if slow_in_flight < slow_cap {
-                        let lane = FAST_LANE + 1 + (rr % (num_threads - 1));
-                        rr += 1;
-                        if let Err(e) = worker_txs[lane].send(req) {
-                            crate::logln!("[thumb] !! slow lane={lane} send FAILED: {e}");
+                        let lane = pick_slow(&lane_load);
+                        match worker_txs[lane].send(req) {
+                            Ok(()) => {
+                                lane_load[lane] += 1;
+                                lane_slow[lane] += 1;
+                                slow_in_flight += 1;
+                            }
+                            Err(e) => {
+                                crate::logln!("[thumb] !! slow lane={lane} send FAILED (worker dead)");
+                                report_lost(e.0);
+                            }
                         }
-                        slow_in_flight += 1;
                     } else {
                         slow_stash.push_back(req);
                     }
                 } else {
-                    // 快格式：优先 lane 0（图片专属通道）。
-                    if let Err(e) = worker_txs[FAST_LANE].send(req) {
-                        crate::logln!("[thumb] !! fast lane send FAILED: {e}");
+                    let lane = pick_fast(&lane_load, &lane_slow);
+                    match worker_txs[lane].send(req) {
+                        Ok(()) => lane_load[lane] += 1,
+                        Err(e) => {
+                            crate::logln!("[thumb] !! fast lane={lane} send FAILED (worker dead)");
+                            report_lost(e.0);
+                        }
                     }
                 }
             }
@@ -2811,9 +2856,32 @@ fn spawn_thumb_worker(rx: mpsc::Receiver<ThumbKey>, prio_rx: mpsc::Receiver<Thum
         .ok();
 }
 
+/// 回收一条完成事件：更新车道负载与慢格式在途计数。
+///
+/// 单独成函数而不是闭包：闭包会把 `lane_load` 长期可借走，
+/// 导致同一条循环里的 `pick_slow(&lane_load)` 借不到。
+#[cfg(windows)]
+fn retire_thumb_task(
+    lane_load: &mut [usize],
+    lane_slow: &mut [usize],
+    slow_in_flight: &mut usize,
+    lane: usize,
+    slow: bool,
+) {
+    if let Some(n) = lane_load.get_mut(lane) {
+        *n = n.saturating_sub(1);
+    }
+    if slow {
+        *slow_in_flight = slow_in_flight.saturating_sub(1);
+        if let Some(n) = lane_slow.get_mut(lane) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
 /// 单个缩略图任务：解码 → （可选）落盘缓存 → 回主线程写内存 LRU。
 ///
-/// `tag` / `idx` 只用于日志区分是主池还是优先池的哪个线程。
+/// `tag` / `idx` 只用于日志区分是哪条 worker 线程。
 #[cfg(windows)]
 fn thumb_decode_one(tag: &str, idx: usize, key: ThumbKey) {
     // 每个工作线程只需在启动时初始化一次 COM (STA)，CoInitializeEx 是幂等的。
@@ -2826,22 +2894,11 @@ fn thumb_decode_one(tag: &str, idx: usize, key: ThumbKey) {
         key.path.display(),
         key.px_size
     );
-    // 优先池：取到的任务如果已经不在当前可视屏幕（用户滚走/跳走），
-    // 直接丢弃。连续快速跳转时，上一个屏幕剩下的几十条在库里被瞬间排空，
-    // 保证最新屏幕的请求总是最先解码。
-    if tag == "prio" && !thumb_is_wanted(&key) {
+    // 取到的任务如果已经不在当前窗口（用户滚走 / 跳走 / 换目录），直接丢弃：
+    // 跳过是一次哈希查找，比解码便宜几个数量级，连续快速跳转时旧请求会被瞬间排空。
+    if !thumb_is_wanted(&key) {
         crate::logv!("[thumb] {tag}-{idx} skip stale {}", key.path.display());
-        let _ = slint::invoke_from_event_loop(move || {
-            let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
-                return;
-            };
-            app.borrow_mut().cancel_thumbnail(key);
-        });
-        return;
-    }
-    // 普通池：这行已经被提到优先池了，跳过这一份以免重复解码。
-    if tag != "prio" && take_thumb_promoted(&key) {
-        crate::logv!("[thumb] {tag}-{idx} skip promoted {}", key.path.display());
+        note_thumb_skipped(key);
         return;
     }
     match crate::ops::thumbs::get_thumbnail_timed(&key.path, key.px_size) {
@@ -2918,7 +2975,6 @@ fn thumb_decode_one(tag: &str, idx: usize, key: ThumbKey) {
 }
 
 /// BGRA→RGBA 已由 thumbs 模块完成；这里包成 Slint 图像。
-#[allow(dead_code)]
 fn to_slint_image(w: u32, h: u32, rgba: &[u8]) -> Option<slint::Image> {
     if w == 0 || h == 0 || rgba.len() != (w * h * 4) as usize {
         return None;
@@ -3162,13 +3218,13 @@ mod tests {
         rows.sort_by_key(|r| thumb_order_key(*r, 0, 5));
         assert_eq!(rows, (0..13).collect::<Vec<usize>>());
 
-        // 滚到中间：屏幕 20..25，上方/下方缓冲都离屏幕近者先发，
-        // 但所有屏幕内的行都排在屏幕外之前。
+        // 滚到中间：屏幕 20..25 自上而下，然后下方 25..29 继续自上而下，
+        // 最后才是上方的行（自下而上）。
         let mut rows: Vec<usize> = (16..29).collect();
         rows.sort_by_key(|r| thumb_order_key(*r, 20, 25));
         assert_eq!(
             rows,
-            vec![20, 21, 22, 23, 24, 19, 25, 18, 26, 17, 27, 16, 28]
+            vec![20, 21, 22, 23, 24, 25, 26, 27, 28, 19, 18, 17, 16]
         );
 
         // 底部钳制：屏幕 8..12，只有一个上缓冲方向。
@@ -3177,7 +3233,7 @@ mod tests {
         assert_eq!(rows, vec![8, 9, 10, 11, 7, 6, 5, 4, 3]);
     }
 
-    /// 优先池「想要」集合：换一屏时旧 key 被丢弃，侧栏小图标不丢。
+    /// 「想要」集合：换一屏时旧 key 被丢弃，侧栏小图标不丢。
     #[test]
     fn publish_thumb_wanted_drops_stale_but_keeps_sidebar() {
         let k = |name: &str, px: u32| ThumbKey {
@@ -4155,10 +4211,10 @@ impl App {
                 let is_recycle = q.is_special();
                 #[cfg(windows)]
                 let icon_img = if is_recycle {
-                    self.thumb_for(Path::new("shell:RecycleBinFolder"), None, 0, SIDEBAR_ICON_PX, true)
+                    self.thumb_for(Path::new("shell:RecycleBinFolder"), None, 0, SIDEBAR_ICON_PX)
                         .0
                 } else {
-                    self.thumb_for(&_path, None, 0, SIDEBAR_ICON_PX, false).0
+                    self.thumb_for(&_path, None, 0, SIDEBAR_ICON_PX).0
                 };
                 #[cfg(not(windows))]
                 let icon_img = slint::Image::default();
@@ -4227,7 +4283,7 @@ impl App {
                         continue;
                     }
                     #[cfg(windows)]
-                    let icon_img = self.thumb_for(&path, None, 0, SIDEBAR_ICON_PX, false).0;
+                    let icon_img = self.thumb_for(&path, None, 0, SIDEBAR_ICON_PX).0;
                     #[cfg(not(windows))]
                     let icon_img = slint::Image::default();
 
@@ -4641,7 +4697,6 @@ impl App {
         mtime: Option<SystemTime>,
         file_size: u64,
         size: u32,
-        priority: bool,
     ) -> (slint::Image, u64) {
         let mtime_ms = mtime
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -4665,15 +4720,6 @@ impl App {
             return (img, epoch);
         }
 
-        // 从现在起真的要发请求了，才登记「想要」：屏幕内的 key 立刻进集合
-        // （worker 可能瞬间就取到任务，不能等到本轮行模型全部建完才发布），
-        // 同时留给本轮结束时整体替换。放在缓存命中之后是为了省掉已缓存行的
-        // 每帧两次 ThumbKey 克隆（各含一次 PathBuf 堆分配）和一次全局锁。
-        if priority {
-            self.prio_wanted.insert(key.clone());
-            thumb_want(&key);
-        }
-
         // 2. 负缓存命中：本会话内该图确实取不到，直接空白。
         if self.thumb_failed.contains(&key) {
             crate::logv!(
@@ -4684,16 +4730,21 @@ impl App {
             return (slint::Image::default(), 0);
         }
 
-        // 3. 已在 pending：**很可能正是「跳过去后要等好几秒」的病灶**。
+        // 从现在起就登记「想要」：key 立刻进集合（worker 可能瞬间就取到任务，
+        // 不能等到本轮行模型全部建完才发布），同时留给本轮结束时整体替换。
+        // 位置在缓存命中之后：已缓存的行没有在途请求，登记它只是白克隆一次 key。
+        // 位置在 pending 判定**之前**：上一帧排队中的行这一帧仍然属于窗口，
+        // 不登记就会被 worker 当成「已经滚走」跳过，白白重来一轮。
+        self.window_wanted.insert(key.clone());
+        thumb_want(&key);
+
+        // 3. 已在 pending：等它出图即可。
         //
-        // 这些行在上一帧是屏幕外的缓冲行，已经交给了普通池；用户一跳转，它们
-        // 变成了当前可见行，但 pending 去重会让它们继续排在主池后面（主池还压着
-        // 几百条缓冲行，且慢格式有并发上限），于是能看到「只有新发出的那几行
-        // 先出图，其余要等好几秒」。所以这里允许**从普通池提到优先池**。
+        // 不需要再"提到优先池"：只有一条队列，且 worker 取活前会查「想要」集合
+        // （见 `thumb_is_wanted`）——跳到新位置时，上一个位置残留的请求会被瞬间
+        // 跳过，本窗口的请求按入队顺序排在前面。滚回来的行如果曾被判定过期，
+        // 它也在本轮的「想要」集合里，40ms 轮询重建时会重新发。
         if self.thumb_pending.contains(&key) {
-            if priority {
-                self.promote_thumb(&key);
-            }
             return (slint::Image::default(), 0);
         }
 
@@ -4733,73 +4784,28 @@ impl App {
                 }
             }
 
-            // 磁盘未命中，发送给后台去解码。
-            // `priority` = 该行在**当前可见窗口**内，走独立优先池，
-            // 不排在主池几千个“已滚走”的任务后面。
-            if priority {
-                if self.thumb_prio_tx.send(key.clone()).is_err() {
-                    self.thumb_pending.remove(&key);
-                    self.thumb_failed.insert(key);
-                    crate::logln!("[thumb] !! prio channel closed");
-                }
-            } else {
-                // 普通池：登记排队时间，队列过长时把最早的（已滑出屏幕的）作废。
-                self.thumb_queued.push(key.clone());
-                if self.thumb_tx.send(key.clone()).is_err() {
-                    // 通道断开：不能把 key 永远留在 pending 里，否则该行永久空白。
-                    crate::logln!(
-                        "[thumb] !! send to worker channel FAILED {} size={}",
-                        path.display(),
-                        size
-                    );
-                    self.thumb_pending.remove(&key);
-                    self.thumb_failed.insert(key);
-                }
+            // 磁盘未命中，发送给后台去解码。全体请求一条队列，
+            // 顺序 = `thumb_order_key` 的三段式（可见自上而下 → 下方自上而下 → 上方自下而上）。
+            if self.thumb_tx.send(key.clone()).is_err() {
+                // 通道断开：不能把 key 永远留在 pending 里，否则该行永久空白。
+                crate::logln!(
+                    "[thumb] !! send to worker channel FAILED {} size={}",
+                    path.display(),
+                    size
+                );
+                self.thumb_pending.remove(&key);
+                self.thumb_failed.insert(key);
             }
             // 缩略图诊断（ROVE_LOG=1）：本窗口前 24 条「真的发出去了」的请求。
             // 顺序 = `[thumb] window ... order=[...]` 里的顺序。
             if self.thumb_diag_left > 0 {
                 self.thumb_diag_left -= 1;
-                crate::logv!(
-                    "[thumb] send {} size={} {}",
-                    if priority { "prio" } else { "main" },
-                    size,
-                    path.display()
-                );
+                crate::logv!("[thumb] send size={} {}", size, path.display());
             }
         }
         // 未在 pending 时的收尾：不记日志。此处在热路径上（每行每次刷新都会调用），
         // 1538 张图加载期间可达 6 万行、占日志 79%。
         (slint::Image::default(), 0)
-    }
-
-    /// 把一条已经在普通池里的任务提到优先池（行从缓冲变成屏幕内时用）。
-    fn promote_thumb(&mut self, key: &ThumbKey) {
-        if self.thumb_promoted.contains(key) {
-            return;
-        }
-        // 还在普通池的待发队列里：直接摘下来改投优先池，不会重复解码。
-        if let Some(pos) = self.thumb_queued.iter().position(|k| k == key) {
-            self.thumb_queued.remove(pos);
-        } else {
-            // 已经派给普通池了（可能卡在慢格式暂存里）：让普通池那份作废。
-            mark_thumb_promoted(key);
-        }
-        if self.thumb_prio_tx.send(key.clone()).is_err() {
-            // 优先池已关闭（收尾阶段）：不能把 key 留在 pending 里，
-            // 否则这一行以后永远空白。清掉，下一轮重建会重新请求。
-            self.thumb_pending.remove(key);
-            return;
-        }
-        self.thumb_promoted.insert(key.clone());
-        self.thumb_promote_n += 1;
-        if self.thumb_promote_n >= 8
-            || self.thumb_cancel_t.elapsed() >= std::time::Duration::from_secs(1)
-        {
-            let n = std::mem::take(&mut self.thumb_promote_n);
-            self.thumb_cancel_t = std::time::Instant::now();
-            crate::logv!("[thumb] promoted {n} pending rows from main pool to prio");
-        }
     }
 
     /// 写入 LRU 缓存（内存），按字节预算 + 项数双上限淘汰。
@@ -4851,7 +4857,6 @@ impl App {
         _mtime: Option<SystemTime>,
         _file_size: u64,
         _size: u32,
-        _priority: bool,
     ) -> (slint::Image, u64) {
         (slint::Image::default(), 0)
     }
@@ -4878,9 +4883,7 @@ impl App {
     }
 
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
-    #[allow(dead_code)]
     fn fail_thumbnail(&mut self, key: ThumbKey) {
-        self.thumb_promoted.remove(&key);
         // 诊断（ROVE_LOG=1）：到图（含失败）顺序，与 send 顺序对照就能看出
         // 哪几行是最后才被解出来的。
         self.log_thumb_got("FAIL", &key.path, key.px_size);
@@ -4890,14 +4893,15 @@ impl App {
             key.px_size
         );
         self.thumb_pending.remove(&key);
-        self.thumb_queued.retain(|k| k != &key);
         self.thumb_failed.insert(key);
+        // 负缓存已经挡住后续请求，这一行不会再自己变；立刻重画一次，
+        // 否则它会一直空着直到下次窗口尺寸/排序变化。
+        self.thumb_needs_refresh = true;
     }
 
-    /// 优先池丢弃了一条已过期（用户已滚走/跳走）的请求：
+    /// worker 丢弃了一条已过期（用户已滚走/跳走）的请求：
     /// 只把 key 从 pending 里拿出来（滚回来时会重新请求），**不进负缓存**。
     fn cancel_thumbnail(&mut self, key: ThumbKey) {
-        self.thumb_promoted.remove(&key);
         self.thumb_pending.remove(&key);
         // 万一用户又滚回来了，下一轮 40ms 轮询重建行时会重新发请求。
         self.thumb_needs_refresh = true;
@@ -4908,17 +4912,14 @@ impl App {
             let n = self.thumb_cancel_n;
             self.thumb_cancel_n = 0;
             self.thumb_cancel_t = std::time::Instant::now();
-            crate::logv!("[thumb] cancelled {n} stale prio requests (scrolled away)");
+            crate::logv!("[thumb] cancelled {n} stale requests (scrolled away)");
         }
     }
 
     /// 写入缩略图缓存（事件循环线程）：只打批量刷新标记，由 poll_timer 统一刷新。
-    #[allow(dead_code)]
     fn store_thumbnail(&mut self, key: ThumbKey, img: slint::Image) {
-        self.thumb_promoted.remove(&key);
         self.log_thumb_got("ok", &key.path, key.px_size);
         self.thumb_pending.remove(&key);
-        self.thumb_queued.retain(|k| k != &key);
         let is_sidebar_icon = key.px_size == SIDEBAR_ICON_PX;
         self.insert_thumb_cache(key, img);
         // 核心修复：不再每次 store 都全量 refresh，只置位，由主线程 40ms 批量刷新。
@@ -4937,29 +4938,6 @@ impl App {
         self.thumb_diag_got += 1;
         let n = self.thumb_diag_got;
         crate::logv!("[thumb] got#{n} {tag} size={px} {}", path.display());
-    }
-
-    /// 丢弃普通池里排得太老的请求（从队首开始，即最早发出的）。
-    ///
-    /// 不丢的话，每滑过一个位置就塞 60 个新请求，队列只增不减；用户突然
-    /// 滑到中间时，他要的那一屏就排在上百个已经滑走的请求之后。
-    /// 最多保留 `keep` 个；被丢弃的不算失败，滑回去会重新请求。
-    ///
-    /// 返回实际丢弃的个数。
-    fn drop_stale_thumb_requests(&mut self, keep: usize) -> usize {
-        let mut dropped = 0;
-        while self.thumb_queued.len() > keep {
-            let key = self.thumb_queued.remove(0);
-            // 已经在解的（缓存里已有图）不能动，只删还没出图的。
-            if self.thumb_cache.contains_key(&key) {
-                continue;
-            }
-            self.thumb_pending.remove(&key);
-            // 这一行之后再变成可见行时需要能重新“提升”，所以把提升标记一并清掉。
-            self.thumb_promoted.remove(&key);
-            dropped += 1;
-        }
-        dropped
     }
 
     /// 当前列表几何（用于检测布局落定 / 窗口尺寸变化）。
@@ -5146,21 +5124,9 @@ impl App {
 
         let (first0, count0) = pane_view_range(total0, cells_per_row, row_h, rows_visible, scroll0);
 
-        // 丢弃排队太久、可能已滑出屏幕的缩略图请求，避免队列无限增长：
-        // 每滑过一个位置就塞 60 个新请求，不丢的话越滑越多，用户突然滑到
-        // 中间时就只能排在上百个已滑走的请求之后（表现：依然从顶部慢慢出图）。
-        // 保留量 = 当前可视窗口的条目数（含 overscan）的 2 倍，留一屏余量。
-        let stale_dropped = self.drop_stale_thumb_requests(count0.max(60) * 2);
-        if stale_dropped > 0 {
-            crate::logv!(
-                "[thumb] dropped {stale_dropped} stale requests (queued={})",
-                self.thumb_queued.len()
-            );
-        }
-
         // 左栏始终绑定 pane 0
         // 先清空「想要」集合：本轮两个分屏的屏幕内容都进去，最后一起发布。
-        self.prio_wanted.clear();
+        self.window_wanted.clear();
         let batch0 =
             self.build_rows_for_pane(self.state.active_tab, 0, first0, count0, list_height);
         let rows0 = &batch0.rows;
@@ -5392,8 +5358,8 @@ impl App {
         #[cfg(windows)]
         autofit_column_widths_if_needed(self);
 
-        // 发布本轮可视屏幕的 key 集合：优先池里不属于「现在这一屏」的旧请求会被丢弃。
-        publish_thumb_wanted(std::mem::take(&mut self.prio_wanted));
+        // 发布本轮窗口的 key 集合：worker 取到不属于「现在这一屏」的旧请求时直接跳过。
+        publish_thumb_wanted(std::mem::take(&mut self.window_wanted));
 
         // 记下两栏本帧真正写进行模型的窗口：滚动回调据此判断“窗口没变，不必重建”。
         self.visible_cache = Some((first0, count0));
@@ -6031,29 +5997,28 @@ impl App {
         //
         // 病灶：可视窗口 = 可视行 + 2*OVERSCAN（icons-xl 下 5 列，约 100 个条目）。
         // 按索引顺序发时，先发的是窗口**顶部**那一批（含上方缓冲）；而旧窗口
-        // 已经往主池排过成千上万个已滚走的任务，新请求只能排在它们后面，于是
+        // 已经排过成千上万个已滚走的任务，新请求只能排在它们后面，于是
         // 看到的是「从顶部一个个慢慢加载」。曾经用「按离视口中心距离」排序解决：
         // 中心先出图（跳转到中间时整屏同时出现）；但滚动条在顶部时“中心”就是
         // 第 3/4 行，于是第 1/2 行反而最后才出图（用户看到的就是“从第 3 行开始渲染”）。
         //
         // 现在的规则同时兼顾两件事：
-        // 1. **屏幕内的行**（不含 overscan）走优先池，且自上而下——顶部时第一行
+        // 1. **屏幕内的行**（不含 overscan）永远排最前，且自上而下——顶部时第一行
         //    第一个出图；
-        // 2. **屏幕外的缓冲行**按离屏幕的距离由近到远，永远排在屏幕内之后——
-        //    突然滚到中间时依旧先把眼前这一屏填满，不会去凑已滚走的旧窗口。
+        // 2. 屏幕**下方**的缓冲行自上而下、屏幕**上方**的缓冲行自下而上，
+        //    都排在屏幕内之后——突然滚到中间时依旧先把眼前这一屏填满。
         //
         // 注意：可见区间必须用**条目下标**算，不能用 `scroll / row_h`。
         // `scroll_y` 不是按行高换算的像素值（图标视图里两者不同步），
-        // 除出来会得到一个偏离真实位置的行号，结果优先池永远收不到任务。
+        // 除出来会得到一个偏离真实位置的行号，结果屏幕区间永远算错。
         // `first` 是本帧窗口的**首个条目下标**，但它包含了上方 OVERSCAN 行缓冲
         // （见 pane_view_range：`first_row = scroll/row_h - OVERSCAN`）。
         // 真实屏幕的首项要跳过「实际存在的」上方缓冲行。
         //
         // 关键修复：窗口在顶部时 pane_view_range 会把 first_row clamp 到 0，
         // 此时 first 已经是屏幕首行、**没有任何上方缓冲**。以前这里无条件
-        // 跳过 OVERSCAN(=4) 行，等于把屏幕最前 4 行排除出优先池，只能排普通
-        // 池（还会被 drop_stale_thumb_requests 优先丢掉）——表现就是「滚动条在
-        // 开头，缩略图却从第 4 行才开始渲染」。改为按 clamp 前的行数算实际缓冲。
+        // 跳过 OVERSCAN(=4) 行，等于把屏幕最前 4 行算成了缓冲行 —— 表现就是
+        // 「滚动条在开头，缩略图却从第 4 行才开始渲染」。改为按 clamp 前的行数算实际缓冲。
         let row_h = if self.ui.get_row_height_out() > 0.0 {
             self.ui.get_row_height_out()
         } else {
@@ -6066,8 +6031,8 @@ impl App {
         // 真实屏幕覆盖的行数＝**与视口相交**的行数，不是 `ceil(视口高/行高)`。
         // 滚动位置几乎从不对齐行高：比如 scroll=6429.5、row_h=144、视口 659 →
         // 顶行 44.65、底边 49.23，屏幕上能看到第 44–49 共 6 行（首尾各被截一半）。
-        // 用 ceil(659/144)=5 会让**最底下那半行**（第 49 行）落进缓冲区，被扔进
-        // 普通池——表现就是“整屏很快就出来了，就最底下那行要等好几秒”。
+        // 用 ceil(659/144)=5 会让**最底下那半行**（第 49 行）落进缓冲区，
+        // 排到整屏之后——表现就是“整屏很快就出来了，就最底下那行要等好几秒”。
         let visible_rows = visible_row_count(scroll, list_height, row_h);
         let raw_first_row = (scroll / row_h).floor() as isize - OVERSCAN as isize;
         let effective_above = if raw_first_row < 0 {
@@ -6079,7 +6044,7 @@ impl App {
         let screen_first = (first + effective_above * cells_per_row).min(first + count);
         // 至少保证一个格子落在「屏幕内」：滚到底时 scroll_y 可能超过内容高度，
         // 这时 screen_first 已被夹到 first+count，若不再兜底，屏幕区间会是空的，
-        // 整屏都跑到普通池里去（旧代码就存在这个隐患）。
+        // 整屏都会被当成缓冲行（旧代码就存在这个隐患）。
         let screen_last = (screen_first + visible_rows * cells_per_row)
             .min(first + count)
             .max((screen_first + 1).min(first + count));
@@ -6133,7 +6098,7 @@ impl App {
             )
         });
         // 缩略图诊断（ROVE_LOG=1）：窗口一变就打印一次「这一帧按什么顺序发请求」。
-        // `prio` = 屏幕内（走优先池，先出图），`main` = 屏幕外缓冲行（普通池）。
+        // `vis` = 屏幕内行，`buf` = 屏幕外缓冲行。
         // 想确认「顶部时是不是先出第 3/4 行」，看这里的序号顺序即可。
         let diag_sig = (mode.clone(), pane_index, first, count, cells_per_row);
         if self.thumb_diag_sig.as_ref() != Some(&diag_sig) {
@@ -6146,15 +6111,15 @@ impl App {
                 .map(|p| {
                     let i = p.index.max(0) as usize;
                     let tag = if p.index >= core_first as i32 && i < core_last {
-                        "prio"
+                        "vis"
                     } else {
-                        "main"
+                        "buf"
                     };
                     format!("{i}:{tag}")
                 })
                 .collect();
             logv!(
-                "[thumb] window mode={} pane={} first={} count={} rows={} cells={} rows_vis={} row_h={:.1} scroll={:.1} above={} screen=[{},{}) screen_rows=[{},{}) | cache={} pending={} queued={} failed={} | order={:?}",
+                "[thumb] window mode={} pane={} first={} count={} rows={} cells={} rows_vis={} row_h={:.1} scroll={:.1} above={} screen=[{},{}) screen_rows=[{},{}) | cache={} pending={} skipped={} failed={} | order={:?}",
                 mode,
                 pane_index,
                 first,
@@ -6171,7 +6136,7 @@ impl App {
                 screen_row_last,
                 self.thumb_cache.len(),
                 self.thumb_pending.len(),
-                self.thumb_queued.len(),
+                thumb_skipped().lock().map(|v| v.len()).unwrap_or(0),
                 self.thumb_failed.len(),
                 head,
             );
@@ -6180,9 +6145,8 @@ impl App {
         let rows: Vec<FileRow> = ordered
             .into_iter()
             .map(|p| {
-                let in_core = p.index >= core_first as i32 && (p.index as usize) < core_last;
                 let (thumb, thumb_epoch) =
-                    self.thumb_for(&p.thumb_path, p.modified, p.size, thumb_px, in_core);
+                    self.thumb_for(&p.thumb_path, p.modified, p.size, thumb_px);
                 // 同一批条目每次重建都会重新格式化一遍（`format_local` 里有
                 // Win32 的时区换算），走记忆表；指纹复用同一份结果，避免第二次格式化。
                 let modified_text = self.time_text(p.modified);
@@ -7324,7 +7288,7 @@ fn cell_metrics(ui: &MainWindow) -> (f32, f32) {
 /// 与视口**相交**的行数（首尾被截一半的行也算一行）。
 ///
 /// 不能用 `ceil(视口高/行高)`：滚动位置几乎从不对齐行高，那样会漏掉
-/// 视口底部那半行，让它在缩略图调度里被当成缓冲区（扔进普通池排队）。
+/// 视口底部那半行，让它在缩略图调度里被当成缓冲区（排到整屏之后）。
 fn visible_row_count(scroll: f32, list_height: f32, row_h: f32) -> usize {
     if row_h <= 0.0 {
         return 1;
@@ -7354,19 +7318,23 @@ fn pane_view_range(
     (first, count)
 }
 
-/// 缩略图请求顺序（键越小越先发）：
+/// 缩略图请求顺序（键越小越先发），严格三段：
 ///
-/// - 屏幕内的行（`[screen_row_first, screen_row_last)`）键为 `(0, 行 - 屏幕首行)`，
-///   即**自上而下**；
-/// - 屏幕外的缓冲行键为 `(1, 离屏幕的距离)`，永远排在屏幕内之后，
-///   这样突然滚到中间时优先填满眼前这一屏，而不是去凑已滚走的旧窗口。
+/// 1. 屏幕内的行（`[screen_row_first, screen_row_last)`）：**自上而下**，永远第一优先；
+/// 2. 屏幕下方还没渲染的行：自**上**而下（越靠近屏幕越先）；
+/// 3. 屏幕上方还没渲染的行：自**下**而上（越靠近屏幕越先）。
+///
+/// 为什么不按「离屏幕远近交替」发：那样上下两侧会同时出图，用户往下滚时看到
+/// 的是「上下两头发力」的乱序；而列表的自然阅读方向是自上而下，下方先铺满才
+/// 符合预期。上方留到最后，是因为它只在用户往回滚时才需要，那时会重新排序
+/// 成「屏幕内」，优先级自然就上去了。
 fn thumb_order_key(row: usize, screen_row_first: usize, screen_row_last: usize) -> (i64, i64) {
     if row >= screen_row_first && row < screen_row_last {
         (0, (row - screen_row_first) as i64)
-    } else if row < screen_row_first {
-        (1, (screen_row_first - row) as i64)
+    } else if row >= screen_row_last {
+        (1, (row - screen_row_last) as i64)
     } else {
-        (1, (row - screen_row_last + 1) as i64)
+        (2, (screen_row_first - 1 - row) as i64)
     }
 }
 
@@ -11772,6 +11740,28 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                     }
                 }
 
+                // 被 worker 判定过期而跳过的请求：在这里一次性从 pending 里摘掉。
+                // 留着会让滚回来的行以为「还在解」而不再发请求（永久空白）。
+                let skipped = take_thumb_skipped();
+                let skip_overflow =
+                    THUMB_SKIP_OVERFLOW.swap(false, std::sync::atomic::Ordering::AcqRel);
+                if !skipped.is_empty() {
+                    for k in skipped {
+                        app.cancel_thumbnail(k);
+                    }
+                }
+                if skip_overflow {
+                    // 兜底：批次被丢过，逐个 key 清已经不可靠 —— 直接按「当前窗口」
+                    // 重建 pending（不在窗口里的都不算在解，滚回来会重新发请求）。
+                    let wanted = thumb_wanted()
+                        .lock()
+                        .map(|w| w.clone())
+                        .unwrap_or_default();
+                    app.thumb_pending
+                        .retain(|k| k.px_size == SIDEBAR_ICON_PX || wanted.contains(k));
+                    app.thumb_needs_refresh = true;
+                    logln!("[thumb] !! 跳过批次溢出，按窗口重建 pending");
+                }
                 // 核心修复：缩略图批量到达后，统一在主线程刷新一次，避免 653 张
                 // 连续 store 触发 653 次全量行重建导致掉帧。
                 if app.thumb_needs_refresh {
@@ -15516,11 +15506,10 @@ fn create_session(
 
     // 缩略图 worker：路径 → 生成缩略图 → 回事件循环写缓存。
     let (thumb_tx, thumb_rx) = mpsc::channel::<ThumbKey>();
-    let (thumb_prio_tx, thumb_prio_rx) = mpsc::channel::<ThumbKey>();
     #[cfg(windows)]
-    spawn_thumb_worker(thumb_rx, thumb_prio_rx);
+    spawn_thumb_worker(thumb_rx);
     #[cfg(not(windows))]
-    drop((thumb_rx, thumb_prio_rx));
+    drop(thumb_rx);
 
     // 文件夹体积统计 worker：逐个递归计算目录大小，算完一个回传一个。
     let (dir_size_tx, dir_size_worker_rx) = mpsc::channel::<DirSizeRequest>();
@@ -15539,7 +15528,6 @@ fn create_session(
         deep_tx,
         deep_rx,
         thumb_tx,
-        thumb_prio_tx,
         dir_size_tx,
         dir_size_rx,
         watch_tx,
