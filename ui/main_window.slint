@@ -1268,6 +1268,8 @@ out property <length> row-height-out: file-list.row-height-out;
                     file-list := FileList {
                         width: 100%;
                         height: 100%;
+                        // 分屏时左栅右边是分隔线（不是缩放热区）→ 保持紧凑的 2px。
+                        edge-inset: root.is-split ? 2px : 7px;
                         visible: true;
                         rows: root.file-rows;
                     expand-index: root.file-expand-index;
@@ -1418,6 +1420,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     file-list-right := FileList {
                         width: 100%;
                         height: 100%;
+                        edge-inset: 7px;
                         rows: root.file-rows-right;
                         expand-index: root.file-expand-index-right;
                         rename-row: root.rename-pane == 1 ? root.file-rename-row : -1;

@@ -263,7 +263,8 @@ component SettingsScrollContainer inherits Rectangle {
 
     // ---- 自绘垂直滚动条（完全移植自 file_list.slint，位置/尺寸/动画/色彩 100% 对齐） ----
     scrollbar := Rectangle {
-        x: parent.width - self.width - 2px;
+        // 与 file_list 一致：让开窗口右侧 6px 缩放热区（贴边会被判成缩放边界）。
+        x: parent.width - self.width - 7px;
         y: 2px;
         width: 8px;
         height: parent.height - 4px;

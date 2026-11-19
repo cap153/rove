@@ -521,6 +521,12 @@ export component FileList inherits Rectangle {
     /// 拖选期间抓住鼠标，行内 TouchArea 收不到事件，重命名输入框的
     /// 「拖选贴边自动滚动」只能从这里拿按下状态。
     in property <bool> mouse-left-pressed: false;
+    /// 滚动条离**本栅**右边界的距离。
+    ///
+    /// 窗口最右边（未分屏的左栅、右栅、设置页）必须让开窗口右侧 6px 的缩放热区
+    /// —— 贴边时鼠标停在滑块上会变成「调整大小」双箭头、按下是缩放窗口。
+    /// 被分隔线夹在中间的那一栅没有这个问题，保持 2px 的紧凑观感（用户偏好）。
+    in property <length> edge-inset: 7px;
     /// 用户拖动列边界结束（或双击自适应）后上报，由 Rust 按当前目录落盘。
     /// `name-w` = 松手瞬间名称列的**显示宽**（自适应时是视口剩余宽，不是 w-name）。
     /// 名称列宽度只能由 Rust 连同 auto 开关一起原子提交，原因见 record_col_width。
@@ -2048,8 +2054,10 @@ export component FileList inherits Rectangle {
     // ---- 自绘横向滚动条（仅在详细/列表视图溢出时出现，图标视图永久禁用） ----
     hscrollbar := Rectangle {
     x: 2px;
+    // 底部保持贴边 2px：下面有状态栏托着，碰不到窗口底边的缩放热区。
     y: parent.height - self.height - 2px;
-    width: parent.width - (scrollbar.visible ? 10px : 0px) - 4px;
+    // 右边让开竖向滚动条占的（边距 + 8px 宽度），保持 2px 间隙。
+    width: parent.width - (scrollbar.visible ? (root.edge-inset + 8px) : 0px) - 4px;
     height: 8px;
     visible: !root.is-icons-view && flick.content-width > flick.width + 1px;
 
@@ -2097,7 +2105,7 @@ export component FileList inherits Rectangle {
 
     // ---- 自绘垂直滚动条（现代浮动呼吸胶囊，绝不消失） ----
     scrollbar := Rectangle {
-        x: parent.width - self.width - 2px;
+        x: parent.width - self.width - root.edge-inset;
         // 核心修复：轨道必须精确覆盖 Flickable 视口（即表头下沿到列表底部），
         // 不能用整个 root 高度。否则轨道顶部伸进 30px 表头区，
         // 滑块在顶部时压住表头、且滑块长度按多 30px 的轨道换算而偏长。
