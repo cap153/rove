@@ -12484,10 +12484,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     {
         // 诊断：地址栏面包屑流几何。窄窗口出现“地址栏空白”时，看这三个数就知道
         // 是内容宽度算错（content_w <= view_w 但 n > 0 仍看不到）、还是偏移越界。
-        upgrade().on_crumb_dbg(move |view_w, content_w, content_x, n| {
+        upgrade().on_crumb_dbg(move |view_w, content_w, content_x, n, pref_w| {
             logv!(
-                "[crumb] n={} view={:.1} content={:.1} x={:.1}",
-                n, view_w, content_w, content_x
+                "[crumb] n={} view={:.1} content={:.1} x={:.1} pref={:.1}",
+                n, view_w, content_w, content_x, pref_w
             );
         });
     }

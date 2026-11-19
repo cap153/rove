@@ -432,7 +432,7 @@ out property <length> row-height-out: file-list.row-height-out;
     callback breadcrumb_clicked(path: string);
     callback path_edit_committed(path: string);
     /// 诊断：地址栏面包屑流量几何（视口 / 内容 / 偏移 / 段数）。
-    callback crumb_dbg(view_w: length, content_w: length, content_x: length, n: int);
+    callback crumb_dbg(view_w: length, content_w: length, content_x: length, n: int, pref_w: length);
     /// 面包屑每段的窗口逻辑几何（拖动落点判定用）。
     /// Slint 的 public function 访问不到 `for` 循环里的元素 id，只能由段自己上报。
     callback crumb_rect(index: int, x: length, y: length, w: length, h: length);
@@ -803,22 +803,47 @@ out property <length> row-height-out: file-list.row-height-out;
                         private property <[BreadcrumbSegment]> breadcrumbs-watch: root.breadcrumbs;
                         private property <bool> scroll-end-pending: true;
                         private property <int> scroll-end-tries: 0;
+                        // 「布局停稳」判定：content-width 连续两档不变才算定。
+                        //
+                        // 旧实现拿「content-width」和「刚算出来的 want」比，一致就收工——
+                        // 但两者可以**同时**是上一帧的旧值：旧 == 旧，于是刚置上的待办
+                        // 立刻被当成「已经到位」清掉，那一帧滚的还是上一次的目标。
+                        // 日志里的表现很直观（每次导航只滚到上一次的位置）：
+                        //   n=9  content=522 x=-104.7  ← 正确（(522-418)）
+                        //   n=10 content=581 x=-103.7  ← 还是 n=9 的目标
+                        //   n=11 content=643 x=-162.7  ← 还是 n=10 的目标
+                        // 最后一段永远差一截，且定时器一次都没跑过（说明是提前收工的）。
+                        private property <length> last-content-w: -1px;
+                        private property <int> stable-ticks: 0;
 
-                        /// 滚到最右；布局还没落定就留着待办标记。
+                        /// 滚到最右；布局没停稳就留着待办标记，下一档再来。
                         function apply-scroll-end() {
-                            // 与上面的 content-width 绑定保持一致：这是布局落定后
-                            // 应该得到的值。两者不同说明这一帧的布局还是旧的。
-                            let want = max(crumbs-layout.preferred-width + 24px, crumbs-flick.width);
                             crumbs-flick.content-x = min(0px, crumbs-flick.width - crumbs-flick.content-width);
-                            if (abs(crumbs-flick.content-width - want) <= 1px || crumbs-flick.scroll-end-tries > 20) {
+                            crumbs-flick.scroll-end-tries += 1;
+                            if (abs(crumbs-flick.content-width - crumbs-flick.last-content-w) <= 1px) {
+                                crumbs-flick.stable-ticks += 1;
+                            } else {
+                                crumbs-flick.stable-ticks = 0;
+                            }
+                            crumbs-flick.last-content-w = crumbs-flick.content-width;
+                            if (crumbs-flick.stable-ticks >= 2 || crumbs-flick.scroll-end-tries > 30) {
                                 crumbs-flick.scroll-end-pending = false;
                                 crumbs-flick.scroll-end-tries = 0;
-                            } else {
-                                crumbs-flick.scroll-end-tries += 1;
                             }
                         }
 
                         changed breadcrumbs-watch => {
+                            // 先无条件报一次：这条不出现 = 新面包屑没进到 UI
+                            // （或 `changed` 没触发），出现了但 pref 没变 = 宽度算错。
+                            root.crumb_dbg(
+                                crumbs-flick.width,
+                                crumbs-flick.content-width,
+                                crumbs-flick.content-x,
+                                root.breadcrumbs.length,
+                                crumbs-layout.preferred-width,
+                            );
+                            crumbs-flick.last-content-w = -1px;
+                            crumbs-flick.stable-ticks = 0;
                             crumbs-flick.scroll-end-pending = true;
                             crumbs-flick.scroll-end-tries = 0;
                         }
@@ -848,6 +873,7 @@ out property <length> row-height-out: file-list.row-height-out;
                                     crumbs-flick.content-width,
                                     crumbs-flick.content-x,
                                     root.breadcrumbs.length,
+                                    crumbs-layout.preferred-width,
                                 );
                             }
                         }
