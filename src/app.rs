@@ -14347,25 +14347,30 @@ fn bind_ipc_server() -> bool {
     })
 }
 
-/// 等某个进程结束（最多 `timeout`）。进程已经不在了就立即返回。
+/// 等目标进程真的退出（最多 `timeout`）。返回 `true` = 已退出
+/// （拿不到句柄也算，说明它已经不在了）。
 #[cfg(windows)]
-fn wait_for_pid_exit(pid: u32, timeout: Duration) {
-    use windows_sys::Win32::Foundation::CloseHandle;
+fn wait_for_pid_exit(pid: u32, timeout: Duration) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
     use windows_sys::Win32::System::Threading::{
         OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
     };
     unsafe {
         let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
         if handle.is_null() {
-            return;
+            return true;
         }
-        WaitForSingleObject(handle, timeout.as_millis().min(u32::MAX as u128) as u32);
+        let waited =
+            WaitForSingleObject(handle, timeout.as_millis().min(u32::MAX as u128) as u32);
         CloseHandle(handle);
+        waited == WAIT_OBJECT_0
     }
 }
 
 #[cfg(not(windows))]
-fn wait_for_pid_exit(_pid: u32, _timeout: Duration) {}
+fn wait_for_pid_exit(_pid: u32, _timeout: Duration) -> bool {
+    true
+}
 
 /// 静默重启的交接标记文件（`%LOCALAPPDATA%\Rove\restart.ok`）。
 fn restart_marker_path() -> PathBuf {
@@ -15084,9 +15089,16 @@ pub fn run() {
             logal!("--await-pipe: 写交接标记失败 {e}");
         }
         if let Some(pid) = await_pid {
-            wait_for_pid_exit(pid, Duration::from_secs(15));
+            // 只等 3 秒：老进程正常会在 ~100 ms 内退出（`restart_handoff` 每 100 ms
+            // 看一次交接标记），只有它自己卡在退出里才需要等满。等太久的表现就是
+            // 托盘图标长时间空窗 —— 而抢管道只是**探测**，抢不到也能降级跑，不必陪等。
+            if !wait_for_pid_exit(pid, Duration::from_secs(3)) {
+                logal!("--await-pipe: 老进程 pid={pid} 3 秒内没退出，先往下走（IPC 可能抢不到）");
+            }
         }
-        for _ in 0..100 {
+        // 3 秒（30 × 100 ms）：抢管道是每次重开一个实例去试，失败不破坏任何东西，
+        // 老进程真死了下一次就成；10 秒只是把托盘空窗拖长。
+        for _ in 0..30 {
             bound = bind_ipc_server();
             if bound {
                 break;
