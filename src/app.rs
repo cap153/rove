@@ -14463,13 +14463,26 @@ pub fn start_ui_watchdog() {
         .spawn(|| {
             let mut stalled_for = 0u64;
             let mut reported = false;
+            let mut no_beat_reported = false;
+            // 首次观察到「会话已存在」的时刻，用于给心跳留出安装时间。
+            let mut session_seen: Option<u64> = None;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 let beat = UI_BEAT_MS.load(std::sync::atomic::Ordering::Acquire);
                 if beat == 0 {
                     // 心跳还没装（会话未创建），不算卡。
+                    // 但如果会话已经存在 8 秒仍然一次心跳都没有，说明事件循环压根没在转：
+                    // 此时托盘点击会被投递进去、然后永远没人处理（表现就是「点了没反应」）。
+                    if SESSION_ALIVE.load(std::sync::atomic::Ordering::Acquire) {
+                        let seen = *session_seen.get_or_insert_with(proc_ms);
+                        if proc_ms().saturating_sub(seen) > 8000 && !no_beat_reported {
+                            no_beat_reported = true;
+                            crate::logal!("[watchdog] !! UI 心跳从未开始（事件循环没在跑）");
+                        }
+                    }
                     continue;
                 }
+                session_seen = None;
                 let lag = proc_ms().saturating_sub(beat);
                 if lag > 5000 {
                     // 每多卡 30 秒再记一条：`reported` 只表示「上一档已经记过」。
@@ -15123,9 +15136,11 @@ pub fn run() {
     });
 
     // 守护托盘：UI 销毁后的常驻入口（打开/退出）。
-    // 托盘句柄保活至进程结束，drop 即移除图标。
+    // 托盘图标必须在**自己的线程**上创建：它的右键菜单用的是模态
+    // `TrackPopupMenu`，跑在拥有图标窗口的那个线程里 —— 放在 UI 线程上，
+    // 菜单一弹就会冻住整个 Slint 事件循环（见 tray::spawn 的注释）。
     #[cfg(windows)]
-    let _tray = crate::tray::create();
+    crate::tray::spawn();
 
     // UI 卡死留证据：心跳 + 看门狗（先装定时器再装看门狗）。
     install_ui_heartbeat();
@@ -15835,10 +15850,11 @@ fn install_shell_select_sink() {
 pub fn wake_session(request: crate::daemon::WakeRequest) {
     let existing = SESSION.with(|slot| slot.borrow().clone());
     logv!(
-        "[wake] 会话已存在={} new_tab={} path={:?}",
+        "[wake] 会话已存在={} new_tab={} path={:?} (pid={})",
         existing.is_some(),
         request.new_tab,
-        request.path
+        request.path,
+        std::process::id()
     );
     if let Some(app) = existing {
         {
@@ -15869,17 +15885,28 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
         let ui = slint::ComponentHandle::clone_strong(&app.borrow().ui);
         // 后台会话（--background）的窗口是「建了但没显示」的：最大化状态、首帧
         // 重绘、拖拽热区都还没落地，这里补一次（与 create_session 里 show 前后那几步一致）。
-        let pending_show = {
-            let mut a = app.borrow_mut();
-            std::mem::replace(&mut a.window_pending_show, false)
-        };
+        // 只读不消费：`show()` 失败时标记必须留着，下一次点击才会再走一遍
+        // 最大化/首帧/拖拽热区那几步；否则窗口会永久停在「建了但没显示」。
+        let pending_show = app.borrow().window_pending_show;
         if pending_show {
             let maximized = app.borrow().config.window_maximized;
             ui.window().set_maximized(maximized);
             ui.set_win_maximized(!maximized);
         }
-        let _ = ui.show();
-        if pending_show {
+        let shown = ui.show();
+        if let Err(e) = &shown {
+            // show 失败还照样清掉 pending 标记的话，后面每次点击都会走
+            // 「已经显示过」的分支，窗口就永远出不来了 —— 必须留下证据。
+            logal!("[wake] !! ui.show() 失败：{e}（窗口可能无法显示）");
+        }
+        logv!(
+            "[wake] show ok={} pending_show={} size={:?}",
+            shown.is_ok(),
+            pending_show,
+            ui.window().size()
+        );
+        if pending_show && shown.is_ok() {
+            app.borrow_mut().window_pending_show = false;
             app.borrow().publish_shell_windows();
             // 首帧重绘要显式请求：后台会话没有走过启动时的 request_redraw，
             // 首帧不来的话 HWND 登记与无边框拖拽钩子会一直缺位。
