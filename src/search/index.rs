@@ -276,7 +276,13 @@ fn spawn_builder(idx: SharedIndex) {
                         if count >= MAX_ENTRIES || stop_thread.load(Ordering::Relaxed) {
                             break;
                         }
-                        count += walk(&root, &staging_idx, count, &stop_thread, &filter);
+                        let n = walk(&root, &staging_idx, count, &stop_thread, &filter);
+                        // 每个根目录单独记一行：某块盘没进索引时能立刻看出来。
+                        logln!(
+                            "index: walk {root:?} -> {n} entries (total {})",
+                            count + n
+                        );
+                        count += n;
                     }
                     logln!(
                         "index: std::fs walk -> {} entries in {:.1} ms",

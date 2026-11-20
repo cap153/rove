@@ -108,6 +108,14 @@ fn scan_drive_mft(
     // 这是 C 盘耗时的大头：WinSxS/System32 等近百万文件根本不该走到路径解析。
     let mut noise_fids: HashSet<u64> = HashSet::new();
     let mut count = 0usize;
+    // 统计漏斗：内核吐出多少条、被哪一步丢掉多少。
+    // 索引「条目少得不正常」时，只有这三组数字能区分「枚举本身就没吐出来」
+    // 和「吐出来了但被我们剪掉了」——两者修法完全不同。
+    let mut seen = 0usize;
+    let mut drop_noise = 0usize;
+    let mut drop_filter = 0usize;
+    let mut drop_meta = 0usize;
+    let mut resolve_fail = 0usize;
 
     // 2. 流式遍历内核吐出的 MFT 记录（内部按 64KB 缓冲批量读取）。
     for entry_res in mft.iter() {
@@ -126,10 +134,12 @@ fn scan_drive_mft(
         // System32/drivers/WinSxS 等深层子树正是因此全量解析，剪枝形同虚设
         // （C 盘 8.3s，比不优化还慢）。登记后噪音标记沿目录链一路下传。
         // 严禁对已确定舍弃的系统文件执行昂贵的路径回溯（OpenFileById）。
+        seen += 1;
         if noise_fids.contains(&entry.parent_fid) {
             if entry.is_dir() {
                 noise_fids.insert(entry.fid);
             }
+            drop_noise += 1;
             continue;
         }
 
@@ -137,6 +147,7 @@ fn scan_drive_mft(
         let file_name = entry.file_name.to_string_lossy();
         // 跳过 $MFT / $LogFile / $Bitmap 等系统元文件。
         if file_name.starts_with('$') {
+            drop_meta += 1;
             continue;
         }
 
@@ -146,13 +157,17 @@ fn scan_drive_mft(
         // 其整棵子树都会被上面（一）拦下，无需再解析任何一个子孙。
         if is_dir && is_skipped(&file_name) {
             noise_fids.insert(entry.fid);
+            drop_noise += 1;
             continue;
         }
 
         // 3. 将文件引用号解析为完整绝对路径；解析不出时退化为盘根 + 文件名。
         let path: PathBuf = match resolver.resolve_path(&entry) {
             Some(p) => p,
-            None => drive.join(&*file_name),
+            None => {
+                resolve_fail += 1;
+                drive.join(&*file_name)
+            }
         };
 
         // 兜底：目录名看不出、但解析出的路径落在噪音子树内（理论上已被
@@ -161,9 +176,11 @@ fn scan_drive_mft(
         if is_dir {
             if filter.is_skipped_dir(&path) {
                 noise_fids.insert(entry.fid);
+                drop_filter += 1;
                 continue;
             }
         } else if filter.is_skipped_file(&path) {
+            drop_filter += 1;
             continue;
         }
 
@@ -179,18 +196,17 @@ fn scan_drive_mft(
         count += 1;
     }
 
+    // level 1：建索引是低频、用户可感知的事件，且这几行是「条目为什么这么少」
+    // 的唯一现场证据（不依赖 ROVE_LOG）。
+    logln!(
+        "mft: {letter}: kept={count} seen={seen} in {:.1}s drop(noise={drop_noise} filter={drop_filter} meta={drop_meta}) resolve_fail={resolve_fail} stop={}",
+        t0.elapsed().as_secs_f64(),
+        stop.load(Ordering::Relaxed)
+    );
     if count == 0 {
-        logln!(
-            "mft: {letter}: 0 usable entries in {:.1} ms -> treated as unavailable",
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
+        logln!("mft: {letter}: 0 usable entries -> treated as unavailable");
         None
     } else {
-        logln!(
-            "mft: {letter}: {} entries in {:.1} ms",
-            count,
-            t0.elapsed().as_secs_f64() * 1000.0
-        );
         Some(count)
     }
 }
