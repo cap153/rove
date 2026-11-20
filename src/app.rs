@@ -3582,6 +3582,28 @@ mod tests {
         );
     }
 
+    /// 图标视图的名称切行不能因为「此电脑」就把高亮段丢掉：
+    /// 从「此电脑」发起的全局搜索，结果条目原名 == 显示名，必须保留高亮。
+    #[test]
+    fn grid_row_lines_keep_highlight_unless_translated() {
+        let parts = vec![("Video".to_string(), true), ("Assets".to_string(), false)];
+        let layout = grid_display_lines(&parts, 200.0, 3);
+        let kept = grid_row_lines(&layout, "VideoAssets", "VideoAssets", 200.0);
+        assert_eq!(kept, layout, "显示名未变时不该重排");
+        assert!(
+            kept
+                .iter()
+                .any(|l| l.iter().any(|(t, hl)| *hl && t.contains("Video"))),
+            "高亮标记丢了: {kept:?}"
+        );
+        // 卷标被翻译：段文本对不上，按纯文本重排。
+        let tr = grid_row_lines(&layout, "本地磁盘 (C:)", "OS (C:)", 200.0);
+        assert!(
+            tr.iter().all(|l| l.iter().all(|(_, hl)| !*hl)),
+            "翻译后的名字不该带旧的高亮段: {tr:?}"
+        );
+    }
+
     /// 状态栏危险提示的判定：失败/超限/删除类应为红色，普通提示不是。
     #[test]
     fn status_danger_markers() {
@@ -5961,10 +5983,8 @@ impl App {
                         // 此电脑视图的显示名被翻译过（探针用的是原名），单独再算一次。
                         let grid_lines = if !grid_view {
                             Vec::new()
-                        } else if computer_view {
-                            grid_display_lines(&[(display_name.to_string(), false)], grid_name_w, 3)
                         } else {
-                            layout.clone()
+                            grid_row_lines(&layout, &display_name, &entry.name, grid_name_w)
                         };
                         // 文字宽度按该视图的字号换算：估算表是按图标视图的 11.5px
                         // 定的，详细信息/列表用 13px、小图标用 12px。
@@ -6799,6 +6819,28 @@ fn est_text_w(parts: &[(String, bool)]) -> f32 {
         .flat_map(|(t, _)| t.chars())
         .map(est_char_w)
         .sum()
+}
+
+/// 图标视图一格的名称切行。
+///
+/// `layout` 是按条目**原名**切出来的（带搜索高亮段）。显示名和原名一致时直接
+/// 复用；「此电脑」里驱动器卷标会被翻译（`OS (C:)` → `本地磁盘 (C:)`），段文本
+/// 就对不上显示名了，只能按翻译后的纯文本重排。
+///
+/// 曾经的写法是「只要是此电脑就按纯文本重排」——于是从「此电脑」发起全局搜索时，
+/// 中/大/超大图标视图拿到的段全部没有高亮标记，命中词不高亮（详细信息 / 列表 /
+/// 小图标走 `name-parts`，所以看着正常）。
+fn grid_row_lines(
+    layout: &GridLines,
+    display_name: &str,
+    raw_name: &str,
+    width_px: f32,
+) -> GridLines {
+    if display_name == raw_name {
+        layout.clone()
+    } else {
+        grid_display_lines(&[(display_name.to_string(), false)], width_px, 3)
+    }
 }
 
 /// 把「带高亮分段的名字」按可用宽度预切成最多 `max_lines` 行，超出时末行以
