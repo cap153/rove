@@ -14042,7 +14042,9 @@ mod drag_hittest {
             return;
         }
         LAST_HIT_LOG_MS.store(now, Ordering::Relaxed);
-        logal!(
+        // level 1：这条在正常拖动标题栏时也会命中（拖拽区几何是 40ms 轮询下发的，
+        // 天生慢半拍），属于常规交互，不能无条件写。
+        logln!(
             "[nc-hit] caption-guard lx={lx:.1} ly={ly:.1} x={x:.1} w={w:.1} tabs_r={tabs_r:.1} zoomed={zoomed}"
         );
     }
@@ -15026,9 +15028,10 @@ pub fn run() {
     if args.iter().any(|a| {
         a == "--shell-open" || a == "--this-pc" || a.to_ascii_lowercase().starts_with("/select")
     }) || args.iter().any(|a| a.to_ascii_lowercase().starts_with("-select")) {
-        // 无条件写入：接管打开（浏览器的「打开所在文件夹」等）是偶发故障的高发入口，
-        // 日志里要有它才能和后面的空白/重试对上时间。
-        logal!("[takeover] argv={args:?}");
+        // 正常接管打开只是日常操作，留在 level 1：接管起来的这一进程本来就
+        // 不带 ROVE_LOG（父进程是浏览器/下载器），排查时用 exe 同目录的
+        // `rove.verbose` 标记即可（见 `log_level`）。
+        logln!("[takeover] argv={args:?}");
     }
     // 「谁接住了这次启动」：出问题时第一件事就是要分清这条请求由哪个 exe、
     // 哪个进程处理 —— 磁盘上的 rove.exe 被换掉，已经在跑的旧进程不会跟着更新，
@@ -15036,9 +15039,9 @@ pub fn run() {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    // 无条件写入：日志文件里必须有「这份日志是谁、什么时候写的」，
-    // 否则拿到一份没有开头的日志就分不清是哪个 exe / 哪个进程。
-    logal!(
+    // level 1：每次启动都写一行太吵（用户明确要求默认静默），排查时开
+    // ROVE_LOG=1 或放 `rove.verbose` 标记就够了 —— 它只是「这份日志是谁写的」。
+    logln!(
         "[boot] pid={} exe={exe} args={args:?}",
         std::process::id()
     );
