@@ -859,6 +859,10 @@ pub struct App {
     /// 哪个面板的列举结果可以消费「待揭示目标」（`None` = 用当前聚焦面板）。
     /// 跨分屏拖放时目标在**另一个**面板里，不能只认聚焦那一栏。
     reveal_pane: Option<usize>,
+    /// 后退回父目录时，把「刚离开的那个子目录」选中（资源管理器同款）。
+    /// (标签 id, 面板下标, 条目路径)：只在那一个标签那一片的下一份列举里
+    /// 消费一次，命中与否都清掉。
+    pending_history_select: Option<(u32, usize, PathBuf)>,
     /// `scroll_to_index` 该滚哪个面板（`None` = 当前聚焦面板）。
     scroll_to_pane: Option<usize>,
     /// diff 命中后待触发的重命名路径（等列表/滚动就绪再执行，避免抢焦点）。
@@ -1164,6 +1168,7 @@ impl App {
             shell_new_reload_at: None,
             reveal_grace_until: None,
             reveal_pane: None,
+            pending_history_select: None,
             scroll_to_pane: None,
             pending_shell_new_rename: None,
             expand_row_cache: [None, None],
@@ -1780,6 +1785,36 @@ impl App {
                             pane.display.len(),
                             self.ui.get_rename_path()
                         );
+                    }
+                }
+            }
+            // 后退选回刚离开的子目录：只在这一次列举里生效。
+            // 找不到（被隐藏开关过滤 / 已经改名删除）就安静放弃，不重试。
+            //
+            // 只认「那一个标签的那一片」的结果：分屏时另一栏先到的列举不能把
+            // 待办吃掉；后台标签恰好停在同一个父目录时，也不能替它选中
+            // （标签 id 才是可靠的身份，下标会随关闭标签变化）。
+            // 有「待揭示」在等（外部程序让我打开某个文件）时让位，那是更明确的请求。
+            let sel_hit = tab_index == self.state.active_tab
+                && self
+                    .pending_history_select
+                    .as_ref()
+                    .is_some_and(|(t, p, _)| *t == tab.id && *p == result.pane)
+                && self.scroll_to_paths.is_empty();
+            if sel_hit {
+                if let Some((_, _, target)) = self.pending_history_select.take() {
+                    if let Some(pos) = pane.display.iter().position(|&ei| {
+                        pane.entries.get(ei).is_some_and(|e| {
+                            e.path == target
+                                || crate::fs::dir::same_path_loose(&e.path, &target)
+                        })
+                    }) {
+                        pane.anchor = Some(target.clone());
+                        pane.selection = [target].into_iter().collect();
+                        self.scroll_to_index = Some(pos);
+                        self.scroll_to_pane = Some(result.pane);
+                        self.visible_cache = None;
+                        self.visible_cache_right = None;
                     }
                 }
             }
@@ -10662,8 +10697,21 @@ impl App {
         }
         let index = tab.active().history_index - 1;
         let before = tab.active().path.clone();
+        let pane_index = tab.active_pane;
+        let tab_id = tab.id;
         self.state.active_mut().active_mut().jump_to(index);
-        self.after_history_jump(before);
+        self.after_history_jump(before.clone());
+        // 后退落点正好是刚离开的那个目录的父目录：把那个目录选中。
+        // 双击进去的目录一定在可视范围内（用户就在那一格上双击的），
+        // 所以这里只做「选中 + 最小位移滚进视野」，不会跳顶。
+        if let (Some(left), Some(now)) = (before, self.state.active().active().path.clone()) {
+            if left
+                .parent()
+                .is_some_and(|p| crate::fs::dir::same_path_loose(p, &now))
+            {
+                self.pending_history_select = Some((tab_id, pane_index, left));
+            }
+        }
     }
 
     fn nav_forward(&mut self) {
