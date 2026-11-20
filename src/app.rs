@@ -204,6 +204,15 @@ pub(crate) fn log_write(msg: &str) {
     }
 }
 
+/// 单调的毫秒时钟，只用于日志节流（不参与任何逻辑判定）。
+pub(crate) fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// 诊断日志：`ROVE_LOG` 存在时写入 `rove.log`（带本地时间戳）。
 #[macro_export]
 macro_rules! logln {
@@ -237,6 +246,16 @@ macro_rules! logal {
     }};
 }
 
+
+/// 窗口焦点抖动取证：3 秒窗口内的获焦/失焦次数。
+static FOCUS_WINDOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static FOCUS_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FOCUS_LOGGED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `sync_tabs` 每秒调用次数统计（标签栏闪烁取证用）。
+static SYNC_TABS_WINDOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SYNC_TABS_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static SYNC_TABS_LOGGED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// 虚拟列表行高（与 ui/file_list.slint 的 row-h 保持一致）。
 const ROW_HEIGHT: f32 = 30.0;
@@ -3701,7 +3720,32 @@ impl App {
         SharedString::from(s)
     }
 
+    /// 重建标签模型并把状态同步给界面。
+    ///
+    /// 每次都会 `set_tabs(新的 ModelRc)` —— Slint 的 Repeater 据此销毁并重建
+    /// **全部**标签实例，悬停态被清零、点击落在被销毁的实例上。正常操作一秒
+    /// 最多几次；一秒十几次就说明有东西在空转，专门记一行取证（带调用点）。
+    #[track_caller]
     fn sync_tabs(&self) {
+        {
+            use std::sync::atomic::Ordering;
+            let now = now_ms();
+            if now.saturating_sub(SYNC_TABS_WINDOW_MS.load(Ordering::Relaxed)) > 1000 {
+                SYNC_TABS_WINDOW_MS.store(now, Ordering::Relaxed);
+                SYNC_TABS_COUNT.store(0, Ordering::Relaxed);
+            } else {
+                let n = SYNC_TABS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= 10
+                    && now.saturating_sub(SYNC_TABS_LOGGED_MS.load(Ordering::Relaxed)) >= 2000
+                {
+                    SYNC_TABS_LOGGED_MS.store(now, Ordering::Relaxed);
+                    logln!(
+                        "!! [tab] 标签模型 1s 内重建 {n} 次（悬停会闪、点击会丢），最近一次来自 {}",
+                        std::panic::Location::caller()
+                    );
+                }
+            }
+        }
         let tabs: Vec<TabInfo> = self
             .state
             .tabs
@@ -12102,6 +12146,27 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         // 吞掉关对话框后立刻敲下的第一个键。解锁靠那一次松键（或 400ms 兜底），
         // 鼠标点进来也立即解锁。
         if let WindowEvent::Focused(focused) = event {
+            // 取证：窗口一秒钟内反复失焦/获焦时，Slint 会清空悬停态、点击还会
+            // 落到正在重建的元素上 —— 表现就是「按钮闪烁 + 点了没反应」。
+            // 只在真的抖起来时写一行（level 1）。
+            {
+                use std::sync::atomic::Ordering;
+                let now = now_ms();
+                if now.saturating_sub(FOCUS_WINDOW_MS.load(Ordering::Relaxed)) > 3000 {
+                    FOCUS_WINDOW_MS.store(now, Ordering::Relaxed);
+                    FOCUS_COUNT.store(0, Ordering::Relaxed);
+                } else {
+                    let n = FOCUS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n >= 4
+                        && now.saturating_sub(FOCUS_LOGGED_MS.load(Ordering::Relaxed)) >= 3000
+                    {
+                        FOCUS_LOGGED_MS.store(now, Ordering::Relaxed);
+                        logln!(
+                            "!! [focus] 窗口 3s 内失焦/获焦 {n} 次（悬停会闪、点击会丢），刚收到 focused={focused}"
+                        );
+                    }
+                }
+            }
             if let Some(focus_app) = key_app.upgrade() {
                 let mut app = focus_app.borrow_mut();
                 if *focused {
@@ -14070,31 +14135,156 @@ mod drag_hittest {
     static TABS_R: AtomicU32 = AtomicU32::new(0);
     /// 窗口缩放系数（物理像素 / 逻辑像素）。
     static DRAG_SCALE: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
+    /// 标签栏布局是否已落定（1 = 已落定）。
+    ///
+    /// 窗口刚建、标签模型刚换掉的头几百毫秒里，Slint 报上来的
+    /// `drag-area-x` 是**旧布局**的值（新建标签那一下，`tabs-area` 宽度还是
+    /// 上一次的），而 `drag-area-w` 会被弹簧撑到恰好填满 —— 两个值自洽，
+    /// 唯独压在了标签上。这种几何一旦被用来判 HTCAPTION，标签和新建按钮的
+    /// 点击就会被吞，悬停也会因为 `WM_MOUSELEAVE` 反复清零而闪烁。
+    /// 判据：有标签时 `tabs-right` 必须 > 0，否则视为未落定，整段按客户区处理。
+    static READY: AtomicU32 = AtomicU32::new(0);
     /// 标签栏高度（逻辑像素）：仅纵向落在此范围内才可能是标题栏拖拽区。
     const TAB_BAR_H: f32 = 38.0;
     /// 命中日志节流（毫秒）：鼠标移动时 WM_NCHITTEST 高频触发，别把日志刷爆。
     static LAST_HIT_LOG_MS: AtomicU64 = AtomicU64::new(0);
+    /// 陈旧命中取证日志的节流时刻。
+    static STALE_LOGGED_MS: AtomicU64 = AtomicU64::new(0);
+    /// 拖拽区几何 1 秒内的改动次数（抖动取证）。
+    static GEO_N: AtomicU32 = AtomicU32::new(0);
+    static GEO_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
+    /// 上一次命中结果（0 = 客户区 / 1 = 标题栏 / 2 = 还没有）。
+    static LAST_CAPTION: AtomicU32 = AtomicU32::new(2);
+    /// 抖动计数：窗口期内命中结果翻转了多少次。
+    static FLIP_N: AtomicU32 = AtomicU32::new(0);
+    static FLIP_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
+    static FLIP_LOGGED_MS: AtomicU64 = AtomicU64::new(0);
+    /// 客户区一秒钟收到多少次 `WM_MOUSELEAVE`（Slint 据此清空全部 has-hover）。
+    static LEAVE_N: AtomicU32 = AtomicU32::new(0);
+    static LEAVE_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
+    static LEAVE_LOGGED_MS: AtomicU64 = AtomicU64::new(0);
 
     fn bits(v: &AtomicU32) -> f32 {
         f32::from_bits(v.load(Ordering::Relaxed))
     }
 
-    /// 更新拖拽区边界；值未变化则跳过写入。返回本次是否真的改变，
-    /// 供调用方只在变化时打日志（poll_timer 每 40ms 都会来一次）。
-    pub fn update(x: f32, w: f32, tabs_r: f32, scale: f32) -> bool {
+    /// 标记标签栏布局是否可用（见 [`READY`]）。
+    pub fn set_ready(ready: bool) {
+        READY.store(ready as u32, Ordering::Relaxed);
+    }
+
+    fn is_ready() -> bool {
+        READY.load(Ordering::Relaxed) != 0
+    }
+
+    /// 兜底取证：把一个**压在标签上**的位置判成了标题栏。
+    ///
+    /// 正常只在拖拽区里（最后一个标签右边 34px 之后）才会走到这里；比这更靠左
+    /// 说明 `drag-area-x` 还是旧布局的值 —— 点击会被吞成拖窗口，正是那个
+    /// 「标签点不动 / 关闭按钮闪烁」的现场。level 1，1s 最多一行。
+    fn note_stale_caption(x: f32, w: f32, tabs_r: f32, lx: f32, ly: f32, zoomed: bool) {
+        let now = crate::app::now_ms();
+        if now.saturating_sub(STALE_LOGGED_MS.load(Ordering::Relaxed)) < 1000 {
+            return;
+        }
+        STALE_LOGGED_MS.store(now, Ordering::Relaxed);
+        logln!(
+            "!! [nc-hit] 判成拖拽区的位置已经压到标签栏 x={x:.1} w={w:.1} tabs_r={tabs_r:.1} lx={lx:.1} ly={ly:.1} zoomed={zoomed}（点击会被吞成拖窗口）"
+        );
+    }
+
+    /// 记一次命中结果。**同一个位置**上客户区/标题栏反复翻转，就是
+    /// 「关闭按钮闪烁 + 点击偶尔没反应」的直接机理：命中判成标题栏时
+    /// Windows 会给客户区发 `WM_MOUSELEAVE`，Slint 立刻清空所有悬停态；
+    /// 下一次命中又判回客户区，悬停重新出现 —— 一秒钟来回几十次就是闪烁。
+    ///
+    /// 只在真的抖起来时写一行（level 1，1s 最多一行），正常拖动标题栏不会触发。
+    fn note_decision(caption: bool, lx: f32, ly: f32, x: f32, w: f32, win_w: f32, zoomed: bool, scale: f32) {
+        let now = crate::app::now_ms();
+        let cur = caption as u32;
+        let last = LAST_CAPTION.swap(cur, Ordering::Relaxed);
+        if now.saturating_sub(FLIP_WINDOW_MS.load(Ordering::Relaxed)) > 500 {
+            FLIP_WINDOW_MS.store(now, Ordering::Relaxed);
+            FLIP_N.store(0, Ordering::Relaxed);
+            return;
+        }
+        if last == cur || last == 2 {
+            return;
+        }
+        let n = FLIP_N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= 6 && now.saturating_sub(FLIP_LOGGED_MS.load(Ordering::Relaxed)) >= 1000 {
+            FLIP_LOGGED_MS.store(now, Ordering::Relaxed);
+            logln!(
+                "!! [nc-hit] 命中在翻转 {n} 次/500ms（悬停会闪、点击会丢）lx={lx:.1} ly={ly:.1} x={x:.1} w={w:.1} tabs_r={:.1} win_w={win_w:.1} zoomed={zoomed} scale={scale:.2}",
+                bits(&TABS_R)
+            );
+        }
+    }
+
+    /// 客户区收到 `WM_MOUSELEAVE`。频繁出现说明悬停态在被反复清零 —— 不管是
+    /// 命中测试判成标题栏，还是别的路径把它踢出客户区，都会走到这里。
+    pub fn note_mouse_leave() {
+        let now = crate::app::now_ms();
+        if now.saturating_sub(LEAVE_WINDOW_MS.load(Ordering::Relaxed)) > 1000 {
+            LEAVE_WINDOW_MS.store(now, Ordering::Relaxed);
+            LEAVE_N.store(0, Ordering::Relaxed);
+            return;
+        }
+        let n = LEAVE_N.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= 8 && now.saturating_sub(LEAVE_LOGGED_MS.load(Ordering::Relaxed)) >= 2000 {
+            LEAVE_LOGGED_MS.store(now, Ordering::Relaxed);
+            let last = LAST_CAPTION.load(Ordering::Relaxed);
+            logln!(
+                "!! [nc-hit] 客户区 1s 内收到 {n} 次 WM_MOUSELEAVE（悬停被反复清零，上一次命中={}）",
+                match last {
+                    1 => "HTCAPTION",
+                    0 => "HTCLIENT",
+                    _ => "未知",
+                }
+            );
+        }
+    }
+
+    /// 一次边界变化附带的信息。
+    pub struct Change {
+        pub prev_x: f32,
+        pub prev_w: f32,
+        pub prev_tabs_r: f32,
+        /// 1 秒窗口内改了几次（≥5 就是在抖，调用方把它提到 level 1）。
+        pub changes_in_window: u32,
+    }
+
+    /// 更新拖拽区边界；值未变化返回 `None`（poll_timer 每 40ms 都会来一次），
+    /// 变化时返回附带旧值和抖动次数的 [`Change`]。
+    pub fn update(x: f32, w: f32, tabs_r: f32, scale: f32) -> Option<Change> {
         let (xb, wb, tb, sb) = (x.to_bits(), w.to_bits(), tabs_r.to_bits(), scale.to_bits());
         if DRAG_X.load(Ordering::Relaxed) == xb
             && DRAG_W.load(Ordering::Relaxed) == wb
             && TABS_R.load(Ordering::Relaxed) == tb
             && DRAG_SCALE.load(Ordering::Relaxed) == sb
         {
-            return false;
+            return None;
         }
+        let prev = Change {
+            prev_x: bits(&DRAG_X),
+            prev_w: bits(&DRAG_W),
+            prev_tabs_r: bits(&TABS_R),
+            changes_in_window: {
+                let now = crate::app::now_ms();
+                if now.saturating_sub(GEO_WINDOW_MS.load(Ordering::Relaxed)) > 1000 {
+                    GEO_WINDOW_MS.store(now, Ordering::Relaxed);
+                    GEO_N.store(1, Ordering::Relaxed);
+                    1
+                } else {
+                    GEO_N.fetch_add(1, Ordering::Relaxed) + 1
+                }
+            },
+        };
         DRAG_X.store(xb, Ordering::Relaxed);
         DRAG_W.store(wb, Ordering::Relaxed);
         TABS_R.store(tb, Ordering::Relaxed);
         DRAG_SCALE.store(sb, Ordering::Relaxed);
-        true
+        Some(prev)
     }
 
     /// 标题栏命中诊断（详细级）。
@@ -14111,6 +14301,7 @@ mod drag_hittest {
         w: f32,
         zoomed: bool,
     ) {
+        note_decision(reason == "CAPTION", lx, ly, x, w, win_w, zoomed, scale);
         if ly < 0.0 || ly > TAB_BAR_H {
             return;
         }
@@ -14160,6 +14351,12 @@ mod drag_hittest {
         // 所以只能在这里清焦点：否则编辑态/重命名退不出去。
         // 必须同步——Windows 随后会进入自己的模态移动循环，
         // invoke_from_event_loop 排队的闭包要等循环结束才跑（表现为“点了没反应”）。
+        // 客户区被「踢出去」时 Windows 发这条，Slint 收到就清空所有悬停态。
+        // 正常使用一秒不会有几次；一秒好多次 = 悬停在被反复清零（取证见
+        // `drag_hittest::note_mouse_leave`）。
+        if msg == 0x02A3 {
+            crate::app::drag_hittest::note_mouse_leave();
+        }
         if msg == WM_NCLBUTTONDOWN || msg == WM_NCRBUTTONDOWN {
             logv!("[nc] nclbuttondown msg={} ht={}", msg, wparam);
             super::clear_global_focus();
@@ -14256,8 +14453,13 @@ mod drag_hittest {
             // 轮询下发的，窗口刚最大化或刚增删标签时可能偏小，一旦偏小就会把
             // 标签上的点击判成 HTCAPTION —— 最大化窗口被拖动即还原。
             let caption_x = x.max(tabs_r);
-            if w > 0.0 {
+            // 布局没落定时（刚建窗口 / 刚换标签模型）宁可整段按客户区处理：
+            // 拖拽区少一段只是拖不动窗口，判错却会让标签点不动。
+            if w > 0.0 && is_ready() {
                 if (0.0..=TAB_BAR_H).contains(&ly) && lx >= caption_x && lx <= x + w {
+                    if caption_x <= tabs_r {
+                        note_stale_caption(x, w, tabs_r, lx, ly, is_maximized);
+                    }
                     log_hit("CAPTION", lx, ly, scale, win_w, x, w, is_maximized);
                     return HTCAPTION as isize;
                 }
@@ -14340,6 +14542,18 @@ fn sync_drag_bounds(app: &App, reason: &str) {
         return;
     }
 
+    // 有标签时 `tabs-right` 必须是正数；为 0 说明标签条还没布局（新建标签那
+    // 一下尤其如此），此时的 `drag-area-x` 是上一次布局的旧值，直接用会把
+    // 标签栏判成标题栏。这种情况不下发几何，只把「未落定」标记挂出去。
+    let has_tabs = !app.state.tabs.is_empty();
+    let slint_tabs_r = app.ui.get_tabs_right() as f32;
+    if has_tabs && slint_tabs_r <= 0.0 {
+        drag_hittest::set_ready(false);
+        logv!("[drag-bounds] skip ({reason}) 标签条尚未布局 (tabs_r={slint_tabs_r})");
+        return;
+    }
+    drag_hittest::set_ready(true);
+
     // 旧估算：仅作为 Slint 几何不可用时的兜底，并保留在日志中便于对比。
     let max_tabs_w = (window_w - 270.0).max(0.0);
     let tabs_w = app.state.tabs.len() as f32 * 153.0; // 单标签 150px + 3px 间距
@@ -14350,7 +14564,6 @@ fn sync_drag_bounds(app: &App, reason: &str) {
     // Slint 真实布局几何（`tab_bar.slint` 导出的 drag-x / drag-w）。
     let slint_x = app.ui.get_drag_area_x() as f32;
     let slint_w = app.ui.get_drag_area_w() as f32;
-    let slint_tabs_r = app.ui.get_tabs_right() as f32;
     let (x, w, source) = if slint_w > 0.0 && slint_x > 0.0 {
         (slint_x, slint_w, "slint")
     } else {
@@ -14360,13 +14573,22 @@ fn sync_drag_bounds(app: &App, reason: &str) {
     // 只在边界真的变化时输出（poll_timer 每 40ms 都会来一次）。
     // 退回 rust-estimate 说明 Slint 几何拿不到，属于可疑状态 -> 无条件写一行；
     // 正常走 Slint 几何的只是常规布局变化，留在详细级。
-    if drag_hittest::update(x, w, slint_tabs_r, scale) {
+    if let Some(c) = drag_hittest::update(x, w, slint_tabs_r, scale) {
         let line = format!(
             "[drag-bounds] {reason} -> {source} x={x:.1} w={w:.1} tabs_r={slint_tabs_r:.1} | rust x={rust_x:.1} w={rust_w:.1} | slint x={slint_x:.1} w={slint_w:.1} | scale={scale:.2} physical_w={physical_w:.1} win_w={window_w:.1} tabs={}",
             app.state.tabs.len()
         );
         if source == "rust-estimate" {
             logal!("{line}");
+        } else if c.changes_in_window >= 5 {
+            // 边界一秒钟变好几次 = 在抖，命中判定跟着抖，标签悬停就会闪。
+            logln!(
+                "!! [drag-bounds] 1s 内改动 {} 次 {line} | prev x={:.1} w={:.1} tabs_r={:.1}",
+                c.changes_in_window,
+                c.prev_x,
+                c.prev_w,
+                c.prev_tabs_r
+            );
         } else {
             logv!("{line}");
         }
