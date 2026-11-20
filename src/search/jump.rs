@@ -228,7 +228,16 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
     // 轨道 2：全局索引兜底（直接透传 query，已内置盘符过滤）
     if let Some(idx) = crate::search::index::try_shared() {
         if let Ok(guard) = idx.read() {
-            let res = guard.search(query, 50);
+            // 只要文件夹，且过滤发生在截断之前（见 `search_dirs`）：
+            // 用 `search` 再筛 `is_dir` 会让同名文件占满 50 个名额。
+            let res = guard.search_dirs(query, 50);
+            crate::logv!(
+                "[jump] index q={:?} top={} total={} dirs={}",
+                query,
+                res.hits.len(),
+                res.total,
+                res.hits.iter().filter(|(e, _)| e.is_dir).count()
+            );
             for (entry, score) in res.hits {
                 if entry.is_dir {
                     let key = path_key(&entry.path);

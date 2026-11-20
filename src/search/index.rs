@@ -48,6 +48,20 @@ impl GlobalIndex {
     /// 拼音/模糊查询，按得分排序取前 `limit` 条，并回报未截断的命中总数。
     /// 支持盘符限定前缀（如 `c: videos`）：非目标盘一票否决；仅输入盘符（如 `c:`）时返回该盘全部条目。
     pub fn search(&self, query: &str, limit: usize) -> SearchHits<'_> {
+        self.search_filtered(query, limit, false)
+    }
+
+    /// 只返回文件夹的查询（吸附窗专用）。
+    ///
+    /// 关键点：**过滤必须发生在截断之前**。吸附窗只列文件夹，旧写法是先取
+    /// 前 `limit` 名再筛 `is_dir`，于是同一个词命中一堆文件时（如 `power`
+    /// 命中几十个 `power*.py`），这些文件会把分数相近的文件夹挤出前 `limit`
+    /// 名，界面表现为「输入 power 一条文件夹都没有，输全名 powershell 才有」。
+    pub fn search_dirs(&self, query: &str, limit: usize) -> SearchHits<'_> {
+        self.search_filtered(query, limit, true)
+    }
+
+    fn search_filtered(&self, query: &str, limit: usize, dirs_only: bool) -> SearchHits<'_> {
         let (drive_filter, clean_query) = crate::search::parse_drive_prefix(query);
         let query_lower = clean_query.to_lowercase();
 
@@ -61,6 +75,11 @@ impl GlobalIndex {
             .entries
             .iter()
             .filter_map(|e| {
+                // 0. 只要文件夹时先筛掉文件：截断在排序之后，这里的过滤必须在
+                //    收集阶段就完成，否则文件会占满 `limit` 个名额。
+                if dirs_only && !e.is_dir {
+                    return None;
+                }
                 // 1. 若指定了盘符，非目标盘一票否决
                 if let Some(target_drive) = drive_filter {
                     let path_str = e.path.to_string_lossy();
@@ -548,6 +567,31 @@ mod tests {
             fields: crate::search::pinyin_fields(name),
             is_dir: false,
         }
+    }
+
+    /// 吸附窗只要文件夹：过滤必须在截断之前，否则文件占满名额会让文件夹消失。
+    #[test]
+    fn search_dirs_filters_before_truncating() {
+        let mut idx = GlobalIndex::default();
+        // 分数相同的一堆文件排在前面（sort_by 稳定，同分保持插入顺序）。
+        for i in 0..60 {
+            idx.entries.push(entry(&format!("power{i:02}")));
+        }
+        idx.entries.push(IndexEntry {
+            path: PathBuf::from("D:\\docs\\PowerShell"),
+            name: "PowerShell".to_string(),
+            fields: crate::search::pinyin_fields("PowerShell"),
+            is_dir: true,
+        });
+        // 前提：只取 1 条时被文件占住。
+        let all = idx.search("power", 1);
+        assert_eq!(all.hits.len(), 1);
+        assert!(!all.hits[0].0.is_dir, "前提：文件应占满前几名");
+        // 只要文件夹：同名文件夹必须还在。
+        let dirs = idx.search_dirs("power", 1);
+        assert_eq!(dirs.hits.len(), 1, "文件夹被文件挤出结果了");
+        assert_eq!(dirs.hits[0].0.name, "PowerShell");
+        assert_eq!(dirs.total, 1, "total 应是过滤后的文件夹总数");
     }
 
     #[test]

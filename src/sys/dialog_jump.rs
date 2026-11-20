@@ -32,6 +32,19 @@ mod imp {
 
     static CURRENT_DIALOG: AtomicIsize = AtomicIsize::new(0);
 
+    /// 我们最近亲手把这个对话框跳到过的目录：(句柄, 所属进程, 目录, 时刻)。
+    ///
+    /// 地址栏在虚拟位置（"此电脑 > 文档"）时只给一个**叶子名**，不是绝对路径；
+    /// 这时唯一可靠的事实就是「刚才我们自己把它跳到了哪里」。
+    /// 带上 pid 是因为窗口句柄会被系统复用：只认句柄会把上一个对话框的目录
+    /// 套到新对话框上。
+    static LAST_NAV: std::sync::Mutex<Option<(isize, u32, PathBuf, std::time::Instant)>> =
+        std::sync::Mutex::new(None);
+
+    /// 「解析不出当前目录」这条日志只对每个对话框记一次：
+    /// 它挂在每次按键触发的刷新里，不去重会刷屏。
+    static ROOT_FAIL_LOGGED: AtomicIsize = AtomicIsize::new(0);
+
     /// 登记 Slint 搜索吸附窗的句柄，防止自我监听引发死循环（抢焦点 → 误判失焦 → 隐藏）。
     static JUMP_WINDOW_HWND: AtomicIsize = AtomicIsize::new(0);
 
@@ -476,9 +489,20 @@ mod imp {
         }
     }
 
+    /// 读出对话框当前所在目录。
+    ///
+    /// 地址栏并不可靠：对话框停在「此电脑 > 文档」这类虚拟位置时，`ToolbarWindow32`
+    /// 的文本只有**叶子名**（"地址: Documents"），拿它当路径会得到相对路径，
+    /// 之后 `read_dir` 相对进程工作目录必然失败 —— 表现就是「当前目录子文件夹」
+    /// 这一轨（权重最高）一条都没有。所以按可靠性分层：
+    ///
+    /// 1. 地址栏给的是绝对路径 → 直接用（不查存在性，网络路径 exists() 会卡 SMB）；
+    /// 2. 叶子名能在用户目录里对上号 → 用（本地 `is_dir` 很快）；
+    /// 3. 我们最近亲手把这个对话框跳到过的目录 → 用（跳转后地址栏就变成虚拟位置了）。
     pub fn extract_current_folder(dialog: HWND) -> Option<PathBuf> {
         struct SearchCtx {
-            found_path: Option<PathBuf>,
+            absolute: Option<PathBuf>,
+            leaf: Option<String>,
         }
 
         unsafe extern "system" fn enum_child(hwnd: HWND, lparam: LPARAM) -> i32 {
@@ -490,22 +514,103 @@ mod imp {
                 for prefix in ["地址: ", "Address: ", "地址:"] {
                     if let Some(rest) = text.strip_prefix(prefix) {
                         let trimmed = rest.trim();
-                        // 地址栏文本本身已足够可信，不再做 exists() 校验
-                        // （网络路径 exists() 会触发 SMB 超时，卡住探测线程）
+                        if trimmed.is_empty() {
+                            break;
+                        }
                         let p = PathBuf::from(trimmed);
-                        ctx.found_path = Some(p);
-                        return 0;
+                        if p.is_absolute() {
+                            ctx.absolute = Some(p);
+                            return 0;
+                        }
+                        // 面包屑（"此电脑 > 文档"）或纯叶子名：只留最后一段。
+                        let leaf = trimmed
+                            .rsplit(" > ")
+                            .next()
+                            .unwrap_or(trimmed)
+                            .trim()
+                            .to_string();
+                        if !leaf.is_empty() {
+                            ctx.leaf = Some(leaf);
+                        }
+                        break;
                     }
                 }
             }
             1
         }
 
-        let mut ctx = SearchCtx { found_path: None };
+        let mut ctx = SearchCtx {
+            absolute: None,
+            leaf: None,
+        };
         unsafe {
             EnumChildWindows(dialog, Some(enum_child), &mut ctx as *mut SearchCtx as LPARAM);
         }
-        ctx.found_path
+        if let Some(p) = ctx.absolute {
+            logv!("[rove:dialog_jump] root via address bar: {:?}", p);
+            return Some(p);
+        }
+        if let Some(p) = ctx.leaf.as_deref().and_then(resolve_leaf) {
+            logv!(
+                "[rove:dialog_jump] root via leaf {:?} -> {:?}",
+                ctx.leaf,
+                p
+            );
+            return Some(p);
+        }
+        if let Some(p) = last_nav_dir(dialog) {
+            logv!("[rove:dialog_jump] root via last navigated dir: {:?}", p);
+            return Some(p);
+        }
+        let key = dialog as isize;
+        if ROOT_FAIL_LOGGED.swap(key, Ordering::Relaxed) != key {
+            logln!(
+                "[rove:dialog_jump] !! 解析不出对话框当前目录（地址栏 leaf={:?}）",
+                ctx.leaf
+            );
+        }
+        None
+    }
+
+    /// 只有叶子名时的兜底：优先在用户目录里找同名文件夹。
+    ///
+    /// 刻意不遍历各盘符根目录：映射的网络驱动器 `is_dir()` 会卡 SMB，
+    /// 而这里跑在界面线程上。用户目录里的查找是纯本地操作。
+    fn resolve_leaf(leaf: &str) -> Option<PathBuf> {
+        let clean = leaf.trim_matches(|c: char| c == '\\' || c == '/');
+        if clean.is_empty() || clean.contains(':') || clean.contains('>') {
+            return None;
+        }
+        let profile = std::env::var("USERPROFILE").ok()?;
+        let p = Path::new(&profile).join(clean);
+        // 漫游配置文件可能把 USERPROFILE 指到网络上：界面线程上不做这种 IO。
+        if crate::fs::dir::is_remote_path(&p) {
+            return None;
+        }
+        p.is_dir().then_some(p)
+    }
+
+    /// 最近一次由本程序驱动跳转的目录（同一个对话框、同一进程，10 分钟内有效）。
+    fn last_nav_dir(dialog: HWND) -> Option<PathBuf> {
+        let mut pid = 0u32;
+        unsafe {
+            GetWindowThreadProcessId(dialog, &mut pid);
+        }
+        let guard = LAST_NAV.lock().ok()?;
+        let (hwnd, nav_pid, path, at) = guard.as_ref()?;
+        if *hwnd != dialog as isize || *nav_pid != pid {
+            return None;
+        }
+        if at.elapsed() > std::time::Duration::from_secs(600) {
+            return None;
+        }
+        // 这条链路跑在界面线程上，远程路径的 is_dir() 会在挂掉的共享上卡几秒。
+        // 目录是我们自己刚跳成功的，直接信它。
+        if crate::fs::dir::is_remote_path(path) || path.is_dir() {
+            Some(path.clone())
+        } else {
+            None
+        }
     }
 
     /// 触发对话框接受。
@@ -582,6 +687,14 @@ mod imp {
         if let Ok(mut g) = NAV_STARTED.lock() {
             *g = Some(started);
         }
+        let nav_pid = {
+            let mut pid = 0u32;
+            unsafe {
+                GetWindowThreadProcessId(dialog, &mut pid);
+            }
+            pid
+        };
+        let nav_target = target_dir.to_path_buf();
 
         // 末尾反斜杠：Windows 对话框识别到目录后直接跳转，而不是当成文件名保存
         let mut target_str = target_dir.to_string_lossy().into_owned();
@@ -660,6 +773,16 @@ mod imp {
                     continue;
                 }
                 restore = Some((edit, original_name));
+                // 只有真的跳成功了才记：失败时记下来，下一次「当前目录」解析
+                // 就会跑到一个对话框根本没到达过的目录上。
+                if let Ok(mut g) = LAST_NAV.lock() {
+                    *g = Some((
+                        dialog as isize,
+                        nav_pid,
+                        nav_target.clone(),
+                        std::time::Instant::now(),
+                    ));
+                }
                 break;
             }
 
