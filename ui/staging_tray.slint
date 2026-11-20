@@ -1,5 +1,5 @@
 import { I18n } from "i18n.slint";
-import { Theme, StagingItem, IconClose } from "common.slint";
+import { Theme, StagingItem, IconClose, IconSwap, IconTrash } from "common.slint";
 
 // 临时暂存托盘：跨标签收集文件，一键批量复制/移动到当前目录。
 // 支持折叠（仅剩标题栏）、单项移除、全部清空。
@@ -66,15 +66,13 @@ export component StagingTray inherits Rectangle {
                     border-radius: 4px;
                     background: Theme.accent.transparentize(0.84);
 
-                    Text {
-                        text: "⇄";
-                        color: Theme.accent;
-                        font-size: 10px;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
+                    // 以前是文本 "⇄"：字体里没有这个字形时整块变成缺字方块，
+                    // 所以改成矢量图标（见 common.slint）。
+                    IconSwap {
+                        size: 11px;
+                        icon-color: Theme.accent;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
                     }
                 }
 
@@ -305,14 +303,12 @@ export component StagingTray inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     border-radius: 6px;
                     background: (root.items.length > 0 && clear-ta.has-hover) ? Theme.close-hover : transparent;
-                    Text {
-                        text: "🗑";
-                        color: root.items.length == 0 ? Theme.text-disabled : (clear-ta.has-hover ? #FFFFFF : Theme.text-secondary);
-                        font-size: 12px;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
-                        width: 100%;
-                        height: 100%;
+                    // 以前是 emoji "🗑"：要 emoji 字体才有字形，缺字体时是方块。
+                    IconTrash {
+                        size: 13px;
+                        icon-color: root.items.length == 0 ? Theme.text-disabled : (clear-ta.has-hover ? #FFFFFF : Theme.text-secondary);
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
                     }
                     clear-ta := TouchArea {
                         width: 100%;

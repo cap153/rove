@@ -335,6 +335,50 @@ export component IconPlus inherits Rectangle {
     }
 }
 
+// 双向箭头（暂存托盘的标题图标）：上下两条反向箭头。
+export component IconSwap inherits Rectangle {
+    in property <length> size: 12px;
+    in property <color> icon-color: Theme.accent;
+    in property <length> stroke-width: 1.15px;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 12;
+        viewbox-height: 12;
+        stroke: root.icon-color;
+        stroke-width: root.stroke-width;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        commands: "M 1.8 4 H 9.6 M 7.6 1.9 L 9.8 4 L 7.6 6.1 M 10.2 8 H 2.4 M 4.4 5.9 L 2.2 8 L 4.4 10.1";
+    }
+}
+
+// 垃圾桶（清空暂存盘）：盖子 + 提手 + 桶身，纯描边。
+export component IconTrash inherits Rectangle {
+    in property <length> size: 13px;
+    in property <color> icon-color: Theme.text-secondary;
+    in property <length> stroke-width: 1.15px;
+    width: root.size;
+    height: root.size;
+    background: transparent;
+
+    Path {
+        width: 100%;
+        height: 100%;
+        viewbox-width: 13;
+        viewbox-height: 13;
+        stroke: root.icon-color;
+        stroke-width: root.stroke-width;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+        commands: "M 2.2 3.6 H 10.8 M 5.1 3.6 V 2.2 H 7.9 V 3.6 M 3.4 3.6 L 4.1 11 H 8.9 L 9.6 3.6 M 5.6 6 V 8.9 M 7.4 6 V 8.9";
+    }
+}
+
 // 标签页图标：圆角方框描边。
 export component IconTab inherits Rectangle {
     in property <length> size: 13px;
