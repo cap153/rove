@@ -16498,6 +16498,7 @@ impl App {
                 use_regex: self.config.batch_rename.use_regex,
                 match_all: self.config.batch_rename.match_all,
                 case_sensitive: self.config.batch_rename.case_sensitive,
+                pinyin: self.config.batch_rename.pinyin,
                 apply_to: crate::ops::batch_rename::ApplyTo::from_index(
                     self.config.batch_rename.apply_to,
                 ),
@@ -16533,6 +16534,7 @@ impl App {
             ui.set_opt_regex(s.options.use_regex);
             ui.set_opt_match_all(s.options.match_all);
             ui.set_opt_case(s.options.case_sensitive);
+            ui.set_opt_pinyin(s.options.pinyin);
             ui.set_opt_apply_to(s.options.apply_to.to_index());
         }
         batch_wire(&ui, &session, id);
@@ -16585,6 +16587,7 @@ fn batch_push_static(ui: &BatchRenameWindow, lang: &str) {
     ui.set_text_regex(tr("使用正则表达式"));
     ui.set_text_match_all(tr("匹配所有出现的对象"));
     ui.set_text_case(tr("区分大小写"));
+    ui.set_text_pinyin(tr("拼音"));
     ui.set_text_original(tr("原始"));
     ui.set_text_renamed(tr("已重命名"));
     ui.set_text_apply(tr("重命名"));
@@ -16652,6 +16655,14 @@ fn batch_wire(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>, id: u64
         let weak = weak.clone();
         ui.on_case_toggled(move |on| {
             state.borrow_mut().options.case_sensitive = on;
+            batch_refresh_weak(&weak, &state);
+        });
+    }
+    {
+        let state = state.clone();
+        let weak = weak.clone();
+        ui.on_pinyin_toggled(move |on| {
+            state.borrow_mut().options.pinyin = on;
             batch_refresh_weak(&weak, &state);
         });
     }
@@ -16766,6 +16777,7 @@ fn batch_remember(s: &BatchSession) {
     p.use_regex = s.options.use_regex;
     p.match_all = s.options.match_all;
     p.case_sensitive = s.options.case_sensitive;
+    p.pinyin = s.options.pinyin;
     p.apply_to = s.options.apply_to.to_index();
 }
 

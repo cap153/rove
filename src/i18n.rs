@@ -303,6 +303,7 @@ pub const ZH: &[&str] = &[
     "标签页",                  // 292
     "关闭当前标签",            // 293
     "索引重建完成：{} 项",     // 294
+    "拼音",                    // 295
 ];
 
 pub const EN: &[&str] = &[
@@ -601,6 +602,7 @@ pub const EN: &[&str] = &[
     "Tabs",
     "Close current tab",
     "Index rebuilt: {} entries",
+    "Pinyin",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -688,6 +690,9 @@ mod tests {
         assert_eq!(ZH[238], "接管资源管理器");
         assert_eq!(EN[238], "Take over Explorer");
         assert_eq!(EN[239].is_empty(), false);
+        // 批量重命名的「拼音」勾选（追加在数组末尾，295）。
+        assert_eq!(ZH[295], "拼音");
+        assert_eq!(EN[295], "Pinyin");
         // 资源管理器右键菜单里的谓词名（写入注册表，跟随界面语言）。
         assert_eq!(ZH[240], "用 Rove 打开");
         assert_eq!(EN[240], "Open with Rove");

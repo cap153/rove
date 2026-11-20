@@ -36,6 +36,8 @@ pub struct BatchRenamePrefs {
     pub use_regex: bool,
     pub match_all: bool,
     pub case_sensitive: bool,
+    /// 搜索串同时按全拼匹配（`baogao` → 「报告」）。
+    pub pinyin: bool,
     /// 0 = 文件名 + 扩展名，1 = 文件名，2 = 扩展名。
     pub apply_to: i32,
 }
@@ -48,8 +50,35 @@ impl Default for BatchRenamePrefs {
             use_regex: false,
             match_all: false,
             case_sensitive: false,
+            pinyin: true,
             apply_to: 0,
         }
+    }
+}
+
+/// 解析 `config.json` 里的 `batch_rename` 段。缺字段一律保留默认值
+/// （「拼音」默认勾选，老配置文件里没有这个键时不能被读成关）。
+fn apply_batch_rename_json(p: &mut BatchRenamePrefs, br: &serde_json::Value) {
+    if let Some(v) = br.get("search").and_then(|v| v.as_str()) {
+        p.search = v.to_string();
+    }
+    if let Some(v) = br.get("replace").and_then(|v| v.as_str()) {
+        p.replace = v.to_string();
+    }
+    if let Some(v) = br.get("use_regex").and_then(|v| v.as_bool()) {
+        p.use_regex = v;
+    }
+    if let Some(v) = br.get("match_all").and_then(|v| v.as_bool()) {
+        p.match_all = v;
+    }
+    if let Some(v) = br.get("case_sensitive").and_then(|v| v.as_bool()) {
+        p.case_sensitive = v;
+    }
+    if let Some(v) = br.get("pinyin").and_then(|v| v.as_bool()) {
+        p.pinyin = v;
+    }
+    if let Some(v) = br.get("apply_to").and_then(|v| v.as_i64()) {
+        p.apply_to = v.clamp(0, 2) as i32;
     }
 }
 
@@ -416,25 +445,7 @@ impl Config {
             }
         }
         if let Some(br) = json.get("batch_rename") {
-            let p = &mut config.batch_rename;
-            if let Some(v) = br.get("search").and_then(|v| v.as_str()) {
-                p.search = v.to_string();
-            }
-            if let Some(v) = br.get("replace").and_then(|v| v.as_str()) {
-                p.replace = v.to_string();
-            }
-            if let Some(v) = br.get("use_regex").and_then(|v| v.as_bool()) {
-                p.use_regex = v;
-            }
-            if let Some(v) = br.get("match_all").and_then(|v| v.as_bool()) {
-                p.match_all = v;
-            }
-            if let Some(v) = br.get("case_sensitive").and_then(|v| v.as_bool()) {
-                p.case_sensitive = v;
-            }
-            if let Some(v) = br.get("apply_to").and_then(|v| v.as_i64()) {
-                p.apply_to = v.clamp(0, 2) as i32;
-            }
+            apply_batch_rename_json(&mut config.batch_rename, br);
         }
         if let Some(s) = json.get("startup_tab").and_then(|v| v.as_str()) {
             if matches!(s, "last_tabs" | "computer") {
@@ -685,6 +696,7 @@ impl Config {
                 "use_regex": self.batch_rename.use_regex,
                 "match_all": self.batch_rename.match_all,
                 "case_sensitive": self.batch_rename.case_sensitive,
+                "pinyin": self.batch_rename.pinyin,
                 "apply_to": self.batch_rename.apply_to,
             },
             "startup_tab": self.startup_tab,
@@ -751,6 +763,28 @@ mod tests {
         // 只有主机名（没有共享名）也合法：资源管理器能直接列出该主机的共享。
         assert_eq!(normalize_network_path("\\\\nas").as_deref(), Some("\\\\nas"));
         assert_eq!(normalize_network_path("\\\\").as_deref(), None);
+    }
+
+    #[test]
+    fn batch_rename_pinyin_defaults_on_and_sticks_when_off() {
+        let mut p = BatchRenamePrefs::default();
+        assert!(p.pinyin, "拼音默认勾选");
+
+        // 老配置文件没有这个键：保持默认勾选，不能被读成关。
+        let old = serde_json::json!({ "search": "a", "replace": "b" });
+        apply_batch_rename_json(&mut p, &old);
+        assert!(p.pinyin);
+        assert_eq!(p.search, "a");
+
+        // 用户取消勾选后必须真的关掉。
+        let off = serde_json::json!({ "pinyin": false });
+        apply_batch_rename_json(&mut p, &off);
+        assert!(!p.pinyin);
+
+        // 再打开也能回来。
+        let on = serde_json::json!({ "pinyin": true });
+        apply_batch_rename_json(&mut p, &on);
+        assert!(p.pinyin);
     }
 
     #[test]

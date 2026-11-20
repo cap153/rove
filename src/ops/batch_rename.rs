@@ -8,6 +8,10 @@
 //!   大小写不敏感、命中区间等行为天然一致，也不可能出现「字面模式算出来的高亮
 //!   和实际替换位置不一致」这类分裂。
 //! - 未勾选「匹配所有出现的对象」时只替换第一处。
+//! - 勾选「拼音」时（默认勾选，仅字面模式生效），搜索串还会在名字的**全拼**上
+//!   匹配：`baogao` 能命中「报告」，并把命中的汉字整字替换掉。全拼与原文两条
+//!   命中通道合并后按位置去重，因此不会出现「同一个字被替换两次」。
+//!   半个音节不算命中（`x` 不命中「喜」，`xi` 才命中）：替换必须以整字为单位。
 //! - 未勾选「区分大小写」时按 Unicode 不区分大小写匹配。
 //! - 目录没有「扩展名」概念，整名当文件名处理。
 //!
@@ -54,6 +58,8 @@ pub struct Options {
     pub use_regex: bool,
     pub match_all: bool,
     pub case_sensitive: bool,
+    /// 搜索串同时在全拼上匹配（`baogao` → 「报告」）。仅字面模式生效。
+    pub pinyin: bool,
     pub apply_to: ApplyTo,
 }
 
@@ -65,6 +71,7 @@ impl Default for Options {
             use_regex: false,
             match_all: false,
             case_sensitive: false,
+            pinyin: true,
             apply_to: ApplyTo::NameAndExt,
         }
     }
@@ -187,36 +194,24 @@ fn join_name(stem: &str, ext: &str) -> String {
 /// 在 `text` 上应用一次规则，返回 (结果文本, 原文命中区间, 结果插入区间)。
 ///
 /// 区间都是**字符**下标（`split_highlight` 用的单位），不是字节。
+///
+/// 命中来自两条通道：原文（字面/正则）与全拼（仅「拼音」勾选且字面模式）。
+/// 两条通道的区间都换算成原文字符区间后**统一排序去重**，所以原文命中与拼音
+/// 命中重叠时（混排名字里的 ASCII 段两条都能命中）不会重复替换。
 fn apply_to_text(
     text: &str,
     re: &Regex,
     options: &Options,
 ) -> (String, Vec<(usize, usize)>, Vec<(usize, usize)>) {
-    // 字节偏移 → 字符下标的映射，只需建一次。
-    let mut byte_to_char = vec![0usize; text.len() + 1];
-    let mut chars = 0usize;
-    for (byte_idx, _) in text.char_indices() {
-        byte_to_char[byte_idx] = chars;
-        chars += 1;
-    }
-    byte_to_char[text.len()] = chars;
+    let chars: Vec<char> = text.chars().collect();
 
-    let mut out = String::with_capacity(text.len() + 16);
-    let mut out_chars = 0usize;
-    let mut last_byte = 0usize;
-    let mut orig_ranges = Vec::new();
-    let mut new_ranges = Vec::new();
+    // (原文字符起点, 原文字符终点(不含), 替换进去的文本)
+    let mut hits: Vec<(usize, usize, String)> = Vec::new();
 
+    // 通道一：原文。字节偏移 → 字符下标。
+    let byte_to_char = byte_to_char_map(text);
     for caps in re.captures_iter(text) {
         let Some(m) = caps.get(0) else { continue };
-        if m.start() < last_byte {
-            continue;
-        }
-        // 命中之前的原文原样搬运。
-        let gap = &text[last_byte..m.start()];
-        out.push_str(gap);
-        out_chars += gap.chars().count();
-
         // 展开替换串：正则模式支持 $1/${name}，字面模式原样写入。
         let inserted = if options.use_regex {
             let mut buf = String::new();
@@ -225,6 +220,32 @@ fn apply_to_text(
         } else {
             options.replace.clone()
         };
+        hits.push((byte_to_char[m.start()], byte_to_char[m.end()], inserted));
+    }
+
+    // 通道二：全拼。正则模式跳过——`$1` 指的是原文的分组，而拼音命中在原文里
+    // 没有对应的分组，混着展开只会产生猜不到的结果。
+    if options.pinyin && !options.use_regex && !text.is_ascii() {
+        for (a, b) in pinyin_ranges(text, &options.search, options.case_sensitive) {
+            hits.push((a, b, options.replace.clone()));
+        }
+    }
+
+    hits.sort_by_key(|(a, b, _)| (*a, *b));
+
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut out_chars = 0usize;
+    let mut cursor = 0usize;
+    let mut orig_ranges = Vec::new();
+    let mut new_ranges = Vec::new();
+
+    for (a, b, inserted) in hits {
+        // 与已经应用过的命中重叠，或空区间：丢掉。
+        if a < cursor || b <= a {
+            continue;
+        }
+        out.extend(&chars[cursor..a]);
+        out_chars += a - cursor;
 
         let ins_chars = inserted.chars().count();
         if ins_chars > 0 {
@@ -232,16 +253,111 @@ fn apply_to_text(
         }
         out.push_str(&inserted);
         out_chars += ins_chars;
-
-        orig_ranges.push((byte_to_char[m.start()], byte_to_char[m.end()]));
-        last_byte = m.end();
+        orig_ranges.push((a, b));
+        cursor = b;
 
         if !options.match_all {
             break;
         }
     }
-    out.push_str(&text[last_byte..]);
+    out.extend(&chars[cursor..]);
     (out, orig_ranges, new_ranges)
+}
+
+/// 全拼命中：把搜索串逐字「吃」进名字的拼音里，返回原名的字符区间（左闭右开）。
+///
+/// 不能直接拿 `pinyin_fields().full` 跑正则：多音字的**所有**读音会被并排拼进
+/// 同一个串（喜 = `xi` + `chi`、兔 = `tu` + `chan`），于是一串中文里到处插着
+/// 干扰读音，`xiqing` 断在 `xichiqing` 的 `chi` 上 ——「喜庆」永远搜不到。
+///
+/// 这里改成**按字对齐**：每个字贡献它的任一读音，搜索串必须被连续几个字刚好
+/// 吃完。这样「喜庆」→ `xi`+`qing` ✓，而「更喜庆」不会因为「更」的第二个读音
+/// 而断开。
+fn pinyin_ranges(text: &str, query: &str, case_sensitive: bool) -> Vec<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    // 读音一律按小写比较（拼音没有大小写），名字里的非汉字段则服从
+    // 「区分大小写」——否则勾了严格匹配，输入 `readme` 还能命中 `Readme` 部分。
+    let lower: Vec<char> = query.to_lowercase().chars().collect();
+    let raw: Vec<char> = query.chars().collect();
+    if lower.is_empty() {
+        return Vec::new();
+    }
+    // 有些字符小写后长度会变（`İ`），两套下标就对不上了，那种情况退回不区分大小写。
+    let strict = case_sensitive && raw.len() == lower.len();
+    // 每个字的候选读音；空 = 不是汉字（按字符本身小写比较）。读音表是静态的，
+    // 这里只是借用，不分配字符串 —— 一次预览要对几百行各扫一遍。
+    let pinyins: Vec<Vec<&'static str>> = chars
+        .iter()
+        .map(|&c| crate::search::char_pinyins(c))
+        .collect();
+
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < chars.len() {
+        match eat(&chars, &pinyins, start, &lower, &raw, strict, 0) {
+            Some(end) => {
+                out.push((start, end));
+                start = end;
+            }
+            None => start += 1,
+        }
+    }
+    out
+}
+
+/// 从第 `ci` 个字、搜索串第 `qi` 个字符开始，能否把剩余搜索串吃完。
+/// 返回结束的字符下标（不含）；多个解取最短（覆盖的汉字最少）。
+fn eat(
+    chars: &[char],
+    pinyins: &[Vec<&'static str>],
+    ci: usize,
+    query: &[char],
+    query_raw: &[char],
+    strict: bool,
+    qi: usize,
+) -> Option<usize> {
+    if qi == query.len() {
+        return Some(ci);
+    }
+    let spelling = pinyins.get(ci)?;
+    let mut best: Option<usize> = None;
+
+    if spelling.is_empty() {
+        // 非汉字：占一个搜索字符。
+        let same = if strict {
+            chars[ci] == query_raw[qi]
+        } else {
+            let mut lower = chars[ci].to_lowercase();
+            matches!((lower.next(), lower.next()), (Some(a), None) if a == query[qi])
+        };
+        return same.then(|| eat(chars, pinyins, ci + 1, query, query_raw, strict, qi + 1))?;
+    }
+
+    for py in spelling {
+        let n = py.chars().count();
+        if qi + n > query.len() {
+            continue;
+        }
+        if !py.chars().eq(query[qi..qi + n].iter().copied()) {
+            continue;
+        }
+        if let Some(end) = eat(chars, pinyins, ci + 1, query, query_raw, strict, qi + n) {
+            best = Some(best.map_or(end, |b: usize| b.min(end)));
+        }
+    }
+    best
+}
+
+/// 每个字节位置对应的字符下标（末位补总字符数）。
+fn byte_to_char_map(text: &str) -> Vec<usize> {
+    let mut map = vec![0usize; text.len() + 1];
+    let mut chars = 0usize;
+    for (byte_idx, _) in text.char_indices() {
+        map[byte_idx] = chars;
+        chars += 1;
+    }
+    map[text.len()] = chars;
+    map
 }
 
 /// 计算一行的预览。
@@ -702,6 +818,119 @@ mod tests {
     fn unicode_case_insensitive_matching() {
         let p = run("ÄRGER.txt", false, &opts("ärger", "ok"), &[]);
         assert_eq!(p.new_name, "ok.txt");
+    }
+
+    #[test]
+    fn pinyin_matches_chinese_and_replaces_whole_characters() {
+        // 默认勾选：搜 `baogao` 能命中「报告」，并把两个汉字整字换掉。
+        let o = opts("baogao", "总结");
+        assert!(o.pinyin, "拼音默认必须是勾选的");
+        let p = run("季度报告.docx", false, &o, &[]);
+        assert_eq!(p.new_name, "季度总结.docx");
+        assert_eq!(p.state, RowState::Ready);
+        // 原始列高亮的是被替换的那两个字。
+        let hl: String = p
+            .orig_parts
+            .iter()
+            .filter(|(_, hot)| *hot)
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(hl, "报告");
+    }
+
+    #[test]
+    fn pinyin_off_falls_back_to_literal_only() {
+        let o = Options {
+            pinyin: false,
+            ..opts("baogao", "总结")
+        };
+        let p = run("季度报告.docx", false, &o, &[]);
+        assert_eq!(p.new_name, "季度报告.docx");
+        assert_eq!(p.state, RowState::Unchanged);
+    }
+
+    #[test]
+    fn pinyin_matches_polyphonic_chars_in_a_long_chinese_name() {
+        // 真实现场：`xiqing` 必须命中「喜庆」。
+        // 多音字（喜 = xi/chi、兔 = tu/chan、的 = de/di）会把 `pinyin_fields().full`
+        // 插成一串干扰读音（`...xichiqing...`），连续子串匹配就断在 `chi` 上。
+        let name = "兔牙Sinar酱-【生日作坚屏】新的一步更喜庆的up&down.mp4";
+        let p = run(name, false, &opts("xiqing", "ABc"), &[]);
+        assert_eq!(
+            p.new_name,
+            "兔牙Sinar酱-【生日作坚屏】新的一步更ABc的up&down.mp4"
+        );
+        assert_eq!(p.state, RowState::Ready);
+        let hl: String = p
+            .orig_parts
+            .iter()
+            .filter(|(_, hot)| *hot)
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(hl, "喜庆", "只高亮被替换的那两个字");
+    }
+
+    #[test]
+    fn pinyin_skips_extra_readings_of_polyphones() {
+        // 兔 = tu / chan：两种读音都得能搜到，且都只吃掉这一个字。
+        let p = run("兔子.mp4", false, &opts("tu", "x"), &[]);
+        assert_eq!(p.new_name, "x子.mp4");
+        let p = run("兔子.mp4", false, &opts("chan", "x"), &[]);
+        assert_eq!(p.new_name, "x子.mp4");
+    }
+
+    #[test]
+    fn pinyin_is_case_insensitive_and_partial_spans_work() {
+        // 拼音没有大小写：`BaoGao` 既命中汉字「报告」，也命中名字里的 ASCII 段。
+        let p = run("2024年BaoGao.pdf", false, &opts("baogao", "x"), &[]);
+        assert_eq!(p.new_name, "2024年x.pdf");
+        let p = run("报告.md", false, &opts("BaoGao", "x"), &[]);
+        assert_eq!(p.new_name, "x.md");
+    }
+
+    #[test]
+    fn pinyin_and_literal_hits_do_not_double_replace() {
+        // 混排名字：ASCII 段两条通道都能命中 `2024`，只能替换一次。
+        let o = Options {
+            match_all: true,
+            ..opts("2024", "-")
+        };
+        let p = run("2024年报告2024.txt", false, &o, &[]);
+        assert_eq!(p.new_name, "-年报告-.txt");
+    }
+
+    #[test]
+    fn pinyin_is_ignored_in_regex_mode() {
+        // 正则模式不做拼音匹配：`$1` 的分组只存在于原文里。
+        let o = Options {
+            use_regex: true,
+            ..opts("baogao", "x")
+        };
+        let p = run("报告.txt", false, &o, &[]);
+        assert_eq!(p.new_name, "报告.txt");
+    }
+
+    #[test]
+    fn pinyin_ascii_part_honours_case_sensitive_switch() {
+        // 勾了「区分大小写」就不能让拼音通道绕过它：名字里的 `Readme` 段
+        // 必须严格匹配大小写。
+        let strict = Options {
+            case_sensitive: true,
+            ..opts("readme", "x")
+        };
+        let p = run("报告Readme.txt", false, &strict, &[]);
+        assert_eq!(p.new_name, "报告Readme.txt");
+        assert_eq!(p.state, RowState::Unchanged);
+
+        // 不勾就照旧命中（大小写不敏感）。
+        let p = run("报告Readme.txt", false, &opts("readme", "x"), &[]);
+        assert_eq!(p.new_name, "报告x.txt");
+    }
+
+    #[test]
+    fn ascii_names_are_unaffected_by_pinyin() {
+        let p = run("readme.md", false, &opts("read", "write"), &[]);
+        assert_eq!(p.new_name, "writeme.md");
     }
 
     #[test]

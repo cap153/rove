@@ -351,6 +351,7 @@ export component BatchRenameWindow inherits Window {
     in property <string> text-regex: "";
     in property <string> text-match-all: "";
     in property <string> text-case: "";
+    in property <string> text-pinyin: "";
     in property <string> text-original: "";
     in property <string> text-renamed: "";
     in property <string> text-apply: "";
@@ -363,6 +364,7 @@ export component BatchRenameWindow inherits Window {
     in-out property <bool> opt-regex: false;
     in-out property <bool> opt-match-all: false;
     in-out property <bool> opt-case: false;
+    in-out property <bool> opt-pinyin: false;
     in-out property <int> opt-apply-to: 0;
     in-out property <int> filter: 0;
     in-out property <[RenameRow]> rows: [];
@@ -378,6 +380,7 @@ export component BatchRenameWindow inherits Window {
     callback regex-toggled(bool);
     callback match-all-toggled(bool);
     callback case-toggled(bool);
+    callback pinyin-toggled(bool);
     callback apply-to-changed(int);
     callback row-toggled(int, bool);
     callback all-toggled(bool);
@@ -488,6 +491,17 @@ export component BatchRenameWindow inherits Window {
                             toggled => {
                                 root.opt-case = !root.opt-case;
                                 root.case-toggled(root.opt-case);
+                            }
+                        }
+                        // 拼音只在字面模式下起作用，勾了正则就直接收起来，
+                        // 免得勾着却毫无反应。收起时不动它的状态，取消正则后
+                        // 用户原来的选择还在。
+                        if !root.opt-regex: LabelCheck {
+                            text: root.text-pinyin;
+                            checked: root.opt-pinyin;
+                            toggled => {
+                                root.opt-pinyin = !root.opt-pinyin;
+                                root.pinyin-toggled(root.opt-pinyin);
                             }
                         }
 

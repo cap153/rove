@@ -9,6 +9,18 @@
 use nucleo_matcher::{Matcher, Utf32Str};
 use pinyin::ToPinyinMulti;
 
+/// 单个字符的全部拼音写法（多音字给出多个）；非汉字返回空。
+///
+/// 与 `pinyin_fields` 的区别在于**不摊平**：正因为 `full` 会把多音字的所有读音
+/// 并排拼起来（喜 = `xi` + `chi`），拿它做连续子串匹配时 `xiqing` 会断在中间，
+/// 「喜庆」就永远搜不到。需要「按字对齐」的调用方用这个自己逐字匹配。
+pub fn char_pinyins(ch: char) -> Vec<&'static str> {
+    match ch.to_pinyin_multi() {
+        Some(multi) => multi.into_iter().map(|p| p.plain()).collect(),
+        None => Vec::new(),
+    }
+}
+
 /// 一个条目的预计算拼音字段。
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)] // indices 反向映射供后续命中高亮使用
