@@ -622,12 +622,6 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 拖拽悬停高亮：把命中的目标行索引暴露给 Rust（拖入/拖出悬停时设置）。
     in-out property <int> file-drop-hover-index <=> file-list.drop-hover-index;
 
-    /// 标题栏空白拖拽区的起止坐标（供 Win32 WM_NCHITTEST 判定，见 app.rs drag_hittest）。
-    out property <length> drag-area-x: tab-bar.drag-x;
-    out property <length> drag-area-w: tab-bar.drag-w;
-    /// 最后一个标签的右边界（窗口坐标），见 tab_bar.slint 的说明。
-    out property <length> tabs-right: tab-bar.tabs-right;
-
     /// 窗口是否处于最大化（Rust 经 IsZoomed 实时同步）。
     ///
     /// 刻意不用 Slint 内置的 `maximized`：那个是**命令属性**（置 true 会真的
@@ -666,6 +660,7 @@ out property <length> row-height-out: file-list.row-height-out;
                 root.clear-all-focus();
                 root.new_tab_requested();
             }
+            caption_clicked => { root.clear-all-focus(); }
             window_minimize => { root.window_minimize(); }
             window_maximize => { root.window_maximize(); }
             window_close => { root.window_close(); }

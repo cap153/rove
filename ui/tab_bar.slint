@@ -22,8 +22,9 @@ export component TabBar inherits Rectangle {
     callback tab_drag(index: int, phase: int, x: length);
 
     // 窗口控制（无边框标题栏整合，详见 main_window.slint 的 no-frame）。
-    // 注意：窗口拖动不使用回调，改用下方原生 WindowMoveArea；
-    // 其几何另行导出给 Win32 WM_NCHITTEST 钩子，以支持触屏手指拖拽。
+    // 注意：窗口拖动不使用回调，改用下方原生 WindowMoveArea。
+    /// 标题栏空白处被点击（拖动不算）：上层据此退出地址栏/重命名编辑态。
+    callback caption_clicked();
     callback window_minimize();
     callback window_maximize();
     callback window_close();
@@ -131,18 +132,6 @@ export component TabBar inherits Rectangle {
     changed active-tab => {
         root.start-scroll(root.active-tab);
     }
-
-    // 导出空白拖拽区的起止位置（供后端 WM_NCHITTEST 判定，见 app.rs drag_hittest）
-    out property <length> drag-x: drag-spacer.x;
-    out property <length> drag-w: drag-spacer.width;
-    /// 最后一个标签的右边界（窗口坐标）。
-    ///
-    /// WM_NCHITTEST 用它兜一道：标题栏拖拽区**绝不允许**从标签右边界左边开始。
-    /// 拖拽区的 x/width 是 40ms 轮询下发的，窗口刚最大化/刚换标签时可能还是旧值，
-    /// 一旦偏小就会把标签上的点击判成 HTCAPTION —— 表现为“点标签没切换，
-    /// 窗口反而从最大化还原了”（Windows 对最大化窗口的标题栏拖动就是这个行为）。
-    out property <length> tabs-right: min(root.width,
-        max(0px, tabs-flick.x - tabs-flick.content-x + tabs-layout.preferred-width));
 
     height: 38px;
     background: Theme.bg-tabstrip;
@@ -373,14 +362,23 @@ export component TabBar inherits Rectangle {
 
 
         // 剩余空白区域：Slint 原生移动区域。
-        // 内部严禁放 TouchArea：触控指针会被其捕获，而手指在非客户区
-        // （HTCAPTION）不会产生对应释放事件，导致指针永久卡在捕获态——
-        // 表现为触屏拖不动，且随后鼠标拖动也一并失效。
-        // 双击最大化由 Windows 原生标题栏语义接管，无需在此处理。
+        //
+        // 这里**是**唯一的拖窗口入口（整段标题栏都回报客户区，系统不再代劳）：
+        // 按下后拖动超过阈值 → winit 发 WM_NCLBUTTONDOWN/HTCAPTION → 系统原生
+        // 移动循环，吸附、最大化拖动还原都在。
+        //
+        // 里面的 TouchArea 只负责双击：空白区现在是客户区，系统不会再把双击
+        // 解释成最大化。它不会抢走拖动——WindowMoveArea 的按下/移动判定跑在
+        // 子元素之前，超过阈值先由它拦截。
         drag-spacer := WindowMoveArea {
             horizontal-stretch: 1;
             min-width: 60px; // 强制至少保留 60px 舒适拖拽宽度
             height: parent.height;
+
+            TouchArea {
+                clicked => { root.caption_clicked(); }
+                double-clicked => { root.window_maximize(); }
+            }
         }
 
         // 窗口控制按钮组 (设置 / 最小化 / 最大化 / 关闭)

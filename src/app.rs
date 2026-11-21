@@ -3779,9 +3779,6 @@ impl App {
             })
             .collect();
         self.ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
-        // 标签数量/宽度变化会改变标题栏空白拖拽区，同步给命中测试钩子。
-        #[cfg(windows)]
-        sync_drag_bounds(self, "tabs");
         self.ui.set_active_tab(self.state.active_tab as i32);
         self.ui.set_tab_loading(self.state.active().active().loading);
         self.ui.set_settings_open(self.state.active().kind == crate::state::TabKind::Settings);
@@ -11766,7 +11763,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     }
 
     // 后台线程启动终端 / 自定义动作失败（目录不存在、进程起不来）在这里显示。
-    // 逐条借一次 App，避免和下面 `sync_drag_bounds` / `borrow_mut` 抢借用。
+    // 逐条借一次 App，避免和下面 `borrow_mut` 抢借用。
     for message in ops::take_launch_errors() {
         app.borrow().set_status_job(message);
     }
@@ -11774,10 +11771,6 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     // 主窗 HWND 登记、无边框拖拽钩子、最大化还原、首次启动居中，已全部移至
     // on_winit_window_event 的首次 RedrawRequested（窗口 realize 后）统一应用，
     // 见 apply_deferred_geometry（由 setup_keyboard 注册）。
-    // 布局落定前 Slint 几何可能仍是 0；每 40ms 重取一次，
-    // 保证最终一定收敛到真实的 drag-spacer 边界（update 内部去重）。
-    sync_drag_bounds(&app.borrow(), "poll");
-
     let mut app = app.borrow_mut();
                 // 布局落定 / 窗口尺寸变化监听。
                 // 启动首帧时 list_height=0、cells_per_row=1，按当时的几何算出的
@@ -12263,7 +12256,6 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                         unsafe { windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed(hwnd as _) != 0 };
                     app.ui.set_win_maximized(is_zoomed);
                 }
-                sync_drag_bounds(&app, "resize");
                 drop(app);
                 // 尺寸变化后强制下一轮 40ms 轮询重建可见行：行模型里的
                 // name-truncated（浮层弹出依据）是按旧几何算的，行内文字的
@@ -14100,23 +14092,27 @@ fn get_window_hwnd(ui: &MainWindow) -> Option<isize> {
     None
 }
 
-/// 无边框窗口的 `WM_NCHITTEST` 子类化：把标题栏空白拖拽区回报为 `HTCAPTION`。
+/// 无边框窗口的 `WM_NCHITTEST` 子类化。
 ///
-/// **目的**：让 Windows **原生**处理该区域的拖拽。winit 的 `drag_window()`
-/// （Slint `WindowMoveArea` 的底座）只支持鼠标；触屏手指拖拽必须经由
-/// 非客户区命中测试走系统路径，否则手指按在标题栏空白处毫无反应。
+/// **这里不再判定标题栏拖拽区**。历史做法是把标签栏右侧的空白算成
+/// `HTCAPTION`（目的只有一个：手指拖窗口走系统原生路径），但那个矩形是从
+/// Slint 布局**轮询**来的副本，新建标签 / 最大化 / 改缩放的一瞬间副本会落后
+/// 于真实布局 —— 偏小时就把标签本身判成标题栏，表现为「点标签变成拖窗口、
+/// 关闭按钮闪烁」，而且只在偶发时机出现，抓不到也复现不了。
 ///
-/// 设计要点：
-/// - 先透传原窗口过程，仅在它回报 `HTCLIENT`（客户区）时才判定拖拽区，
-///   因此 `resize-border-width` 生成的边缘缩放手柄（`HTLEFT`/`HTTOP`/…）
-///   与原生标题栏语义都不被破坏；
-/// - 用原子量而非 `static mut` 保存边界与前一过程，避免 edition 2021 的
-///   `static_mut_refs` 警告（本项目要求 Windows 零警告）；
-/// - 安装时若当前过程已是自身则跳过，防止守护进程多次建会话时把前一过程
-///   链成自身而造成无限递归。
+/// 现在整段一律 `HTCLIENT`：命中的裁决交给 Slint 自己的元素命中测试（同步、
+/// 精确、不存在滞后），拖窗口走 `WindowMoveArea` → winit 发
+/// `WM_NCLBUTTONDOWN/HTCAPTION` → 系统原生移动循环（吸附、从最大化拖出时
+/// 自动还原都还在）。代价只有两个：手指拖窗口失效、空白处双击最大化改由
+/// Slint 的 `double-clicked` 自己处理。
+///
+/// 仍然必须留在子类化里的只有三件事：
+/// - 无边框窗口的**边缘缩放**（系统不知道 `resize-border-width`）；
+/// - 右上角窗口按钮区压制缩放边（否则点关闭按钮的上沿会变成拉高窗口）；
+/// - 自己发起 OLE 拖拽期间把一切压成 `HTCLIENT`，别让缩放光标盖掉拖放光标。
 #[cfg(windows)]
 mod drag_hittest {
-    use std::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     /// 前一窗口过程（`SetWindowLongPtrW` 的返回值）。
     static PREV_WNDPROC: AtomicI64 = AtomicI64::new(0);
@@ -14125,212 +14121,13 @@ mod drag_hittest {
     /// 守护进程常驻时会多次建会话、每次都是新窗口；只有"同一个 HWND 已装过"
     /// 才允许跳过，否则第二个窗口永远拿不到钩子。
     static INSTALLED_HWND: AtomicI64 = AtomicI64::new(0);
-    /// 拖拽区起点 x（逻辑像素，以 f32 位模式存放）。
-    static DRAG_X: AtomicU32 = AtomicU32::new(0);
-    /// 拖拽区宽度（逻辑像素，f32 位模式）。
-    static DRAG_W: AtomicU32 = AtomicU32::new(0);
-    /// 最后一个标签的右边界（逻辑像素，f32 位模式）。
-    ///
-    /// 标题栏拖拽判定必须从它右边开始：拖拽区的 x/width 是 40ms 轮询写入的，
-    /// 窗口刚最大化 / 刚增删标签时可能仍是旧值，x 偏小时就会把「点标签」
-    /// 判成 HTCAPTION —— 最大化窗口被拖动即还原。
-    static TABS_R: AtomicU32 = AtomicU32::new(0);
-    /// 窗口缩放系数（物理像素 / 逻辑像素）。
-    static DRAG_SCALE: AtomicU32 = AtomicU32::new(1.0f32.to_bits());
-    /// 标签栏布局是否已落定（1 = 已落定）。
-    ///
-    /// 窗口刚建、标签模型刚换掉的头几百毫秒里，Slint 报上来的
-    /// `drag-area-x` 是**旧布局**的值（新建标签那一下，`tabs-area` 宽度还是
-    /// 上一次的），而 `drag-area-w` 会被弹簧撑到恰好填满 —— 两个值自洽，
-    /// 唯独压在了标签上。这种几何一旦被用来判 HTCAPTION，标签和新建按钮的
-    /// 点击就会被吞，悬停也会因为 `WM_MOUSELEAVE` 反复清零而闪烁。
-    /// 判据：有标签时 `tabs-right` 必须 > 0，否则视为未落定，整段按客户区处理。
-    static READY: AtomicU32 = AtomicU32::new(0);
-    /// 标签栏高度（逻辑像素）：仅纵向落在此范围内才可能是标题栏拖拽区。
-    const TAB_BAR_H: f32 = 38.0;
-    /// 命中日志节流（毫秒）：鼠标移动时 WM_NCHITTEST 高频触发，别把日志刷爆。
-    static LAST_HIT_LOG_MS: AtomicU64 = AtomicU64::new(0);
-    /// 陈旧命中取证日志的节流时刻。
-    static STALE_LOGGED_MS: AtomicU64 = AtomicU64::new(0);
-    /// 拖拽区几何 1 秒内的改动次数（抖动取证）。
-    static GEO_N: AtomicU32 = AtomicU32::new(0);
-    static GEO_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
-    /// 上一次命中结果（0 = 客户区 / 1 = 标题栏 / 2 = 还没有）。
-    static LAST_CAPTION: AtomicU32 = AtomicU32::new(2);
-    /// 抖动计数：窗口期内命中结果翻转了多少次。
-    static FLIP_N: AtomicU32 = AtomicU32::new(0);
-    static FLIP_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
-    static FLIP_LOGGED_MS: AtomicU64 = AtomicU64::new(0);
-    /// 客户区一秒钟收到多少次 `WM_MOUSELEAVE`（Slint 据此清空全部 has-hover）。
-    static LEAVE_N: AtomicU32 = AtomicU32::new(0);
-    static LEAVE_WINDOW_MS: AtomicU64 = AtomicU64::new(0);
-    static LEAVE_LOGGED_MS: AtomicU64 = AtomicU64::new(0);
 
-    fn bits(v: &AtomicU32) -> f32 {
-        f32::from_bits(v.load(Ordering::Relaxed))
-    }
-
-    /// 标记标签栏布局是否可用（见 [`READY`]）。
-    pub fn set_ready(ready: bool) {
-        READY.store(ready as u32, Ordering::Relaxed);
-    }
-
-    fn is_ready() -> bool {
-        READY.load(Ordering::Relaxed) != 0
-    }
-
-    /// 兜底取证：把一个**压在标签上**的位置判成了标题栏。
-    ///
-    /// 正常只在拖拽区里（最后一个标签右边 34px 之后）才会走到这里；比这更靠左
-    /// 说明 `drag-area-x` 还是旧布局的值 —— 点击会被吞成拖窗口，正是那个
-    /// 「标签点不动 / 关闭按钮闪烁」的现场。level 1，1s 最多一行。
-    fn note_stale_caption(x: f32, w: f32, tabs_r: f32, lx: f32, ly: f32, zoomed: bool) {
-        let now = crate::app::now_ms();
-        if now.saturating_sub(STALE_LOGGED_MS.load(Ordering::Relaxed)) < 1000 {
-            return;
-        }
-        STALE_LOGGED_MS.store(now, Ordering::Relaxed);
-        logln!(
-            "!! [nc-hit] 判成拖拽区的位置已经压到标签栏 x={x:.1} w={w:.1} tabs_r={tabs_r:.1} lx={lx:.1} ly={ly:.1} zoomed={zoomed}（点击会被吞成拖窗口）"
-        );
-    }
-
-    /// 记一次命中结果。**同一个位置**上客户区/标题栏反复翻转，就是
-    /// 「关闭按钮闪烁 + 点击偶尔没反应」的直接机理：命中判成标题栏时
-    /// Windows 会给客户区发 `WM_MOUSELEAVE`，Slint 立刻清空所有悬停态；
-    /// 下一次命中又判回客户区，悬停重新出现 —— 一秒钟来回几十次就是闪烁。
-    ///
-    /// 只在真的抖起来时写一行（level 1，1s 最多一行），正常拖动标题栏不会触发。
-    fn note_decision(caption: bool, lx: f32, ly: f32, x: f32, w: f32, win_w: f32, zoomed: bool, scale: f32) {
-        let now = crate::app::now_ms();
-        let cur = caption as u32;
-        let last = LAST_CAPTION.swap(cur, Ordering::Relaxed);
-        if now.saturating_sub(FLIP_WINDOW_MS.load(Ordering::Relaxed)) > 500 {
-            FLIP_WINDOW_MS.store(now, Ordering::Relaxed);
-            FLIP_N.store(0, Ordering::Relaxed);
-            return;
-        }
-        if last == cur || last == 2 {
-            return;
-        }
-        let n = FLIP_N.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= 6 && now.saturating_sub(FLIP_LOGGED_MS.load(Ordering::Relaxed)) >= 1000 {
-            FLIP_LOGGED_MS.store(now, Ordering::Relaxed);
-            logln!(
-                "!! [nc-hit] 命中在翻转 {n} 次/500ms（悬停会闪、点击会丢）lx={lx:.1} ly={ly:.1} x={x:.1} w={w:.1} tabs_r={:.1} win_w={win_w:.1} zoomed={zoomed} scale={scale:.2}",
-                bits(&TABS_R)
-            );
-        }
-    }
-
-    /// 客户区收到 `WM_MOUSELEAVE`。频繁出现说明悬停态在被反复清零 —— 不管是
-    /// 命中测试判成标题栏，还是别的路径把它踢出客户区，都会走到这里。
-    pub fn note_mouse_leave() {
-        let now = crate::app::now_ms();
-        if now.saturating_sub(LEAVE_WINDOW_MS.load(Ordering::Relaxed)) > 1000 {
-            LEAVE_WINDOW_MS.store(now, Ordering::Relaxed);
-            LEAVE_N.store(0, Ordering::Relaxed);
-            return;
-        }
-        let n = LEAVE_N.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= 8 && now.saturating_sub(LEAVE_LOGGED_MS.load(Ordering::Relaxed)) >= 2000 {
-            LEAVE_LOGGED_MS.store(now, Ordering::Relaxed);
-            let last = LAST_CAPTION.load(Ordering::Relaxed);
-            logln!(
-                "!! [nc-hit] 客户区 1s 内收到 {n} 次 WM_MOUSELEAVE（悬停被反复清零，上一次命中={}）",
-                match last {
-                    1 => "HTCAPTION",
-                    0 => "HTCLIENT",
-                    _ => "未知",
-                }
-            );
-        }
-    }
-
-    /// 一次边界变化附带的信息。
-    pub struct Change {
-        pub prev_x: f32,
-        pub prev_w: f32,
-        pub prev_tabs_r: f32,
-        /// 1 秒窗口内改了几次（≥5 就是在抖，调用方把它提到 level 1）。
-        pub changes_in_window: u32,
-    }
-
-    /// 更新拖拽区边界；值未变化返回 `None`（poll_timer 每 40ms 都会来一次），
-    /// 变化时返回附带旧值和抖动次数的 [`Change`]。
-    pub fn update(x: f32, w: f32, tabs_r: f32, scale: f32) -> Option<Change> {
-        let (xb, wb, tb, sb) = (x.to_bits(), w.to_bits(), tabs_r.to_bits(), scale.to_bits());
-        if DRAG_X.load(Ordering::Relaxed) == xb
-            && DRAG_W.load(Ordering::Relaxed) == wb
-            && TABS_R.load(Ordering::Relaxed) == tb
-            && DRAG_SCALE.load(Ordering::Relaxed) == sb
-        {
-            return None;
-        }
-        let prev = Change {
-            prev_x: bits(&DRAG_X),
-            prev_w: bits(&DRAG_W),
-            prev_tabs_r: bits(&TABS_R),
-            changes_in_window: {
-                let now = crate::app::now_ms();
-                if now.saturating_sub(GEO_WINDOW_MS.load(Ordering::Relaxed)) > 1000 {
-                    GEO_WINDOW_MS.store(now, Ordering::Relaxed);
-                    GEO_N.store(1, Ordering::Relaxed);
-                    1
-                } else {
-                    GEO_N.fetch_add(1, Ordering::Relaxed) + 1
-                }
-            },
-        };
-        DRAG_X.store(xb, Ordering::Relaxed);
-        DRAG_W.store(wb, Ordering::Relaxed);
-        TABS_R.store(tb, Ordering::Relaxed);
-        DRAG_SCALE.store(sb, Ordering::Relaxed);
-        Some(prev)
-    }
-
-    /// 标题栏命中诊断（详细级）。
-    ///
-    /// 正常的 `HTCAPTION` / `HTCLIENT` 命中和鼠标移动一样频繁，只在 `ROVE_LOG=2`
-    /// 时输出；「兜底生效」那种异常命中由 [`log_guarded`] 无条件写一行。
-    fn log_hit(
-        reason: &str,
-        lx: f32,
-        ly: f32,
-        scale: f32,
-        win_w: f32,
-        x: f32,
-        w: f32,
-        zoomed: bool,
-    ) {
-        note_decision(reason == "CAPTION", lx, ly, x, w, win_w, zoomed, scale);
-        if ly < 0.0 || ly > TAB_BAR_H {
-            return;
-        }
-        logv!(
-            "[nc-hit] {reason} lx={lx:.1} ly={ly:.1} scale={scale:.2} win_w={win_w:.1} x={x:.1} w={w:.1} tabs_r={:.1} zoomed={zoomed}",
-            bits(&TABS_R)
-        );
-    }
-
-    /// 兜底拦截：这次命中本来会被判成标题栏（拖拽区几何压到了标签上）。
-    ///
-    /// 这属于「本不该发生」，正常使用一行都不会写；真出现了就是我们要的证据：
-    /// 说明 40ms 轮询下发的拖拽区 x 曾经偏小（窗口刚最大化 / 刚增删标签）。
-    /// 保留 200ms 节流：真踩上时鼠标每动一下都会命中，不要刷屏。
-    fn log_guarded(lx: f32, ly: f32, x: f32, w: f32, tabs_r: f32, zoomed: bool) {
-        let now = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() };
-        let last = LAST_HIT_LOG_MS.load(Ordering::Relaxed);
-        if now.saturating_sub(last) < 200 {
-            return;
-        }
-        LAST_HIT_LOG_MS.store(now, Ordering::Relaxed);
-        // level 1：这条在正常拖动标题栏时也会命中（拖拽区几何是 40ms 轮询下发的，
-        // 天生慢半拍），属于常规交互，不能无条件写。
-        logln!(
-            "[nc-hit] caption-guard lx={lx:.1} ly={ly:.1} x={x:.1} w={w:.1} tabs_r={tabs_r:.1} zoomed={zoomed}"
-        );
-    }
+    /// 标题栏高度（逻辑像素）。只有落在这一带里的右上角才是窗口按钮区。
+    const TITLE_BAND_H: f32 = 38.0;
+    /// 右上角窗口按钮组的宽度（设置 36 + 最小化 44 + 最大化 44 + 关闭 46 + 余量）。
+    const CONTROLS_W: f32 = 172.0;
+    /// 无边框窗口的边缘缩放厚度（逻辑像素）。滚动条按 7px 内缩躲开它。
+    const BORDER: f32 = 6.0;
 
     /// 窗口过程拦截。
     ///
@@ -14344,21 +14141,14 @@ mod drag_hittest {
         lparam: windows_sys::Win32::Foundation::LPARAM,
     ) -> windows_sys::Win32::Foundation::LRESULT {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
-            CallWindowProcW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCAPTION, HTCLIENT, HTLEFT,
-            HTRIGHT, HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, SC_MOVE, WNDPROC, WM_GETMINMAXINFO,
+            CallWindowProcW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT,
+            HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, SC_MOVE, WNDPROC, WM_GETMINMAXINFO,
             WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_SYSCOMMAND,
         };
 
-        // 标题栏空白是**非客户区**（HTCAPTION），Slint 收不到这次点击，
-        // 所以只能在这里清焦点：否则编辑态/重命名退不出去。
+        // 非客户区点击 / 系统发起的移动：编辑态与重命名必须先退出。
         // 必须同步——Windows 随后会进入自己的模态移动循环，
         // invoke_from_event_loop 排队的闭包要等循环结束才跑（表现为“点了没反应”）。
-        // 客户区被「踢出去」时 Windows 发这条，Slint 收到就清空所有悬停态。
-        // 正常使用一秒不会有几次；一秒好多次 = 悬停在被反复清零（取证见
-        // `drag_hittest::note_mouse_leave`）。
-        if msg == 0x02A3 {
-            crate::app::drag_hittest::note_mouse_leave();
-        }
         if msg == WM_NCLBUTTONDOWN || msg == WM_NCRBUTTONDOWN {
             logv!("[nc] nclbuttondown msg={} ht={}", msg, wparam);
             super::clear_global_focus();
@@ -14396,9 +14186,10 @@ mod drag_hittest {
                 return HTCLIENT as isize;
             }
 
-            let scale = bits(&DRAG_SCALE);
-            let (x, w) = (bits(&DRAG_X), bits(&DRAG_W));
-            let tabs_r = bits(&TABS_R);
+            // 物理像素 → 逻辑像素用窗口自己的 DPI：本进程是 per-monitor v2，
+            // 换屏或改缩放后窗口宽必须按当前显示器算，不能沿用启动时的 scale。
+            let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd) as f32 / 96.0;
+            let scale = if dpi > 0.01 { dpi } else { 1.0 };
             let sx = (lparam as i32 & 0xFFFF) as i16 as i32;
             let sy = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
             let mut pt = windows_sys::Win32::Foundation::POINT { x: sx, y: sy };
@@ -14406,72 +14197,51 @@ mod drag_hittest {
             let lx = pt.x as f32 / scale;
             let ly = pt.y as f32 / scale;
 
-            let mut rect = windows_sys::Win32::Foundation::RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            let mut rect = windows_sys::Win32::Foundation::RECT {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            };
             windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(hwnd, &mut rect);
             let win_w = (rect.right - rect.left) as f32 / scale;
             let win_h = (rect.bottom - rect.top) as f32 / scale;
-            let is_maximized = IsZoomed(hwnd as _) != 0;
 
-            // 核心修复：右上角 172px（设置 36 + 最小化 44 + 最大化 44 + 关闭 46
-            // = 170px + 2px 余量）为窗口控制按钮的绝对独占区。任何缩放或窗口
-            // 尺寸下，只要落入此处 100% 回报 HTCLIENT，绝不允许被后面的标题栏
-            // 拖拽判定吞成 HTCAPTION（窄窗口下按钮失灵的根因）。
-            if (0.0..=TAB_BAR_H).contains(&ly) && lx >= win_w - 172.0 {
-                log_hit("CLIENT-controls", lx, ly, scale, win_w, x, w, is_maximized);
+            // 右上角窗口控制按钮的独占区：任何缩放或窗口尺寸下都回报客户区，
+            // 否则点在按钮上沿会变成「拉高窗口」（窄窗口下尤其明显）。
+            if (0.0..=TITLE_BAND_H).contains(&ly) && lx >= win_w - CONTROLS_W {
                 return HTCLIENT as isize;
             }
 
-            if !is_maximized {
-                let border = 6.0;
-
+            if IsZoomed(hwnd) == 0 {
                 // 1. 顶部边缘（宽 8px 防漏网）
                 if ly <= 8.0 {
-                    if lx <= border { return HTTOPLEFT as isize; }
-                    if lx >= win_w - border { return HTTOPRIGHT as isize; }
+                    if lx <= BORDER {
+                        return HTTOPLEFT as isize;
+                    }
+                    if lx >= win_w - BORDER {
+                        return HTTOPRIGHT as isize;
+                    }
                     return HTTOP as isize;
                 }
-
                 // 2. 底部边缘
-                if ly >= win_h - border {
-                    if lx <= border { return HTBOTTOMLEFT as isize; }
-                    if lx >= win_w - border { return HTBOTTOMRIGHT as isize; }
+                if ly >= win_h - BORDER {
+                    if lx <= BORDER {
+                        return HTBOTTOMLEFT as isize;
+                    }
+                    if lx >= win_w - BORDER {
+                        return HTBOTTOMRIGHT as isize;
+                    }
                     return HTBOTTOM as isize;
                 }
-
-                // 3. 左侧边缘
-                if lx <= border {
+                // 3. 左右边缘
+                if lx <= BORDER {
                     return HTLEFT as isize;
                 }
-
-                // 4. 右侧边缘
-                if lx >= win_w - border {
+                if lx >= win_w - BORDER {
                     return HTRIGHT as isize;
                 }
             }
-
-            // 非缩放边缘：判断是否在标题栏空白拖拽区（坐标已在上面转换好）。
-            //
-            // 起点取 max(拖拽区 x, 最后一个标签的右边界)：拖拽区几何是 40ms
-            // 轮询下发的，窗口刚最大化或刚增删标签时可能偏小，一旦偏小就会把
-            // 标签上的点击判成 HTCAPTION —— 最大化窗口被拖动即还原。
-            let caption_x = x.max(tabs_r);
-            // 布局没落定时（刚建窗口 / 刚换标签模型）宁可整段按客户区处理：
-            // 拖拽区少一段只是拖不动窗口，判错却会让标签点不动。
-            if w > 0.0 && is_ready() {
-                if (0.0..=TAB_BAR_H).contains(&ly) && lx >= caption_x && lx <= x + w {
-                    if caption_x <= tabs_r {
-                        note_stale_caption(x, w, tabs_r, lx, ly, is_maximized);
-                    }
-                    log_hit("CAPTION", lx, ly, scale, win_w, x, w, is_maximized);
-                    return HTCAPTION as isize;
-                }
-                // 落在拖拽区范围里，但被标签右边界挡住了：几何曾经偏小。
-                if (0.0..=TAB_BAR_H).contains(&ly) && lx >= x && lx < caption_x {
-                    log_guarded(lx, ly, x, w, tabs_r, is_maximized);
-                    return HTCLIENT as isize;
-                }
-            }
-            log_hit("CLIENT", lx, ly, scale, win_w, x, w, is_maximized);
             return HTCLIENT as isize;
         }
         CallWindowProcW(prev, hwnd, msg, wparam, lparam)
@@ -14494,105 +14264,13 @@ mod drag_hittest {
             let current = GetWindowLongPtrW(hwnd as _, GWLP_WNDPROC);
             // 0 = 句柄无效；已是自身 = 重复安装；本窗口已装过 = 跳过。
             // 二者都必须跳过，否则会把前一过程链成自身 → 无限递归爆栈。
-            if current == 0
-                || current == wndproc as *const () as isize
-                || is_installed(hwnd)
-            {
+            if current == 0 || current == wndproc as *const () as isize || is_installed(hwnd) {
                 return;
             }
             PREV_WNDPROC.store(current as i64, Ordering::Relaxed);
             let _ = SetWindowLongPtrW(hwnd as _, GWLP_WNDPROC, wndproc as *const () as isize);
             INSTALLED_HWND.store(hwnd as i64, Ordering::Relaxed);
             logv!("drag hittest: hooked hwnd={hwnd:#x} prev={current:#x}");
-        }
-    }
-}
-
-/// 把标题栏空白拖拽区边界同步给 Win32 命中测试钩子（仅 Windows）。
-///
-/// 优先采用 Slint 布局算出的真实 `drag-spacer` 几何；旧版纯 Rust 估算只作
-/// 窗口未 realize 时的兜底。估算曾用 `window().size()/scale` 再 `.max(400.0)`，
-/// 而 `size()` 在 show() 刚返回或部分后端上为 0 → 窗口宽被当成 400 →
-/// 拖拽区起点落到第二个标签里，标签被回报为 HTCAPTION，点击全部失效。
-/// 现在窗口宽度改从 HWND 的 `GetClientRect` 取（物理像素，一定准确），
-/// 宽度为 0 时直接跳过本次更新，绝不再用假宽度覆盖上次的有效边界。
-#[cfg(windows)]
-fn sync_drag_bounds(app: &App, reason: &str) {
-    let scale = app.ui.window().scale_factor() as f32;
-    let mut physical_w = app.ui.window().size().width as f32;
-    if let Some(hwnd) = get_window_hwnd(&app.ui) {
-        let mut rect = windows_sys::Win32::Foundation::RECT {
-            left: 0,
-            top: 0,
-            right: 0,
-            bottom: 0,
-        };
-        unsafe {
-            windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect(
-                hwnd as windows_sys::Win32::Foundation::HWND,
-                &mut rect,
-            );
-        }
-        let w = (rect.right - rect.left) as f32;
-        if w > 0.0 {
-            physical_w = w;
-        }
-    }
-    let window_w = physical_w / scale.max(0.01);
-    if window_w <= 0.0 {
-        logv!("[drag-bounds] skip ({reason}) window not realized yet, scale={scale:.2}");
-        return;
-    }
-
-    // 有标签时 `tabs-right` 必须是正数；为 0 说明标签条还没布局（新建标签那
-    // 一下尤其如此），此时的 `drag-area-x` 是上一次布局的旧值，直接用会把
-    // 标签栏判成标题栏。这种情况不下发几何，只把「未落定」标记挂出去。
-    let has_tabs = !app.state.tabs.is_empty();
-    let slint_tabs_r = app.ui.get_tabs_right() as f32;
-    if has_tabs && slint_tabs_r <= 0.0 {
-        drag_hittest::set_ready(false);
-        logv!("[drag-bounds] skip ({reason}) 标签条尚未布局 (tabs_r={slint_tabs_r})");
-        return;
-    }
-    drag_hittest::set_ready(true);
-
-    // 旧估算：仅作为 Slint 几何不可用时的兜底，并保留在日志中便于对比。
-    let max_tabs_w = (window_w - 270.0).max(0.0);
-    let tabs_w = app.state.tabs.len() as f32 * 153.0; // 单标签 150px + 3px 间距
-    let actual_tabs_w = tabs_w.min(max_tabs_w);
-    let rust_x = 8.0 + actual_tabs_w + 3.0 + 28.0 + 4.0;
-    let rust_w = (window_w - 176.0 - rust_x).max(0.0);
-
-    // Slint 真实布局几何（`tab_bar.slint` 导出的 drag-x / drag-w）。
-    let slint_x = app.ui.get_drag_area_x() as f32;
-    let slint_w = app.ui.get_drag_area_w() as f32;
-    let (x, w, source) = if slint_w > 0.0 && slint_x > 0.0 {
-        (slint_x, slint_w, "slint")
-    } else {
-        (rust_x, rust_w, "rust-estimate")
-    };
-
-    // 只在边界真的变化时输出（poll_timer 每 40ms 都会来一次）。
-    // 退回 rust-estimate 说明 Slint 几何拿不到，属于可疑状态 -> 无条件写一行；
-    // 正常走 Slint 几何的只是常规布局变化，留在详细级。
-    if let Some(c) = drag_hittest::update(x, w, slint_tabs_r, scale) {
-        let line = format!(
-            "[drag-bounds] {reason} -> {source} x={x:.1} w={w:.1} tabs_r={slint_tabs_r:.1} | rust x={rust_x:.1} w={rust_w:.1} | slint x={slint_x:.1} w={slint_w:.1} | scale={scale:.2} physical_w={physical_w:.1} win_w={window_w:.1} tabs={}",
-            app.state.tabs.len()
-        );
-        if source == "rust-estimate" {
-            logal!("{line}");
-        } else if c.changes_in_window >= 5 {
-            // 边界一秒钟变好几次 = 在抖，命中判定跟着抖，标签悬停就会闪。
-            logln!(
-                "!! [drag-bounds] 1s 内改动 {} 次 {line} | prev x={:.1} w={:.1} tabs_r={:.1}",
-                c.changes_in_window,
-                c.prev_x,
-                c.prev_w,
-                c.prev_tabs_r
-            );
-        } else {
-            logv!("{line}");
         }
     }
 }
@@ -16079,7 +15757,6 @@ fn create_session(
     if first_run {
         app.borrow_mut().first_run_pending = true;
     }
-    sync_drag_bounds(&app.borrow(), "show");
     // 登记给 Shell 必须在这里补一次：`get_window_hwnd` 在窗口 show() 之前拿不到
     // 句柄，所以 create_session 内部那些 publish 全是空转。不补这一下，登记要等到
     // 「第一次列举结果回来 → sync_file_list」，网络盘上就是好几秒之后 ——
@@ -16245,7 +15922,6 @@ pub fn wake_session(request: crate::daemon::WakeRequest) {
             // 首帧重绘要显式请求：后台会话没有走过启动时的 request_redraw，
             // 首帧不来的话 HWND 登记与无边框拖拽钩子会一直缺位。
             ui.window().request_redraw();
-            sync_drag_bounds(&app.borrow(), "show-late");
         }
         focus_window(&ui);
         logv!("woke existing session, path={:?} new_tab={}", request.path, request.new_tab);
