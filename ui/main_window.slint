@@ -963,7 +963,8 @@ out property <length> row-height-out: file-list.row-height-out;
                                     crumb-ta := TouchArea {
                                         width: 100%;
                                         height: 100%;
-                                        mouse-cursor: text; // 整条地址栏统一文本光标（与资源管理器一致）
+                                        // 这里不显示文本光标：胶囊是"跳转按钮"，不是输入区。
+                                        // 只有右侧空白和编辑态才是工字光标（与资源管理器一致）。
                                         clicked => {
                                             root.breadcrumb_clicked(seg.path);
                                         }

@@ -89,6 +89,16 @@ export component SingleLineEdit inherits Rectangle {
     preferred-width: 0px;
     min-width: 0px;
 
+    // 光标提示背景层：`TextInput` 自身只在**文字实际宽度**内报 I 形光标，
+    // 文字右边的空白拿到的是默认箭头（点在那里也不会落光标）。
+    // 这一层垫在输入框下面，把整块矩形都变成文本光标；点击仍归 TextInput。
+    TouchArea {
+        width: 100%;
+        height: 100%;
+        // 注意：本组件有同名属性 `text`，裸写 `text` 会被解析成它，必须写全限定名。
+        mouse-cursor: MouseCursor.text;
+    }
+
     // 不可见测量文本：算出这段文字的自然宽度（与输入框同字体、不换行）。
     measure := Text {
         visible: false;
