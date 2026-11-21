@@ -48,6 +48,8 @@ export struct FileRow {
     // 图标视图逐行文字宽度（与 grid-lines 一一对应）。多行名字里后面几行往往
     // 短很多，只看「最宽一行」会把那些行右侧的空白也当成文字。
     name-line-ws: [length],
+    // 同一排内所有条目的最大名称行数（1..=3），用于让同排文件大小水平对齐。
+    row-name-lines: int,
 }
 
 export struct TabInfo {
@@ -146,9 +148,9 @@ export global Theme {
     in-out property <color> bg-tabstrip: #E7E8EB;
     in-out property <color> bg-hover: #0000000B;
     in-out property <color> bg-selected: #0E8A4A24;
-    in-out property <color> bg-active-tab: #FFFFFF;
     in-out property <color> bg-statusbar: #F6F7F8;
     in-out property <color> bg-popup: #FFFFFF;
+    in-out property <color> bg-active-tab: #FFFFFF;
     in-out property <color> bg-input: #FFFFFF;
     in-out property <color> bg-badge: #0000000D;
 

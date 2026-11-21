@@ -36,8 +36,9 @@ component nav-btn inherits Rectangle {
         width: 28px;
         height: 28px;
         y: (parent.height - self.height) / 2;
-        border-radius: 5px;
+        border-radius: 6px;
         background: (root.enabled && nav-ta.has-hover) ? Theme.bg-hover : transparent;
+        animate background { duration: 100ms; easing: ease-out; }
 
         IconNavArrow {
             x: (parent.width - self.width) / 2;
@@ -125,10 +126,12 @@ export component MainWindow inherits Window {
     /// 「开机自启动」开关（真源是注册表 Run 键，由 Rust 读实况下发）。
     in-out property <bool> autostart: false;
     callback autostart_toggled(bool);
-    /// 通用设置：显示语言 / 启动时打开（下标由 Rust 按配置下发）。
+    /// 通用设置：显示语言 / 主题色 / 启动时打开（下标由 Rust 按配置下发）。
     in-out property <int> language-index: 0;
+    in-out property <int> theme-index: 0;
     in-out property <int> startup-index: 0;
     callback language_changed(int);
+    callback theme_changed(int);
     callback startup_changed(int);
 
     // ---- 搜索与索引看板（Rust 驱动） ----
@@ -272,7 +275,8 @@ export component MainWindow inherits Window {
     /// 标签拖动交换的视觉状态（Rust 计算，透传给 TabBar）。
     in-out property <int> tab-drag-index: -1;
     in-out property <int> tab-drop-slot: -1;
-    in-out property <bool> tab-drop-visible: false;
+    /// 被拖标签跟手位移（像素，相对它自己的槽位）。
+    in-out property <length> tab-drag-dx: 0px;
     /// 文件列表可视高度（Rust 只读，用于虚拟窗口计算；由 FileList 绑定）。
     in-out property <length> list-height;
 /// 视图模式（Pulse 式视图切换）。直通 FileList。
@@ -529,7 +533,6 @@ out property <length> row-height-out: file-list.row-height-out;
     in-out property <bool> can-paste: false;
 
     // ---- 布局常量 ----
-    private property <length> topbar-h: 82px; // 标签栏 38 + 工具栏 44
     private property <length> statusbar-h: 28px;
 
     // 供 Rust 强制对齐滚动条（直接操作底层 Flickable，不依赖属性 changed 事件）。
@@ -644,7 +647,7 @@ out property <length> row-height-out: file-list.row-height-out;
             loading: root.tab-loading;
             drag-index: root.tab-drag-index;
             drop-slot: root.tab-drop-slot;
-            tab-drop-visible: root.tab-drop-visible;
+            drag-dx: root.tab-drag-dx;
             tab_drag(index, phase, x) => { root.tab_drag(index, phase, x); }
             tab_activated(id) => {
                 root.clear-all-focus();
@@ -674,7 +677,9 @@ out property <length> row-height-out: file-list.row-height-out;
         Rectangle {
             visible: !root.settings-open;
             height: root.settings-open ? 0px : 44px;
-            background: Theme.bg-main;
+            // 暗色靠 bg-toolbar 把工具栏从底色里拎出来；亮色回到 bg-main，
+            // 与下方列表白底自然过渡，不需要色块。
+            background: Theme.dark ? Theme.bg-toolbar : Theme.bg-main;
 
             // 工具栏空白处点击：退出一切输入聚焦
             TouchArea {
@@ -715,21 +720,22 @@ out property <length> row-height-out: file-list.row-height-out;
                 // 分隔竖线。
                 Rectangle {
                     width: 1px;
-                    height: 20px;
-                    y: (parent.height - 20px) / 2;
-                    background: Theme.border;
+                    height: 16px;
+                    y: (parent.height - 16px) / 2;
+                    background: Theme.divider;
                 }
 
                 // 面包屑地址栏（复刻 Pulse：常态即为 28px 圆角输入框，与右侧搜索框严格统一）
                 Rectangle {
                     horizontal-stretch: 1;
                     min-width: 0px; // 窄窗口下允许压缩到 0，绝不把其他按钮挤出窗口
-                    height: 28px;
+                    height: 30px;
                     y: (parent.height - self.height) / 2;
-                    border-radius: 6px;
+                    border-radius: 7px;
                     background: Theme.bg-input;
                     border-width: 1px;
                     border-color: root.path-editing ? Theme.accent : Theme.border;
+                    animate border-color { duration: 120ms; easing: ease-out; }
                     clip: true;
 
                     // 1. 编辑态：文本输入框直接嵌入
@@ -927,7 +933,7 @@ out property <length> row-height-out: file-list.row-height-out;
                                     width: 12px;
                                     height: parent.height;
                                     text: "›";
-                                    color: Theme.text-disabled;
+                                    color: Theme.text-secondary;
                                     font-size: 12px;
                                     horizontal-alignment: center;
                                     vertical-alignment: center;
@@ -939,7 +945,7 @@ out property <length> row-height-out: file-list.row-height-out;
                                     width: parent.width - (i == 0 ? 0px : 12px);
                                     height: 22px;
                                     y: (parent.height - 22px) / 2;
-                                    border-radius: 4px;
+                                    border-radius: 5px;
                                     background: crumb-ta.has-hover ? Theme.bg-hover : transparent;
 
                                     crumb-text := Text {
@@ -984,8 +990,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     width: 28px;
                     height: 28px;
                     y: (parent.height - self.height) / 2;
-                    border-radius: 5px;
+                    border-radius: 6px;
                     background: refresh-ta.has-hover ? Theme.bg-hover : transparent;
+                    animate background { duration: 100ms; easing: ease-out; }
 
                     IconRefresh {
                         x: (parent.width - self.width) / 2;
@@ -1008,8 +1015,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     width: 28px;
                     height: 28px;
                     y: (parent.height - self.height) / 2;
-                    border-radius: 5px;
+                    border-radius: 6px;
                     background: newfolder-ta.has-hover ? Theme.bg-hover : transparent;
+                    animate background { duration: 100ms; easing: ease-out; }
 
                     IconPlus {
                         x: (parent.width - self.width) / 2;
@@ -1032,12 +1040,13 @@ out property <length> row-height-out: file-list.row-height-out;
                     width: 28px;
                     height: 28px;
                     y: (parent.height - self.height) / 2;
-                    border-radius: 5px;
+                    border-radius: 6px;
                     background: view-ta.has-hover ? Theme.bg-hover : transparent;
+                    animate background { duration: 100ms; easing: ease-out; }
 
                     Text {
                         text: "▦";
-                        color: Theme.text-secondary;
+                        color: view-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
                         font-family: Theme.symbol-font-family;
                         font-size: 13px;
                         horizontal-alignment: center;
@@ -1061,8 +1070,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     width: 28px;
                     height: 28px;
                     y: (parent.height - self.height) / 2;
-                    border-radius: 5px;
+                    border-radius: 6px;
                     background: root.is-split ? Theme.accent : (split-ta.has-hover ? Theme.bg-hover : transparent);
+                    animate background { duration: 100ms; easing: ease-out; }
 
                     IconSplit {
                         x: (parent.width - self.width) / 2;
@@ -1083,12 +1093,13 @@ out property <length> row-height-out: file-list.row-height-out;
                 // 当前目录过滤搜索（全局 MFT 搜索为后续阶段）。
                 Rectangle {
                     width: 200px;
-                    height: 28px;
-                    y: (parent.height - 28px) / 2;
-                    border-radius: 6px;
+                    height: 30px;
+                    y: (parent.height - 30px) / 2;
+                    border-radius: 7px;
                     background: Theme.bg-input;
                     border-width: 1px;
-                    border-color: Theme.border;
+                    border-color: filter-input.has-focus ? Theme.accent : Theme.border;
+                    animate border-color { duration: 120ms; easing: ease-out; }
 
                     // 底层兜底:点击图标 / 边距等空白处也能聚焦输入框。
                     // 落在输入框上的点击由上层 TextInput 自己处理(光标定位)。
@@ -1186,6 +1197,16 @@ out property <length> row-height-out: file-list.row-height-out;
                         overflow: elide;
                     }
                 }
+            }
+
+            // 工具栏与下方文件区之间的 1px 分界线：只在暗色画。
+            // 亮色下 #F3F4F5 接 #FFFFFF 本身就有层次，画线反而生硬。
+            if (Theme.dark) : Rectangle {
+                x: 0px;
+                y: parent.height - 1px;
+                width: 100%;
+                height: 1px;
+                background: Theme.divider;
             }
         }
 
@@ -1575,8 +1596,10 @@ out property <length> row-height-out: file-list.row-height-out;
                     autostart: root.autostart;
                     autostart_toggled(v) => { root.autostart_toggled(v); }
                     language-index: root.language-index;
+                    theme-index: root.theme-index;
                     startup-index: root.startup-index;
                     language_changed(i) => { root.language_changed(i); }
+                    theme_changed(i) => { root.theme_changed(i); }
                     startup_changed(i) => { root.startup_changed(i); }
                     search-ready: root.search-ready;
                     search-status-text: root.search-status-text;

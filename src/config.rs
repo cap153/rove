@@ -4,8 +4,11 @@
 
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ThemeChoice {
+    /// 跟随系统（Windows「个性化 → 颜色」里的应用深浅）。
+    #[default]
+    System,
     Light,
     Dark,
 }
@@ -79,6 +82,23 @@ fn apply_batch_rename_json(p: &mut BatchRenamePrefs, br: &serde_json::Value) {
     }
     if let Some(v) = br.get("apply_to").and_then(|v| v.as_i64()) {
         p.apply_to = v.clamp(0, 2) as i32;
+    }
+}
+
+/// 从配置 JSON 解析主题选择。
+///
+/// 键名从早期的 `theme` 变成 `theme-mode`：老配置里的 `theme` 只可能是
+/// "light"（那时界面还不能选深色），一律当「跟随系统」才符合新默认；
+/// 手动改过 "dark" 的仍然认，免得把人手写的设置抹掉。
+fn theme_from_json(json: &serde_json::Value) -> ThemeChoice {
+    match json.get("theme-mode").and_then(|v| v.as_str()) {
+        Some("light") => ThemeChoice::Light,
+        Some("dark") => ThemeChoice::Dark,
+        Some(_) => ThemeChoice::System,
+        None => match json.get("theme").and_then(|v| v.as_str()) {
+            Some("dark") => ThemeChoice::Dark,
+            _ => ThemeChoice::System,
+        },
     }
 }
 
@@ -259,7 +279,7 @@ pub fn default_context_menu_hide() -> Vec<String> {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            theme: ThemeChoice::Light,
+            theme: ThemeChoice::System,
             recent: Vec::new(),
             window_width: 1150,
             window_height: 690,
@@ -354,12 +374,7 @@ impl Config {
             return Self::default();
         };
         let mut config = Self::default();
-        if let Some(theme) = json.get("theme").and_then(|v| v.as_str()) {
-            config.theme = match theme {
-                "dark" => ThemeChoice::Dark,
-                _ => ThemeChoice::Light,
-            };
-        }
+        config.theme = theme_from_json(&json);
         if let Some(recent) = json.get("recent").and_then(|v| v.as_array()) {
             config.recent = recent
                 .iter()
@@ -671,7 +686,8 @@ impl Config {
             let _ = std::fs::create_dir_all(parent);
         }
         let json = serde_json::json!({
-            "theme": match self.theme {
+            "theme-mode": match self.theme {
+                ThemeChoice::System => "system",
                 ThemeChoice::Light => "light",
                 ThemeChoice::Dark => "dark",
             },
@@ -763,6 +779,31 @@ mod tests {
         // 只有主机名（没有共享名）也合法：资源管理器能直接列出该主机的共享。
         assert_eq!(normalize_network_path("\\\\nas").as_deref(), Some("\\\\nas"));
         assert_eq!(normalize_network_path("\\\\").as_deref(), None);
+    }
+
+    #[test]
+    fn theme_defaults_to_follow_system_and_reads_both_keys() {
+        // 没有键（首次启动）→ 跟随系统。
+        assert_eq!(theme_from_json(&serde_json::json!({})), ThemeChoice::System);
+        // 老配置里的 "light"（那时界面只能亮）→ 跟随系统，别把人锁在亮色。
+        assert_eq!(
+            theme_from_json(&serde_json::json!({ "theme": "light" })),
+            ThemeChoice::System
+        );
+        // 老配置里手改的 "dark" 仍然认。
+        assert_eq!(
+            theme_from_json(&serde_json::json!({ "theme": "dark" })),
+            ThemeChoice::Dark
+        );
+        // 新键优先。
+        assert_eq!(
+            theme_from_json(&serde_json::json!({ "theme-mode": "light", "theme": "dark" })),
+            ThemeChoice::Light
+        );
+        assert_eq!(
+            theme_from_json(&serde_json::json!({ "theme-mode": "system" })),
+            ThemeChoice::System
+        );
     }
 
     #[test]

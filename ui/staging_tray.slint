@@ -45,6 +45,8 @@ export component StagingTray inherits Rectangle {
         // ---- 标题栏 ----
         Rectangle {
             height: root.header-h;
+            // 与侧栏同底：收起时托盘和侧栏浑然一体，不再像贴了一块工具栏。
+            background: transparent;
 
             TouchArea {
                 width: 100%;
@@ -249,18 +251,22 @@ export component StagingTray inherits Rectangle {
                     height: 28px;
                     y: (parent.height - self.height) / 2;
                     horizontal-stretch: 1;
-                    border-radius: 6px;
-                    background: root.items.length > 0 ? Theme.accent : Theme.border;
+                    border-radius: 7px;
+                    background: root.items.length > 0
+                        ? (copy-ta.has-hover ? Theme.accent-hover : Theme.accent)
+                        : Theme.bg-badge;
+                    animate background { duration: 100ms; easing: ease-out; }
                     Text {
                         text: I18n.strings[37];
                         color: root.items.length > 0 ? Theme.accent-text : Theme.text-disabled;
                         font-size: 11.5px;
+                        font-weight: 500;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                         width: 100%;
                         height: 100%;
                     }
-                    TouchArea {
+                    copy-ta := TouchArea {
                         width: 100%;
                         height: 100%;
                         clicked => {
@@ -274,10 +280,15 @@ export component StagingTray inherits Rectangle {
                     height: 28px;
                     y: (parent.height - self.height) / 2;
                     horizontal-stretch: 1;
-                    border-radius: 6px;
-                    background: (root.items.length > 0) ? Theme.bg-badge : transparent;
+                    border-radius: 7px;
+                    background: root.items.length > 0
+                        ? (move-ta.has-hover ? Theme.bg-selected : Theme.bg-badge)
+                        : transparent;
                     border-width: 1px;
-                    border-color: Theme.border;
+                    border-color: root.items.length > 0
+                        ? Theme.accent.transparentize(move-ta.has-hover ? 0.25 : 0.55)
+                        : Theme.border;
+                    animate background, border-color { duration: 100ms; easing: ease-out; }
                     Text {
                         text: I18n.strings[67];
                         color: root.items.length > 0 ? Theme.text-primary : Theme.text-disabled;
@@ -287,7 +298,7 @@ export component StagingTray inherits Rectangle {
                         width: 100%;
                         height: 100%;
                     }
-                    TouchArea {
+                    move-ta := TouchArea {
                         width: 100%;
                         height: 100%;
                         clicked => {
@@ -329,18 +340,22 @@ export component StagingTray inherits Rectangle {
                 Rectangle {
                     height: 28px;
                     width: 100%;
-                    border-radius: 6px;
-                    background: root.items.length > 0 ? Theme.accent : Theme.border;
+                    border-radius: 7px;
+                    background: root.items.length > 0
+                        ? (copy-ta-narrow.has-hover ? Theme.accent-hover : Theme.accent)
+                        : Theme.bg-badge;
+                    animate background { duration: 100ms; easing: ease-out; }
                     Text {
                         text: I18n.strings[36];
                         color: root.items.length > 0 ? Theme.accent-text : Theme.text-disabled;
                         font-size: 11.5px;
+                        font-weight: 500;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                         width: 100%;
                         height: 100%;
                     }
-                    TouchArea {
+                    copy-ta-narrow := TouchArea {
                         width: 100%;
                         height: 100%;
                         clicked => {
@@ -352,10 +367,15 @@ export component StagingTray inherits Rectangle {
                 Rectangle {
                     height: 28px;
                     width: 100%;
-                    border-radius: 6px;
-                    background: (root.items.length > 0) ? Theme.bg-badge : transparent;
+                    border-radius: 7px;
+                    background: root.items.length > 0
+                        ? (move-ta-narrow.has-hover ? Theme.bg-selected : Theme.bg-badge)
+                        : transparent;
                     border-width: 1px;
-                    border-color: Theme.border;
+                    border-color: root.items.length > 0
+                        ? Theme.accent.transparentize(move-ta-narrow.has-hover ? 0.25 : 0.55)
+                        : Theme.border;
+                    animate background, border-color { duration: 100ms; easing: ease-out; }
                     Text {
                         text: I18n.strings[67];
                         color: root.items.length > 0 ? Theme.text-primary : Theme.text-disabled;
@@ -365,7 +385,7 @@ export component StagingTray inherits Rectangle {
                         width: 100%;
                         height: 100%;
                     }
-                    TouchArea {
+                    move-ta-narrow := TouchArea {
                         width: 100%;
                         height: 100%;
                         clicked => {

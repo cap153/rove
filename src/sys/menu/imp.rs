@@ -53,6 +53,14 @@ const CMIC_MASK_UNICODE: u32 = 0x4000;
 const WM_APP_OPEN_MENU: u32 = WM_APP + 0x51;
 /// 宿主窗口消息：存活探测。宿主窗口过程直接回 1，用来区分「忙」和「死了」。
 const WM_APP_PING: u32 = WM_APP + 0x52;
+/// 宿主窗口消息：切换菜单深浅色（wparam 1 = 深色 / 0 = 浅色）。
+const WM_APP_SET_DARK: u32 = WM_APP + 0x53;
+/// 菜单是否要跟随深色（由 UI 线程按当前主题写入）。
+static DARK: AtomicBool = AtomicBool::new(false);
+/// 宿主窗口是否已经挂上深色主题（避免每次弹菜单都重复调用）。
+static HOST_DARK: AtomicBool = AtomicBool::new(false);
+/// 进程级偏好当前是深还是浅（与 [`DARK`] 比对，避免重复调 `SetPreferredAppMode`）。
+static MODE_DARK: AtomicBool = AtomicBool::new(false);
 /// 上一份菜单挂着超过这么久，才值得去探测一次（正常操作菜单不会超过它）。
 const MENU_STALL_MS: u64 = 1_500;
 /// 构建阶段（菜单还没弹出来）的判死时限。
@@ -492,6 +500,96 @@ mod site {
 // 菜单线程
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 深色菜单（uxtheme 的未公开序号；任何一步拿不到就整体退回浅色）
+// ---------------------------------------------------------------------------
+
+/// 取 `uxtheme.dll` 里的未公开导出（按序号）。
+///
+/// 序号：133 `AllowDarkModeForWindow` / 135 `SetPreferredAppMode` /
+/// 136 `FlushMenuThemes`。这几个接口微软从 Win10 1809 起就一直有，但从未
+/// 公开——所以全程尽力而为：取不到就是浅色，绝不让菜单因此弹不出来。
+fn uxtheme_export(ordinal: usize) -> Option<unsafe extern "system" fn() -> isize> {
+    use windows::core::{w, PCSTR};
+    use windows::Win32::System::LibraryLoader::{
+        GetModuleHandleW, GetProcAddress, LoadLibraryW,
+    };
+    unsafe {
+        // 先找已加载的模块；没有就主动加载（uxtheme 通常早就被通用控件带进来了）。
+        let module = match GetModuleHandleW(w!("uxtheme.dll")) {
+            Ok(module) => module,
+            Err(_) => LoadLibraryW(w!("uxtheme.dll")).ok()?,
+        };
+        GetProcAddress(module, PCSTR(ordinal as *const u8))
+    }
+}
+
+/// 进程级深浅偏好（`SetPreferredAppMode`，0=Default 1=AllowDark 2=ForceDark 3=ForceLight）。
+fn set_preferred_mode(dark: bool) -> bool {
+    let Some(export) = uxtheme_export(135) else {
+        return false;
+    };
+    let set_mode: unsafe extern "system" fn(i32) -> i32 = unsafe { std::mem::transmute(export) };
+    unsafe { set_mode(if dark { 2 } else { 3 }) };
+    MODE_DARK.store(dark, Ordering::Release);
+    flush_menu_themes();
+    true
+}
+
+/// 让菜单主题缓存失效，下一次弹出才吃新设置。
+fn flush_menu_themes() {
+    if let Some(export) = uxtheme_export(136) {
+        let flush: unsafe extern "system" fn() = unsafe { std::mem::transmute(export) };
+        unsafe { flush() };
+    }
+}
+
+/// 给宿主窗口挂上（或摘掉）深色主题。
+fn theme_host(hwnd: HWND, dark: bool) {
+    unsafe {
+        if let Some(export) = uxtheme_export(133) {
+            let allow: unsafe extern "system" fn(HWND, i32) -> i32 =
+                std::mem::transmute(export);
+            allow(hwnd, dark as i32);
+        }
+        // Win10 认 "DarkMode_Explorer"；空串 = 恢复系统默认主题。
+        let theme = if dark {
+            windows::core::w!("DarkMode_Explorer")
+        } else {
+            windows::core::PCWSTR::null()
+        };
+        let _ = windows::Win32::UI::Controls::SetWindowTheme(
+            hwnd,
+            theme,
+            windows::core::PCWSTR::null(),
+        );
+        flush_menu_themes();
+    }
+    HOST_DARK.store(dark, Ordering::Release);
+}
+
+/// 让原生菜单跟随主题（UI 线程调用；真正的绘制在菜单线程上）。
+///
+/// 应急退路：设置环境变量 `ROVE_NO_DARK_MENU=1` 后一律浅色菜单。
+pub fn set_dark(dark: bool) {
+    let dark = dark && std::env::var_os("ROVE_NO_DARK_MENU").is_none();
+    if DARK.swap(dark, Ordering::AcqRel) == dark {
+        return;
+    }
+    // 还没弹过菜单：宿主窗口建起来时会自己按 DARK 决定，不必在这里做什么。
+    let hwnd = HOST.load(Ordering::Acquire);
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as _)),
+                WM_APP_SET_DARK,
+                WPARAM(dark as usize),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 fn ensure_host() -> Option<isize> {
     let existing = HOST.load(Ordering::Acquire);
     if existing != 0 {
@@ -531,6 +629,12 @@ fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>, gen: u64) {
         let class_ok = atom != 0
             || windows::Win32::Foundation::GetLastError()
                 == windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
+        // 必须在**这条线程的第一个窗口建出来之前**设：`SetPreferredAppMode`
+        // 对已经创建过的窗口不追溯，晚一步菜单就还是浅色。
+        let want_dark = DARK.load(Ordering::Acquire);
+        if want_dark {
+            let _ = set_preferred_mode(true);
+        }
         let hwnd = if class_ok {
             CreateWindowExW(
                 // 注意：不能加 WS_EX_NOACTIVATE —— 激活不了就拿不到键盘焦点，
@@ -557,6 +661,9 @@ fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>, gen: u64) {
             let _ = ready.send(None);
             return;
         };
+        if want_dark {
+            theme_host(hwnd, true);
+        }
         if HOST_GEN.load(Ordering::Acquire) == gen {
             HOST.store(hwnd.0 as isize, Ordering::Release);
         }
@@ -582,6 +689,12 @@ unsafe extern "system" fn host_proc(
     if msg == WM_APP_PING {
         // 回非 0：`SendMessageTimeoutW` 靠这个区分「活着但忙」和「超时没回」。
         return LRESULT(1);
+    }
+    if msg == WM_APP_SET_DARK {
+        let dark = wp.0 != 0;
+        let _ = set_preferred_mode(dark);
+        theme_host(hwnd, dark);
+        return LRESULT(0);
     }
     if msg == WM_APP_OPEN_MENU {
         // 一次性取走全部入队请求，只执行最新那一条（旧的在 BUSY 竞态下
@@ -906,6 +1019,15 @@ fn invoke_shell(
 
 fn run_menu(host: HWND, job: Job) {
     let _busy = BusyGuard(job.gen);
+    // 深浅色兜底对齐：UI 线程切主题的那一刻宿主窗口可能还没建好（`HOST` 还是 0），
+    // 那条切换消息就丢了。每次弹菜单前对一次，代价只是一次原子比较。
+    let want_dark = DARK.load(Ordering::Acquire);
+    if MODE_DARK.load(Ordering::Acquire) != want_dark {
+        let _ = set_preferred_mode(want_dark);
+    }
+    if HOST_DARK.load(Ordering::Acquire) != want_dark {
+        theme_host(host, want_dark);
+    }
     // `owner`（Rove 主窗口）只用来在菜单关闭后归还前台权。
     // Shell 菜单本身的 hwnd 一律用宿主窗口：Shell 弹的属性/确认框都归属于它，
     // 而宿主窗口被摆到鼠标位置，对话框就落在鼠标附近而不是屏幕左上角。

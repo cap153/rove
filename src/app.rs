@@ -3502,13 +3502,15 @@ mod tests {
             total_bytes: total_gib * 1024 * 1024 * 1024,
             free_bytes: (total_gib - used_gib) * 1024 * 1024 * 1024,
         };
-        // 调色盘按序号轮替：蓝 → 薄荷绿 → 琥珀黄 → 紫 → 回到蓝。
+        // 缤纷色板按序号轮替：鲜亮蓝 → 翠绿 → 琥珀橙 → 紫罗兰 → 珊瑚红 → 薄荷青 → 回到蓝。
         let expected = [
-            (0x3B, 0x82, 0xF6),
+            (0x25, 0x7A, 0xFD),
             (0x10, 0xB9, 0x81),
             (0xF5, 0x9E, 0x0B),
             (0xA8, 0x55, 0xF7),
-            (0x3B, 0x82, 0xF6),
+            (0xEF, 0x44, 0x44),
+            (0x14, 0xB8, 0xA6),
+            (0x25, 0x7A, 0xFD),
         ];
         for (i, (r, g, b)) in expected.iter().enumerate() {
             let c = drive_pulse_color(i, &drive(200, 1000));
@@ -3519,7 +3521,7 @@ mod tests {
         assert_eq!((full.red(), full.green(), full.blue()), (0xE0, 0x52, 0x52));
         // 恰好 90% 不算告急，仍用调色盘。
         let edge = drive_pulse_color(0, &drive(900, 1000));
-        assert_eq!((edge.red(), edge.green(), edge.blue()), (0x3B, 0x82, 0xF6));
+        assert_eq!((edge.red(), edge.green(), edge.blue()), (0x25, 0x7A, 0xFD));
     }
 
     #[test]
@@ -3751,8 +3753,9 @@ impl App {
             .tabs
             .iter()
             .map(|t| {
-                // 标签图标：设置页齿轮 / 此电脑 / 回收站 / 盘符字母（大写）。
+                // 标签图标角标：设置页齿轮 / 此电脑 / 回收站 / 盘符字母（大写）。
                 // 取路径首组件（如 "C:"）的首字符，非字母（网络路径等）回落文件夹符号。
+                // 注意：标签图标底色由 Slint 统一用主题色，Rust 不再算颜色。
                 let icon_text = if t.kind == crate::state::TabKind::Settings {
                     "⚙".to_string()
                 } else {
@@ -4449,7 +4452,7 @@ impl App {
                         label: label.clone().into(),
                         detail: String::new().into(),
                         kind: "network".into(),
-                        icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
+                        icon_color: rgb(NETWORK_ICON_COLOR),
                         icon_text: "N".into(),
                         usage: -1.0,
                         icon: slint::Image::default(),
@@ -4476,7 +4479,7 @@ impl App {
                         label: label.clone().into(),
                         detail: String::new().into(),
                         kind: "network".into(),
-                        icon_color: Color::from_rgb_u8(0x3A, 0xA6, 0xA6),
+                        icon_color: rgb(NETWORK_ICON_COLOR),
                         icon_text: "N".into(),
                         usage: -1.0,
                         icon: slint::Image::default(),
@@ -6237,6 +6240,18 @@ impl App {
                 head,
             );
         }
+        // 同排名称行数对齐：Slint 没有循环，扫不了「这一排最长几行」，只能在这里
+        // 先按 `index / cells_per_row` 分组取最大行数，再逐行写回 `row_name_lines`。
+        // 详情/列表视图 grid_lines 为空（= 1 行），整排恒为 1，等价于旧行为。
+        let mut row_line_max: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
+        for p in &ordered {
+            let slot = p.index.max(0) / cells_per_row.max(1) as i32;
+            let lines = (p.grid_lines.len() as i32).clamp(1, 3);
+            let e = row_line_max.entry(slot).or_insert(1);
+            if lines > *e {
+                *e = lines;
+            }
+        }
         let mut stamps: Vec<RowStamp> = Vec::with_capacity(ordered.len());
         let rows: Vec<FileRow> = ordered
             .into_iter()
@@ -6315,6 +6330,9 @@ impl App {
                     )),
                     name_truncated: p.name_truncated,
                     name_line_ws: ModelRc::new(VecModel::from(p.name_line_ws)),
+                    row_name_lines: *row_line_max
+                        .get(&(p.index.max(0) / cells_per_row.max(1) as i32))
+                        .unwrap_or(&1),
                 }
             })
             .collect();
@@ -7488,31 +7506,56 @@ fn format_pulse_size(bytes: u64) -> String {
     }
 }
 
-/// 复刻 Pulse 的多色容量条调色盘。
+/// 驱动器图标的原版缤纷色板（Pulse 那套）。
 ///
-/// 蓝 / 薄荷绿 / 琥珀黄 / 紫按驱动器序号轮替；占用 >90% 时切换为告警红，
-/// 与 Pulse 的「空间告急」视觉一致。`index` 为驱动器在 `list_drives()`
-/// 中的序号（数据盘优先的顺序，见 `search::index::list_roots` 的同源排序）。
+/// 亮暗两个主题共用同一套颜色：深色下的收敛交给 `.slint`（透明度/底色分支），
+/// Rust 侧只提供"这个盘是什么颜色"。占用 >90% 切换为告警红。
+
 fn drive_pulse_color(index: usize, drive: &DriveInfo) -> Color {
     if drive.usage() > 0.90 {
         return Color::from_rgb_u8(0xE0, 0x52, 0x52); // 空间告急：红
     }
-    const PALETTE: [(u8, u8, u8); 4] = [
-        (0x3B, 0x82, 0xF6), // 蓝 (win10 C:)
-        (0x10, 0xB9, 0x81), // 薄荷绿 (learn D:)
-        (0xF5, 0x9E, 0x0B), // 琥珀黄 (extend E:)
-        (0xA8, 0x55, 0xF7), // 紫 (move_hard_disk)
+    const PALETTE: [(u8, u8, u8); 6] = [
+        (0x25, 0x7A, 0xFD), // 鲜亮蓝 (C:)
+        (0x10, 0xB9, 0x81), // 翠绿 (D:)
+        (0xF5, 0x9E, 0x0B), // 琥珀橙 (E:)
+        (0xA8, 0x55, 0xF7), // 紫罗兰 (F:)
+        (0xEF, 0x44, 0x44), // 珊瑚红 (G:)
+        (0x14, 0xB8, 0xA6), // 薄荷青 (O:)
     ];
     let (r, g, b) = PALETTE[index % PALETTE.len()];
     Color::from_rgb_u8(r, g, b)
 }
 
+/// 网络位置图标（侧栏 "N"）的青绿色。
+const NETWORK_ICON_COLOR: (u8, u8, u8) = (0x14, 0xB8, 0xA6);
+
+fn rgb(t: (u8, u8, u8)) -> Color {
+    Color::from_rgb_u8(t.0, t.1, t.2)
+}
 // ---------------------------------------------------------------------------
 // 主题
 // ---------------------------------------------------------------------------
 
 fn apply_theme(ui: &MainWindow, choice: ThemeChoice) {
-    apply_theme_to(&ui.global::<Theme>(), choice);
+    let effective = resolve_theme(choice);
+    apply_theme_to(&ui.global::<Theme>(), effective);
+    // 原生右键菜单是 Windows 自己画的：只有把进程偏好也切过去它才会变深。
+    crate::sys::menu::set_dark(effective == ThemeChoice::Dark);
+}
+
+/// 把「跟随系统」落到具体主题上（其余原样返回）。
+fn resolve_theme(choice: ThemeChoice) -> ThemeChoice {
+    match choice {
+        ThemeChoice::System => {
+            if crate::sys::theme::system_dark() {
+                ThemeChoice::Dark
+            } else {
+                ThemeChoice::Light
+            }
+        }
+        other => other,
+    }
 }
 
 /// 主题只往传入的 Theme 全局里写，这样主窗口和批量重命名窗口可以共用一套色值。
@@ -7526,9 +7569,9 @@ fn apply_theme_to(theme: &Theme, choice: ThemeChoice) {
             theme.set_bg_tabstrip(Color::from_rgb_u8(0xE7, 0xE8, 0xEB));
             theme.set_bg_hover(Color::from_rgb_u8(0x00, 0x00, 0x00).with_alpha(0.043));
             theme.set_bg_selected(Color::from_rgb_u8(0x0E, 0x8A, 0x4A).with_alpha(0.14));
-            theme.set_bg_active_tab(Color::from_rgb_u8(0xFF, 0xFF, 0xFF));
             theme.set_bg_statusbar(Color::from_rgb_u8(0xF6, 0xF7, 0xF8));
             theme.set_bg_popup(Color::from_rgb_u8(0xFF, 0xFF, 0xFF));
+            theme.set_bg_active_tab(Color::from_rgb_u8(0xFF, 0xFF, 0xFF));
             theme.set_bg_input(Color::from_rgb_u8(0xFF, 0xFF, 0xFF));
             theme.set_bg_badge(Color::from_rgb_u8(0x00, 0x00, 0x00).with_alpha(0.05));
             theme.set_text_primary(Color::from_rgb_u8(0x19, 0x1A, 0x1C));
@@ -7542,30 +7585,35 @@ fn apply_theme_to(theme: &Theme, choice: ThemeChoice) {
             theme.set_danger(Color::from_rgb_u8(0xC4, 0x2B, 0x1C));
             theme.set_dark(false);
         }
+        // 深色 = 黑曜石炭灰底色 + 柔紫强调（去除了 Dracula 的蓝紫脏调）。
+        // 关键：次要/禁用文字改用中性冷灰，避免大面积小字发蓝发糊；
+        // 底色层级压低色偏，输入框比面板深一档做出凹陷层次。
         ThemeChoice::Dark => {
-            theme.set_bg_main(Color::from_rgb_u8(0x1B, 0x1B, 0x1F));
-            theme.set_bg_sidebar(Color::from_rgb_u8(0x23, 0x23, 0x27));
-            theme.set_bg_list(Color::from_rgb_u8(0x1E, 0x1E, 0x22));
-            theme.set_bg_toolbar(Color::from_rgb_u8(0x25, 0x25, 0x29));
-            theme.set_bg_tabstrip(Color::from_rgb_u8(0x17, 0x17, 0x1A));
-            theme.set_bg_hover(Color::from_rgb_u8(0xFF, 0xFF, 0xFF).with_alpha(0.06));
-            theme.set_bg_selected(Color::from_rgb_u8(0x3F, 0xB2, 0x7F).with_alpha(0.20));
-            theme.set_bg_active_tab(Color::from_rgb_u8(0x2A, 0x2A, 0x2E));
-            theme.set_bg_statusbar(Color::from_rgb_u8(0x25, 0x25, 0x29));
-            theme.set_bg_popup(Color::from_rgb_u8(0x2A, 0x2A, 0x2E));
-            theme.set_bg_input(Color::from_rgb_u8(0x17, 0x17, 0x1A));
-            theme.set_bg_badge(Color::from_rgb_u8(0xFF, 0xFF, 0xFF).with_alpha(0.08));
-            theme.set_text_primary(Color::from_rgb_u8(0xF0, 0xF0, 0xF0));
-            theme.set_text_secondary(Color::from_rgb_u8(0xA0, 0xA0, 0xA6));
-            theme.set_text_disabled(Color::from_rgb_u8(0x66, 0x6A, 0x70));
-            theme.set_border(Color::from_rgb_u8(0x3A, 0x3A, 0x40));
-            theme.set_divider(Color::from_rgb_u8(0x33, 0x33, 0x38));
-            theme.set_accent(Color::from_rgb_u8(0x3F, 0xB2, 0x7F));
-            theme.set_accent_hover(Color::from_rgb_u8(0x4C, 0xC2, 0x8E));
-            theme.set_accent_text(Color::from_rgb_u8(0x10, 0x24, 0x1A));
-            theme.set_danger(Color::from_rgb_u8(0xE0, 0x6C, 0x5E));
+            theme.set_bg_main(Color::from_rgb_u8(0x22, 0x22, 0x2A));
+            theme.set_bg_sidebar(Color::from_rgb_u8(0x1B, 0x1B, 0x22));
+            theme.set_bg_list(Color::from_rgb_u8(0x22, 0x22, 0x2A));
+            theme.set_bg_toolbar(Color::from_rgb_u8(0x1E, 0x1E, 0x25));
+            theme.set_bg_tabstrip(Color::from_rgb_u8(0x15, 0x15, 0x1A));
+            theme.set_bg_hover(Color::from_rgb_u8(0xFF, 0xFF, 0xFF).with_alpha(0.05));
+            theme.set_bg_selected(Color::from_rgb_u8(0xA7, 0x8B, 0xFA).with_alpha(0.14));
+            theme.set_bg_statusbar(Color::from_rgb_u8(0x1B, 0x1B, 0x22));
+            theme.set_bg_popup(Color::from_rgb_u8(0x27, 0x27, 0x31));
+            theme.set_bg_active_tab(Color::from_rgb_u8(0x24, 0x24, 0x2D));
+            theme.set_bg_input(Color::from_rgb_u8(0x16, 0x16, 0x1C));
+            theme.set_bg_badge(Color::from_rgb_u8(0xFF, 0xFF, 0xFF).with_alpha(0.07));
+            theme.set_text_primary(Color::from_rgb_u8(0xEF, 0xEF, 0xF4));
+            theme.set_text_secondary(Color::from_rgb_u8(0x9A, 0x9A, 0xA6));
+            theme.set_text_disabled(Color::from_rgb_u8(0x5E, 0x5E, 0x6B));
+            theme.set_border(Color::from_rgb_u8(0x32, 0x32, 0x3E));
+            theme.set_divider(Color::from_rgb_u8(0x29, 0x29, 0x33));
+            theme.set_accent(Color::from_rgb_u8(0xA7, 0x8B, 0xFA));
+            theme.set_accent_hover(Color::from_rgb_u8(0xB8, 0xA0, 0xFC));
+            theme.set_accent_text(Color::from_rgb_u8(0x16, 0x15, 0x1E));
+            theme.set_danger(Color::from_rgb_u8(0xF2, 0x6D, 0x6D));
             theme.set_dark(true);
         }
+        // 已在 [`resolve_theme`] 里折成 Light / Dark。
+        ThemeChoice::System => {}
     }
 }
 
@@ -8460,6 +8508,37 @@ impl App {
     fn sidebar_row_metrics(&self) -> Vec<(f32, f32)> {
         let model = self.ui.get_sidebar_items();
         let n = model.row_count();
+        if n == 0 {
+            return Vec::new();
+        }
+        // 优先用 Slint 每行**实际上报**的几何（窗口坐标，含 Flickable 滚动）。
+        // 行高和间距只写在 `.slint` 里，Rust 这边再抄一份常量迟早会跟丢——本次
+        // 「快速访问拖动指示线错位」就是布局改成 34/48 而这里还写着 32/46，
+        // 每行累加 2px 漂移出来的。换算回内容坐标（第 0 行 = padding-top 8px）
+        // 之后与滚动无关，落点判定和指示线都对得上。
+        let ids: Vec<String> = (0..n)
+            .filter_map(|i| model.row_data(i).map(|r| r.id.to_string()))
+            .collect();
+        if ids.len() == n {
+            let rects = self.sidebar_rects.borrow();
+            if let Some(&(_, base_y, _, _)) = rects.get(ids[0].as_str()) {
+                let mut v = Vec::with_capacity(n);
+                for id in &ids {
+                    match rects.get(id.as_str()) {
+                        Some(&(_, y, _, h)) if h > 0.0 => v.push((y - base_y + 8.0, h)),
+                        // 有任意一行还没上报就先整体退回常量，避免半新半旧混着算。
+                        _ => {
+                            v.clear();
+                            break;
+                        }
+                    }
+                }
+                if v.len() == n {
+                    return v;
+                }
+            }
+        }
+        // 兜底（首帧几何还没上报时）：与 `ui/sidebar.slint` 里的行高保持一致。
         let mut metrics = Vec::with_capacity(n);
         let mut y = 8.0_f32;
         for i in 0..n {
@@ -8467,10 +8546,10 @@ impl App {
                 .row_data(i)
                 .map(|it| match it.kind.as_str() {
                     "header" => 30.0,
-                    "drive" => 46.0,
-                    _ => 32.0,
+                    "drive" => 48.0,
+                    _ => 34.0,
                 })
-                .unwrap_or(32.0);
+                .unwrap_or(34.0);
             metrics.push((y, h));
             y += h + 2.0;
         }
@@ -9287,8 +9366,8 @@ impl App {
         let Some((index, start_x, moved)) = self.tab_drag.take() else {
             return;
         };
-        self.ui.set_tab_drop_visible(false);
         self.ui.set_tab_drag_index(-1);
+        self.ui.set_tab_drag_dx(0.0);
         self.ui.set_tab_drop_slot(-1);
         if moved {
             // 无条件写入：这是「标签栏上多出一条竖条」的现场证据。
@@ -9346,16 +9425,19 @@ impl App {
                 }
                 // 这里只切"视觉拖动态"。**不要**在这里丢弃 clicked：
                 // 松手时位移可能仍然不足（见 phase 2 的距离门槛），那时用户其实只想点标签。
+                // 用「被拖标签的视觉中心点」判槽位：抓在标签左缘还是右缘都不影响，
+                // 必须把标签拖过邻居中线才让位，不会一点边缘就乱跳。
+                let dragged_center_x = from as f32 * 153.0 + 75.0 + (pointer_x - start_x);
                 self.ui.set_tab_drag_index(from as i32);
-                self.ui.set_tab_drop_slot(slot_of(pointer_x) as i32);
-                self.ui.set_tab_drop_visible(true);
+                self.ui.set_tab_drag_dx(pointer_x - start_x);
+                self.ui.set_tab_drop_slot(slot_of(dragged_center_x) as i32);
             }
             2 => {
                 let Some((from, start_x, moved)) = self.tab_drag.take() else {
                     return;
                 };
-                self.ui.set_tab_drop_visible(false);
                 self.ui.set_tab_drag_index(-1);
+                self.ui.set_tab_drag_dx(0.0);
                 self.ui.set_tab_drop_slot(-1);
                 if from != index || !moved {
                     return;
@@ -9372,7 +9454,8 @@ impl App {
                     return;
                 }
                 self.suppress_tab_click = Some(std::time::Instant::now());
-                let to = slot_of(pointer_x);
+                let dragged_center_x = from as f32 * 153.0 + 75.0 + (pointer_x - start_x);
+                let to = slot_of(dragged_center_x);
                 logv!(
                     "[tab] drag release from={from} to={to} travel={:.1} tabs={}",
                     pointer_x - start_x,
@@ -13649,6 +13732,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         // 供下面两个下拉回调共用（第一个闭包会移走 app）。
         let lang_app = app.clone();
         let startup_app = app.clone();
+        let theme_app = app.clone();
         let auto_edit_app = app.clone();
         upgrade().on_auto_edit_path_on_new_tab_toggled(move |enabled| {
             let Some(app) = auto_edit_app.upgrade() else { return };
@@ -13730,6 +13814,30 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.sync_sidebar();
             app.sync_breadcrumbs();
             app.sync_status();
+        });
+        // 通用设置：主题色（跟随系统 / 亮 / 暗）——即时换全套色值 + 原生菜单深浅。
+        upgrade().on_theme_changed(move |index| {
+            let Some(app) = theme_app.upgrade() else { return };
+            let (choice, ui) = {
+                let mut app = app.borrow_mut();
+                app.config.theme = match index {
+                    1 => ThemeChoice::Light,
+                    2 => ThemeChoice::Dark,
+                    _ => ThemeChoice::System,
+                };
+                app.config.save();
+                (app.config.theme, slint::ComponentHandle::clone_strong(&app.ui))
+            };
+            apply_theme(&ui, choice);
+            // 侧栏 / 标签栏的图标颜色分亮暗两套，必须跟着重算一遍，否则切主题后
+            // 盘符和 "N" 图标还是旧主题那套色。
+            if let Some(app) = theme_app.upgrade() {
+                if let Ok(mut app) = app.try_borrow_mut() {
+                    app.sync_sidebar();
+                    app.sync_tabs();
+                }
+            }
+            retheme_extra_windows(choice);
         });
         upgrade().on_startup_changed(move |index| {
             let Some(app) = startup_app.upgrade() else { return };
@@ -14092,6 +14200,64 @@ fn get_window_hwnd(ui: &MainWindow) -> Option<isize> {
     None
 }
 
+/// `WM_SETTINGCHANGE` 的 lParam 是否指向 `"ImmersiveColorSet"`（系统换深浅色）。
+///
+/// 这条消息是**跨进程广播**：lParam 里的指针是在发送方地址空间里有效的，
+/// 在我们进程里未必可读，直接解引用就是野指针（能直接把程序带崩）。
+/// 所以用 `ReadProcessMemory` 读自己的地址空间——地址无效时它只会返回
+/// `FALSE`，不会触发访问违例。
+#[cfg(windows)]
+fn is_immersive_color_set(lparam: windows_sys::Win32::Foundation::LPARAM) -> bool {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    const NEEDLE: &str = "ImmersiveColorSet";
+    if lparam == 0 {
+        return false;
+    }
+    let mut buf = [0u16; NEEDLE.len()];
+    let bytes = buf.len() * std::mem::size_of::<u16>();
+    let mut read = 0usize;
+    unsafe {
+        let ok = ReadProcessMemory(
+            GetCurrentProcess(),
+            lparam as *const core::ffi::c_void,
+            buf.as_mut_ptr() as *mut core::ffi::c_void,
+            bytes,
+            &mut read,
+        );
+        if ok == 0 || read < bytes {
+            return false;
+        }
+    }
+    buf.iter().copied().eq(NEEDLE.encode_utf16())
+}
+
+/// 系统深浅色变了：只有「跟随系统」需要重新配色（其余是用户钉死的选择）。
+///
+/// 走 `invoke_from_event_loop` 而不是同步执行：这里还在窗口过程里，
+/// 直接写 Slint 属性会重入事件循环；而且 WM_SETTINGCHANGE 一次会来好几条。
+#[cfg(windows)]
+fn resync_follow_system_theme() {
+    let _ = slint::invoke_from_event_loop(|| {
+        let app = SESSION.with(|slot| slot.borrow().clone());
+        let Some(app) = app else { return };
+        let Ok(mut app) = app.try_borrow_mut() else { return };
+        if app.config.theme != ThemeChoice::System {
+            return;
+        }
+        let ui = slint::ComponentHandle::clone_strong(&app.ui);
+        apply_theme(&ui, ThemeChoice::System);
+        // 侧栏 / 标签栏图标色分亮暗两套：先把主题写进 Slint（sync_* 读的是
+        // Theme.dark），再重建这两个模型。
+        app.sync_sidebar();
+        app.sync_tabs();
+        drop(app);
+        retheme_extra_windows(ThemeChoice::System);
+        crate::logv!("[theme] 系统深浅色变化，已按「跟随系统」重算配色");
+    });
+}
+
 /// 无边框窗口的 `WM_NCHITTEST` 子类化。
 ///
 /// **这里不再判定标题栏拖拽区**。历史做法是把标签栏右侧的空白算成
@@ -14143,7 +14309,7 @@ mod drag_hittest {
         use windows_sys::Win32::UI::WindowsAndMessaging::{
             CallWindowProcW, HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT, HTCLIENT, HTLEFT, HTRIGHT,
             HTTOP, HTTOPLEFT, HTTOPRIGHT, IsZoomed, SC_MOVE, WNDPROC, WM_GETMINMAXINFO,
-            WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_SYSCOMMAND,
+            WM_NCHITTEST, WM_NCLBUTTONDOWN, WM_NCRBUTTONDOWN, WM_SETTINGCHANGE, WM_SYSCOMMAND,
         };
 
         // 非客户区点击 / 系统发起的移动：编辑态与重命名必须先退出。
@@ -14158,6 +14324,12 @@ mod drag_hittest {
         // 接了就变成“拉一下窗口边就把重命名提交了”。
         if msg == WM_SYSCOMMAND && (wparam & 0xFFF0) == SC_MOVE as usize {
             super::clear_global_focus();
+        }
+        // 系统「个性化 → 颜色」一变，Windows 就广播 WM_SETTINGCHANGE 且
+        // lParam 指向 "ImmersiveColorSet"。只在「跟随系统」时重算配色，
+        // 否则用户选的是固定主题，系统怎么变都与我们无关。
+        if msg == WM_SETTINGCHANGE && super::is_immersive_color_set(lparam) {
+            super::resync_follow_system_theme();
         }
 
         let prev: WNDPROC = std::mem::transmute(PREV_WNDPROC.load(Ordering::Relaxed));
@@ -14618,6 +14790,28 @@ pub(crate) fn set_jump_language(language: &str) {
     with_jump(|state| state.language = language.to_string());
 }
 
+/// 主题变了：吸附窗独立的 Theme 全局也要跟着换。
+fn set_jump_theme(theme: ThemeChoice) {
+    with_jump(|state| apply_theme_to(&state.window.global::<Theme>(), resolve_theme(theme)));
+}
+
+/// 主题变了：把**独立组件树**的窗口也刷一遍（主窗口之外还有吸附窗、批量重命名）。
+///
+/// 这些窗口各自持有一份 `Theme` 全局，建窗时下发过、之后不会自动同步。
+fn retheme_extra_windows(theme: ThemeChoice) {
+    set_jump_theme(theme);
+    let effective = resolve_theme(theme);
+    let windows: Vec<BatchRenameWindow> = BATCH_WINDOWS.with(|list| {
+        list.borrow()
+            .iter()
+            .filter_map(|e| e.ui.upgrade())
+            .collect()
+    });
+    for ui in windows {
+        apply_theme_to(&ui.global::<Theme>(), effective);
+    }
+}
+
 /// 当前会话正在看的目录（没有会话 / App 正被借用时返回 None）。
 fn session_current_dir() -> Option<PathBuf> {
     let app = SESSION.with(|slot| slot.try_borrow().ok().and_then(|s| s.clone()))?;
@@ -14700,8 +14894,10 @@ fn jump_refresh() {
 }
 
 /// 建好吸附窗并接线。进程内只做一次（见 `run()`），与主窗口生命周期无关。
-pub(crate) fn init_dialog_jump(language: &str) {
+pub(crate) fn init_dialog_jump(language: &str, theme: ThemeChoice) {
     let window = DialogJumpWindow::new().unwrap();
+    // 吸附窗是独立的组件树，主题全局要单独下发一次（否则深色下它是白的）。
+    apply_theme_to(&window.global::<Theme>(), resolve_theme(theme));
     window.set_mouse_left_pressed(false);
     JUMP.with(|slot| {
         *slot.borrow_mut() = Some(JumpState {
@@ -15061,7 +15257,8 @@ pub fn run() {
 
     // 文件对话框吸附窗：进程级常驻，和主窗口完全解耦（关了主窗口它还在）。
     // 放在转发判断之后：转发进程秒退，没必要建这一套。
-    crate::app::init_dialog_jump(&crate::config::Config::load().language);
+    let boot_config = crate::config::Config::load();
+    crate::app::init_dialog_jump(&boot_config.language, boot_config.theme);
 
     // Shell 的「选中这个条目」投递口（IShellView::SelectItem → 事件循环）。
     install_shell_select_sink();
@@ -15495,6 +15692,11 @@ fn create_session(
         _ => 0,
     });
     ui.set_startup_index(if config.startup_tab == "computer" { 1 } else { 0 });
+    ui.set_theme_index(match config.theme {
+        ThemeChoice::Light => 1,
+        ThemeChoice::Dark => 2,
+        ThemeChoice::System => 0,
+    });
     // 窗口初始尺寸：直接用配置里的值（首次启动即配置默认值 1150×690）。
     // 不要在这里用 scale_factor() 去算 75%——此时窗口尚未 show，scale 恒为 1.0，
     // 在 2× 屏上会先弹出一个逻辑像素意义上“超屏”的瞬时大窗，再到首帧
@@ -16423,7 +16625,7 @@ impl App {
             .set_strings(ModelRc::new(VecModel::from(i18n::strings_for(
                 &self.config.language,
             ))));
-        apply_theme_to(&ui.global::<Theme>(), self.config.theme);
+        apply_theme_to(&ui.global::<Theme>(), resolve_theme(self.config.theme));
 
         let id = BATCH_NEXT_ID.with(|c| {
             let id = c.get();

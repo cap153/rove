@@ -14,11 +14,14 @@ component Toggle inherits Rectangle {
     /// 点击：外部负责取反并回填状态。
     callback toggled();
 
-    width: 36px;
+    width: 38px;
     height: 20px;
     border-radius: 10px;
-    background: root.checked ? Theme.accent : Theme.border;
+    background: root.checked ? Theme.accent : (Theme.dark ? Theme.bg-input : Theme.border);
+    border-width: root.checked ? 0px : 1px;
+    border-color: Theme.border;
     opacity: root.enabled ? 1.0 : 0.4;
+    animate background { duration: 140ms; easing: ease-out; }
 
     Rectangle {
         x: root.checked ? parent.width - self.width - 2px : 2px;
@@ -27,6 +30,7 @@ component Toggle inherits Rectangle {
         height: 16px;
         border-radius: 8px;
         background: white;
+        animate x { duration: 140ms; easing: ease-out; }
     }
 
     TouchArea {
@@ -138,7 +142,7 @@ component SettingRow inherits Rectangle {
 
             Text {
                 text: I18n.strings[23];
-                color: #C0392B;
+                color: Theme.danger;
                 font-size: 11px;
                 horizontal-alignment: center;
                 vertical-alignment: center;
@@ -165,8 +169,10 @@ component GroupCard inherits Rectangle {
     callback delete(id: string);
 
     height: root.group.expanded ? 44px + root.group.items.length * 42px : 44px;
-    background: Theme.bg-input;
-    border-radius: 8px;
+    background: Theme.bg-popup;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: Theme.border;
     clip: true;
 
     VerticalLayout {
@@ -326,10 +332,20 @@ component ComboRow inherits Rectangle {
     in-out property <int> selected: 0;
     callback selection_changed(int);
     in-out property <bool> open: false;
+    /// 弹出列表的可用竖直范围（窗口坐标，由所在滚动容器传入）。
+    in property <length> viewport-top: -100000px;
+    in property <length> viewport-bottom: 100000px;
+    private property <length> list-h: min(140px, root.options.length * 30px + 8px);
+    /// 下方装不下、上方装得下时，列表改成往上弹。
+    ///
+    /// 早先是"滚动容器自动上滚让位"，但滚动条位置跟着跳，体验更差；
+    /// 这里只翻转列表自身，页面一点不动。
+    private property <bool> flip-up: root.absolute-position.y + 48px + root.list-h > root.viewport-bottom
+        && root.absolute-position.y - root.list-h + 11px >= root.viewport-top;
 
     height: 58px;
-    background: Theme.bg-input;
-    border-radius: 8px;
+    background: Theme.bg-popup;
+    border-radius: 10px;
     border-width: 1px;
     border-color: Theme.border;
 
@@ -351,7 +367,7 @@ component ComboRow inherits Rectangle {
         y: 11px;
         width: 194px;
         height: 36px;
-        background: Theme.bg-main;
+        background: Theme.dark ? Theme.bg-input : Theme.bg-main;
         border-radius: 6px;
         border-width: 1px;
         border-color: Theme.border;
@@ -387,13 +403,18 @@ component ComboRow inherits Rectangle {
 
     if (root.open) : Rectangle {
         x: parent.width - 210px;
-        y: 48px;
+        // 上翻时压进所在行 11px：面板底边正好贴住值框上沿，肉眼零间隙。
+        y: root.flip-up ? (11px - root.list-h) : 48px;
         width: 194px;
-        height: min(140px, root.options.length * 30px + 8px);
-        background: Theme.bg-input;
-        border-radius: 6px;
+        height: root.list-h;
+        background: Theme.bg-popup;
+        border-radius: 8px;
         border-width: 1px;
-        border-color: Theme.border;
+        // 亮色的主题色是绿的，描一圈 accent 就成了"绿框下拉"，显脏；亮色回中性灰边。
+        border-color: Theme.dark ? Theme.accent.transparentize(0.45) : Theme.border;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+        drop-shadow-offset-y: root.flip-up ? -4px : 4px;
         z: 100;
 
         for opt[i] in root.options : Rectangle {
@@ -471,6 +492,9 @@ export component SettingsPage inherits Rectangle {
     /// 显示语言：0 跟随系统 / 1 简体中文 / 2 English。
     in-out property <int> language-index: 0;
     callback language_changed(int);
+    /// 主题色：0 跟随系统 / 1 亮 / 2 暗。
+    in-out property <int> theme-index: 0;
+    callback theme_changed(int);
     /// 启动时打开：0 上次的标签页(包括分屏) / 1 电脑选项。
     in-out property <int> startup-index: 0;
     callback startup_changed(int);
@@ -522,6 +546,7 @@ export component SettingsPage inherits Rectangle {
     // 诊断：滚动几何变化时回报（视口 / 内容 / 实测首选高度）。
     callback scroll_debug(viewport: length, content: length, preferred: length);
 
+    // 页面底色保持 bg-main：卡片走 bg-popup，才有「卡片浮在页面上」的层次。
     background: Theme.bg-main;
 
     // 点击空白关闭右键菜单
@@ -537,7 +562,7 @@ export component SettingsPage inherits Rectangle {
         width: 100%;
         height: 100%;
 
-        // 左侧子导航
+        // 左侧子导航（与主侧栏同一套圆角胶囊语言）
         Rectangle {
             width: 200px;
             height: 100%;
@@ -545,28 +570,55 @@ export component SettingsPage inherits Rectangle {
 
             VerticalLayout {
                 x: 0px;
-                y: 16px;
+                y: 12px;
                 width: 100%;
+                spacing: 4px;
 
                 for nav in root.nav-items : Rectangle {
-                    height: 40px;
-                    background: nav.selected ? Theme.bg-hover : transparent;
+                    height: 38px;
+                    background: transparent;
+
+                    // 与主侧栏同一套两段式质感：暗色内缩胶囊 + 圆角竖条，
+                    // 亮色整行贴边浅灰底、无边框无竖条（原版观感）。
+                    Rectangle {
+                        x: Theme.dark ? 10px : 0px;
+                        y: Theme.dark ? 1px : 0px;
+                        width: Theme.dark ? (parent.width - 20px) : parent.width;
+                        height: Theme.dark ? (parent.height - 2px) : parent.height;
+                        border-radius: Theme.dark ? 8px : 0px;
+                        background: nav.selected
+                            ? (Theme.dark ? Theme.bg-selected : Theme.bg-hover)
+                            : (nav-ta.has-hover ? Theme.bg-hover : transparent);
+                        border-width: (Theme.dark && nav.selected) ? 1px : 0px;
+                        border-color: Theme.accent.transparentize(0.45);
+                        animate background { duration: 100ms; easing: ease-out; }
+
+                        if (Theme.dark && nav.selected) : Rectangle {
+                            x: 3px;
+                            y: (parent.height - 14px) / 2;
+                            width: 3px;
+                            height: 14px;
+                            border-radius: 1.5px;
+                            background: Theme.accent;
+                        }
+                    }
 
                     HorizontalLayout {
-                        x: 16px;
-                        width: parent.width - 32px;
+                        x: 20px;
+                        width: parent.width - 36px;
                         height: parent.height;
 
                         Text {
                             text: nav.label;
                             color: nav.selected ? Theme.text-primary : Theme.text-secondary;
                             font-size: 13px;
+                            font-weight: nav.selected ? 600 : 400;
                             vertical-alignment: center;
                             horizontal-stretch: 1;
                         }
                     }
 
-                    TouchArea {
+                    nav-ta := TouchArea {
                         width: 100%;
                         height: 100%;
                         clicked => {
@@ -574,6 +626,15 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
                 }
+            }
+
+            // 只在暗色下画分割线（亮色两侧底色已足够区分）。
+            if (Theme.dark) : Rectangle {
+                x: parent.width - 1px;
+                y: 0px;
+                width: 1px;
+                height: parent.height;
+                background: Theme.divider;
             }
         }
 
@@ -615,8 +676,9 @@ export component SettingsPage inherits Rectangle {
 
                         Text {
                             text: I18n.strings[4];
-                            color: white;
+                            color: Theme.accent-text;
                             font-size: 12px;
+                            font-weight: 500;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                             width: 100%;
@@ -671,7 +733,7 @@ export component SettingsPage inherits Rectangle {
             }
 
             // ---- 子页 1：通用设置面板 ----
-            if (root.page-title == I18n.strings[79]) : SettingsScrollContainer {
+            if (root.page-title == I18n.strings[79]) : gen-scroll := SettingsScrollContainer {
                 content-height: gen-layout.preferred-height + 28px;
 
                 gen-layout := VerticalLayout {
@@ -683,10 +745,12 @@ export component SettingsPage inherits Rectangle {
                     // 接管资源管理器：文件夹 / 磁盘 / 此电脑的默认打开程序改为 Rove。
                     Rectangle {
                         width: 100%;
-                        background: gen-takeover-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
-                        border-radius: 8px;
+                        // 亮色悬停 = 底色变灰（原版观感）；暗色悬停 = 描边泛紫（深底上换底色太闷）。
+                        background: (!Theme.dark && gen-takeover-ta.has-hover) ? Theme.bg-hover : Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
-                        border-color: Theme.border;
+                        border-color: (Theme.dark && gen-takeover-ta.has-hover) ? Theme.accent.transparentize(0.45) : Theme.border;
+                        animate background, border-color { duration: 100ms; easing: ease-out; }
                         height: 58px;
 
                         gen-takeover-ta := TouchArea {
@@ -737,10 +801,12 @@ export component SettingsPage inherits Rectangle {
                     // 开机自启动：登录 Windows 时后台常驻（托盘 + 对话框吸附 + 索引预热）。
                     Rectangle {
                         width: 100%;
-                        background: gen-autostart-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
-                        border-radius: 8px;
+                        // 亮色悬停 = 底色变灰（原版观感）；暗色悬停 = 描边泛紫（深底上换底色太闷）。
+                        background: (!Theme.dark && gen-autostart-ta.has-hover) ? Theme.bg-hover : Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
-                        border-color: Theme.border;
+                        border-color: (Theme.dark && gen-autostart-ta.has-hover) ? Theme.accent.transparentize(0.45) : Theme.border;
+                        animate background, border-color { duration: 100ms; easing: ease-out; }
                         height: 58px;
 
                         gen-autostart-ta := TouchArea {
@@ -790,10 +856,12 @@ export component SettingsPage inherits Rectangle {
 
                     Rectangle {
                         width: 100%;
-                        background: gen-row-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
-                        border-radius: 8px;
+                        // 亮色悬停 = 底色变灰（原版观感）；暗色悬停 = 描边泛紫（深底上换底色太闷）。
+                        background: (!Theme.dark && gen-row-ta.has-hover) ? Theme.bg-hover : Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
-                        border-color: Theme.border;
+                        border-color: (Theme.dark && gen-row-ta.has-hover) ? Theme.accent.transparentize(0.45) : Theme.border;
+                        animate background, border-color { duration: 100ms; easing: ease-out; }
                         height: 58px;
 
                         gen-row-ta := TouchArea {
@@ -844,10 +912,12 @@ export component SettingsPage inherits Rectangle {
                     // 新建标签时是否自动进入地址栏编辑态（默认关闭）。
                     Rectangle {
                         width: 100%;
-                        background: gen-auto-edit-ta.has-hover ? Theme.bg-hover : Theme.bg-input;
-                        border-radius: 8px;
+                        // 亮色悬停 = 底色变灰（原版观感）；暗色悬停 = 描边泛紫（深底上换底色太闷）。
+                        background: (!Theme.dark && gen-auto-edit-ta.has-hover) ? Theme.bg-hover : Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
-                        border-color: Theme.border;
+                        border-color: (Theme.dark && gen-auto-edit-ta.has-hover) ? Theme.accent.transparentize(0.45) : Theme.border;
+                        animate background, border-color { duration: 100ms; easing: ease-out; }
                         height: 58px;
 
                         gen-auto-edit-ta := TouchArea {
@@ -895,23 +965,43 @@ export component SettingsPage inherits Rectangle {
                         }
                     }
 
-                    ComboRow {
+                    combo-language := ComboRow {
                         // 展开时抬高层级：否则下拉列表会被布局里更靠后的行盖住。
                         z: self.open ? 10 : 0;
                         label: I18n.strings[85];
                         options: [I18n.strings[86], I18n.strings[87], I18n.strings[88]];
                         selected: root.language-index;
+                        // 自己不知道自己被裁在哪儿，可视范围由滚动容器告诉它。
+                        viewport-top: gen-scroll.absolute-position.y;
+                        viewport-bottom: gen-scroll.absolute-position.y + gen-scroll.height;
                         selection_changed(i) => {
                             root.language-index = i;
                             root.language_changed(i);
                         }
                     }
 
-                    ComboRow {
+                    combo-theme := ComboRow {
+                        z: self.open ? 10 : 0;
+                        label: I18n.strings[296];
+                        options: [I18n.strings[86], I18n.strings[297], I18n.strings[298]];
+                        selected: root.theme-index;
+                        // 自己不知道自己被裁在哪儿，可视范围由滚动容器告诉它。
+                        viewport-top: gen-scroll.absolute-position.y;
+                        viewport-bottom: gen-scroll.absolute-position.y + gen-scroll.height;
+                        selection_changed(i) => {
+                            root.theme-index = i;
+                            root.theme_changed(i);
+                        }
+                    }
+
+                    combo-startup := ComboRow {
                         z: self.open ? 10 : 0;
                         label: I18n.strings[89];
                         options: [I18n.strings[90], I18n.strings[91]];
                         selected: root.startup-index;
+                        // 自己不知道自己被裁在哪儿，可视范围由滚动容器告诉它。
+                        viewport-top: gen-scroll.absolute-position.y;
+                        viewport-bottom: gen-scroll.absolute-position.y + gen-scroll.height;
                         selection_changed(i) => {
                             root.startup-index = i;
                             root.startup_changed(i);
@@ -949,8 +1039,8 @@ export component SettingsPage inherits Rectangle {
                     // 1. 顶部指标看板卡片
                     Rectangle {
                         width: 100%;
-                        background: Theme.bg-input;
-                        border-radius: 8px;
+                        background: Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
                         border-color: Theme.border;
                         height: 126px;
@@ -989,7 +1079,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 6px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: rescan-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+                                    background: rescan-ta.has-hover ? Theme.bg-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     HorizontalLayout {
                                         alignment: center;
@@ -1022,7 +1112,7 @@ export component SettingsPage inherits Rectangle {
                                 Rectangle {
                                     height: 58px;
                                     horizontal-stretch: 1;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
                                     border-radius: 6px;
                                     VerticalLayout {
                                         alignment: center;
@@ -1036,7 +1126,7 @@ export component SettingsPage inherits Rectangle {
                                 Rectangle {
                                     height: 58px;
                                     horizontal-stretch: 1;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
                                     border-radius: 6px;
                                     VerticalLayout {
                                         alignment: center;
@@ -1050,7 +1140,7 @@ export component SettingsPage inherits Rectangle {
                                 Rectangle {
                                     height: 58px;
                                     horizontal-stretch: 1;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
                                     border-radius: 6px;
                                     VerticalLayout {
                                         alignment: center;
@@ -1064,7 +1154,7 @@ export component SettingsPage inherits Rectangle {
                                 Rectangle {
                                     height: 58px;
                                     horizontal-stretch: 1;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
                                     border-radius: 6px;
                                     VerticalLayout {
                                         alignment: center;
@@ -1080,8 +1170,8 @@ export component SettingsPage inherits Rectangle {
                     // 2. 驱动器管理卡片
                     Rectangle {
                         width: 100%;
-                        background: Theme.bg-input;
-                        border-radius: 8px;
+                        background: Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
                         border-color: Theme.border;
                         height: 44px + root.search-drives.length * 44px;
@@ -1174,11 +1264,12 @@ export component SettingsPage inherits Rectangle {
                     // 3. 忽略与排除路径
                     Rectangle {
                         width: 100%;
-                        background: Theme.bg-input;
-                        border-radius: 8px;
+                        background: Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
                         border-color: Theme.border;
-                        height: 126px; // 删减了一行副标题，高度回缩
+                        // 出现横向滚动条时多留 12(spacing) + 8(滑块命中区)，否则滑块会落到卡片外。
+                        height: tags-flick.content-width > tags-flick.width ? 146px : 126px;
 
                         VerticalLayout {
                             padding: 12px;
@@ -1203,7 +1294,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 5px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: pick-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+                                    background: pick-ta.has-hover ? Theme.bg-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     Text {
                                         text: I18n.strings[78];
@@ -1229,7 +1320,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 5px;
                                     border-width: 1px;
                                     border-color: input-ta.has-focus ? Theme.accent : Theme.border;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     input-ta := SingleLineEdit {
                                         mouse-pressed: root.mouse-pressed;
@@ -1276,7 +1367,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 5px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: add-ex-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+                                    background: add-ex-ta.has-hover ? Theme.bg-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     Text {
                                         text: I18n.strings[63];
@@ -1303,7 +1394,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 5px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: reset-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+                                    background: reset-ta.has-hover ? Theme.bg-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     Text {
                                         text: I18n.strings[47];
@@ -1341,7 +1432,7 @@ export component SettingsPage inherits Rectangle {
                                         // 核心防抖逻辑：用隐藏的 ghost-text 测量真实文本的宽度，防止悬停变成“删除”时宽度缩水闪烁
                                         width: min(max(ghost-text.preferred-width + 24px, 64px), 200px);
                                         border-radius: 5px;
-                                        background: c-ta.has-hover ? Theme.close-hover : Theme.bg-main;
+                                        background: c-ta.has-hover ? Theme.close-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
                                         border-width: 1px;
                                         border-color: c-ta.has-hover ? Theme.close-hover : Theme.border;
 
@@ -1394,25 +1485,28 @@ export component SettingsPage inherits Rectangle {
 
                             // 横向滚动条（悬停加粗高亮 + 点击跳转 + 拖动滑块）
                             if (tags-flick.content-width > tags-flick.width) : Rectangle {
-                                height: 6px;
+                                height: 8px;
                                 width: 100%;
                                 background: transparent;
 
                                 property <length> max-scroll: max(1px, tags-flick.content-width - tags-flick.width);
                                 property <length> thumb-w: max(32px, self.width * (tags-flick.width / max(tags-flick.content-width, 1px)));
                                 property <length> max-travel: max(0px, self.width - self.thumb-w);
-                                property <bool> active: h-track-ta.has-hover || h-track-ta.pressed;
+                                property <length> thumb-x: self.max-travel * (-tags-flick.content-x / self.max-scroll);
 
-                                // 视觉轨道：3px → 5px，命中区固定 6px
+                                // 样式直接复用 file_list 详细视图的横向滚动条：没有轨道，
+                                // 只有一根胶囊滑块（4px，悬停/拖动时 6px 并变亮）。
                                 Rectangle {
-                                    y: (parent.height - self.height) / 2;
-                                    width: 100%;
-                                    height: parent.active ? 5px : 3px;
+                                    x: min(parent.max-travel, max(0px, parent.thumb-x));
+                                    y: parent.height - self.height;
+                                    width: parent.thumb-w;
+                                    height: (h-track-ta.has-hover || h-track-ta.pressed) ? 6px : 4px;
                                     border-radius: self.height / 2;
-                                    background: parent.active ? Theme.bg-hover : Theme.bg-main;
+                                    background: h-track-ta.pressed
+                                        ? Theme.text-primary.transparentize(0.35)
+                                        : (h-track-ta.has-hover ? Theme.text-primary.transparentize(0.5) : Theme.text-primary.transparentize(0.72));
 
-                                    animate height { duration: 120ms; }
-                                    animate background { duration: 120ms; }
+                                    animate height, background { duration: 150ms; easing: ease-out; }
                                 }
 
                                 h-track-ta := TouchArea {
@@ -1423,9 +1517,9 @@ export component SettingsPage inherits Rectangle {
                                     property <length> drag-start-scroll: 0px;
 
                                     pointer-event(event) => {
-                                        if (event.kind == PointerEventKind.down) {
-                                            // 按在滑块上直接拖拽；按在轨道空白处先跳转到该位置。
-                                            let thumb-left = parent.max-travel * (-tags-flick.content-x / parent.max-scroll);
+                                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                            // 按在滑块上直接拖；按在空白处先跳到该位置。
+                                            let thumb-left = min(parent.max-travel, max(0px, parent.thumb-x));
                                             if (self.mouse-x < thumb-left || self.mouse-x > thumb-left + parent.thumb-w) {
                                                 let click-ratio = (self.mouse-x - parent.thumb-w / 2) / max(1px, parent.max-travel);
                                                 tags-flick.content-x = -max(0.0, min(1.0, click-ratio)) * parent.max-scroll;
@@ -1443,21 +1537,6 @@ export component SettingsPage inherits Rectangle {
                                         }
                                     }
                                 }
-
-                                // 滑块本体（悬停/拖动时加粗加亮）
-                                Rectangle {
-                                    x: parent.max-travel * (-tags-flick.content-x / parent.max-scroll);
-                                    y: (parent.height - self.height) / 2;
-                                    width: parent.thumb-w;
-                                    height: parent.active ? 5px : 3px;
-                                    border-radius: self.height / 2;
-                                    background: h-track-ta.pressed ? Theme.accent : (h-track-ta.has-hover ? Theme.text-secondary : Theme.border);
-                                    opacity: parent.active ? 0.9 : 0.6;
-
-                                    animate height { duration: 120ms; }
-                                    animate background { duration: 120ms; }
-                                    animate opacity { duration: 120ms; }
-                                }
                             }
                         }
                     }
@@ -1465,8 +1544,8 @@ export component SettingsPage inherits Rectangle {
                     // 4. 自动化与结果策略卡片
                     Rectangle {
                         width: 100%;
-                        background: Theme.bg-input;
-                        border-radius: 8px;
+                        background: Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
                         border-color: Theme.border;
                         height: 108px;
@@ -1508,7 +1587,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 6px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
                                     opacity: root.search-idle-enabled ? 1.0 : 0.4;
 
                                     HorizontalLayout {
@@ -1574,7 +1653,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 6px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     HorizontalLayout {
                                         Rectangle {
@@ -1649,12 +1728,12 @@ export component SettingsPage inherits Rectangle {
                     // 只作用于系统 / 第三方项，Rove 自己的菜单项不受影响。
                     Rectangle {
                         width: 100%;
-                        background: Theme.bg-input;
-                        border-radius: 8px;
+                        background: Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
                         border-color: Theme.border;
-                        // 12+20+12+28+12+30+12 = 126；出现横向滚动条时多留 12+6。
-                        height: hide-tags-flick.content-width > hide-tags-flick.width ? 144px : 126px;
+                        // 12+20+12+28+12+30+12 = 126；出现横向滚动条时多留 12+8。
+                        height: hide-tags-flick.content-width > hide-tags-flick.width ? 146px : 126px;
 
                         VerticalLayout {
                             padding: 12px;
@@ -1676,7 +1755,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 5px;
                                     border-width: 1px;
                                     border-color: hide-input-ta.has-focus ? Theme.accent : Theme.border;
-                                    background: Theme.bg-main;
+                                    background: Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     hide-input-ta := SingleLineEdit {
                                         mouse-pressed: root.mouse-pressed;
@@ -1717,7 +1796,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 5px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: hide-add-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+                                    background: hide-add-ta.has-hover ? Theme.bg-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     Text {
                                         text: I18n.strings[63];
@@ -1744,7 +1823,7 @@ export component SettingsPage inherits Rectangle {
                                     border-radius: 5px;
                                     border-width: 1px;
                                     border-color: Theme.border;
-                                    background: hide-restore-ta.has-hover ? Theme.bg-hover : Theme.bg-main;
+                                    background: hide-restore-ta.has-hover ? Theme.bg-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
 
                                     Text {
                                         text: I18n.strings[47];
@@ -1782,7 +1861,7 @@ export component SettingsPage inherits Rectangle {
                                         // 用隐藏的 ghost-text 测真实文本宽度：否则悬停变成「删除」时宽度会缩水闪烁。
                                         width: min(max(hide-ghost-text.preferred-width + 24px, 64px), 200px);
                                         border-radius: 5px;
-                                        background: hide-c-ta.has-hover ? Theme.close-hover : Theme.bg-main;
+                                        background: hide-c-ta.has-hover ? Theme.close-hover : Theme.dark ? Theme.bg-input : Theme.bg-main;
                                         border-width: 1px;
                                         border-color: hide-c-ta.has-hover ? Theme.close-hover : Theme.border;
 
@@ -1813,24 +1892,28 @@ export component SettingsPage inherits Rectangle {
 
                             // 横向滚动条（悬停加粗高亮 + 点击跳转 + 拖动滑块）
                             if (hide-tags-flick.content-width > hide-tags-flick.width) : Rectangle {
-                                height: 6px;
+                                height: 8px;
                                 width: 100%;
                                 background: transparent;
 
                                 property <length> max-scroll: max(1px, hide-tags-flick.content-width - hide-tags-flick.width);
                                 property <length> thumb-w: max(32px, self.width * (hide-tags-flick.width / max(hide-tags-flick.content-width, 1px)));
                                 property <length> max-travel: max(0px, self.width - self.thumb-w);
-                                property <bool> active: hide-h-track-ta.has-hover || hide-h-track-ta.pressed;
+                                property <length> thumb-x: self.max-travel * (-hide-tags-flick.content-x / self.max-scroll);
 
+                                // 样式直接复用 file_list 详细视图的横向滚动条：没有轨道，
+                                // 只有一根胶囊滑块（4px，悬停/拖动时 6px 并变亮）。
                                 Rectangle {
-                                    y: (parent.height - self.height) / 2;
-                                    width: 100%;
-                                    height: parent.active ? 5px : 3px;
+                                    x: min(parent.max-travel, max(0px, parent.thumb-x));
+                                    y: parent.height - self.height;
+                                    width: parent.thumb-w;
+                                    height: (hide-h-track-ta.has-hover || hide-h-track-ta.pressed) ? 6px : 4px;
                                     border-radius: self.height / 2;
-                                    background: parent.active ? Theme.bg-hover : Theme.bg-main;
+                                    background: hide-h-track-ta.pressed
+                                        ? Theme.text-primary.transparentize(0.35)
+                                        : (hide-h-track-ta.has-hover ? Theme.text-primary.transparentize(0.5) : Theme.text-primary.transparentize(0.72));
 
-                                    animate height { duration: 120ms; }
-                                    animate background { duration: 120ms; }
+                                    animate height, background { duration: 150ms; easing: ease-out; }
                                 }
 
                                 hide-h-track-ta := TouchArea {
@@ -1841,8 +1924,9 @@ export component SettingsPage inherits Rectangle {
                                     property <length> drag-start-scroll: 0px;
 
                                     pointer-event(event) => {
-                                        if (event.kind == PointerEventKind.down) {
-                                            let thumb-left = parent.max-travel * (-hide-tags-flick.content-x / parent.max-scroll);
+                                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                            // 按在滑块上直接拖；按在空白处先跳到该位置。
+                                            let thumb-left = min(parent.max-travel, max(0px, parent.thumb-x));
                                             if (self.mouse-x < thumb-left || self.mouse-x > thumb-left + parent.thumb-w) {
                                                 let click-ratio = (self.mouse-x - parent.thumb-w / 2) / max(1px, parent.max-travel);
                                                 hide-tags-flick.content-x = -max(0.0, min(1.0, click-ratio)) * parent.max-scroll;
@@ -1859,20 +1943,6 @@ export component SettingsPage inherits Rectangle {
                                             hide-tags-flick.content-x = max(-parent.max-scroll, min(0px, self.drag-start-scroll - delta-scroll));
                                         }
                                     }
-                                }
-
-                                Rectangle {
-                                    x: parent.max-travel * (-hide-tags-flick.content-x / parent.max-scroll);
-                                    y: (parent.height - self.height) / 2;
-                                    width: parent.thumb-w;
-                                    height: parent.active ? 5px : 3px;
-                                    border-radius: self.height / 2;
-                                    background: hide-h-track-ta.pressed ? Theme.accent : (hide-h-track-ta.has-hover ? Theme.text-secondary : Theme.border);
-                                    opacity: parent.active ? 0.9 : 0.6;
-
-                                    animate height { duration: 120ms; }
-                                    animate background { duration: 120ms; }
-                                    animate opacity { duration: 120ms; }
                                 }
                             }
                         }
@@ -1902,8 +1972,8 @@ export component SettingsPage inherits Rectangle {
                     alignment: start;
 
                     for group in root.shortcut-groups : Rectangle {
-                        background: Theme.bg-input;
-                        border-radius: 8px;
+                        background: Theme.bg-popup;
+                        border-radius: 10px;
                         border-width: 1px;
                         border-color: Theme.border;
                         // 高度必须跟着内部布局自己算：以前写成 42px + n * 40px，
@@ -2001,7 +2071,7 @@ export component SettingsPage inherits Rectangle {
                                             : (item.is-readonly ? Theme.border.transparentize(0.5) : Theme.border);
                                         background: root.recording-item-key == item.item-key
                                             ? Theme.accent.transparentize(0.85)
-                                            : (item.is-readonly ? Theme.bg-input : Theme.bg-main);
+                                            : (item.is-readonly ? Theme.bg-input : Theme.dark ? Theme.bg-input : Theme.bg-main);
 
                                         key-txt := Text {
                                             text: root.recording-item-key == item.item-key
@@ -2078,11 +2148,13 @@ export component SettingsPage inherits Rectangle {
         width: 164px;
         height: root.menu-target-slot > 0 ? 134px : 102px; // 备用行多一项，高度自适应
         background: Theme.bg-popup;
-        border-radius: 6px;
+        border-radius: 8px;
         border-width: 1px;
-        border-color: Theme.border;
-        drop-shadow-blur: 12px;
-        drop-shadow-color: #00000033;
+        // 同上：亮色不要绿框。
+        border-color: Theme.dark ? Theme.accent.transparentize(0.45) : Theme.border;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+        drop-shadow-offset-y: 4px;
 
         VerticalLayout {
             padding: 4px;
@@ -2169,7 +2241,7 @@ export component SettingsPage inherits Rectangle {
                 Text {
                     x: 10px;
                     text: I18n.strings[68];
-                    color: #C0392B;
+                    color: Theme.danger;
                     font-size: 12px;
                     vertical-alignment: center;
                 }

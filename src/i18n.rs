@@ -304,6 +304,9 @@ pub const ZH: &[&str] = &[
     "关闭当前标签",            // 293
     "索引重建完成：{} 项",     // 294
     "拼音",                    // 295
+    "主题色",                  // 296
+    "亮",                      // 297
+    "暗",                      // 298
 ];
 
 pub const EN: &[&str] = &[
@@ -603,6 +606,9 @@ pub const EN: &[&str] = &[
     "Close current tab",
     "Index rebuilt: {} entries",
     "Pinyin",
+    "Theme",
+    "Light",
+    "Dark",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -736,6 +742,13 @@ mod tests {
         assert_eq!(EN[293], "Close current tab");
         assert_eq!(ZH[294], "索引重建完成：{} 项");
         assert_eq!(EN[294], "Index rebuilt: {} entries");
+        // 通用页「主题色」下拉（亮 / 暗；「跟随系统」复用语言那一条 86）。
+        assert_eq!(ZH[296], "主题色");
+        assert_eq!(EN[296], "Theme");
+        assert_eq!(ZH[297], "亮");
+        assert_eq!(EN[297], "Light");
+        assert_eq!(ZH[298], "暗");
+        assert_eq!(EN[298], "Dark");
     }
 
     /// 索引表必须与旧的线性扫描语义一致：每个中文键都命中它**首次出现**的下标。

@@ -11,7 +11,8 @@ export component TabBar inherits Rectangle {
     // 否则 Repeater 会销毁行实例、动画被中断。松手时由 Rust 一次性交换。
     in property <int> drag-index: -1;  // 正在拖的标签（-1 = 无）
     in property <int> drop-slot: -1;   // 目标位置（-1 = 无）
-    in property <bool> tab-drop-visible: false;
+    /// 被拖标签的跟手位移（像素）。外层槽位格不动，只有里面的卡片滑。
+    in property <length> drag-dx: 0px;
 
     callback tab_activated(id: int);
     callback tab_closed(id: int);
@@ -176,95 +177,166 @@ export component TabBar inherits Rectangle {
                     }
                 }
 
+                // 两套质感：
+                //  · 暗色 —— 深底需要胶囊 + 细描边撑层次（LANChat 那套）。
+                //  · 亮色 —— 底色本来就通透，恢复「贴底无缝白标签 + 闲置完全透明」，
+                //    靠底部 2px 主题色横条表示选中，多余的外框一律不要。
                 tabs-layout := HorizontalLayout {
                     x: 0px;
-                    y: 0px;
-                    height: 100%;
+                    y: 4px;
+                    height: Theme.dark ? 30px : 34px;
                     spacing: 3px;
 
                     for tab[i] in root.tabs : Rectangle {
                         width: 150px;
                         horizontal-stretch: 0;
-                        height: 34px;
-                        border-top-left-radius: 6px;
-                        border-top-right-radius: 6px;
-                        background: tab.active ? Theme.bg-active-tab
-                            : (root.drop-slot == i && root.drag-index >= 0 ? Theme.bg-selected
-                            : (ta.has-hover ? Theme.bg-hover : transparent));
-                        animate background { duration: 120ms; easing: ease-out; }
-                        // 被拖起的标签淡出，配合落点竖线给出交换反馈。
-                        opacity: root.drag-index == i ? 0.55 : 1.0;
-                        animate opacity { duration: 120ms; easing: ease-out; }
+                        height: Theme.dark ? 30px : 34px;
+                        background: transparent;
+                        // 被拖起的标签抬到最上层，直接盖过正在让位的邻居。
+                        z: root.drag-index == i ? 20 : 0;
+
+                        // 关键：外层槽位格与 TouchArea 永远不动，只有里面的视觉卡片
+                        // 在滑。否则卡片一动，TouchArea 的 mouse-x 会反向跳变，
+                        // 拖动会自己抖。
+                        private property <length> drag-x: max(-i * 153px,
+                            min((root.tabs.length - 1 - i) * 153px, root.drag-dx));
+                        // 邻居让位：被拖标签越过谁，谁就往反方向让出一格（平滑动画）。
+                        private property <length> slide-x: (root.drag-index < 0 || root.drop-slot < 0 || root.drag-index == i)
+                            ? 0px
+                            : (root.drag-index < root.drop-slot
+                                ? ((i > root.drag-index && i <= root.drop-slot) ? -153px : 0px)
+                                : ((i >= root.drop-slot && i < root.drag-index) ? 153px : 0px));
+                        animate slide-x { duration: 150ms; easing: ease-out; }
 
                         Rectangle {
-                            y: parent.height - 2px;
-                            x: 0px;
+                            x: root.drag-index == i ? parent.drag-x : parent.slide-x;
+                            y: 0px;
                             width: parent.width;
-                            height: 2px;
-                            background: tab.active ? Theme.accent : transparent;
-                        }
-
-                        HorizontalLayout {
-                            spacing: 6px;
-                            padding-left: 10px;
-                            padding-right: 6px;
                             height: parent.height;
+                            // 亮色下标签底边要齐平标签栏底部（圆角只留上面两个），
+                            // 才能和下方工具栏"焊"在一起，看不出缝。
+                            border-top-left-radius: Theme.dark ? 7px : 6px;
+                            border-top-right-radius: Theme.dark ? 7px : 6px;
+                            border-bottom-left-radius: Theme.dark ? 7px : 0px;
+                            border-bottom-right-radius: Theme.dark ? 7px : 0px;
+                            background: root.drag-index == i
+                                ? (Theme.dark ? Theme.bg-popup : Theme.bg-active-tab)
+                                : (Theme.dark
+                                    ? (tab.active ? Theme.bg-selected
+                                        : ((root.drag-index < 0 && ta.has-hover) ? Theme.bg-hover : Theme.bg-badge.transparentize(0.45)))
+                                    : (tab.active ? Theme.bg-active-tab
+                                        : ((root.drag-index < 0 && ta.has-hover) ? Theme.bg-hover : transparent)));
+                            border-width: (Theme.dark || root.drag-index == i) ? 1px : 0px;
+                            border-color: root.drag-index == i
+                                ? Theme.accent.transparentize(0.3)
+                                : (tab.active ? Theme.accent.transparentize(0.45)
+                                    : ((root.drag-index < 0 && ta.has-hover) ? Theme.border : Theme.border.transparentize(0.3)));
+                            // 抬起感：拖动时阴影 + 主题色描边，代替原来的"半透明 + 落点竖条"。
+                            drop-shadow-blur: root.drag-index == i ? 10px : 0px;
+                            drop-shadow-color: root.drag-index == i ? (Theme.dark ? #00000066 : #00000024) : transparent;
+                            drop-shadow-offset-y: root.drag-index == i ? 2px : 0px;
+                            animate background, border-color { duration: 120ms; easing: ease-out; }
 
-                            if (tab.active && root.loading) : Rectangle {
-                                width: 14px;
-                                height: 14px;
+                            // 暗色：左侧小圆角竖条。
+                            // 绝对定位在标签内部而不是放进布局里：切换标签时图标和文字
+                            // 不会因为竖条的出现/消失左右跳动。
+                            if (Theme.dark && tab.active) : Rectangle {
+                                x: 3px;
                                 y: (parent.height - 14px) / 2;
-                                border-radius: 7px;
-                                background: Math.mod(animation-tick(), 800ms) < 400ms
-                                    ? Theme.accent.transparentize(0.55)
-                                    : Theme.accent;
+                                width: 3px;
+                                height: 14px;
+                                border-radius: 1.5px;
+                                background: Theme.accent;
                             }
-                            if (!(tab.active && root.loading)) : Rectangle {
-                                width: 16px;
-                                height: 16px;
-                                y: (parent.height - 16px) / 2;
-                                border-radius: 4px;
-                                background: Theme.accent.transparentize(0.82);
+                            // 亮色：恢复原版贴底的 2px 主题色横条。
+                            if (!Theme.dark) : Rectangle {
+                                y: parent.height - 2px;
+                                x: 0px;
+                                width: parent.width;
+                                height: 2px;
+                                background: tab.active ? Theme.accent : transparent;
+                            }
+
+                            HorizontalLayout {
+                                spacing: 6px;
+                                padding-left: 10px;
+                                padding-right: 6px;
+                                height: parent.height;
+
+                                if (tab.active && root.loading) : Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    y: (parent.height - 14px) / 2;
+                                    border-radius: 7px;
+                                    background: Math.mod(animation-tick(), 800ms) < 400ms
+                                        ? Theme.accent.transparentize(0.55)
+                                        : Theme.accent;
+                                }
+                                if (!(tab.active && root.loading)) : Rectangle {
+                                    width: 16px;
+                                    height: 16px;
+                                    y: (parent.height - 16px) / 2;
+                                    border-radius: 4px;
+                                    // 两个主题都走主题色（绿 / 紫）：
+                                    // 顶栏是一排并列的标签，统一色才整；跟着盘符变彩反而花。
+                                    background: Theme.dark
+                                        ? ((tab.active || (root.drag-index < 0 && ta.has-hover))
+                                            ? Theme.accent.transparentize(0.82)
+                                            : Theme.accent.transparentize(0.88))
+                                        : Theme.accent.transparentize(0.82);
+
+                                    Text {
+                                        text: tab.icon-text;
+                                        color: Theme.dark
+                                            ? ((tab.active || (root.drag-index < 0 && ta.has-hover))
+                                                ? Theme.accent
+                                                : Theme.accent.transparentize(0.25))
+                                            : Theme.accent;
+                                        font-size: 10px;
+                                        font-weight: 700;
+                                        font-family: Theme.symbol-font-family;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
 
                                 Text {
-                                    text: tab.icon-text;
-                                    color: Theme.accent;
-                                    font-size: 10px;
-                                    font-weight: 700;
-                                    font-family: Theme.symbol-font-family;
-                                    horizontal-alignment: center;
+                                    text: tab.title;
+                                    // 告别"禁用灰"：未选中保持清晰的 78% 主文字亮度，悬停即刻提亮
+                                    color: (tab.active || (root.drag-index < 0 && ta.has-hover))
+                                        ? Theme.text-primary
+                                        : (Theme.dark ? Theme.text-primary.transparentize(0.22) : Theme.text-secondary);
+                                    font-size: 12.5px;
+                                    font-weight: tab.active ? 500 : 400;
                                     vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                }
+
+                                close-btn := Rectangle {
+                                    width: 18px;
+                                    height: 18px;
+                                    y: (parent.height - 18px) / 2;
+                                    border-radius: 5px;
+                                    background: (root.drag-index < 0 && close-ta.has-hover) ? Theme.close-hover : transparent;
+                                    // 悬停关闭按钮时外层 ta.has-hover 未必成立，必须把
+                                    // close-ta 也算进来，否则整个红底会被一起淡掉。
+                                    // 非激活标签平时完全不显示：顶栏干净很多。
+                                    opacity: (tab.active || (root.drag-index < 0 && (ta.has-hover || close-ta.has-hover)))
+                                        ? 1.0
+                                        : (Theme.dark ? 0.0 : 0.35);
+                                    animate opacity, background { duration: 100ms; easing: ease-out; }
+
+                                    IconClose {
+                                        x: (parent.width - self.width) / 2;
+                                        y: (parent.height - self.height) / 2;
+                                        size: 8px;
+                                        stroke-width: 1.1px;
+                                        icon-color: (root.drag-index < 0 && close-ta.has-hover) ? #FFFFFF : Theme.text-secondary;
+                                    }
                                 }
                             }
-
-                            Text {
-                                text: tab.title;
-                                color: tab.active ? Theme.text-primary : Theme.text-secondary;
-                                font-size: 12.5px;
-                                vertical-alignment: center;
-                                overflow: elide;
-                                horizontal-stretch: 1;
                             }
-
-                            close-btn := Rectangle {
-                                width: 18px;
-                                height: 18px;
-                                y: (parent.height - 18px) / 2;
-                                border-radius: 4px;
-                                background: close-ta.has-hover ? Theme.close-hover : transparent;
-                                // 悬停关闭按钮时外层 ta.has-hover 未必成立，必须把
-                                // close-ta 也算进来，否则整个红底会被压到 35% 透明。
-                                opacity: (tab.active || ta.has-hover || close-ta.has-hover) ? 1.0 : 0.35;
-
-                                IconClose {
-                                    x: (parent.width - self.width) / 2;
-                                    y: (parent.height - self.height) / 2;
-                                    size: 8px;
-                                    stroke-width: 1.1px;
-                                    icon-color: close-ta.has-hover ? #FFFFFF : Theme.text-secondary;
-                                }
-                            }
-                        }
 
                         ta := TouchArea {
                             width: 100%;
@@ -312,26 +384,19 @@ export component TabBar inherits Rectangle {
 
                         close-ta := TouchArea {
                             x: parent.width - 34px;
-                            y: 8px;
+                            y: Theme.dark ? 6px : 8px;
                             width: 26px;
                             height: 18px;
+                            // 不可见时不接收点击：否则非激活标签右端那块"看不见的 X"
+                            // 会把用户的普通点击变成"关掉这个标签"。
+                            // 拖动期间让路，避免拖到标签右端时误触关标签。
+                            enabled: root.drag-index < 0 && (tab.active || ta.has-hover || close-ta.has-hover);
 
                             clicked => {
                                 root.tab_closed(tab.id);
                             }
                         }
                     }
-                }
-                // 落点竖线：随目标标签平滑滑动，作为交换动画的视觉反馈。
-                if (root.tab-drop-visible) : Rectangle {
-                    x: root.drop-slot * 153px - 1.5px;
-                    y: 2px;
-                    width: 3px;
-                    height: parent.height - 4px;
-                    border-radius: 1.5px;
-                    background: Theme.accent;
-                    z: 10;
-                    animate x { duration: 120ms; easing: ease-out; }
                 }
             }
         }
@@ -470,5 +535,15 @@ export component TabBar inherits Rectangle {
                 }
             }
         }
+    }
+
+    // 标签栏与下方工具栏之间的 1px 边界线：只在暗色下画。
+    // 亮色下选中标签本身就贴底焊在工具栏上，再画一条线就成了补丁。
+    if (Theme.dark) : Rectangle {
+        x: 0px;
+        y: parent.height - 1px;
+        width: 100%;
+        height: 1px;
+        background: Theme.divider;
     }
 }

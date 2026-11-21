@@ -1,6 +1,6 @@
 [package]
 name = "rove"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 description = "Rove — 极速响应、极低内存的 Windows 文件管理器 (Rust + Slint)"
 
@@ -98,6 +98,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Ole",
     "Win32_System_Threading",
     "Win32_System_Registry",
+    # ReadProcessMemory：安全读取 WM_SETTINGCHANGE 广播进来的字符串指针
+    # （跨进程指针在我们地址空间里未必可读，直接解引用会崩）。
+    "Win32_System_Diagnostics_Debug",
     # GetLocalTime：诊断日志本地时间戳。
     "Win32_System_SystemInformation",
     "Win32_System_Time",

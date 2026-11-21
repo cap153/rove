@@ -107,8 +107,8 @@ export component Sidebar inherits Rectangle {
 
             for item[i] in root.items : Rectangle {
                 width: parent.width;
-                height: item.kind == "header" ? 30px : (item.kind == "drive" ? 46px : 32px);
-                background: (root.active-id == item.id) ? Theme.bg-selected : (item-ta.has-hover ? Theme.bg-hover : transparent);
+                height: item.kind == "header" ? 30px : (item.kind == "drive" ? 48px : 34px);
+                background: transparent;
 
                 // 拖动落点需要每行的窗口几何。`item-ta` 覆盖整行，几何等价于行矩形；
                 // 用字符串属性当触发器：滚动 / 展开 / 排序都会重发，天然纠正偏移。
@@ -121,13 +121,32 @@ export component Sidebar inherits Rectangle {
                                       item-ta.width, item-ta.height);
                 }
 
-                // 选中态左侧主题色竖条。
-                Rectangle {
-                    x: 0px;
-                    y: 0px;
-                    width: 3px;
-                    height: parent.height;
-                    background: (root.active-id == item.id) ? Theme.accent : transparent;
+                // 高亮块：两套质感。
+                //  · 暗色 —— 内缩 8px 的圆角胶囊 + 1px 淡紫边（深底需要这层边界）。
+                //  · 亮色 —— 原版整行贴边浅绿底 + 贴边竖条，不加任何外框。
+                // 两种情况都画在行内部，外层行仍保持整宽，拖动落点几何不受影响。
+                if (item.kind != "header") : Rectangle {
+                    x: Theme.dark ? 8px : 0px;
+                    y: Theme.dark ? 1px : 0px;
+                    width: Theme.dark ? (parent.width - 16px) : parent.width;
+                    height: Theme.dark ? (parent.height - 2px) : parent.height;
+                    border-radius: Theme.dark ? 8px : 0px;
+                    background: (root.active-id == item.id)
+                        ? Theme.bg-selected
+                        : (item-ta.has-hover ? Theme.bg-hover : transparent);
+                    border-width: (Theme.dark && root.active-id == item.id) ? 1px : 0px;
+                    border-color: Theme.accent.transparentize(0.45);
+                    animate background { duration: 100ms; easing: ease-out; }
+
+                    // 选中态指示条：暗色是胶囊内的圆角小竖条，亮色是贴边通高竖条。
+                    if (root.active-id == item.id) : Rectangle {
+                        x: Theme.dark ? 3px : 0px;
+                        y: Theme.dark ? (parent.height - 14px) / 2 : 0px;
+                        width: 3px;
+                        height: Theme.dark ? 14px : parent.height;
+                        border-radius: Theme.dark ? 1.5px : 0px;
+                        background: Theme.accent;
+                    }
                 }
 
                 item-ta := TouchArea {
@@ -185,14 +204,14 @@ export component Sidebar inherits Rectangle {
                 }
 
                 if (item.kind == "header") : HorizontalLayout {
-                    x: 14px;
-                    width: parent.width - 28px;
+                    x: 16px;
+                    width: parent.width - 32px;
                     height: parent.height;
 
                     Text {
                         text: item.label;
-                        color: Theme.text-secondary;
-                        font-size: 11.5px;
+                        color: item-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                        font-size: 11px;
                         font-weight: 600;
                         vertical-alignment: center;
                         horizontal-stretch: 1;
@@ -201,8 +220,8 @@ export component Sidebar inherits Rectangle {
                     // 右侧折叠指示箭头（实心三角风格，与底部暂存托盘一致）
                     if (item.icon-text != "") : Text {
                         text: item.icon-text;
-                        color: Theme.text-secondary;
-                        font-size: 9.5px; // 实心符号在 9.5px 时与 11.5px 标题比例最协调
+                        color: item-ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+                        font-size: 9px; // 实心符号在 9px 时与 11px 标题比例最协调
                         font-family: Theme.symbol-font-family;
                         vertical-alignment: center;
                         horizontal-alignment: right;
@@ -210,8 +229,8 @@ export component Sidebar inherits Rectangle {
                 }
 
                 if (item.kind != "header" && item.kind != "drive") : HorizontalLayout {
-                    x: 10px;
-                    width: parent.width - 18px;
+                    x: Theme.dark ? 16px : 10px;
+                    width: Theme.dark ? (parent.width - 30px) : (parent.width - 18px);
                     height: parent.height;
                     spacing: 8px;
 
@@ -230,7 +249,7 @@ export component Sidebar inherits Rectangle {
                             image-fit: contain;
                         }
 
-                        // 2. 兜底占位小方块
+                        // 2. 兜底占位小方块（亮暗一致：跟随条目自身的颜色）
                         if (item.icon.width <= 0) : Rectangle {
                             width: 20px;
                             height: 20px;
@@ -257,8 +276,11 @@ export component Sidebar inherits Rectangle {
 
                         Text {
                             text: item.label;
-                            color: (item.kind == "hint") ? Theme.text-secondary : ((root.active-id == item.id) ? Theme.accent : Theme.text-primary);
+                            // 选中只靠左侧竖条 / 底色表达，文字统一黑字常规字重
+                            // （变色、加粗都会让人以为那是另一类东西）。
+                            color: (item.kind == "hint") ? Theme.text-secondary : Theme.text-primary;
                             font-size: 12.5px;
+                            font-weight: 400;
                             vertical-alignment: center;
                             overflow: elide;
                             height: item.detail == "" ? parent.height : parent.height / 2;
@@ -277,8 +299,8 @@ export component Sidebar inherits Rectangle {
 
                 // 驱动器行：复刻 Pulse（第一行：图标 + 卷标 + 右侧紧凑容量；第二行：通栏全宽彩色容量条）
                 if (item.kind == "drive") : VerticalLayout {
-                    x: 10px;
-                    width: parent.width - 20px;
+                    x: Theme.dark ? 16px : 10px;
+                    width: Theme.dark ? (parent.width - 32px) : (parent.width - 20px);
                     height: parent.height;
                     alignment: center;
                     spacing: 6px;
@@ -291,8 +313,8 @@ export component Sidebar inherits Rectangle {
                         Rectangle {
                             width: 18px;
                             height: 18px;
-                            border-radius: 4px;
-                            background: item.icon-color.transparentize(0.85);
+                            border-radius: 5px;
+                            background: item.icon-color.transparentize(0.84);
 
                             Text {
                                 text: item.icon-text;
@@ -306,9 +328,9 @@ export component Sidebar inherits Rectangle {
 
                         Text {
                             text: item.label;
-                            color: (root.active-id == item.id) ? Theme.accent : Theme.text-primary;
+                            color: Theme.text-primary;
                             font-size: 12.5px;
-                            font-weight: 500;
+                            font-weight: 400;
                             horizontal-alignment: left; // 显式左对齐
                             vertical-alignment: center;
                             overflow: elide;
@@ -319,7 +341,8 @@ export component Sidebar inherits Rectangle {
                         Text {
                             text: item.detail;
                             color: Theme.text-secondary;
-                            font-size: 11px;
+                            font-size: 10.5px;
+                            font-family: Theme.mono-font-family;
                             vertical-alignment: center;
                             horizontal-alignment: right;
                         }
@@ -330,7 +353,7 @@ export component Sidebar inherits Rectangle {
                         width: 100%;
                         height: 4px;
                         border-radius: 2px;
-                        background: Theme.text-primary.transparentize(0.88);
+                        background: Theme.text-primary.transparentize(0.90);
 
                         Rectangle {
                             x: 0px;
@@ -425,5 +448,15 @@ export component Sidebar inherits Rectangle {
         move_here_requested() => {
             root.staging_move_here_requested();
         }
+    }
+
+    // 侧栏与文件区之间的 1px 分割线：只在暗色下画（亮色两块底色本就分得开）。
+    if (Theme.dark) : Rectangle {
+        x: parent.width - 1px;
+        y: 0px;
+        width: 1px;
+        height: parent.height;
+        z: 30;
+        background: Theme.divider;
     }
 }

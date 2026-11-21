@@ -222,7 +222,6 @@ component RowView inherits Rectangle {
 
     // 行高跟着名字的行数走：一行就是一行的高度，绝不为了照顾长的把短的撑高。
     // 具体数值由 Rust 算好（它要据此累计每行的位置），这里只做排版。
-    property <int> lines: max(data.orig.length, data.new.length);
     property <length> row-height: data.h;
 
     height: data.h;

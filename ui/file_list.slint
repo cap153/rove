@@ -337,7 +337,6 @@ export component FileList inherits Rectangle {
     private property <int> hv-row: floor(max(0, root.hover-expand-index) / max(1, root.cells-per-row));
     private property <length> ex-item-x: root.cell-x(root.ex-col);
     /// 框的最小宽度（= 格子的可见宽，左右各留 4px 边距）
-    private property <length> ex-cell-w: root.cell-w - 8px;
     /// 一行名称的高度（11.5px 字号实测），网格与浮层共用。
     private property <length> line-h: fm-name-1.preferred-height;
     /// 框宽由 Rust 与逐行分段一起算好：Slint 自己测量无法与 Rust 的切行对齐，
@@ -552,7 +551,6 @@ export component FileList inherits Rectangle {
     /// 最右侧留白：方便在空白处拖拽框选文件（减为原来一半，少占名称列空间）。
     private property <length> right-pad: 48px;
     /// 滚动条轨道宽（含内边距）。
-    private property <length> sb-width: 12px;
     /// 滚动条按下时记录的滑块 y，用于计算拖拽增量。
     private property <length> sb-drag-grab-y: 0px;
     /// 横向滚动条按下时记录的滑块 x 与鼠标 x（拖拽用增量算目标位置）。
@@ -809,7 +807,7 @@ export component FileList inherits Rectangle {
                     y: (parent.height - 16px) / 2;
                     width: 1px;
                     height: 16px;
-                    background: root.rs-col == 0 || h-name.has-hover ? Theme.accent : Theme.text-secondary;
+                    background: root.rs-col == 0 || h-name.has-hover ? Theme.accent : Theme.border;
                 }
                 moved => {
                     if (self.pressed) {
@@ -870,7 +868,7 @@ export component FileList inherits Rectangle {
                     y: (parent.height - 16px) / 2;
                     width: 1px;
                     height: 16px;
-                    background: root.rs-col == 1 || h-mod.has-hover ? Theme.accent : Theme.text-secondary;
+                    background: root.rs-col == 1 || h-mod.has-hover ? Theme.accent : Theme.border;
                 }
                 moved => {
                     if (self.pressed) {
@@ -923,7 +921,7 @@ export component FileList inherits Rectangle {
                     y: (parent.height - 16px) / 2;
                     width: 1px;
                     height: 16px;
-                    background: root.rs-col == 2 || h-type.has-hover ? Theme.accent : Theme.text-secondary;
+                    background: root.rs-col == 2 || h-type.has-hover ? Theme.accent : Theme.border;
                 }
                 moved => {
                     if (self.pressed) {
@@ -969,7 +967,7 @@ export component FileList inherits Rectangle {
                     y: (parent.height - 16px) / 2;
                     width: 1px;
                     height: 16px;
-                    background: root.rs-col == 3 || h-size.has-hover ? Theme.accent : Theme.text-secondary;
+                    background: root.rs-col == 3 || h-size.has-hover ? Theme.accent : Theme.border;
                 }
                 moved => {
                     if (self.pressed) {
@@ -1013,7 +1011,7 @@ export component FileList inherits Rectangle {
                 y: (parent.height - 16px) / 2;
                 width: 1px;
                 height: 16px;
-                background: Theme.text-secondary;
+                background: Theme.border;
             }
 
             // 底部分隔线。
@@ -1157,7 +1155,9 @@ export component FileList inherits Rectangle {
                     : (row.index == root.drop-hover-index ? Theme.bg-hover : (ta.has-hover ? Theme.bg-hover : transparent));
                 border-width: (row.index == root.drop-hover-index && row.is-dir) ? 2px : 0px;
                 border-color: Theme.accent;
-                border-radius: 4px;
+                // 详细信息 / 列表视图的选中底色是整行通铺的，不留圆角（圆角会让行尾露出缺口）。
+                border-radius: 0px;
+                animate background { duration: 100ms; easing: ease-out; }
 
                 ta := TouchArea {
                     // 行容器本身已截止到最后一列边界，这里铺满行即可；
@@ -1317,9 +1317,9 @@ export component FileList inherits Rectangle {
                     background: Theme.bg-input;
                     border-width: 1.5px;
                     border-color: Theme.accent;
-                    drop-shadow-blur: 8px;
-                    drop-shadow-color: #00000022;
-                    drop-shadow-offset-y: 2px;
+                    drop-shadow-blur: 14px;
+                    drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+                    drop-shadow-offset-y: 3px;
 
                     rename-measure-details := Text {
                         visible: false;
@@ -1487,9 +1487,9 @@ export component FileList inherits Rectangle {
                     background: Theme.bg-popup;
                     border-width: 1px;
                     border-color: Theme.border;
-                    drop-shadow-blur: 8px;
-                    drop-shadow-color: #00000022;
-                    drop-shadow-offset-y: 2px;
+                    drop-shadow-blur: 14px;
+                    drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+                    drop-shadow-offset-y: 3px;
                     // 纯文字（无搜索查询）：浮层宽度已按完整名算，无需再 elide。
                     if (row.tip-parts.length == 0) : Text {
                         x: 6px;
@@ -1614,12 +1614,14 @@ export component FileList inherits Rectangle {
                 // 所以要把「整个格子」抬到邻居之上，浮层才不会被右邻盖住。
                 z: (root.rename-path == row.path || row.selected || ta-icons.has-hover) ? 10 : 0;
                 border-radius: 8px;
-                // 拖拽悬停到文件夹：显示醒目的选中色 + 强调色高亮边框；悬停到普通文件显示弱悬停底色
+                // 悬停与选中采用通透微光底色 + 细腻描边（深色主题下尤其需要这层边界）
                 background: (row.index == root.drop-hover-index && row.is-dir) || row.selected
                     ? Theme.bg-selected
-                    : (row.index == root.drop-hover-index ? Theme.bg-hover : (ta-icons.has-hover ? Theme.bg-hover : transparent));
-                border-width: (row.index == root.drop-hover-index && row.is-dir) ? 2.5px : (row.index == root.drop-hover-index ? 1px : 0px);
+                    : (row.index == root.drop-hover-index || ta-icons.has-hover ? Theme.bg-hover : transparent);
+                border-width: (row.index == root.drop-hover-index && row.is-dir) ? 2px
+                    : (row.index == root.drop-hover-index ? 1px : 0px);
                 border-color: (row.index == root.drop-hover-index && row.is-dir) ? Theme.accent : Theme.border;
+                animate background { duration: 100ms; easing: ease-out; }
 
                 ta-icons := TouchArea {
                     width: 100%;
@@ -1832,9 +1834,9 @@ export component FileList inherits Rectangle {
                     background: root.rename-path == row.path ? Theme.bg-input : Theme.bg-popup;
                     border-width: root.rename-path == row.path ? 1.5px : 1px;
                     border-color: root.rename-path == row.path ? Theme.accent : Theme.border;
-                    drop-shadow-blur: 8px;
-                    drop-shadow-color: #00000022;
-                    drop-shadow-offset-y: 2px;
+                    drop-shadow-blur: 14px;
+                    drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+                    drop-shadow-offset-y: 3px;
 
                     rename-measure-small := Text {
                         visible: false;
@@ -1938,13 +1940,11 @@ export component FileList inherits Rectangle {
                         y: 0px;
                         width: 100%;
                         height: root.cell-thumb;
-                        border-radius: 6px;
-                        // 选中 / 悬停 / 拖拽悬停时让格子自己的底色透上来：以前这里恒为
-                        // bg-input（白），铺在选中色上面，图标区域就把底色盖住了，
-                        // 只看得到格子四周一圈颜色（像只「框选」了一块）。
-                        background: (row.selected
-                            || ta-icons.has-hover
-                            || row.index == root.drop-hover-index) ? transparent : Theme.bg-input;
+                        border-radius: 8px;
+                        // 永远透明：缩略图/角标直接透出格子底色。
+                        // 以前常温下垫了一层 `bg-input`（亮色是白、深色是近黑），
+                        // 深色主题下就变成每个图标背后一块黑方框。
+                        background: transparent;
                         clip: true;
 
                         if (row.thumb.width > 0) : Image {
@@ -2014,15 +2014,15 @@ export component FileList inherits Rectangle {
                         }
                     }
 
-                    // 容量行：紧跟在名字区下面（被浮层接管的那一行不画，避免漏底）。
+                    // 容量行：按同排最大名称行数统一对齐（无 Rust 字段值时回退自身行数）
                     if (row.size-text != "" && !root.row-expanded(row.index)) : Text {
                         x: 0px;
-                        y: root.cell-thumb + 4px + root.name-h;
+                        y: root.cell-thumb + 5px + max(1, row.row-name-lines > 0 ? row.row-name-lines : row.grid-lines.length) * root.line-h;
                         width: 100%;
-                        height: root.size-line-h + 4px;
+                        height: root.size-line-h + 2px;
                         text: row.size-text;
                         color: Theme.text-secondary;
-                        font-size: 11px;
+                        font-size: 10.5px;
                         horizontal-alignment: center;
                         vertical-alignment: center;
                         overflow: elide;
@@ -2236,13 +2236,13 @@ export component FileList inherits Rectangle {
         width: root.ex-box-w;
         height: root.ex-box-h;
         border-radius: 6px;
-        background: Theme.bg-input;
+        background: root.rename-path != "" ? Theme.bg-input : Theme.bg-popup;
         border-width: root.rename-path != "" ? 1.5px : 1px;
         border-color: root.rename-path != "" ? Theme.accent : Theme.border;
         // 轻微阴影，让它看起来“浮”在格子上
-        drop-shadow-blur: 8px;
-        drop-shadow-color: #00000022;
-        drop-shadow-offset-y: 2px;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+        drop-shadow-offset-y: 3px;
 
         if (root.rename-path != "") : rename-input-expand := TextInput {
             x: 4px;
@@ -2386,9 +2386,9 @@ export component FileList inherits Rectangle {
         background: Theme.bg-input;
         border-width: 1.5px;
         border-color: Theme.accent;
-        drop-shadow-blur: 8px;
-        drop-shadow-color: #00000022;
-        drop-shadow-offset-y: 2px;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+        drop-shadow-offset-y: 3px;
 
         rename-input-fixed := SingleLineEdit {
             mouse-pressed: root.mouse-left-pressed;
@@ -2451,12 +2451,12 @@ export component FileList inherits Rectangle {
         width: root.hv-box-w;
         height: root.hv-box-h;
         border-radius: 6px;
-        background: Theme.bg-input;
+        background: Theme.bg-popup;
         border-width: 1px;
         border-color: Theme.border;
-        drop-shadow-blur: 8px;
-        drop-shadow-color: #00000022;
-        drop-shadow-offset-y: 2px;
+        drop-shadow-blur: 14px;
+        drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+        drop-shadow-offset-y: 3px;
 
         Rectangle {
             x: 4px;
