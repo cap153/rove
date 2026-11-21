@@ -7,6 +7,7 @@
 //! - `Directory`：普通文件夹
 //! - `Drive`：磁盘
 //! - `CLSID\{20D04FE0-…}`：此电脑
+//! - `CLSID\{52205fd8-…}` 的 `opennewwindow` 谓词：Win+E
 //!
 //! 写入前把每个受影响值的原样（类型 + 数据，或「本来不存在」）记到
 //! `%APPDATA%\Rove\shell_integration.json`。关闭开关时只还原「当前仍是我们
@@ -25,8 +26,19 @@ const VERB: &str = "Rove";
 const CLASSES: &str = r"Software\Classes";
 /// 此电脑的 CLSID 类。
 const THIS_PC_CLASS: &str = r"CLSID\{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+/// Win+E 走的关联：Explorer 窗口那个 CLSID。
+const WIN_E_ROOT: &str = r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}";
+/// Win+E 实际执行的谓词命令。
+///
+/// 系统解析 Win+E 时会去查这个 CLSID 的 `opennewwindow` 谓词。**只有
+/// `DelegateExecute`、没有命令**是坏状态：按 Win+E 会弹「该文件没有与之
+/// 关联的应用来执行该操作」（用户实测）。所以要么写全，要么整棵删掉。
+const WIN_E_COMMAND: &str =
+    r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command";
 /// REG_SZ 的类型号（与注册表 API 一致）。
 const REG_SZ_U32: u32 = 1;
+/// REG_EXPAND_SZ 的类型号（判断 Win+E 关联是否可用时一并认）。
+const REG_EXPAND_SZ_U32: u32 = 2;
 
 // ---------------------------------------------------------------------------
 // 注册表读写（Windows 实现 / 其他平台桩）
@@ -58,7 +70,8 @@ pub(super) mod reg {
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::ERROR_SUCCESS;
     use windows::Win32::System::Registry::{
-        RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegOpenKeyExW, RegQueryInfoKeyW,
+        RegCloseKey, RegDeleteKeyValueW, RegDeleteKeyW, RegDeleteTreeW, RegOpenKeyExW,
+        RegQueryInfoKeyW,
         RegQueryValueExW, RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, KEY_READ, REG_VALUE_TYPE,
     };
 
@@ -236,6 +249,18 @@ pub(super) mod reg {
         let path = wide(key);
         let _ = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr())) };
     }
+
+    /// 连同子键整棵删掉。只对「确定是坏的」那几项用（见 `prune_broken_win_e`）。
+    pub fn delete_tree(key: &str) -> io::Result<()> {
+        let path = wide(key);
+        let status = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, PCWSTR(path.as_ptr())) };
+        if status == ERROR_SUCCESS || status.0 == ERROR_NOT_FOUND || status.0 == 3 {
+            // 2 = ERROR_FILE_NOT_FOUND，3 = ERROR_PATH_NOT_FOUND：本来就没有。
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(status.0 as i32))
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -261,6 +286,10 @@ pub(super) mod reg {
         Ok(())
     }
     pub fn delete_key_if_empty(_key: &str) {}
+
+    pub fn delete_tree(_key: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,11 +355,22 @@ pub fn sync(enabled: bool, label: &str) -> Result<bool, String> {
     }
 }
 
-fn command_for(exe: &Path, this_pc: bool) -> String {
-    if this_pc {
-        format!("\"{}\" --this-pc", exe.display())
-    } else {
-        format!("\"{}\" --shell-open \"%1\"", exe.display())
+/// 谓词命令要打开什么。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    /// 文件夹 / 磁盘：带 `%1` 路径。
+    Folder,
+    /// 此电脑。
+    ThisPc,
+    /// Win+E：改的是 Explorer 窗口 CLSID 的 `opennewwindow` 谓词。
+    ExplorerKey,
+}
+
+fn command_for(exe: &Path, target: Target) -> String {
+    match target {
+        Target::Folder => format!("\"{}\" --shell-open \"%1\"", exe.display()),
+        Target::ThisPc => format!("\"{}\" --this-pc", exe.display()),
+        Target::ExplorerKey => format!("\"{}\" --win-e", exe.display()),
     }
 }
 
@@ -343,13 +383,28 @@ fn command_for(exe: &Path, this_pc: bool) -> String {
 fn plan(exe: &Path, label: &str) -> Vec<(String, Option<&'static str>, String)> {
     let icon = format!("\"{}\",0", exe.display());
     let mut out = Vec::new();
-    for (class, this_pc) in [("Directory", false), ("Drive", false), (THIS_PC_CLASS, true)] {
+    for (class, target) in [
+        ("Directory", Target::Folder),
+        ("Drive", Target::Folder),
+        (THIS_PC_CLASS, Target::ThisPc),
+    ] {
         let verb = format!(r"{CLASSES}\{class}\shell\{VERB}");
         out.push((format!(r"{CLASSES}\{class}\shell"), None, VERB.to_string()));
         out.push((verb.clone(), None, label.to_string()));
         out.push((verb.clone(), Some("Icon"), icon.clone()));
-        out.push((format!(r"{verb}\command"), None, command_for(exe, this_pc)));
+        out.push((format!(r"{verb}\command"), None, command_for(exe, target)));
     }
+    // Win+E：只写这条谓词的命令，**不**改 CLSID 的默认谓词（系统认的是
+    // `opennewwindow` 这个名字），也不需要标签/图标。
+    // `DelegateExecute` 写空串：与 pulse / zsdesk 的做法一致，系统会忽略它
+    // 并回落到命令；但如果只剩它、没有命令，Win+E 就一定报错 —— 见
+    // `prune_broken_win_e` 的清理。
+    out.push((
+        WIN_E_COMMAND.to_string(),
+        None,
+        command_for(exe, Target::ExplorerKey),
+    ));
+    out.push((WIN_E_COMMAND.to_string(), Some("DelegateExecute"), String::new()));
     out
 }
 
@@ -359,6 +414,38 @@ fn notify_shell() {
     unsafe {
         use windows::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+    }
+}
+
+/// Win+E 关联只剩 `DelegateExecute`、没有命令时，把整棵子树删掉。
+///
+/// 这是坏状态：系统解析 Win+E 时会去这条命令，命令不存在 → 弹「该文件没有
+/// 与之关联的应用来执行该操作」（用户机器上实测出现过，键里只有一条空的
+/// `DelegateExecute`）。删掉子树后系统回落到自己的 Explorer 行为，至少可用。
+///
+/// **只在没有命令时动手**：有正常关联时（无论指向谁）一律不碰。
+fn prune_broken_win_e() -> bool {
+    // 认 REG_SZ 与 REG_EXPAND_SZ（别人可能写展开型路径）：只要有非空命令
+    // 就不是坏状态，绝不删。
+    let has_command = reg::read_value(WIN_E_COMMAND, None)
+        .ok()
+        .flatten()
+        .is_some_and(|(kind, data)| {
+            (kind == REG_SZ_U32 || kind == REG_EXPAND_SZ_U32)
+                && !bytes_to_string(&data).trim().is_empty()
+        });
+    if has_command || !reg::key_exists(WIN_E_ROOT) {
+        return false;
+    }
+    match reg::delete_tree(WIN_E_ROOT) {
+        Ok(()) => {
+            logln!("[takeover] 清掉 Win+E 的空关联（只剩 DelegateExecute，按 Win+E 会报错）");
+            true
+        }
+        Err(e) => {
+            logln!("!! 清理 Win+E 空关联失败：{e}");
+            false
+        }
     }
 }
 
@@ -380,7 +467,21 @@ fn legacy_builtin_keys() -> Vec<String> {
 /// 与之关联的应用」（命令指向一个已经不存在的 rove.exe）。
 fn is_our_shell_command(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    lower.contains("rove.exe") && (lower.contains("--shell-open") || lower.contains("--this-pc"))
+    lower.contains("rove.exe")
+        && (lower.contains("--shell-open")
+            || lower.contains("--this-pc")
+            || lower.contains("--win-e"))
+}
+
+/// 备份里没记过的一项，当前值算不算「我们写的」。
+///
+/// **空值一律不算**：Win+E 那条 `DelegateExecute` 我们写的就是空串，它由备份
+/// 里的记录负责还原；如果这里也把空值当成自己的，关闭接管时会把**别的程序**
+/// （pulse / zsdesk）写的空 `DelegateExecute` 当残留删掉 —— 它们的「是否还
+/// 拥有 Win+E」判断依赖这个值，被删掉就会误以为接管失效、悄悄退让。
+fn orphan_value_is_ours(kind: u32, current: &str, planned: &str) -> bool {
+    kind == REG_SZ_U32 && (!current.trim().is_empty() && current == planned
+        || is_our_shell_command(current))
 }
 
 /// 清掉旧版本对内置 `open` / `explore` 命令的覆盖。
@@ -517,6 +618,13 @@ fn register(exe: &Path, label: &str) -> Result<bool, String> {
     if written > 0 || cleaned > 0 {
         notify_shell();
     }
+    // 上次开机把 Win+E 关联写了一半（或别的程序留下的）时，这次写全之后
+    // 就自愈了；这里只负责在「本次没写成命令」的情况下别把坏键留着。
+    // 删了关联必须再通知一次外壳，否则它可能还在用缓存里的坏关联
+    // （表现为开关关了、按 Win+E 照样弹「没有关联的应用」）。
+    if prune_broken_win_e() {
+        notify_shell();
+    }
     if written == 0 && cleaned == 0 {
         logv!(
             "接管资源管理器：登记 {} 个值，无需改动",
@@ -557,6 +665,7 @@ fn unregister(label: &str) -> Result<bool, String> {
     let planned = exe.as_deref().map(|exe| plan(exe, label)).unwrap_or_default();
     let mut backup = load_backup().unwrap_or_default();
     if backup.applied.is_empty() && planned.is_empty() {
+        prune_broken_win_e();
         return Ok(false);
     }
     let mut orphaned: Vec<(String, Option<String>)> = Vec::new();
@@ -572,13 +681,7 @@ fn unregister(label: &str) -> Result<bool, String> {
         let ours = reg::read_value(key, *name)
             .ok()
             .flatten()
-            .is_some_and(|(kind, data)| {
-                if kind != REG_SZ_U32 {
-                    return false;
-                }
-                let current = bytes_to_string(&data);
-                current == *text || is_our_shell_command(&current)
-            });
+            .is_some_and(|(kind, data)| orphan_value_is_ours(kind, &bytes_to_string(&data), text));
         if ours {
             logln!(
                 "[takeover] 备份外的残留 {} [{}] 仍指向我们，直接清理",
@@ -682,6 +785,9 @@ fn unregister(label: &str) -> Result<bool, String> {
     for key in backup.created_keys.iter().rev() {
         reg::delete_key_if_empty(key);
     }
+    // 还原完之后若 Win+E 关联只剩一条空的 DelegateExecute（接管前本来就是
+    // 坏的，或者我们的命令已删掉），整棵清掉，别把「按 Win+E 报错」留在系统里。
+    prune_broken_win_e();
     if failed == 0 {
         if let Some(path) = backup_path() {
             let _ = std::fs::remove_file(path);
@@ -738,6 +844,17 @@ mod tests {
                 assert!(key(&k).is_none(), "{k} 不应被接管");
             }
         }
+        // Win+E：只登记 Explorer 窗口 CLSID 的 opennewwindow 谓词命令，
+        // 外加一条空的 DelegateExecute（与 pulse/zsdesk 一致）。
+        assert_eq!(
+            key(WIN_E_COMMAND).as_deref(),
+            Some(r#""C:\Apps\rove.exe" --win-e"#)
+        );
+        let delegate = planned
+            .iter()
+            .find(|(k, n, _)| k == WIN_E_COMMAND && *n == Some("DelegateExecute"))
+            .map(|(_, _, text)| text.as_str());
+        assert_eq!(delegate, Some(""));
         // 谓词名用传进来的本地化文本。
         let label = planned
             .iter()
@@ -781,11 +898,37 @@ mod tests {
         ));
     }
 
+    /// 别的程序（pulse / zsdesk）写的空 `DelegateExecute` 不能被当残留删掉。
+    #[test]
+    fn orphan_cleanup_never_deletes_someone_elses_empty_value() {
+        // 我们的 Win+E 命令：认出来，该删。
+        assert!(orphan_value_is_ours(
+            REG_SZ_U32,
+            r#""C:\Apps\rove.exe" --win-e"#,
+            "",
+        ));
+        // 文本完全一致且非空：是我们的。
+        assert!(orphan_value_is_ours(REG_SZ_U32, "Rove", "Rove"));
+        // 空串：不管是哪一项，都不许当残留。
+        assert!(!orphan_value_is_ours(REG_SZ_U32, "", ""));
+        // 别人的命令：别碰。
+        assert!(!orphan_value_is_ours(
+            REG_SZ_U32,
+            r#""C:\Tools\pulse.exe" --win-e"#,
+            "",
+        ));
+        // 类型不是 REG_SZ：别碰。
+        assert!(!orphan_value_is_ours(2, "Rove", "Rove"));
+    }
+
     #[test]
     fn recognizes_our_shell_commands_from_any_old_path() {
         // 老版本写的覆盖：exe 早就换地方了，但仍然是我们的，必须能认出来。
         assert!(is_our_shell_command(
             r#""D:\old\build\rove.exe" --shell-open "%1""#
+        ));
+        assert!(is_our_shell_command(
+            r#""D:\old\build\rove.exe" --win-e"#
         ));
         assert!(is_our_shell_command(
             r#""C:\Program Files\Rove\ROVE.EXE" --shell-open "%1""#

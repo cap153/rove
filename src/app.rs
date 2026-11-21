@@ -13681,6 +13681,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.config.explorer_takeover = enabled;
             app.config.save();
             app.ui.set_explorer_takeover(enabled);
+            // Win+E 的键盘钩子跟着开关走：关掉时立刻卸下，一次按键都不多吞。
+            crate::sys::win_e::sync(enabled);
         });
         // 开机自启动：写/删 HKCU 的 Run 键，成败都以注册表实况回填开关。
         let autostart_app = app.clone();
@@ -15338,7 +15340,10 @@ pub fn run() {
     // 下载器），命令行就成了盲区 —— 排查这类场景要靠 exe 同目录的 `rove.verbose`
     // 标记文件（见 `log_level`）。顺带记下有没有程序往命令行里塞 `/select`。
     if args.iter().any(|a| {
-        a == "--shell-open" || a == "--this-pc" || a.to_ascii_lowercase().starts_with("/select")
+        a == "--shell-open"
+            || a == "--this-pc"
+            || a == "--win-e"
+            || a.to_ascii_lowercase().starts_with("/select")
     }) || args.iter().any(|a| a.to_ascii_lowercase().starts_with("-select")) {
         // 正常接管打开只是日常操作，留在 level 1：接管起来的这一进程本来就
         // 不带 ROVE_LOG（父进程是浏览器/下载器），排查时用 exe 同目录的
@@ -15788,6 +15793,8 @@ fn create_session(
     if let Err(err) = crate::sys::integration::sync(config.explorer_takeover, &takeover_label) {
         logln!("!! 接管资源管理器同步失败：{err}");
     }
+    // Win+E 的第二层（键盘钩子）。关掉接管时这里什么都不装。
+    crate::sys::win_e::sync(config.explorer_takeover);
 
     let ui = match MainWindow::new() {
         Ok(ui) => ui,

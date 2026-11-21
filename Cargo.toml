@@ -63,6 +63,8 @@ windows = { version = "0.59", features = [
     "Win32_System_Threading",
     # CreateEventW 需要 SECURITY_ATTRIBUTES。
     "Win32_Security",
+    # GetModuleHandleW：Win+E 的低级键盘钩子要拿模块句柄。
+    "Win32_System_LibraryLoader",
     "Win32_System_Com",
     # DEFCONTEXTMENU 结构体在 windows crate 里受此 feature 门控（原生右键菜单用）。
     "Win32_System_Registry",

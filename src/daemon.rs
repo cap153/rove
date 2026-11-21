@@ -32,11 +32,12 @@ pub struct WakeRequest {
 ///
 /// `--background` 是登录自启动（Run 键）带的后台常驻参数，见 [`wants_background`]。
 ///
-/// `--shell-open <路径>`（文件夹/磁盘）与 `--this-pc`（此电脑）是资源管理器
-/// 转来的打开请求，一律新开标签；其他参数沿用旧行为：取第一个存在的目录，
-/// 在当前标签里导航。
+/// `--shell-open <路径>`（文件夹/磁盘）、`--this-pc`（此电脑）与 `--win-e`
+/// （Win+E 接管）都是外部转来的打开请求，一律新开标签；其他参数沿用旧行为：
+/// 取第一个存在的目录，在当前标签里导航。
 pub fn parse_args(args: &[String]) -> WakeRequest {
-    if args.iter().any(|a| a == "--this-pc") {
+    // Win+E 与「此电脑」同义：新开一格，不动用户正在看的目录。
+    if args.iter().any(|a| a == "--this-pc" || a == "--win-e") {
         return WakeRequest {
             path: None,
             new_tab: true,
@@ -334,6 +335,15 @@ mod tests {
         let req = parse_args(&args(&["--this-pc"]));
         assert_eq!(req.path, None);
         assert!(req.new_tab);
+    }
+
+    #[test]
+    fn win_e_opens_a_new_this_pc_tab() {
+        // Win+E 与「此电脑」同义：新开标签、不覆盖用户正在看的目录。
+        let req = parse_args(&args(&["--win-e"]));
+        assert_eq!(req.path, None);
+        assert!(req.new_tab);
+        assert_eq!(req.select, None);
     }
 
     #[test]
