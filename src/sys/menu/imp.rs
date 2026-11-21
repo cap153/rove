@@ -631,10 +631,11 @@ fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>, gen: u64) {
                 == windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
         // 必须在**这条线程的第一个窗口建出来之前**设：`SetPreferredAppMode`
         // 对已经创建过的窗口不追溯，晚一步菜单就还是浅色。
+        //
+        // 注意浅色时也要显式设成 ForceLight：进程默认值是「跟随系统」，
+        // 用户把 Rove 钉成亮色而 Windows 是深色时，不设就还是深色菜单。
         let want_dark = DARK.load(Ordering::Acquire);
-        if want_dark {
-            let _ = set_preferred_mode(true);
-        }
+        let _ = set_preferred_mode(want_dark);
         let hwnd = if class_ok {
             CreateWindowExW(
                 // 注意：不能加 WS_EX_NOACTIVATE —— 激活不了就拿不到键盘焦点，
@@ -661,9 +662,7 @@ fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>, gen: u64) {
             let _ = ready.send(None);
             return;
         };
-        if want_dark {
-            theme_host(hwnd, true);
-        }
+        theme_host(hwnd, want_dark);
         if HOST_GEN.load(Ordering::Acquire) == gen {
             HOST.store(hwnd.0 as isize, Ordering::Release);
         }

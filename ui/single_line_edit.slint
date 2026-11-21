@@ -97,6 +97,12 @@ export component SingleLineEdit inherits Rectangle {
         height: 100%;
         // 注意：本组件有同名属性 `text`，裸写 `text` 会被解析成它，必须写全限定名。
         mouse-cursor: MouseCursor.text;
+        // 这一层会吃掉"文字右边空白"上的点击（以前那里会穿到父级的
+        // "点空白也聚焦"兜底层）。所以这里自己补上聚焦，行为才不会退化。
+        // 光标位置保持原样（Slint 拿不到按字节算的文本末尾偏移，不硬猜）。
+        clicked => {
+            input.focus();
+        }
     }
 
     // 不可见测量文本：算出这段文字的自然宽度（与输入框同字体、不换行）。

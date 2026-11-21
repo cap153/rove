@@ -307,6 +307,9 @@ pub const ZH: &[&str] = &[
     "主题色",                  // 296
     "亮",                      // 297
     "暗",                      // 298
+    "后退",                    // 299
+    "前进",                    // 300
+    "上一级",                  // 301
 ];
 
 pub const EN: &[&str] = &[
@@ -609,6 +612,9 @@ pub const EN: &[&str] = &[
     "Theme",
     "Light",
     "Dark",
+    "Back",
+    "Forward",
+    "Up one level",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -749,6 +755,13 @@ mod tests {
         assert_eq!(EN[297], "Light");
         assert_eq!(ZH[298], "暗");
         assert_eq!(EN[298], "Dark");
+        // 快捷键「导航与查看」组新增的三个动作名。
+        assert_eq!(ZH[299], "后退");
+        assert_eq!(EN[299], "Back");
+        assert_eq!(ZH[300], "前进");
+        assert_eq!(EN[300], "Forward");
+        assert_eq!(ZH[301], "上一级");
+        assert_eq!(EN[301], "Up one level");
     }
 
     /// 索引表必须与旧的线性扫描语义一致：每个中文键都命中它**首次出现**的下标。

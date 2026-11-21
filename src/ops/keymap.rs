@@ -22,6 +22,9 @@ pub const DEFAULT_SHORTCUTS: &[ShortcutMeta] = &[
     ShortcutMeta { id: "delete", name: "删除至回收站", group: "文件操作", default_chord: "Delete", is_readonly: false },
     ShortcutMeta { id: "delete_perm", name: "永久删除", group: "文件操作", default_chord: "Shift+Delete", is_readonly: false },
     // 导航与查看
+    ShortcutMeta { id: "nav_back", name: "后退", group: "导航与查看", default_chord: "Alt+Left", is_readonly: false },
+    ShortcutMeta { id: "nav_forward", name: "前进", group: "导航与查看", default_chord: "Alt+Right", is_readonly: false },
+    ShortcutMeta { id: "nav_up", name: "上一级", group: "导航与查看", default_chord: "Alt+Up", is_readonly: false },
     ShortcutMeta { id: "refresh", name: "刷新当前目录", group: "导航与查看", default_chord: "F5", is_readonly: false },
     ShortcutMeta { id: "clear_filter", name: "清空筛选 / 取消", group: "导航与查看", default_chord: "Escape", is_readonly: true },
     ShortcutMeta { id: "focus_search", name: "聚焦搜索框", group: "导航与查看", default_chord: "Ctrl+F", is_readonly: false },
@@ -95,6 +98,10 @@ pub fn format_chord(
             NamedKey::Escape => "Escape",
             NamedKey::Delete => "Delete",
             NamedKey::Backspace => "Backspace",
+            NamedKey::ArrowLeft => "Left",
+            NamedKey::ArrowRight => "Right",
+            NamedKey::ArrowUp => "Up",
+            NamedKey::ArrowDown => "Down",
             NamedKey::F1 => "F1",
             NamedKey::F2 => "F2",
             NamedKey::F3 => "F3",
@@ -140,6 +147,44 @@ fn build_chord_string(key: &str, ctrl: bool, shift: bool, alt: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 方向键必须能格式化：Alt+方向 是后退/前进/上一级的默认键位，
+    /// 这里一旦漏掉 `NamedKey::Arrow*`，设置页就录不进、运行期也解析不出。
+    #[test]
+    fn arrow_keys_are_formattable() {
+        use slint::winit_030::winit::keyboard::{Key, NamedKey};
+        let chord = |key, ctrl, shift, alt| format_chord(&Key::Named(key), ctrl, shift, alt);
+        assert_eq!(
+            chord(NamedKey::ArrowLeft, false, false, true).as_deref(),
+            Some("Alt+Left")
+        );
+        assert_eq!(
+            chord(NamedKey::ArrowRight, false, false, true).as_deref(),
+            Some("Alt+Right")
+        );
+        assert_eq!(
+            chord(NamedKey::ArrowUp, false, false, true).as_deref(),
+            Some("Alt+Up")
+        );
+        assert_eq!(
+            chord(NamedKey::ArrowDown, false, false, true).as_deref(),
+            Some("Alt+Down")
+        );
+        // 修饰键顺序固定为 Ctrl → Alt → Shift，改键后回显才不会变来变去。
+        assert_eq!(
+            chord(NamedKey::ArrowLeft, true, true, true).as_deref(),
+            Some("Ctrl+Alt+Shift+Left")
+        );
+    }
+
+    /// 三个导航动作必须真的绑在 Alt+方向 上（默认键位表改错时立刻炸出来）。
+    #[test]
+    fn navigation_actions_default_to_alt_arrows() {
+        let map = Keymap::new(&HashMap::new());
+        assert_eq!(map.resolve("Alt+Left"), Some("nav_back"));
+        assert_eq!(map.resolve("Alt+Right"), Some("nav_forward"));
+        assert_eq!(map.resolve("Alt+Up"), Some("nav_up"));
+    }
 
     /// 默认键位不能撞车：每个默认组合键必须解析到它自己那个动作。
     /// 以前只有十来条、肉眼能扫，加 Ctrl+W 这种常用键时很容易和别处重复。

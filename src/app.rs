@@ -3525,6 +3525,36 @@ mod tests {
     }
 
     #[test]
+    fn network_active_id_matches_ancestor_by_path_boundary() {
+        let targets = [
+            r"\\192.168.1.5\Video",
+            r"\\192.168.1.5\Video\bsf",
+            r"\\nas\V",
+        ];
+        let pick = |p: &str| network_active_id(p, targets.iter().copied());
+        // 精确命中。
+        assert_eq!(pick(r"\\192.168.1.5\Video"), r"net:\\192.168.1.5\Video");
+        // 子目录命中祖先（这是本次修的 bug：以前这里返回空）。
+        assert_eq!(
+            pick(r"\\192.168.1.5\Video\bsf"),
+            r"net:\\192.168.1.5\Video\bsf"
+        );
+        assert_eq!(
+            pick(r"\\192.168.1.5\Video\bsf\2024"),
+            r"net:\\192.168.1.5\Video\bsf"
+        );
+        // 前缀必须在分隔符边界上：`\\nas\V` 不能吃掉 `\\nas\Video`。
+        assert_eq!(pick(r"\\nas\Video\x"), "");
+        // 大小写不敏感（UNC 服务器名经常大小写混写）；回填的 id 用配置里原本的大小写。
+        assert_eq!(
+            pick(r"\\192.168.1.5\VIDEO\x"),
+            r"net:\\192.168.1.5\Video"
+        );
+        // 一个都不沾边。
+        assert_eq!(pick(r"\\other\share"), "");
+    }
+
+    #[test]
     fn drag_gesture_accumulates_until_threshold() {
         let paths = vec![PathBuf::from("C:\\a.txt")];
         let dp = Some((0.0f32, 0.0f32, paths.clone()));
@@ -4510,7 +4540,13 @@ impl App {
                 if let Some(drive) = self.drives.iter().find(|d| s.starts_with(format!("{}:", d.letter).as_str())) {
                     format!("drive:{}", drive.letter)
                 } else if s.starts_with("\\\\") {
-                    format!("net:{s}")
+                    network_active_id(
+                        &s,
+                        network
+                            .iter()
+                            .map(|(_, t)| t.as_str())
+                            .chain(detected.iter().map(|(_, t)| t.as_str())),
+                    )
                 } else {
                     String::new()
                 }
@@ -6574,7 +6610,13 @@ impl App {
                 {
                     format!("drive:{}", drive.letter).into()
                 } else if s.starts_with("\\\\") {
-                    format!("net:{s}").into()
+                    // 网络位置按祖先匹配（见 `network_active_id`）。
+                    let model = self.ui.get_sidebar_items();
+                    let targets: Vec<String> = (0..model.row_count())
+                        .filter_map(|i| model.row_data(i).map(|it| it.id.to_string()))
+                        .filter_map(|id| id.strip_prefix("net:").map(str::to_string))
+                        .collect();
+                    network_active_id(&s, targets.iter().map(|t| t.as_str())).into()
                 } else {
                     SharedString::default()
                 }
@@ -6585,6 +6627,38 @@ impl App {
         #[cfg(windows)]
         apply_column_widths(self);
     }
+}
+
+/// UNC 路径该选中哪个侧栏网络位置：取「当前路径的祖先里最深的那一条」。
+///
+/// 以前是全等比较（`net:{当前路径}`），于是在 `\\nas\Video\bsf` 里侧栏整列
+/// 都没有高亮，只有正好停在 `\\nas\Video` 时才亮一下——用户会以为"没进网络位置"。
+/// 这里按**路径边界**做前缀匹配：`\\nas\Video` 是 `\\nas\Video\bsf` 的祖先，
+/// 而 `\\nas\V` 不算（否则会把 `\\nas\Video` 误判成子目录）。
+/// 多个目标都命中时取最深的那个（共享目录可以嵌套登记）。
+fn network_active_id<'a, I>(path: &str, targets: I) -> String
+where
+    I: Iterator<Item = &'a str>,
+{
+    let cur = path.to_lowercase();
+    let mut best: Option<(usize, String)> = None;
+    for target in targets {
+        if target.is_empty() || target.eq_ignore_ascii_case("none") {
+            continue;
+        }
+        // 去掉登记值末尾的反斜杠：`\\nas\media\` 和 `\\nas\media` 必须等价，
+        // 否则带尾巴的那条永远匹配不到子目录。
+        let lower = target.to_lowercase();
+        let lower = lower.trim_end_matches('\\');
+        if lower.is_empty() {
+            continue;
+        }
+        let hit = cur == lower || cur.starts_with(&format!("{lower}\\"));
+        if hit && best.as_ref().is_none_or(|(len, _)| lower.len() > *len) {
+            best = Some((lower.len(), format!("net:{target}")));
+        }
+    }
+    best.map(|(_, id)| id).unwrap_or_default()
 }
 
 /// 把 `path` 对应的条目移动到 `index`（重命名后保持原位置）。
@@ -12502,6 +12576,9 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             "rename" => app.start_rename(),
             "delete" => app.delete_selection(true),
             "delete_perm" => app.delete_selection(false),
+            "nav_back" => app.nav_back(),
+            "nav_forward" => app.nav_forward(),
+            "nav_up" => app.nav_up(),
             "refresh" => app.user_refresh_active(),
             "focus_search" => {
                 // 进入搜索框前取消挂起的延迟重命名，否则 rename 输入框稍后弹出、

@@ -717,14 +717,6 @@ out property <length> row-height-out: file-list.row-height-out;
                     clicked => { root.nav_up(); }
                 }
 
-                // 分隔竖线。
-                Rectangle {
-                    width: 1px;
-                    height: 16px;
-                    y: (parent.height - 16px) / 2;
-                    background: Theme.divider;
-                }
-
                 // 面包屑地址栏（复刻 Pulse：常态即为 28px 圆角输入框，与右侧搜索框严格统一）
                 Rectangle {
                     horizontal-stretch: 1;
