@@ -141,6 +141,12 @@ fn walk(input: &str, collect_indices: bool) -> (PinyinFields, Vec<FieldIndicesEn
     }
 
     indices.sort_by_key(|e| (e.abbr_start, e.full_start));
+    // `ü` → `v`：一个字符换一个字符，反向定位表的位置不受影响。
+    let full = if full.contains('ü') {
+        full.replace('ü', "v")
+    } else {
+        full
+    };
     (
         PinyinFields {
             full: full.into(),
@@ -173,6 +179,20 @@ fn lookup_indices(indices: &[FieldIndicesEntry], idx: usize, abbr: bool) -> Opti
 }
 
 /// 查询是否匹配一个条目（name / 全拼 / 简拼任一命中即可）。
+/// 查询归一化：转小写，并把 `ü` 换成 `v`。
+///
+/// 拼音库给的是带两点的 `lü`，而中文用户几乎一律打 `lv`（`lüxing` 要打特殊
+/// 字符）——不归一化就等于「旅行」搜不到。索引侧同样把 `ü` 存成 `v`（见
+/// [`walk`]），两边一致才能命中。
+pub fn normalize_query(q: &str) -> String {
+    let lower = q.to_lowercase();
+    if lower.contains('ü') {
+        lower.replace('ü', "v")
+    } else {
+        lower
+    }
+}
+
 pub fn matches_query(
     name: &str,
     fields: &PinyinFields,
@@ -183,7 +203,7 @@ pub fn matches_query(
     let (buf_a, buf_b, buf_c) = bufs;
     // 强制小写：规避 nucleo Smart-case 在「混合大小写查询 + 删除容错」
     // 下的内部断言（nucleo-matcher 0.3.1，双 ASCII 路径误报）。
-    let query_owned = query_lower.to_lowercase();
+    let query_owned = normalize_query(query_lower);
     let q = Utf32Str::new(&query_owned, buf_a);
     if matcher.fuzzy_match(Utf32Str::new(name, buf_b), q).is_some() {
         return true;
@@ -224,7 +244,7 @@ pub fn score_parts(
     bufs: &mut (Vec<char>, Vec<char>, Vec<char>),
 ) -> Option<u16> {
     let (buf_a, buf_b, buf_c) = bufs;
-    let query_owned = query_lower.to_lowercase();
+    let query_owned = normalize_query(query_lower);
     let q = Utf32Str::new(&query_owned, buf_a);
     let mut best = matcher.fuzzy_match(Utf32Str::new(name, buf_b), q);
     if let Some(s) = matcher.fuzzy_match(Utf32Str::new(abbr, buf_c), q) {
@@ -246,7 +266,7 @@ pub fn highlight_ranges(
     bufs: &mut (Vec<char>, Vec<char>, Vec<char>),
 ) -> Vec<(usize, usize)> {
     let (buf_a, buf_b, buf_c) = bufs;
-    let query_owned = query_lower.to_lowercase();
+    let query_owned = normalize_query(query_lower);
     let q = Utf32Str::new(&query_owned, buf_a);
     let total = name.chars().count();
     let mut idx_buf: Vec<u32> = Vec::new();
@@ -354,6 +374,7 @@ mod tests {
         let mut bufs = (Vec::new(), Vec::new(), Vec::new());
         matches_query(name, &f, query, &mut m(), &mut bufs)
     }
+
 
     #[test]
     fn pinyin_fields_are_computed() {

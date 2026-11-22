@@ -407,7 +407,7 @@ pub type SharedIndex = Arc<RwLock<GlobalIndex>>;
 /// 带上魔数与版本号后，旧文件在读任何条目之前就被判为过期，正常走重建。
 const CACHE_MAGIC: [u8; 8] = *b"ROVEIDX1";
 /// 缓存格式版本。**`IndexEntry` 布局有任何变化都必须 +1**。
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 /// 全局索引单例（首次调用初始化，后台线程异步填充）。
 static INDEX: std::sync::OnceLock<SharedIndex> = std::sync::OnceLock::new();

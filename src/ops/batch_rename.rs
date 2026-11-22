@@ -338,7 +338,14 @@ fn eat(
         if qi + n > query.len() {
             continue;
         }
-        if !py.chars().eq(query[qi..qi + n].iter().copied()) {
+        // 读音里的 `ü` 与用户输入的 `v` 视为同一个字母：拼音库给的是 `lü`，
+        // 而没人会去打那个两点（都打 `lv`）——不归一化，「旅行 / 女性 / 策略」
+        // 这类名字在全拼命中里永远替换不了。
+        if !py
+            .chars()
+            .zip(query[qi..qi + n].iter())
+            .all(|(a, b)| norm_pinyin_char(a) == norm_pinyin_char(*b))
+        {
             continue;
         }
         if let Some(end) = eat(chars, pinyins, ci + 1, query, query_raw, strict, qi + n) {
@@ -346,6 +353,14 @@ fn eat(
         }
     }
     best
+}
+
+/// 拼音比对用的归一化：`ü` 当 `v`。
+fn norm_pinyin_char(c: char) -> char {
+    match c {
+        'ü' | 'ǖ' | 'ǘ' | 'ǚ' | 'ǜ' => 'v',
+        _ => c,
+    }
 }
 
 /// 每个字节位置对应的字符下标（末位补总字符数）。
@@ -836,6 +851,19 @@ mod tests {
             .map(|(t, _)| t.as_str())
             .collect();
         assert_eq!(hl, "报告");
+    }
+
+    #[test]
+    fn pinyin_v_matches_uumlaut() {
+        // 拼音库给的读音带两点（`lü`），用户一律打 `lv`：两边都要认。
+        let p = run("旅行记录.mp4", false, &opts("lvxing", "travel"), &[]);
+        assert_eq!(p.new_name, "travel记录.mp4");
+        // 真打两点也得命中。
+        let p = run("旅行记录.mp4", false, &opts("lüxing", "travel"), &[]);
+        assert_eq!(p.new_name, "travel记录.mp4");
+        // üe → ve（策略 = ce + lüe）。
+        let p = run("策略笔记.txt", false, &opts("celve", "plan"), &[]);
+        assert_eq!(p.new_name, "plan笔记.txt");
     }
 
     #[test]
