@@ -290,6 +290,11 @@ const THUMB_CACHE_MAX_ITEMS: usize = 4096;
 /// 缩略图缓存字节预算（192 MB）。Rove 的 Image 常驻 CPU 侧 RGBA，
 /// 按最大尺寸(132px*2.0=264px)每张约 278 KB，192 MB 可存约 690 张。
 const THUMB_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
+/// 全盘索引空闲多久后把内存还给系统（分钟）。
+///
+/// 索引常驻要几十兆，而绝大多数会话根本不做全盘搜索。清掉之后再次搜索会
+/// 重新读盘（约 0.3 s、后台线程、不卡输入），比长期白占划算。
+const INDEX_UNLOAD_IDLE_MINS: u64 = 5;
 /// 失败负缓存的条数上限（先进先出淘汰）。
 const THUMB_FAILED_MAX_ITEMS: usize = 4096;
 /// 缩略图磁盘缓存预算（512 MB，对标 Pulse）。超限按最后修改时间淘汰到 80%。
@@ -993,6 +998,9 @@ pub struct App {
     bg_hit_row: bool,
     /// 空白处右键按下时先存下菜单，等抬手再弹（见 `background_pointer_event`）。
     deferred_bg_menu: Option<MenuScope>,
+    /// 索引还没加载时敲下的那次全盘搜索。加载完成后由轮询定时器补跑，
+    /// 不依赖“索引就绪”那条通知 —— 通知只要漏一次，用户就只看到空列表。
+    pending_global_search: Option<String>,
     /// 已经做过「列宽自适应」的目录键，按栏记录（左 0 / 右 1）。
     /// 每个目录只在打开时算一次，避免滚动 / 刷新时反复重算导致列宽跳动。
     /// 必须按栏分：两栏可能在不同目录，共用一个键会让切焦点时用另一栏的内容
@@ -1276,6 +1284,7 @@ impl App {
             rubber_band_base: None,
             bg_hit_row: false,
             deferred_bg_menu: None,
+            pending_global_search: None,
             autofit_key: [None, None],
             cur_col_widths: [
                 [
@@ -3917,23 +3926,27 @@ mod tests {
 ///
 /// 相比定时器轮询：零空转开销，且就绪与刷新落在同一事件循环 tick。
 pub(crate) fn on_index_ready() {
-    let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
-        return;
-    };
-    let mut app = app.borrow_mut();
-    app.refresh_after_index_ready();
-    // 无论是否重查都同步一次状态栏：把「全盘索引构建中...」摘掉。
-    app.sync_status();
-    // 设置页「重新扫描驱动器」留下的「正在重新扫描…」在此换成完成信息。
-    app.finish_index_rescan();
-    // 设置页「搜索与索引」正在前台：立即刷新看板，无需等下一次轮询。
-    let on_search_settings = {
-        let tab = app.state.active();
-        tab.kind == crate::state::TabKind::Settings
-            && tab.settings_subpage == crate::state::SettingsSubpage::SearchAndIndex
-    };
-    if on_search_settings {
-        app.sync_search_stats(false);
+    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+        let mut app = app.borrow_mut();
+        app.refresh_after_index_ready();
+        // 无论是否重查都同步一次状态栏：把「全盘索引构建中...」摘掉。
+        app.sync_status();
+        // 设置页「重新扫描驱动器」留下的「正在重新扫描…」在此换成完成信息。
+        app.finish_index_rescan();
+        // 设置页「搜索与索引」正在前台：立即刷新看板，无需等下一次轮询。
+        let on_search_settings = {
+            let tab = app.state.active();
+            tab.kind == crate::state::TabKind::Settings
+                && tab.settings_subpage == crate::state::SettingsSubpage::SearchAndIndex
+        };
+        if on_search_settings {
+            app.sync_search_stats(false);
+        }
+    }
+    // 吸附窗正在输入：索引到位后补刷一次，让它出现「全盘文件夹」那一轨。
+    // 必须在 `app` 借用之外调用（`SESSION` 与 `JUMP` 是两套状态，别叠着借）。
+    if jump_query_active() {
+        jump_refresh();
     }
 }
 
@@ -4343,6 +4356,18 @@ impl App {
             tab.active_mut().display = (0..n).collect();
             return;
         }
+        // 索引还没加载（启动不再预热）：交给后台线程读盘，先把这次查询记下来，
+        // 加载完成后补跑（见 `run_pending_global_search`）—— 输入不会卡住。
+        // 「没加载」与「正在构建」要分开：构建中照旧直接查已有的部分结果
+        // （最后会由「索引就绪」补查一次），只有真的没加载才去读盘。
+        if !crate::search::index::has_data() && !crate::search::index::is_building() {
+            logln!("index: first global search -> lazy load {query:?}");
+            self.pending_global_search = Some(query.to_string());
+            crate::search::index::warm_up_async();
+            return;
+        }
+        self.pending_global_search = None;
+        crate::search::index::touch();
         let index = shared();
         let Ok(guard) = index.read() else {
             return;
@@ -4365,6 +4390,62 @@ impl App {
         tab.active_mut().rebuild_display();
     }
 
+    /// 索引加载完成后补跑那次「当时还没加载完」的全盘搜索。
+    ///
+    /// 为什么不全靠“索引就绪通知”：那条通知是异步投递的，漏一次用户看到的
+    /// 就是「首次搜索没有结果，得再敲一下才出来」。这里由 40ms 轮询直接看
+    /// 状态，最多晚 40ms；与通知重复触发时只是多跑一次同样的查询。
+    fn run_pending_global_search(&mut self) {
+        let Some(query) = self.pending_global_search.clone() else {
+            return;
+        };
+        if !crate::search::index::has_data() {
+            return;
+        }
+        self.pending_global_search = None;
+        let (is_root, filter) = {
+            let tab = self.state.active();
+            (tab.active().path.is_none(), tab.active().filter.trim().to_string())
+        };
+        // 用户已经离开「此电脑」或者又改了搜索词：这一条过期了，丢掉。
+        if !is_root || filter != query {
+            return;
+        }
+        logln!("index: run pending global search {query:?}");
+        self.run_global_search(&query);
+        self.visible_cache = None;
+        self.visible_cache_right = None;
+        self.sync_file_list();
+        self.sync_status();
+    }
+
+    /// 长时间没做全盘搜索：把索引内存还给系统（磁盘缓存保留）。
+    fn maybe_unload_index(&mut self) {
+        // 有一次搜索还在等索引加载：这时候卸载等于把它掐掉。
+        if self.pending_global_search.is_some() {
+            return;
+        }
+        // 吸附窗正在搜：它依赖索引里的文件夹那一轨，别在人家搜的时候清空。
+        if jump_query_active() {
+            return;
+        }
+        // 从没被用过（比如只是打开了索引设置页）→ 立刻可卸。
+        let idle = crate::search::index::idle_for().unwrap_or(Duration::from_secs(u64::MAX / 2));
+        if idle < Duration::from_secs(INDEX_UNLOAD_IDLE_MINS * 60) {
+            return;
+        }
+        // 正在看「搜索与索引」看板：那里显示的就是真实占用，别让它突然变 0。
+        let on_search_settings = {
+            let tab = self.state.active();
+            tab.kind == crate::state::TabKind::Settings
+                && tab.settings_subpage == crate::state::SettingsSubpage::SearchAndIndex
+        };
+        if on_search_settings {
+            return;
+        }
+        crate::search::index::unload();
+    }
+
     /// 全盘索引刚刚就绪：若当前正处于「此电脑」全局搜索且搜索框非空，
     /// 静默重查一次，把构建期的部分结果补全为完整结果。
     ///
@@ -4380,6 +4461,9 @@ impl App {
             return;
         }
         logln!("index ready: re-query global search {query:?}");
+        // 这次补查和 `run_pending_global_search` 是两条路，已经查了就别让
+        // 40ms 轮询再查一遍（同一句话扫两遍十几万条，纯浪费）。
+        self.pending_global_search = None;
         self.run_global_search(&query);
         // 必须清虚拟列表缓存，否则列表命中旧窗口不重渲染（只有状态栏会变）。
         self.visible_cache = None;
@@ -4396,8 +4480,18 @@ impl App {
     /// 用 `try_read` 而非 `read`：此函数运行在 UI 线程，而索引线程正高频
     /// 持写锁推条目，阻塞等待会把卡顿带到界面上。取不到锁时退化为「不提示」，
     /// 代价仅是偶尔少一行状态文案，远优于卡死主线程。
+    /// 返回值：`Some(true)` 有数据 / `Some(false)` 正在构建 / `None` 未加载（已卸载或还没用过）。
+    ///
+    /// 不能只看 `ready`：索引闲置卸载之后 `ready` 也会是 false，那样状态栏
+    /// 会一直挂着一句根本不存在的「全盘索引构建中...」。
     fn index_build_state() -> Option<bool> {
-        crate::search::index::try_shared().and_then(|i| i.try_read().ok().map(|g| g.ready))
+        if crate::search::index::is_building() {
+            return Some(false);
+        }
+        if crate::search::index::has_data() {
+            return Some(true);
+        }
+        None
     }
 
     /// 手动「重新扫描驱动器」扫完后的收尾：把状态栏那句「正在重新扫描…」换成结果。
@@ -8510,7 +8604,7 @@ impl App {
         self.ui.set_search_ready(is_ready);
         let status_text = if is_ready {
             self.tr("索引已就绪")
-        } else if snapshot.is_some() {
+        } else if crate::search::index::is_building() {
             self.tr("正在构建索引...")
         } else {
             self.tr("索引未构建")
@@ -12358,6 +12452,11 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
 
     // 合并窗口到点则触发索引重建（设置页连续改多项只重建一次）。
     maybe_run_pending_reindex();
+    if let Some(app) = SESSION.with(|slot| slot.borrow().clone()) {
+        if let Ok(mut app) = app.try_borrow_mut() {
+            app.run_pending_global_search();
+        }
+    }
 
     // 采样「前台是不是别人」：给按键处理判「这次按键是不是刚被别的程序扔过来的」。
     note_foreign_foreground();
@@ -12728,6 +12827,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                     // 探测在线程里跑：有变化才会经 40ms 轮询重绘侧栏。
                     app.request_sidebar_probe();
                     app.maybe_idle_rescan();
+                    app.maybe_unload_index();
                     app.log_memory_snapshot();
                 }
             });
@@ -14041,6 +14141,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 _ => crate::state::SettingsSubpage::General,
             };
             app.state.active_mut().settings_subpage = subpage;
+            if subpage == crate::state::SettingsSubpage::SearchAndIndex {
+                // 看板要显示真实条目数：进这个子页才把索引加载起来（后台线程）。
+                crate::search::index::warm_up_async();
+            }
             app.sync_settings();
             app.sync_tabs(); // 修复核心：点击后立即刷新标签栏标题，无需切标签！
         });
@@ -15362,10 +15466,18 @@ struct JumpState {
     geom: Option<(i32, i32, i32, String)>,
     /// 界面语言快照：会话销毁后就没有 App 可以问了。
     language: String,
+    /// 后台常驻时的索引空闲卸载定时器（见 `init_dialog_jump`）。
+    /// 必须存在这里：`slint::Timer` 一析构就停，放局部变量等于从没启动。
+    unload_timer: slint::Timer,
 }
 
 thread_local! {
     static JUMP: RefCell<Option<JumpState>> = const { RefCell::new(None) };
+}
+
+/// 吸附窗输入框里是否有内容（有内容才值得等全盘索引那一轨）。
+fn jump_query_active() -> bool {
+    with_jump(|state| !state.window.get_query().is_empty()).unwrap_or(false)
 }
 
 /// 只读/可变访问吸附窗状态；未初始化（非 Windows 或初始化失败）时返回 None。
@@ -15448,6 +15560,16 @@ fn jump_refresh() {
         });
         #[cfg(not(windows))]
         let root: Option<PathBuf> = None;
+        // 吸附窗的「全盘文件夹」那一轨也吃这份索引。索引是按需加载的，
+        // 这里既然用户在搜，就顺手让它去读（幂等；读完 `on_index_ready`
+        // 会回来补刷一次结果）。
+        if !state.window.get_query().is_empty() {
+            crate::search::index::touch();
+            if !crate::search::index::has_data() {
+                logv!("[jump] 索引未加载，为吸附窗检索触发加载");
+            }
+            crate::search::index::warm_up_async();
+        }
         let hits = if state.window.get_query().is_empty() {
             let mut hits = crate::search::jump::search("", None);
             with_current_dir_pin(&mut hits, &state.language);
@@ -15493,7 +15615,24 @@ pub(crate) fn init_dialog_jump(language: &str, theme: ThemeChoice) {
             target: None,
             geom: None,
             language: language.to_string(),
+            unload_timer: slint::Timer::default(),
         });
+    });
+
+    // 后台常驻（没有主窗口）时没人跑空闲卸载：吸附窗自己看着点。
+    // 主窗口在的时候由 `App::maybe_unload_index` 负责，这里直接让路。
+    with_jump(|state| {
+        state
+            .unload_timer
+            .start(slint::TimerMode::Repeated, Duration::from_secs(60), || {
+                if SESSION.with(|slot| slot.borrow().is_some()) || jump_query_active() {
+                    return;
+                }
+                let idle = crate::search::index::idle_for();
+                if idle.is_some_and(|d| d >= Duration::from_secs(INDEX_UNLOAD_IDLE_MINS * 60)) {
+                    crate::search::index::unload();
+                }
+            });
     });
 
     // 输入变化（含程序化清空）：重算候选。
@@ -16492,9 +16631,10 @@ fn create_session(
         // 位置很关键：它要读十几万条缓存（实测约 300ms），而上面那次
         // `sync_file_list` 已经把窗格登记给 Shell 了。冷启动时「打开文件所在
         // 位置」的选中请求就在等这一步，绝不能让它挡在登记之前。
-        logln!("[boot] index warm-up start");
-        let _ = crate::search::index::shared();
-        logln!("[boot] index warm-up done");
+        // 索引改为**按需加载**：启动不再把几十万条读进内存。
+        // 用不上全盘搜索的人（多数人）不必替它付几十上百兆；第一次搜索或打开
+        // 「搜索与索引」设置页时才在后台读缓存（见 `index::warm_up_async`）。
+        logln!("[boot] index lazy (loads on first global search / index settings page)");
         // 启动时窗口还没显示，标签条其实一个像素都没布局（视口宽度为 0），
         // 恢复出来的「当前标签」可能落在可视区外，用户看不到自己在哪一页。
         // 这里只丢一个目标下标，TabBar 内部会等布局落定后补滚

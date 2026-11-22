@@ -143,6 +143,36 @@ const CACHE_VERSION: u32 = 2;
 
 /// 全局索引单例（首次调用初始化，后台线程异步填充）。
 static INDEX: std::sync::OnceLock<SharedIndex> = std::sync::OnceLock::new();
+/// 索引里是否已经有可用数据（加载完成 / 构建完成 / 明确是空范围）。
+///
+/// 与 `ready` 的区别：`ready` 表示「构建完了、结果可信」，卸载后也会置假；
+/// 这个标记专门用来回答「要不要为一次搜索去读盘」，卸载与空范围两种情况
+/// 都不会误判成「需要重新加载」。
+static LOADED: AtomicBool = AtomicBool::new(false);
+/// 是否有构建线程在跑（用于区分「构建中，直接查部分结果」和「没加载，去读盘」）。
+static BUILDING: AtomicBool = AtomicBool::new(false);
+
+/// 构建线程退出时清标记。
+struct ClearBuilding;
+impl Drop for ClearBuilding {
+    fn drop(&mut self) {
+        BUILDING.store(false, Ordering::Relaxed);
+    }
+}
+
+/// 索引是否已有可用数据（见 [`LOADED`]）。
+pub fn has_data() -> bool {
+    LOADED.load(Ordering::Relaxed)
+}
+
+/// 是否有线程正在装载缓存（防止并发重复读盘）。
+static LOADING: AtomicBool = AtomicBool::new(false);
+
+/// 是否有构建线程正在跑。
+pub fn is_building() -> bool {
+    BUILDING.load(Ordering::Relaxed)
+}
+
 /// 构建轮次：新轮次启动会令旧轮次在下次检查时自行退出并丢弃结果。
 static BUILD_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// 当前构建线程的停止开关（重新扫描时先置位旧线程）。
@@ -164,6 +194,7 @@ pub fn shared() -> SharedIndex {
                     w.heap_bytes = 0;
                     w.built_at = Some(std::time::SystemTime::now());
                 }
+                LOADED.store(true, Ordering::Relaxed);
                 logln!("index: no drive in scope, skip cache load (0 entries)");
                 let _ = slint::invoke_from_event_loop(|| {
                     crate::app::on_index_ready();
@@ -177,19 +208,7 @@ pub fn shared() -> SharedIndex {
                     crate::app::on_index_ready();
                 });
                 // 校验时效：未超过空闲重扫周期则直接复用，不无端扫盘
-                let config = crate::config::Config::load();
-                let is_fresh = if config.search_idle_rescan_minutes > 0 {
-                    idx.read()
-                        .ok()
-                        .and_then(|g| g.built_at)
-                        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
-                        .is_some_and(|elapsed| {
-                            elapsed < std::time::Duration::from_secs(config.search_idle_rescan_minutes as u64 * 60)
-                        })
-                } else {
-                    true
-                };
-                if !is_fresh {
+                if !cache_is_fresh(&idx) {
                     spawn_builder(idx.clone());
                 }
             } else {
@@ -198,6 +217,136 @@ pub fn shared() -> SharedIndex {
             idx
         })
         .clone()
+}
+
+/// 按需加载：第一次真正要用索引时才把缓存读进内存（后台线程）。
+///
+/// 启动不再预热。全盘搜索大多不常用，而 14.8 万条的索引常驻就是三十多兆，
+/// 上百万条时两百多兆 —— 用不上的人不该替它付这笔钱。什么时候要：
+///
+/// * 用户第一次做全盘搜索（`run_global_search`）；
+/// * 用户打开设置 →「搜索与索引」看板（那里要显示真实条目数）。
+///
+/// 读盘期间界面照常响应，读完经 `on_index_ready` 通知，正在输入的那次全盘
+/// 搜索会被自动补查一次（`refresh_after_index_ready`），用户感觉不到断档。
+pub fn warm_up_async() {
+    if has_data() || is_building() || LOADING.load(Ordering::Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("rove-index-load".into())
+        .spawn(ensure_loaded);
+    if let Err(e) = spawned {
+        logln!("!! index: lazy load thread SPAWN FAILED: {e}");
+        // 兜底：线程起不来就同步加载，慢一点也比搜不出东西强。
+        ensure_loaded();
+    }
+}
+
+/// 确保索引已经装进内存：缓存命中就把缓存读进来并通知界面，否则拉起后台构建。
+///
+/// 幂等。**不能只靠 `shared()`**：`OnceLock` 初始化过一次之后，即使后来
+/// 被 [`unload`] 清空，`shared()` 也只会把那个空索引原样还回来 —— 那样
+/// 「闲置卸载后再次搜索」就会搜出 0 条。这里每次都按真实状态判断。
+pub fn ensure_loaded() {
+    if has_data() || is_building() {
+        return;
+    }
+    // 同一时刻只允许一个线程在装载：多按几下搜索不该把几十兆读两遍。
+    if LOADING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let _guard = ClearLoading;
+    let idx = shared();
+    if has_data() || is_building() {
+        return;
+    }
+    if load_cache(&idx) {
+        notify_ready();
+        // 与首次初始化一致：缓存过期了就顺手重扫，别让用户一直吃旧索引。
+        if !cache_is_fresh(&idx) {
+            spawn_builder(idx);
+        }
+    } else {
+        spawn_builder(idx);
+    }
+}
+
+/// 磁盘缓存是否还在「空闲重扫周期」之内（周期为 0 表示永不因过期重扫）。
+fn cache_is_fresh(idx: &SharedIndex) -> bool {
+    let config = crate::config::Config::load();
+    if config.search_idle_rescan_minutes == 0 {
+        return true;
+    }
+    idx.read()
+        .ok()
+        .and_then(|g| g.built_at)
+        .and_then(|t| std::time::SystemTime::now().duration_since(t).ok())
+        .is_some_and(|elapsed| {
+            elapsed < std::time::Duration::from_secs(config.search_idle_rescan_minutes as u64 * 60)
+        })
+}
+
+/// 通知界面「索引可用了」。
+fn notify_ready() {
+    let _ = slint::invoke_from_event_loop(|| {
+        crate::app::on_index_ready();
+    });
+}
+
+/// 装载线程退出时清标记。
+struct ClearLoading;
+impl Drop for ClearLoading {
+    fn drop(&mut self) {
+        LOADING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 索引最近一次被真正使用（全盘搜索 / 吸附窗检索）的时刻。
+///
+/// 空闲卸载只看这一个时间戳：它比「谁来装、谁来卸」更重要 —— 主窗口和
+/// 吸附窗（`--background` 常驻时可能只有它）共用同一份判定。
+static LAST_TOUCH: std::sync::OnceLock<std::sync::Mutex<std::time::Instant>> =
+    std::sync::OnceLock::new();
+
+/// 记一次「索引被用过」。
+pub fn touch() {
+    let slot = LAST_TOUCH.get_or_init(|| std::sync::Mutex::new(std::time::Instant::now()));
+    if let Ok(mut t) = slot.lock() {
+        *t = std::time::Instant::now();
+    }
+}
+
+/// 距离上一次使用过了多久；从没被用过返回 `None`。
+pub fn idle_for() -> Option<std::time::Duration> {
+    LAST_TOUCH.get()?.lock().ok().map(|t| t.elapsed())
+}
+
+/// 把内存里的索引还给系统（磁盘缓存 `index.bin` 原样保留，下次用再读）。
+///
+/// 只在空闲足够久之后调用：常驻的内存要 30 MB（上百万条时两百多兆），
+/// 而多数人一天也用不上一次全盘搜索。再次搜索时会重新读盘（约 0.3 s，
+/// 后台线程执行，不卡输入），所以这里不需要保守。
+///
+/// 正在构建时（`ready == false`）不动：那会儿条目还是一半的，清了反而添乱。
+pub fn unload() {
+    let Some(idx) = INDEX.get() else {
+        return;
+    };
+    let Ok(mut w) = idx.write() else {
+        return;
+    };
+    if !w.ready || w.entries.is_empty() {
+        return;
+    }
+    let freed = w.heap_bytes;
+    w.entries = Vec::new();
+    w.heap_bytes = 0;
+    w.ready = false;
+    w.built_at = None;
+    LOADED.store(false, Ordering::Relaxed);
+    drop(w);
+    logln!("index: unloaded, freed ~{} MB (disk cache kept)", freed / (1024 * 1024));
 }
 
 /// 持久化缓存文件路径：%LOCALAPPDATA%\Rove\index.bin
@@ -278,6 +427,7 @@ pub fn load_cache(idx: &SharedIndex) -> bool {
         w.built_at = mtime.or_else(|| Some(std::time::SystemTime::now()));
         w.heap_bytes = heap;
     }
+    LOADED.store(true, Ordering::Relaxed);
     logln!(
         "index: loaded {count} cached entries from disk (resident ~{} MB)",
         heap / (1024 * 1024)
@@ -319,6 +469,7 @@ pub fn rebuild() -> SharedIndex {
 
 fn spawn_builder(idx: SharedIndex) {
     let epoch = BUILD_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    BUILDING.store(true, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
     // 登记新开关并停掉上一轮（若重建时未显式停止）。
     if let Ok(mut cur) = CURRENT_STOP.lock() {
@@ -330,6 +481,7 @@ fn spawn_builder(idx: SharedIndex) {
     std::thread::Builder::new()
         .name("rove-indexer".into())
         .spawn(move || {
+            let _clear_building = ClearBuilding;
             let mut count = 0usize;
             let roots = list_roots();
             let config = crate::config::Config::load();
@@ -405,6 +557,7 @@ fn spawn_builder(idx: SharedIndex) {
                 w.built_at = Some(now);
                 w.heap_bytes = heap;
             }
+            LOADED.store(true, Ordering::Relaxed);
             logln!(
                 "global index built and committed: {} entries (~{} MB resident)",
                 count,
@@ -417,6 +570,12 @@ fn spawn_builder(idx: SharedIndex) {
             let _ = slint::invoke_from_event_loop(|| {
                 crate::app::on_index_ready();
             });
+        })
+        .map_err(|e| {
+            // 线程起不来 = 这一轮构建根本不存在。不留着 `BUILDING`，
+            // 否则之后每次搜索都会被当成「构建中，先查部分结果」，永远是空的。
+            BUILDING.store(false, Ordering::Relaxed);
+            logln!("!! index: builder thread SPAWN FAILED: {e}");
         })
         .ok();
 }
