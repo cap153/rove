@@ -4643,6 +4643,11 @@ impl App {
                 .wrapping_add(q.id.bytes().map(|b| b as u64).sum::<u64>())
                 .wrapping_add(q.path.len() as u64);
         }
+        // 纳入界面语言：分区标题（快速访问 / 此电脑 / 网络位置…）是 Rust 侧
+        // 用 `tr()` 生成后下发到模型的字符串，不是 Slint 绑定，切语言必须重建。
+        fingerprint = fingerprint
+            .wrapping_mul(31)
+            .wrapping_add(!i18n::is_chinese(&self.config.language) as u64);
         // 纳入 5 个分区的展开状态（任一状态切换均触发侧栏重绘）
         for exp in [
             self.config.quick_expanded,
@@ -6867,6 +6872,9 @@ impl App {
         self.sync_status();
         self.sync_file_list();
         self.sync_tabs();
+        // 聚焦面板随分屏切换（关闭分屏时右栏整个消失）：侧栏高亮要跟着换，
+        // 否则右栏停在 D:\ 时收回分屏，侧栏还亮着 D:\。
+        self.sync_sidebar_active();
         // 打开/关闭分屏后左栏视口宽度变了：立刻按左栏内容重新自适应一次列宽，
         // 否则名称列仍按分屏前的宽视口估算，右栏挤进来后会出现横向滚动条。
         #[cfg(windows)]
@@ -6928,8 +6936,9 @@ impl App {
             }
             if tab.active_pane == index {
                 // 状态已经在这一栏，但界面可能还停在旧值上（某条路径漏了同步）：
-                // 用户点这一栏时顺手纠正一次，代价只有两次属性写。
+                // 用户点这一栏时顺手纠正一次，代价只有几次属性写。
                 self.sync_split_state();
+                self.sync_sidebar_active();
                 return;
             }
             tab.active_pane = index;
@@ -6963,6 +6972,8 @@ impl App {
         self.ui.set_filter_text(pane_filter.into());
         // 同步标签栏标题、图标和 loading：标签作用于当前聚焦面板。
         self.sync_tabs();
+        // 两栏可能停在不同的盘 / 网络位置：侧栏高亮跟着聚焦面板走。
+        self.sync_sidebar_active();
     }
 
     /// 把分屏状态同步到 UI（开关 / 当前聚焦面板）。
@@ -6983,11 +6994,20 @@ impl App {
             None => SharedString::default(),
             Some(path) => {
                 let s = path.to_string_lossy().into_owned();
-                if let Some(drive) = self
-                    .drives
-                    .iter()
-                    .find(|d| s.starts_with(format!("{}:", d.letter).as_str()))
-                {
+                // 盘符大小写不敏感：手输 / 从别处粘来的路径可能是 `c:\`，
+                // 按 `starts_with("C:")` 比较会整条高亮都消失。
+                let letter = s
+                    .as_bytes()
+                    .get(1)
+                    .filter(|b| **b == b':')
+                    .and_then(|_| s.chars().next())
+                    .map(|c| c.to_ascii_uppercase());
+                let drive = letter.and_then(|c| {
+                    self.drives
+                        .iter()
+                        .find(|d| d.letter.to_ascii_uppercase() == c)
+                });
+                if let Some(drive) = drive {
                     format!("drive:{}", drive.letter).into()
                 } else if s.starts_with("\\\\") {
                     // 网络位置按祖先匹配（见 `network_active_id`）。
