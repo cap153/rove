@@ -1172,6 +1172,11 @@ export component FileList inherits Rectangle {
                         // 误触 / 取消时恢复按下前的选择（Ctrl/Shift 累加基线）。
                         if (event.kind == PointerEventKind.up) {
                             root.rubber-band-selected(root.sel-x1, root.sel-y1, root.sel-x2, root.sel-y2);
+                            // 空白处左键抬手也上报一次：Rust 用它判定「双击空白 = 上一级」。
+                            // 与左键按下用同一套视口坐标，两者相减就是拖了多少。
+                            if (event.button == PointerEventButton.left) {
+                                root.background-pointer-event(event, self.mouse-x, self.mouse-y);
+                            }
                         } else {
                             // cancel：传零尺寸矩形，等价于撤销本轮框选。
                             root.rubber-band-selected(root.sel-x1, root.sel-y1, root.sel-x1, root.sel-y1);

@@ -998,6 +998,11 @@ pub struct App {
     bg_hit_row: bool,
     /// 空白处右键按下时先存下菜单，等抬手再弹（见 `background_pointer_event`）。
     deferred_bg_menu: Option<MenuScope>,
+    /// 空白处左键按下的位置（视口坐标）：抬手时用来区分「点一下」和「拖着框选」。
+    blank_press: Option<(f32, f32)>,
+    /// 空白处上一次单击的 (时刻, x, y, 窗格)：两次够近才算双击 → 回上一级。
+    /// 带上窗格是防「左栏点一下、右栏点一下」被误判成双击。
+    blank_click: Option<(std::time::Instant, f32, f32, usize)>,
     /// 索引还没加载时敲下的那次全盘搜索。加载完成后由轮询定时器补跑，
     /// 不依赖“索引就绪”那条通知 —— 通知只要漏一次，用户就只看到空列表。
     pending_global_search: Option<String>,
@@ -1268,6 +1273,8 @@ impl App {
             row_diff_left: None,
             row_diff_right: None,
             last_click: None,
+            blank_press: None,
+            blank_click: None,
             sidebar_drag: None,
             network_drag: None,
             quick_drag: None,
@@ -10409,8 +10416,57 @@ impl App {
     }
 
     /// 删除选中项。
+    /// 彻底删除：交给 Shell 的 `delete` 动词，确认框由系统自己弹。
+    ///
+    /// 不自己画确认框的原因见 `sys::menu::invoke_shell_verb`：只有 Shell 弹的
+    /// 那个才和资源管理器长得一样（图标、按钮、默认按钮、「不再提示」勾选框）。
+    /// 用户点「否」时命令也可能返回失败，所以结果按「条目还在不在」判定。
+    fn purge_items_with_confirm(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        logln!("[recycle] purge request n={}", paths.len());
+        let invoked =
+            crate::sys::shell::purge_items(&paths, crate::sys::shell::current_owner_hwnd());
+        // 结果只认「条目还在不在」：Shell 的 delete 动词在用户点「否」时也可能
+        // 返回成功，光看 HRESULT 分不出删没删。
+        let removed = fs::drives::recycle_remaining(&paths)
+            .map(|left| paths.len().saturating_sub(left));
+        match removed {
+            Some(n) if n > 0 => {
+                logln!("[recycle] purge done n={}", n);
+                self.set_status_job(self.trf("已彻底删除 {} 项", &[n.to_string()]));
+                self.reload_active();
+                self.sidebar_fingerprint = 0;
+            }
+            Some(_) if invoked => {
+                // 命令投递成功但条目还在 = 用户点了「否」：什么都不做，也不报错。
+                logln!("[recycle] purge cancelled");
+            }
+            Some(_) => {
+                logln!("[recycle] purge failed");
+                self.set_status_job(self.tr("删除失败"));
+            }
+            None => {
+                // 列举失败，判断不了：刷新一遍让列表自己说话，不写状态。
+                logln!("[recycle] purge result unknown (trash list failed)");
+                self.reload_active();
+                self.sidebar_fingerprint = 0;
+            }
+        }
+    }
+
     fn delete_selection(&mut self, to_trash: bool) {
         let paths = self.state.active().active().selected_paths();
+        // 回收站里「删除」= 永久删除（Delete 与 Shift+Delete 都是），
+        // 走 Shell 自己的确认框，跟资源管理器一致。
+        if !paths.is_empty()
+            && self.state.active().active().path.as_deref()
+                == Some(fs::drives::recycle_virtual_path().as_path())
+        {
+            self.purge_items_with_confirm(paths);
+            return;
+        }
         if !paths.is_empty() {
             // 低频、关键时刻：Shell 确认框会在此期间拦截打开/删除类按键。
             logln!(
@@ -10700,22 +10756,23 @@ impl App {
             "recycle-cut" => self.copy_selection(true),
             "recycle-purge" => {
                 if let MenuScope::Selection(paths) = &target {
-                    let n = fs::drives::purge_recycle_entries(paths);
-                    self.set_status_job(if n > 0 {
-                        self.trf("已彻底删除 {} 项", &[n.to_string()])
-                    } else {
-                        self.tr("删除失败").to_string()
-                    });
-                    self.reload_active();
-                    self.sidebar_fingerprint = 0;
+                    self.purge_items_with_confirm(paths.clone());
                 }
             }
             "recycle-empty" => {
-                if fs::drives::empty_recycle_bin() {
-                    self.set_status_job(self.tr("回收站已清空"));
-                } else {
-                    self.set_status_job(self.tr("清空回收站失败"));
+                // 走系统 API：确认框 / 进度条 / 提示音都由它提供（见 `empty_recycle_bin`）。
+                match fs::drives::empty_recycle_bin(crate::sys::shell::current_owner_hwnd()) {
+                    fs::drives::EmptyResult::Emptied | fs::drives::EmptyResult::AlreadyEmpty => {
+                        self.set_status_job(self.tr("回收站已清空"));
+                    }
+                    // 用户点了「否」：列表没变，不刷新也不报错。
+                    fs::drives::EmptyResult::Cancelled => return,
+                    fs::drives::EmptyResult::Failed => {
+                        self.set_status_job(self.tr("清空回收站失败"));
+                        return;
+                    }
                 }
+                // 条目真的没了（或本来就是空的）：重新列举，否则列表还挂着旧条目。
                 self.reload_active();
                 self.sidebar_fingerprint = 0;
             }
@@ -10832,7 +10889,8 @@ impl App {
                     let mut app = app.borrow_mut();
                     if is_dir {
                         app.navigate_active(Some(path));
-                    } else if let Err(e) = open::that_detached(&path) {
+                    } else if let Err(e) = crate::sys::shell::shell_open(&path) {
+                        crate::logal!("!! open {:?} failed: {}", path, e);
                         let msg = app.trf("打开失败：{}", &[e.to_string()]);
                         app.set_status_job(msg);
                     }
@@ -10843,7 +10901,8 @@ impl App {
         let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
         if is_dir {
             self.navigate_active(Some(path.to_path_buf()));
-        } else if let Err(e) = open::that_detached(path) {
+        } else if let Err(e) = crate::sys::shell::shell_open(path) {
+            crate::logal!("!! open {:?} failed: {}", path, e);
             self.set_status_job(self.trf("打开失败：{}", &[e.to_string()]));
         }
     }
@@ -11727,6 +11786,8 @@ impl App {
         if event.kind != PointerEventKind::Down {
             return;
         }
+        // 点到条目就打断「空白双击」链条，免得「行上一下 + 空白一下」被凑成双击。
+        self.blank_click = None;
         let Some(path) = self.state.active().active().display_entry(index).map(|e| e.path.clone()) else {
             return;
         };
@@ -12159,9 +12220,54 @@ impl App {
         self.submit_job(kind);
     }
 
+    /// 空白处单击的收尾：判定双击。规则与行上的双击一致（同一套系统间隔、
+    /// 同一套 4px 抖动容差），并且只有「按下列抬」之间没怎么动才算点击 ——
+    /// 拖着框选一大片之后松手不该触发导航。
+    fn on_blank_click(&mut self, x: f32, y: f32) {
+        const SLOP: f32 = 4.0;
+        let moved = match self.blank_press.take() {
+            Some((px, py)) => (px - x).abs() > SLOP || (py - y).abs() > SLOP,
+            // 没收到按下（比如从行上按下、空白处松开）：不当作点击。
+            None => true,
+        };
+        if moved {
+            self.blank_click = None;
+            return;
+        }
+        // 正在改名时不导航：那会儿空白处的点击常是「放弃改名」，跳走会连着丢上下文。
+        if !self.ui.get_rename_path().is_empty() {
+            self.blank_click = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        let pane = self.state.active().active_pane;
+        let is_double = self.blank_click.as_ref().is_some_and(|(t, lx, ly, lp)| {
+            *lp == pane
+                && t.elapsed().as_millis() < effective_double_click_ms() as u128
+                && (*lx - x).abs() <= SLOP
+                && (*ly - y).abs() <= SLOP
+        });
+        if is_double {
+            self.blank_click = None;
+            logv!("[nav] blank double-click at=({x:.0},{y:.0}) pane={pane} -> up");
+            self.nav_up();
+        } else {
+            self.blank_click = Some((now, x, y, pane));
+        }
+    }
+
     fn background_pointer_event(&mut self, event: &PointerEvent, x: f32, y: f32) {
+        // 左键抬手：判「双击空白 = 回上一级」。只在这里判，是因为空白层在
+        // Slint 侧被 pointer-event 全接管了，`double-clicked` 不会触发。
+        if event.kind == PointerEventKind::Up && event.button == PointerEventButton::Left {
+            self.on_blank_click(x, y);
+            return;
+        }
         if event.kind != PointerEventKind::Down {
             return;
+        }
+        if event.button == PointerEventButton::Left {
+            self.blank_press = Some((x, y));
         }
         // 每次新按下都复位：上一下的兜底标记不能留到下一轮。
         self.bg_hit_row = false;
@@ -12187,6 +12293,9 @@ impl App {
                 // + 立刻双击」的第二下会被当成第一次按下，只是选中而不打开。
                 self.last_left_press_row = Some(path.clone());
                 self.bg_hit_row = true;
+                // 这一下是「行」的点击（只是事件落到了空白层），别让它参与空白双击判定。
+                self.blank_press = None;
+                self.blank_click = None;
                 let now = std::time::Instant::now();
                 if self.last_click.as_ref().is_some_and(|(p, t)| {
                     *p == path && t.elapsed().as_millis() < effective_double_click_ms() as u128
@@ -15349,6 +15458,8 @@ pub fn start_ui_watchdog() {
             let mut no_beat_reported = false;
             // 首次观察到「会话已存在」的时刻，用于给心跳留出安装时间。
             let mut session_seen: Option<u64> = None;
+            // 上一轮是否正处在模态系统对话框里（见下方豁免）。
+            let mut modal_seen = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(1000));
                 let beat = UI_BEAT_MS.load(std::sync::atomic::Ordering::Acquire);
@@ -15367,6 +15478,20 @@ pub fn start_ui_watchdog() {
                 }
                 session_seen = None;
                 let lag = proc_ms().saturating_sub(beat);
+                // 模态系统对话框（确认框 / 清空回收站）本来就占着 UI 线程，
+                // 那不是卡死，不该记 `!!`。
+                if crate::sys::shell::modal_active() {
+                    modal_seen = true;
+                    continue;
+                }
+                // 对话框刚关掉的那一轮同样要跳过：心跳还停在对话框弹出之前，
+                // 算出来的 lag 全是用户按对话框的时间，等下一拍心跳才是真的。
+                if modal_seen {
+                    modal_seen = false;
+                    reported = false;
+                    stalled_for = 0;
+                    continue;
+                }
                 if lag > 5000 {
                     // 每多卡 30 秒再记一条：`reported` 只表示「上一档已经记过」。
                     let next_step = lag / 30_000 > stalled_for / 30_000;
@@ -16237,12 +16362,14 @@ fn double_click_ms() -> u64 {
     }
 }
 
-/// 用于「双击打开 / 延迟重命名」的有效双击间隔：取系统值但封顶 300ms。
-/// 否则系统默认 500ms 会让单击重命名延迟到 550ms 太不跟手；封顶后默认 Windows
-/// 下窗口=300、延迟=350，既跟手又保证延迟（窗口+50）> 窗口，不破坏正常双击打开。
-/// 系统设得比 300 更快时仍精确跟随。
+/// 用于「双击打开 / 延迟重命名」的有效双击间隔。
+///
+/// 必须严格等于系统设置（`GetDoubleClickTime`，默认 500ms）。曾经为了「单击重命名
+/// 更跟手」把它封顶到 300ms，结果**慢一点的双击（320~500ms）被当成两次单击**：
+/// 文件打不开，落在名称列上还会直接进重命名。用户控制面板里设的间隔就是他的
+/// 双击速度，不能替他收紧——宁可重命名晚 200ms，也不能双击打不开。
 fn effective_double_click_ms() -> u64 {
-    double_click_ms().min(300)
+    double_click_ms()
 }
 
 /// 创建一个 UI 会话（窗口 + 状态 + 回调 + 定时器）。

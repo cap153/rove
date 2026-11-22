@@ -296,33 +296,79 @@ pub fn restore_recycle_entry(key: &std::path::Path) -> usize {
     }
 }
 
-/// 清空回收站，返回是否成功。
-pub fn empty_recycle_bin() -> bool {
-    let Ok(items) = trash::os_limited::list() else {
-        return false;
-    };
-    trash::os_limited::purge_all(items).is_ok()
+/// 这批键里还有几条留在回收站（彻底删除后用它判断真实结果）。
+///
+/// `None` = 列举失败、无法判断。不能拿 0 当「都删掉了」：那样一旦列举出错，
+/// 就会对着根本没删的文件报「已彻底删除 N 项」。
+pub fn recycle_remaining(keys: &[std::path::PathBuf]) -> Option<usize> {
+    let items = trash::os_limited::list().ok()?;
+    Some(
+        items
+            .iter()
+            .filter(|it| keys.iter().any(|p| trash_item_matches(it, p.as_path())))
+            .count(),
+    )
 }
 
-/// 彻底删除回收站中指定的条目，返回成功数量。
-pub fn purge_recycle_entries(keys: &[std::path::PathBuf]) -> usize {
-    let Ok(items) = trash::os_limited::list() else {
-        return 0;
+/// 清空回收站的结果。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EmptyResult {
+    /// 真的清掉了。
+    Emptied,
+    /// 本来就是空的（`S_FALSE`）。
+    AlreadyEmpty,
+    /// 用户在确认框里点了「否」。
+    Cancelled,
+    /// 其它失败。
+    Failed,
+}
+
+/// 清空回收站。
+///
+/// **必须走 `SHEmptyRecycleBinW`，不能自己拿 `trash` 库 `purge_all`**：确认框、
+/// 进度条、结束提示音都是这个 API 自带的，自己删就等于「右键清空 → 文件没了，
+/// 一声不响也没得后悔」——真机上被用户当成 bug 报过。
+///
+/// `hwnd` 传主窗口：确认框归它所有，弹着时主窗不会被回车穿透。
+#[cfg(windows)]
+pub fn empty_recycle_bin(hwnd: isize) -> EmptyResult {
+    use windows_sys::Win32::UI::Shell::SHEmptyRecycleBinW;
+    // 确认框 + 进度条都要占着 UI 线程，先给看门狗打个豁免。
+    let _modal = crate::sys::shell::modal_guard();
+    // 标志位全 0：确认框 + 进度条 + 结束提示音，与资源管理器完全一致。
+    let hr = unsafe {
+        SHEmptyRecycleBinW(
+            hwnd as windows_sys::Win32::Foundation::HWND,
+            std::ptr::null(),
+            0,
+        )
     };
-    let targets: Vec<_> = items
-        .into_iter()
-        .filter(|it| keys.iter().any(|p| trash_item_matches(it, p.as_path())))
-        .collect();
-    if targets.is_empty() {
-        return 0;
+    if hr >= 0 {
+        // S_OK = 清掉了；S_FALSE = 本来就没有东西，两种都不该报错。
+        return if hr == 0 { EmptyResult::Emptied } else { EmptyResult::AlreadyEmpty };
     }
-    let count = targets.len();
-    if trash::os_limited::purge_all(targets).is_ok() {
-        count
+    // 0x800704C7 = HRESULT_FROM_WIN32(ERROR_CANCELLED)：用户点了「否」。
+    if hr == 0x8007_04C7_u32 as i32 {
+        return EmptyResult::Cancelled;
+    }
+    EmptyResult::Failed
+}
+
+#[cfg(not(windows))]
+pub fn empty_recycle_bin(_hwnd: isize) -> EmptyResult {
+    let Ok(items) = trash::os_limited::list() else {
+        return EmptyResult::Failed;
+    };
+    if items.is_empty() {
+        return EmptyResult::AlreadyEmpty;
+    }
+    if trash::os_limited::purge_all(items).is_ok() {
+        EmptyResult::Emptied
     } else {
-        0
+        EmptyResult::Failed
     }
 }
+
 
 /// 枚举已连接的网络位置（映射盘与 UNC 共享）。
 #[cfg(windows)]

@@ -6,8 +6,8 @@ mod imp {
     use windows_sys::Win32::Foundation::HWND;
     use std::sync::atomic::{AtomicIsize, Ordering};
     use windows_sys::Win32::UI::Shell::{
-        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FO_COPY, FO_DELETE, FO_MOVE,
-        SHFILEOPSTRUCTW,
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOF_WANTNUKEWARNING, FO_COPY, FO_DELETE,
+        FO_MOVE, SHFILEOPSTRUCTW,
     };
 
     /// 主窗口 HWND（UI 线程写入，后台 Shell 操作线程读取）。
@@ -21,6 +21,48 @@ mod imp {
         if hwnd != 0 {
             OWNER_HWND.store(hwnd, Ordering::Relaxed);
         }
+    }
+
+    /// 正在显示模态系统对话框（确认框 / 清空回收站进度）。
+    ///
+    /// 这类对话框会把 UI 线程堵住，看门狗会误报「UI 线程无响应」并打 `!!`；
+    /// 用户正在按确认框的时候不该记异常，所以给它一个豁免标记。
+    static MODAL_DEPTH: AtomicIsize = AtomicIsize::new(0);
+
+    pub fn modal_active() -> bool {
+        MODAL_DEPTH.load(Ordering::Relaxed) > 0
+    }
+
+    /// RAII 标记：析构时自动减一，中途 return / panic 都不会漏掉。
+    pub struct ModalGuard;
+
+    impl Drop for ModalGuard {
+        fn drop(&mut self) {
+            MODAL_DEPTH.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn modal_guard() -> ModalGuard {
+        MODAL_DEPTH.fetch_add(1, Ordering::Relaxed);
+        ModalGuard
+    }
+
+    /// 取登记过的主窗口 HWND（0 = 还没登记）。
+    pub fn current_owner_hwnd() -> isize {
+        OWNER_HWND.load(Ordering::Relaxed)
+    }
+
+    /// 彻底删除回收站里的一组条目。
+    ///
+    /// 走回收站文件夹自己的 `delete` 动词，确认框由 Shell 弹——和资源管理器
+    /// 右键「删除」完全同一条路，所以对话框长得一样。实现见 `menu::purge_recycle_items`。
+    pub fn purge_items(paths: &[PathBuf], hwnd: isize) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        // 确认框会把 UI 线程堵住（资源管理器也一样），先给看门狗打豁免。
+        let _modal = modal_guard();
+        crate::sys::menu::purge_recycle_items(paths, hwnd) > 0
     }
 
     /// 取当前可用宿主窗口：优先传入值，否则用登记过的全局值。
@@ -75,6 +117,11 @@ mod imp {
 
         let ret = unsafe { SHFileOperationW(&mut sh_op) };
         if ret != 0 {
+            // 1223 = ERROR_CANCELLED：用户在确认框里点了「否」。
+            // 这不是失败，不该在状态栏报错——资源管理器也不报。
+            if ret == 1223 {
+                return Ok(true);
+            }
             return Err(format!("Shell 操作失败，错误代码: {ret}"));
         }
         // 返回是否被用户中途取消
@@ -105,8 +152,58 @@ mod imp {
         let mut flags = 0u32;
         if to_trash {
             flags |= FOF_ALLOWUNDO;
+        } else {
+            // Shift+Delete：不设这个标志，系统会「一声不响」直接抹掉。
+            // 设了才会弹「确实要永久删除此文件吗？」（和资源管理器一致）。
+            flags |= FOF_WANTNUKEWARNING;
         }
         run_shell_op(FO_DELETE, from, None, flags, hwnd)
+    }
+
+    /// 用默认程序打开一个文件 / 文件夹 / 脚本。
+    ///
+    /// 不用 `open` crate：它只检查「powershell 子进程有没有创建成功」，
+    /// 真正执行 ShellExecute 的那一步失败（没有关联程序、需要提权、
+    /// 路径在 UNC 上、被策略拦住……）一律被吞掉，表现就是「双击没反应」。
+    /// 这里直接拿 `ShellExecuteExW` 的返回值 + `GetLastError`，失败必有话说。
+    pub fn shell_open(path: &Path) -> Result<(), String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::Shell::{
+            ShellExecuteExW, SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let mut file: Vec<u16> = path.as_os_str().encode_wide().collect();
+        file.push(0);
+        let verb: Vec<u16> = "open".encode_utf16().chain([0]).collect();
+        // 工作目录必须是**文件自己所在的那个文件夹**。资源管理器就是这么做的：
+        // 脚本里的 `.\venv\Scripts\activate`、`.\python.exe xxx.py` 这些相对路径
+        // 全靠它。留空的话子进程继承 Rove 自己的当前目录（一般是装的目录），
+        // 相对路径全指错地方，脚本一声不响地失败——表现就是「双击没反应」。
+        let mut workdir: Vec<u16> = path
+            .parent()
+            .map(|d| d.as_os_str().encode_wide().chain([0]).collect())
+            .unwrap_or_default();
+
+        let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        // NOASYNC：调用线程有消息循环（UI 线程），Shell 不会把工作丢到后台
+        // 然后立刻返回成功——那样错误码就永远拿不到了。
+        // NO_UI：失败时不要系统模态框（它会卡住调用线程），错误交给状态栏。
+        info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+        info.hwnd = owner_hwnd(0);
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = file.as_ptr();
+        if !workdir.is_empty() {
+            info.lpDirectory = workdir.as_mut_ptr();
+        }
+        info.nShow = SW_SHOWNORMAL;
+        let ok = unsafe { ShellExecuteExW(&mut info) };
+        if ok != 0 {
+            return Ok(());
+        }
+        let code = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+        Err(describe_shell_error(code))
     }
 
     /// 显示 Shell 条目的「属性」对话框。
@@ -162,6 +259,26 @@ mod imp {
         }
         Ok(())
     }
+
+    /// `ShellExecuteExW` 的错误码 → 人话。
+    ///
+    /// 这些码值来自 WinError.h。刻意不把原始数字塞给用户，
+    /// 只在后面附上，方便排查。
+    fn describe_shell_error(code: u32) -> String {
+        let reason = match code {
+            2 => "找不到这个文件（可能刚被移动或删除）",
+            3 => "找不到这个路径（上级文件夹可能已不存在）",
+            5 => "拒绝访问：权限不够，或文件被占用",
+            15 => "驱动器不存在（U 盘拔了 / 网络位置掉线）",
+            31 => "设备未就绪",
+            32 => "文件被其他程序占用",
+            1155 => "这种文件没有默认打开方式，请先设置文件关联",
+            1223 => "操作已取消",
+            740 => "这个操作需要管理员权限",
+            _ => "系统没能执行这个操作",
+        };
+        format!("{reason}（错误 {code}）")
+    }
 }
 
 #[cfg(windows)]
@@ -173,6 +290,45 @@ mod imp {
     use std::path::{Path, PathBuf};
 
     pub fn set_owner_hwnd(_hwnd: isize) {}
+
+    pub fn current_owner_hwnd() -> isize {
+        0
+    }
+
+    /// 非 Windows：退回 `open` crate（只有宿主机 check/test 会走到）。
+    pub fn shell_open(path: &Path) -> Result<(), String> {
+        open::that_detached(path).map_err(|e| e.to_string())
+    }
+
+    pub fn purge_items(paths: &[PathBuf], _hwnd: isize) -> bool {
+        let Ok(items) = trash::os_limited::list() else {
+            return false;
+        };
+        let hit: Vec<_> = items
+            .into_iter()
+            .filter(|it| {
+                paths.iter().any(|p| {
+                    std::path::Path::new(&it.id) == p.as_path()
+                        || it.original_path().as_path() == p.as_path()
+                })
+            })
+            .collect();
+        if hit.is_empty() {
+            return true;
+        }
+        trash::os_limited::purge_all(hit).is_ok()
+    }
+
+    pub fn modal_active() -> bool {
+        false
+    }
+
+
+    pub struct ModalGuard;
+
+    pub fn modal_guard() -> ModalGuard {
+        ModalGuard
+    }
     pub fn shell_copy(
         _from: &[PathBuf],
         _dest_dir: &Path,

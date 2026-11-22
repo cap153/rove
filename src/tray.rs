@@ -69,6 +69,10 @@ fn create() -> Option<TrayIcon> {
     }
     match builder.build() {
         Ok(tray) => {
+            // 隐藏窗口刚刚建出来：把 Rove 的深浅主题补挂上去（`apply_theme` 早于
+            // 本线程时那次调用找不到窗口，只能由这边补一次），否则托盘菜单会
+            // 退回「跟随系统」，与 Rove 的主题对不上。
+            crate::sys::menu::apply_tray_theme();
             start_event_forwarder();
             Some(tray)
         }

@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::mem::ManuallyDrop;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -34,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowPos, ShowWindow,
     TranslateMessage, TrackPopupMenuEx, HMENU, MSG, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP,
     MF_SEPARATOR, MF_STRING, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
-    SMTO_ABORTIFHUNG, SMTO_BLOCK, TPM_RIGHTBUTTON, WM_APP, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSW,
+    GetClassNameW, SMTO_ABORTIFHUNG, SMTO_BLOCK, TPM_RIGHTBUTTON, WM_APP, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_POPUP,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -61,6 +61,14 @@ static DARK: AtomicBool = AtomicBool::new(false);
 static HOST_DARK: AtomicBool = AtomicBool::new(false);
 /// 进程级偏好当前是深还是浅（与 [`DARK`] 比对，避免重复调 `SetPreferredAppMode`）。
 static MODE_DARK: AtomicBool = AtomicBool::new(false);
+
+/// 进程级偏好是否**已经显式设过**。`SetPreferredAppMode` 的默认值是
+/// 「跟随系统」——只要没设过，Shell 弹的任何菜单都按系统走，而不是按 Rove 的主题。
+static MODE_SET: AtomicBool = AtomicBool::new(false);
+
+/// `tray-icon` 那个隐藏窗口的句柄（类名固定 `tray_icon_app`）。托盘菜单的配色
+/// 只认它自己的窗口，缓存下来免得每次 `FindWindowW`。
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
 /// 上一份菜单挂着超过这么久，才值得去探测一次（正常操作菜单不会超过它）。
 const MENU_STALL_MS: u64 = 1_500;
 /// 构建阶段（菜单还没弹出来）的判死时限。
@@ -532,6 +540,7 @@ fn set_preferred_mode(dark: bool) -> bool {
     let set_mode: unsafe extern "system" fn(i32) -> i32 = unsafe { std::mem::transmute(export) };
     unsafe { set_mode(if dark { 2 } else { 3 }) };
     MODE_DARK.store(dark, Ordering::Release);
+    MODE_SET.store(true, Ordering::Release);
     flush_menu_themes();
     true
 }
@@ -544,8 +553,8 @@ fn flush_menu_themes() {
     }
 }
 
-/// 给宿主窗口挂上（或摘掉）深色主题。
-fn theme_host(hwnd: HWND, dark: bool) {
+/// 给任意窗口挂上（或摘掉）深色主题（不改 Rove 自己的宿主状态）。
+fn apply_dark_flag(hwnd: HWND, dark: bool) {
     unsafe {
         if let Some(export) = uxtheme_export(133) {
             let allow: unsafe extern "system" fn(HWND, i32) -> i32 =
@@ -565,7 +574,81 @@ fn theme_host(hwnd: HWND, dark: bool) {
         );
         flush_menu_themes();
     }
+}
+
+/// 给 Rove 自己的菜单宿主窗口挂主题，并记下状态。
+fn theme_host(hwnd: HWND, dark: bool) {
+    apply_dark_flag(hwnd, dark);
     HOST_DARK.store(dark, Ordering::Release);
+}
+
+/// 让托盘右键菜单跟随 Rove 的主题。
+///
+/// 托盘菜单是 `tray-icon` / `muda` 用普通 `TrackPopupMenu` 弹的，配色取决于两件事：
+/// 进程级 `SetPreferredAppMode`，以及**拥有窗口**（`tray_icon_app` 隐藏窗口）的
+/// 深色允许位。后者它自己从不设，所以要么继承进程状态，要么跟着 Windows 走。
+pub fn apply_tray_theme() {
+    let dark = DARK.load(Ordering::Acquire);
+    let mut hwnd = TRAY_HWND.load(Ordering::Acquire);
+    if hwnd == 0 {
+        // 托盘图标还没建出来（`apply_theme` 早于 `tray::spawn`）：托管给托盘线程，
+        // 它建完图标会自己调一次本函数。
+        match find_own_tray_window() {
+            Some(found) => {
+                hwnd = found;
+                TRAY_HWND.store(hwnd, Ordering::Release);
+            }
+            None => return,
+        }
+    }
+    apply_dark_flag(HWND(hwnd as _), dark);
+}
+
+/// 找 `tray-icon` 的隐藏窗口，**必须是本进程的**。
+///
+/// 类名 `tray_icon_app` 是 `tray-icon` 库写死的，同一个桌面上别的程序
+/// （很多托盘程序也用这个库）可能也有同名窗口。`FindWindowW` 会返回第一个
+/// 命中的，可能不是我们的 —— 那就会去给别人的窗口改主题，自己的托盘菜单
+/// 反而没变。所以枚举顶层窗口，按进程号过滤。
+fn find_own_tray_window() -> Option<isize> {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    struct Ctx {
+        class: Vec<u16>,
+        pid: u32,
+        found: isize,
+    }
+    let mut class: Vec<u16> = "tray_icon_app".encode_utf16().collect();
+    class.push(0);
+    let mut ctx = Ctx {
+        class,
+        pid: unsafe { GetCurrentProcessId() },
+        found: 0,
+    };
+    unsafe extern "system" fn each(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let ctx = unsafe { &mut *(lp.0 as *mut Ctx) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        if pid != ctx.pid {
+            return BOOL(1);
+        }
+        let want = ctx.class.len() - 1;
+        let mut buf = [0u16; 32];
+        let n = unsafe { GetClassNameW(hwnd, &mut buf) } as usize;
+        if n > 0 && n == want && buf[..want] == ctx.class[..want] {
+            // 托盘窗口是隐藏的：不看可见性，有句柄就够。
+            let _ = unsafe { IsWindowVisible(hwnd) };
+            ctx.found = hwnd.0 as isize;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+    unsafe { EnumWindows(Some(each), LPARAM(&mut ctx as *mut Ctx as isize)) }.ok();
+    (ctx.found != 0).then_some(ctx.found)
 }
 
 /// 让原生菜单跟随主题（UI 线程调用；真正的绘制在菜单线程上）。
@@ -573,7 +656,16 @@ fn theme_host(hwnd: HWND, dark: bool) {
 /// 应急退路：设置环境变量 `ROVE_NO_DARK_MENU=1` 后一律浅色菜单。
 pub fn set_dark(dark: bool) {
     let dark = dark && std::env::var_os("ROVE_NO_DARK_MENU").is_none();
-    if DARK.swap(dark, Ordering::AcqRel) == dark {
+    // 第一次即使值等于默认的 `false` 也不能提前返回：进程默认是「跟随系统」，
+    // 用户「Rove 亮色 + Windows 深色」时不设就一直是深色菜单。
+    let first = !MODE_SET.swap(true, Ordering::AcqRel);
+    crate::logv!("[menu] set_dark dark={} first={}", dark, first);
+    if DARK.swap(dark, Ordering::AcqRel) == dark && !first {
+        return;
+    }
+    if first {
+        let _ = set_preferred_mode(dark);
+        apply_tray_theme();
         return;
     }
     // 还没弹过菜单：宿主窗口建起来时会自己按 DARK 决定，不必在这里做什么。
@@ -588,6 +680,7 @@ pub fn set_dark(dark: bool) {
             );
         }
     }
+    apply_tray_theme();
 }
 
 fn ensure_host() -> Option<isize> {
@@ -779,6 +872,161 @@ fn items_context_menu(host: HWND, pidls: &[*mut ITEMIDLIST]) -> Option<IContextM
         .collect();
     let parent: IShellFolder = unsafe { SHBindToParent(first, None) }.ok()?;
     unsafe { parent.GetUIObjectOf(host, &children, None) }.ok()
+}
+
+/// 回收站里的「彻底删除」：在**回收站命名空间**上执行 Shell 的 `delete` 动词。
+///
+/// 为什么不能在 `C:\$Recycle.Bin\...` 的物理路径上调 `SHFileOperationW` /
+/// `IFileOperation`：那样 Shell 把条目当普通文件处理，一声不响就抹掉了，
+/// 资源管理器那句「确实要永久删除此文件吗？」根本不会出现。真正弹确认框的是
+/// 回收站文件夹自己的删除处理器，所以要拿到 `FOLDERID_RecycleBinFolder` 的
+/// `IShellFolder`，把命中的子项 PIDL 交给它取 `IContextMenu` 再触发 `delete`。
+///
+/// `paths` 里既可能是 `$R` 物理路径（`trash` 库给的 id），也可能是命名空间解析名。
+/// 匹配先按 `$R` 文件名（每条唯一），退而按显示名（原名）。
+///
+/// 返回投递给 Shell 的条目数；用户点「否」时命令返回失败，所以结果仍以
+/// 「条目还在不在」为准。
+pub(crate) fn purge_recycle_items(paths: &[PathBuf], owner: isize) -> usize {
+    use windows::Win32::UI::Shell::{
+        IShellItem, IShellFolder, IEnumIDList, SHCreateItemWithParent, SHGetKnownFolderItem,
+        BHID_SFObject, FOLDERID_RecycleBinFolder, KF_FLAG_DEFAULT, SHCONTF_FOLDERS,
+        SHCONTF_NONFOLDERS, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+    };
+    if paths.is_empty() {
+        return 0;
+    }
+    let folder_item: IShellItem =
+        match unsafe { SHGetKnownFolderItem(&FOLDERID_RecycleBinFolder, KF_FLAG_DEFAULT, None) } {
+            Ok(item) => item,
+            Err(e) => {
+                crate::logal!("!! menu: 打不开回收站 {:?}", e.code());
+                return 0;
+            }
+        };
+    let folder: IShellFolder = match unsafe { folder_item.BindToHandler(None, &BHID_SFObject) } {
+        Ok(folder) => folder,
+        Err(e) => {
+            crate::logal!("!! menu: 回收站不是 IShellFolder {:?}", e.code());
+            return 0;
+        }
+    };
+    let host = HWND(owner as *mut core::ffi::c_void);
+    let mut list: Option<IEnumIDList> = None;
+    if unsafe { folder.EnumObjects(host, (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32, &mut list) }.is_err()
+    {
+        return 0;
+    }
+    let Some(list) = list else {
+        return 0;
+    };
+
+    // (子 PIDL, 解析名, 显示名)
+    //
+    // `IEnumIDList::Next` 给的子项 PIDL 是 `CoTaskMemAlloc` 出来的，调用方必须
+    // 自己还 —— 这里交给守卫，提前 return 也不会漏。
+    let mut owned = ChildPidls(Vec::new());
+    let mut children: Vec<(*mut ITEMIDLIST, String, String)> = Vec::new();
+    loop {
+        let mut buf: [*mut ITEMIDLIST; 1] = [std::ptr::null_mut()];
+        let mut fetched = 0u32;
+        if unsafe { list.Next(&mut buf, Some(&mut fetched)) }.is_err() || fetched == 0 {
+            break;
+        }
+        let child = buf[0];
+        if child.is_null() {
+            break;
+        }
+        owned.0.push(child);
+        let names = unsafe { SHCreateItemWithParent::<_, IShellItem>(None, &folder, child) }
+            .ok()
+            .and_then(|item| {
+                let parsing = shell_item_name(&item, SIGDN_DESKTOPABSOLUTEPARSING)?;
+                let display = shell_item_name(&item, SIGDN_NORMALDISPLAY)?;
+                Some((parsing, display))
+            });
+        match names {
+            Some((parsing, display)) => children.push((child, parsing, display)),
+            None => children.push((child, String::new(), String::new())),
+        }
+    }
+
+    let tail = |path: &Path| path.file_name().map(|n| n.to_string_lossy().to_string());
+    let mut hit: Vec<*const ITEMIDLIST> = Vec::new();
+    for path in paths {
+        let Some(name) = tail(path) else { continue };
+        // 先按 `$R` 文件名（唯一）匹配；同名副本再多也不会误伤。
+        let found = children
+            .iter()
+            .find(|(_, parsing, _)| parsing.rsplit('\\').next() == Some(name.as_str()))
+            .or_else(|| {
+                children
+                    .iter()
+                    .find(|(_, _, display)| display.eq_ignore_ascii_case(&name))
+            });
+        if let Some((pidl, _, _)) = found {
+            let pidl = *pidl as *const ITEMIDLIST;
+            // 两个键命中同一条（显示名回退撞车）时只能交一次，否则 Shell 会
+            // 把同一条删两遍、真正想要的那条反而留下。
+            if !hit.contains(&pidl) {
+                hit.push(pidl);
+            }
+        }
+    }
+    if hit.is_empty() {
+        crate::logal!("!! menu: 回收站里没匹配到要删除的条目");
+        return 0;
+    }
+
+    let menu: IContextMenu = match unsafe { folder.GetUIObjectOf(host, &hit, None) } {
+        Ok(menu) => menu,
+        Err(e) => {
+            crate::logal!("!! menu: 回收站取不到 IContextMenu {:?}", e.code());
+            return 0;
+        }
+    };
+    let verb = "delete";
+    let ansi: Vec<u8> = verb.bytes().chain(Some(0)).collect();
+    let wide: Vec<u16> = verb.encode_utf16().chain(Some(0)).collect();
+    let info = CMINVOKECOMMANDINFOEX {
+        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+        fMask: CMIC_MASK_UNICODE,
+        hwnd: host,
+        lpVerb: PCSTR(ansi.as_ptr()),
+        nShow: 1, // SW_SHOWNORMAL
+        lpVerbW: PCWSTR(wide.as_ptr()),
+        ..Default::default()
+    };
+    let result = unsafe {
+        menu.InvokeCommand((&info as *const CMINVOKECOMMANDINFOEX).cast::<CMINVOKECOMMANDINFO>())
+    };
+    crate::logv!(
+        "[menu] purge_recycle n={} hr={:?}",
+        hit.len(),
+        result.as_ref().err().map(|e| e.code().0)
+    );
+    hit.len()
+}
+
+/// 一批由 Shell 分配的子项 PIDL，析构时统一还给 `CoTaskMemFree`。
+struct ChildPidls(Vec<*mut ITEMIDLIST>);
+
+impl Drop for ChildPidls {
+    fn drop(&mut self) {
+        for pidl in self.0.drain(..) {
+            if !pidl.is_null() {
+                unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
+            }
+        }
+    }
+}
+
+/// `IShellItem` 显示名（调用方负责释放 `CoTaskMem` 那块内存）。
+fn shell_item_name(item: &windows::Win32::UI::Shell::IShellItem, kind: windows::Win32::UI::Shell::SIGDN) -> Option<String> {
+    let raw = unsafe { item.GetDisplayName(kind) }.ok()?;
+    let text = unsafe { raw.to_string() }.ok();
+    unsafe { CoTaskMemFree(Some(raw.0 as *const core::ffi::c_void)) };
+    text
 }
 
 /// 目录空白处 → `IContextMenu`。

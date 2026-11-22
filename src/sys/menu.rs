@@ -109,7 +109,9 @@ pub struct Options {
 /// 菜单本身由内部专用线程的零面积窗口持有。
 /// 返回 false 表示菜单线程不可用（调用方记日志并放弃本次菜单）。
 #[cfg(windows)]
-pub(crate) use imp::{busy_for_ms, exhausted, open, set_dark};
+pub(crate) use imp::{
+    apply_tray_theme, busy_for_ms, exhausted, open, purge_recycle_items, set_dark,
+};
 
 /// 非 Windows：没有菜单线程，永远不忙。
 #[cfg(not(windows))]
@@ -131,6 +133,10 @@ pub fn open(_: Target, _: Vec<MenuNode>, _: Options, _: isize, _: Sink) -> bool 
 /// 非 Windows：菜单由系统绘制，没有深浅可切。
 #[cfg(not(windows))]
 pub fn set_dark(_: bool) {}
+
+/// 非 Windows：没有托盘菜单要上色。
+#[cfg(not(windows))]
+pub(crate) fn apply_tray_theme() {}
 
 /// 菜单项文字归一化：去掉助记符 `&`、小写化、丢掉 `\t` 之后的热键说明、
 /// 全角标点转半角、去掉尾部 `.` / `…`。两边都走它，才能跨语言 / 跨输入法比较。
