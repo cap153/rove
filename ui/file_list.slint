@@ -671,7 +671,9 @@ export component FileList inherits Rectangle {
         flick.width - root.col-name-x - root.eff-modified-w - root.w-type - root.w-size
         - root.col-path-w - root.right-pad - 8px);
     private property <length> col-name-w: root.view-mode == "list"
-        ? max(140px, flick.width - root.col-name-x - 10px)
+        // 列表视图也要在右侧留一条空白（right-pad）：否则行铺满整个视口宽度，
+        // 右侧没有任何「不是行」的地方，鼠标框选无处起手。
+        ? max(140px, flick.width - root.col-name-x - root.right-pad - 8px)
         : (root.view-mode == "details"
             ? (root.rs-name-lock >= 0px
                 // 拖动任何分隔符期间用本地锁定值：不能靠 auto-col-widths，
@@ -687,6 +689,12 @@ export component FileList inherits Rectangle {
     /// 最后一列的右边界（= 「大小」列右边那条分隔符的位置，显示路径列时顺延）。
     /// 三个用途：行点击区的右界、表头最后一条分隔线、横向滚动条的判定基准。
     private property <length> col-end: root.col-path-x + root.col-path-w;
+    /// 行（含点击区）的右边界。
+    /// 列表视图不画修改时间/类型/大小列，`col-end` 会落到视口之外，
+    /// 所以按「名称列右边界 + 8px」算，右侧留下可框选的空白。
+    private property <length> row-end: root.view-mode == "list"
+        ? root.col-name-x + root.col-name-w + 8px
+        : root.col-end;
     private property <length> col-modified-x: root.col-name-x + root.col-name-w;
     private property <length> col-type-x: root.col-modified-x + root.eff-modified-w;
     private property <length> col-size-x: root.col-type-x + root.w-type;
@@ -1188,9 +1196,10 @@ export component FileList inherits Rectangle {
 
                 y: row.index * root.row-h;
                 x: 0px;
-                // 行元素（含点击区）只铺到最后一列右边界：右侧留白里不存在行，
-                // 点它等于点空白、从那里起手就是框选。列表视图仍整行铺满。
-                width: root.view-mode == "list" ? flick.content-width : root.col-end;
+                // 行元素（含点击区）只铺到内容右边界：右侧留白里不存在行，
+                // 点它等于点空白、从那里起手就是框选。列表视图同样留白
+                // （以前整行铺满视口，右侧一点空白都没有，根本没法框选）。
+                width: min(flick.content-width, root.row-end);
                 height: root.row-h;
                 background: (row.index == root.drop-hover-index && row.is-dir) || row.selected
                     ? Theme.bg-selected
