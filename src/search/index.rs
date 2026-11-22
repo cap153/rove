@@ -153,6 +153,23 @@ pub fn shared() -> SharedIndex {
     INDEX
         .get_or_init(|| {
             let idx: SharedIndex = Arc::new(RwLock::new(GlobalIndex::default()));
+            // 磁盘索引范围被关空（设置里把每个盘的开关都关了）：**不读缓存、也不扫描**。
+            //
+            // 以前这里无条件 `load_cache`，于是「明明关掉了所有盘的索引」进程
+            // 启动后照样把几十上百兆的旧索引读进内存 —— 一条都用不上，纯白占。
+            // 真机反馈过这一条（关掉索引仍近 200 MB），确实是我们没处理好。
+            if list_roots().is_empty() {
+                if let Ok(mut w) = idx.write() {
+                    w.ready = true;
+                    w.heap_bytes = 0;
+                    w.built_at = Some(std::time::SystemTime::now());
+                }
+                logln!("index: no drive in scope, skip cache load (0 entries)");
+                let _ = slint::invoke_from_event_loop(|| {
+                    crate::app::on_index_ready();
+                });
+                return idx;
+            }
             let cached = load_cache(&idx);
             if cached {
                 // 缓存命中：立即向 UI 发送就绪通知，第一帧即亮绿灯！
