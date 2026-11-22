@@ -148,8 +148,13 @@ export component TabBar inherits Rectangle {
 
         // 1. 标签滚动视口：自适应宽度但严格受右侧控制区约束，超量时绝对不挤占窗口按钮
         tabs-area := Rectangle {
-            // 右侧预留：控制按钮组 170px + 新建按钮 28px + 舒适拖拽空白区 68px + 间距 = 270px
-            width: min(tabs-layout.preferred-width, max(0px, parent.width - 270px));
+            // 右侧预留：控制按钮组 170px + 新建按钮 28px + 舒适拖拽空白区 68px + 3 处间距 9px = 275px
+            //
+            // 这个数必须和右边实际占位**逐像素对齐**：少留 5px，标签多到视口被
+            // 撑满时整条布局就向右溢出 5px，关闭按钮右缘被窗口裁掉，× 看起来
+            // 偏右（左边留白宽、右边窄）。标签少时不溢出，所以只有部分机器/标签
+            // 数量下才看得出偏。
+            width: min(tabs-layout.preferred-width, max(0px, parent.width - 275px));
             height: parent.height;
             clip: true;
 

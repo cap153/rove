@@ -8,7 +8,7 @@
 //! - 文件操作线程：复制/移动/删除，进度经共享状态暴露。
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc, Weak};
@@ -190,6 +190,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// GUI 子系统进程的 stderr 不可见，文件日志是 WSL 下排查的唯一渠道；
 /// 写在 exe 同目录（WSL 文件系统上 Windows 进程可写），避免依赖 %TEMP% 解析。
 pub(crate) fn log_write(msg: &str) {
+    log_write_lvl("L0", msg);
+}
+
+/// 带级别标记写一行日志。
+///
+/// 每行都标出自己属于哪一级，用户拿一份 `ROVE_LOG=2` 的日志时能一眼看出
+/// 哪些行在默认级别（`L1`）本来就不会有：
+///
+/// * `L0` —— 无条件写入，正常使用一行都不会产生（`logal!`）。
+/// * `L1` —— `ROVE_LOG=1`：一次性的状态、异常、取证告警。
+/// * `L2` —— `ROVE_LOG=2`：逐条/逐帧的流量日志（缩略图、登记、行补丁…）。
+pub(crate) fn log_write_lvl(lvl: &str, msg: &str) {
     use std::io::Write as _;
     let path = std::env::current_exe()
         .ok()
@@ -198,7 +210,7 @@ pub(crate) fn log_write(msg: &str) {
     // 必须先拼成整行、再一次 write_all：`write_fmt` 会按格式片段分多次
     // write_all，多个后台线程并发写日志时会把两行交错成一团
     // （表现为时间戳重复、两行粘成一行）。
-    let line = format!("[rove] {} {}\n", log_stamp(), msg);
+    let line = format!("[rove:{lvl}] {} {}\n", log_stamp(), msg);
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
@@ -218,7 +230,7 @@ pub(crate) fn now_ms() -> u64 {
 macro_rules! logln {
     ($($arg:tt)*) => {{
         if $crate::app::log_enabled(1) {
-            $crate::app::log_write(&format!($($arg)*));
+            $crate::app::log_write_lvl("L1", &format!($($arg)*));
         }
     }};
 }
@@ -229,7 +241,7 @@ macro_rules! logln {
 macro_rules! logv {
     ($($arg:tt)*) => {{
         if $crate::app::log_enabled(2) {
-            $crate::app::log_write(&format!($($arg)*));
+            $crate::app::log_write_lvl("L2", &format!($($arg)*));
         }
     }};
 }
@@ -242,7 +254,7 @@ macro_rules! logv {
 #[macro_export]
 macro_rules! logal {
     ($($arg:tt)*) => {{
-        $crate::app::log_write(&format!($($arg)*));
+        $crate::app::log_write_lvl("L0", &format!($($arg)*));
     }};
 }
 
@@ -261,8 +273,14 @@ static SYNC_TABS_LOGGED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::At
 const ROW_HEIGHT: f32 = 30.0;
 /// 视口上下过扫描行数。
 const OVERSCAN: usize = 4;
-/// 单条索引记录的粗估内存占用（路径 + 名称 + 拼音字段）。
-const INDEX_ENTRY_BYTES: usize = 80;
+/// 单条索引记录的**兜底**粗估（真实值由 `GlobalIndex::heap_bytes` 上报）。
+///
+/// 曾经写的是 80 B/条（那份注释假设「路径 + 名称 + 拼音字段」共 80 字节），
+/// 实测仅结构体内联就有 120 字节，再加路径 / 名字 / 全拼 / 简拼四条堆字符串，
+/// 平均约 220 字节——旧常数让设置页把占用少报了 3 倍。去掉反向定位表后
+/// 内联降到 96 字节（ASCII 名约 155 B、中文名约 205 B），
+/// 真实值由 `heap_bytes` 上报，这个常数只在不该有索引时兜底。
+const INDEX_ENTRY_BYTES: usize = 220;
 
 /// 后台预建拼音缓存的条目数上限：比这更大的目录只在真的有搜索词时才算
 /// （否则每进一个大目录就白烧一个后台核）。
@@ -272,6 +290,8 @@ const THUMB_CACHE_MAX_ITEMS: usize = 4096;
 /// 缩略图缓存字节预算（192 MB）。Rove 的 Image 常驻 CPU 侧 RGBA，
 /// 按最大尺寸(132px*2.0=264px)每张约 278 KB，192 MB 可存约 690 张。
 const THUMB_CACHE_MAX_BYTES: usize = 192 * 1024 * 1024;
+/// 失败负缓存的条数上限（先进先出淘汰）。
+const THUMB_FAILED_MAX_ITEMS: usize = 4096;
 /// 缩略图磁盘缓存预算（512 MB，对标 Pulse）。超限按最后修改时间淘汰到 80%。
 const THUMB_DISK_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -967,6 +987,12 @@ pub struct App {
     /// 框选基线：按下时若按住 Ctrl/Shift，记录当时的选择集作为累加底本；
     /// None 表示普通替换式框选。预览与结束都基于它重算，矩形缩回时高亮也跟着缩回。
     rubber_band_base: Option<HashSet<PathBuf>>,
+    /// 本轮按下被「空白层兜底」当成行点击处理了（见 `background_pointer_event`）。
+    /// 抬手时空白层会把 `hits=0` 的单击当「点空白 → 取消选择」，
+    /// 不拦住的话刚选中的行会立刻被取消，表现为闪一下选中又掉。
+    bg_hit_row: bool,
+    /// 空白处右键按下时先存下菜单，等抬手再弹（见 `background_pointer_event`）。
+    deferred_bg_menu: Option<MenuScope>,
     /// 已经做过「列宽自适应」的目录键，按栏记录（左 0 / 右 1）。
     /// 每个目录只在打开时算一次，避免滚动 / 刷新时反复重算导致列宽跳动。
     /// 必须按栏分：两栏可能在不同目录，共用一个键会让切焦点时用另一栏的内容
@@ -1043,8 +1069,18 @@ pub struct App {
     thumb_cache_bytes: usize,
     /// 已请求未完成的缩略图（防重复提交）。
     thumb_pending: HashSet<ThumbKey>,
+    /// 上次 `sync_tabs` 下发的标签模型指纹（内容相同就不换模型，见该函数）。
+    last_tabs_sig: std::cell::Cell<u64>,
+    /// 上次打印内存明细的时刻（`ROVE_LOG=2` 节流 2 秒）。
+    last_mem_log: Option<std::time::Instant>,
     /// 失败负缓存（本会话内不再重试）。
+    ///
+    /// 有上限：长会话翻遍一堆没有缩略图的目录（压缩包、字体、系统文件）
+    /// 会攒出几万条 PathBuf，只增不减就是慢性泄漏。上限按先进先出淘汰，
+    /// 淘汰掉的老条目最多被重试一次，代价远小于永不释放。
     thumb_failed: HashSet<ThumbKey>,
+    /// 负缓存的插入顺序（FIFO 淘汰用，与 `thumb_failed` 同步增删）。
+    thumb_failed_order: VecDeque<ThumbKey>,
     /// 批量刷新标记：后台有缩略图到达时置位，由 poll_timer 统一刷新。
     thumb_needs_refresh: bool,
     /// 缩略图请求通道：**全部**请求走同一条队列，顺序即渲染顺序。
@@ -1238,6 +1274,8 @@ impl App {
             drop_timer: Timer::default(),
             drag_pending: None,
             rubber_band_base: None,
+            bg_hit_row: false,
+            deferred_bg_menu: None,
             autofit_key: [None, None],
             cur_col_widths: [
                 [
@@ -1273,7 +1311,10 @@ impl App {
             thumb_use_seq: 0,
             thumb_cache_bytes: 0,
             thumb_pending: HashSet::new(),
+            last_tabs_sig: std::cell::Cell::new(0),
+            last_mem_log: None,
             thumb_failed: HashSet::new(),
+            thumb_failed_order: VecDeque::new(),
             thumb_needs_refresh: false,
             syncing_tab: false,
             first_run_pending: false,
@@ -1311,6 +1352,7 @@ impl App {
     }
 
     /// 请求列举目录（工作线程执行）。
+    #[track_caller]
     fn request_listing(
         &self,
         tab_id: u32,
@@ -1319,7 +1361,10 @@ impl App {
         path: Option<PathBuf>,
         sort: SortState,
     ) {
-        logv!("request_listing tab={tab_id} pane={pane} gen={generation} path={path:?}");
+        logv!(
+            "request_listing tab={tab_id} pane={pane} gen={generation} path={path:?} from {}",
+            std::panic::Location::caller()
+        );
         let _ = self.list_tx.send(ListRequest {
             tab_id,
             pane,
@@ -1342,7 +1387,12 @@ impl App {
         };
         // 只有聚焦面板才点亮标签的“加载中”，否则非聚焦面板的结果不会去清它。
         if pane_index == tab.active_pane {
-            tab_loading_flag(&self.ui, tab_index == self.state.active_tab, true);
+            tab_loading_flag(
+                &self.ui,
+                tab_index == self.state.active_tab,
+                true,
+                !pane.display.is_empty(),
+            );
         }
         self.request_listing(
             tab.id,
@@ -1535,7 +1585,7 @@ impl App {
                 pane.entries.len()
             );
             if result.pane == tab.active_pane {
-                tab_loading_flag(&self.ui, is_active_tab, false);
+                tab_loading_flag(&self.ui, is_active_tab, false, true);
             }
             // 自动重试登记：同一面板连续失败时累加次数，3 次以后收手。
             let tries = self
@@ -1886,6 +1936,10 @@ impl App {
             self.visible_cache = None;
             self.visible_cache_right = None;
             self.sync_file_list();
+            // 进目录 / 刷新后打一条内存明细（`ROVE_LOG=2`，2 秒节流）：
+            // 「越用越大」这类慢性问题只有在日常导航中连续采样才看得出来，
+            // 只在启动时打一条的话，翻十分钟大目录那一段完全是盲区。
+            self.log_memory_snapshot();
             if listed_is_active {
                 self.sync_status();
                 self.sync_nav();
@@ -2538,10 +2592,14 @@ impl App {
     }
 }
 
-/// 设置标签栏加载态（仅影响激活标签的 spinner）。
-fn tab_loading_flag(ui: &MainWindow, is_active: bool, loading: bool) {
+/// 标签图标处的加载圆点（仅影响激活标签）。
+///
+/// 只在「这一栏还没有任何内容」时点亮：刷新、被文件操作重载、恢复会话时的
+/// 重复列举都会短暂把 loading 置真，那时列表里明明已经有内容，圆点却把标签
+/// 图标顶掉再换回来 —— 看起来就是「标签图标闪了一下圆点」。
+fn tab_loading_flag(ui: &MainWindow, is_active: bool, loading: bool, has_content: bool) {
     if is_active {
-        ui.set_tab_loading(loading);
+        ui.set_tab_loading(loading && !has_content);
     }
 }
 
@@ -3921,25 +3979,6 @@ impl App {
     /// 最多几次；一秒十几次就说明有东西在空转，专门记一行取证（带调用点）。
     #[track_caller]
     fn sync_tabs(&self) {
-        {
-            use std::sync::atomic::Ordering;
-            let now = now_ms();
-            if now.saturating_sub(SYNC_TABS_WINDOW_MS.load(Ordering::Relaxed)) > 1000 {
-                SYNC_TABS_WINDOW_MS.store(now, Ordering::Relaxed);
-                SYNC_TABS_COUNT.store(0, Ordering::Relaxed);
-            } else {
-                let n = SYNC_TABS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-                if n >= 10
-                    && now.saturating_sub(SYNC_TABS_LOGGED_MS.load(Ordering::Relaxed)) >= 2000
-                {
-                    SYNC_TABS_LOGGED_MS.store(now, Ordering::Relaxed);
-                    logln!(
-                        "!! [tab] 标签模型 1s 内重建 {n} 次（悬停会闪、点击会丢），最近一次来自 {}",
-                        std::panic::Location::caller()
-                    );
-                }
-            }
-        }
         let tabs: Vec<TabInfo> = self
             .state
             .tabs
@@ -3973,15 +4012,70 @@ impl App {
                 }
             })
             .collect();
-        self.ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
-        self.ui.set_active_tab(self.state.active_tab as i32);
-        self.ui.set_tab_loading(self.state.active().active().loading);
-        self.ui.set_settings_open(self.state.active().kind == crate::state::TabKind::Settings);
+        // 指纹去重：内容没变就**不**换模型。
+        //
+        // `set_tabs` 传入新 ModelRc 会让 Slint 的 Repeater 销毁并重建全部标签
+        // 实例：悬停态被清零、点击落在被销毁的实例上、标签栏整条重新布局。
+        // 恢复会话时每个标签的列举结果都会各自调一次 `sync_tabs`，10 个标签就是
+        // 10 次重建 —— 日志里那条 `!! [tab] 标签模型 1s 内重建 10 次` 就是这么来的。
+        // 内容没变时换模型纯属副作用，跳过它。
+        // 标签上的加载圆点只在「这一栏还没有任何内容」时点亮。
+        // 刷新、被文件操作重载、恢复会话时的重复列举都会短暂把 loading 置真，
+        // 那时列表里明明已经有内容，圆点却把标签图标顶掉又换回来 —— 看起来
+        // 就是「标签图标闪了一下圆点」。没有内容时才需要这个提示。
+        let active_pane_now = self.state.active().active();
+        let loading_flag = active_pane_now.loading && active_pane_now.display.is_empty();
+        let settings_open = self.state.active().kind == crate::state::TabKind::Settings;
         // 标题栏实时显示当前聚焦标签的名称（切换标签、导航、设置子页都会走这里）。
         let window_title = format!(
             "{} - Rove",
             i18n::text(&self.config.language, &self.state.active().title())
         );
+        let sig = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            for t in &tabs {
+                t.id.hash(&mut h);
+                t.title.as_str().hash(&mut h);
+                t.icon_text.as_str().hash(&mut h);
+                t.active.hash(&mut h);
+                t.is_settings.hash(&mut h);
+            }
+            self.state.active_tab.hash(&mut h);
+            loading_flag.hash(&mut h);
+            settings_open.hash(&mut h);
+            window_title.hash(&mut h);
+            h.finish()
+        };
+        // 圆点必须**无条件**写一次：`reload_pane` 里有直写通道，若这里因指纹
+        // 相同提前返回，那个 true 就再也没人去清，圆点会一直闪。
+        self.ui.set_tab_loading(loading_flag);
+        if self.last_tabs_sig.replace(sig) == sig {
+            return;
+        }
+        {
+            use std::sync::atomic::Ordering;
+            let now = now_ms();
+            if now.saturating_sub(SYNC_TABS_WINDOW_MS.load(Ordering::Relaxed)) > 1000 {
+                SYNC_TABS_WINDOW_MS.store(now, Ordering::Relaxed);
+                SYNC_TABS_COUNT.store(0, Ordering::Relaxed);
+            } else {
+                let n = SYNC_TABS_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= 10
+                    && now.saturating_sub(SYNC_TABS_LOGGED_MS.load(Ordering::Relaxed)) >= 2000
+                {
+                    SYNC_TABS_LOGGED_MS.store(now, Ordering::Relaxed);
+                    logln!(
+                        "!! [tab] 标签模型 1s 内重建 {n} 次（悬停会闪、点击会丢），最近一次来自 {}",
+                        std::panic::Location::caller()
+                    );
+                }
+            }
+        }
+        self.ui.set_tabs(ModelRc::new(VecModel::from(tabs)));
+        self.ui.set_active_tab(self.state.active_tab as i32);
+        self.ui.set_tab_loading(loading_flag);
+        self.ui.set_settings_open(settings_open);
         self.ui.set_window_title(window_title.into());
     }
 
@@ -5102,7 +5196,7 @@ impl App {
                     size
                 );
                 self.thumb_pending.remove(&key);
-                self.thumb_failed.insert(key);
+                self.mark_thumb_failed(key);
             }
             // 缩略图诊断（ROVE_LOG=1）：本窗口前 24 条「真的发出去了」的请求。
             // 顺序 = `[thumb] window ... order=[...]` 里的顺序。
@@ -5190,6 +5284,20 @@ impl App {
         self.ui_scale.max(1.0)
     }
 
+    /// 登记一条缩略图失败。超过上限时按插入顺序淘汰最老的几条。
+    fn mark_thumb_failed(&mut self, key: ThumbKey) {
+        if !self.thumb_failed.insert(key.clone()) {
+            return;
+        }
+        self.thumb_failed_order.push_back(key);
+        while self.thumb_failed.len() > THUMB_FAILED_MAX_ITEMS {
+            let Some(old) = self.thumb_failed_order.pop_front() else {
+                break;
+            };
+            self.thumb_failed.remove(&old);
+        }
+    }
+
     /// 标记缩略图失败（清理 pending + 负缓存，本会话不再重试）。
     fn fail_thumbnail(&mut self, key: ThumbKey) {
         // 诊断（ROVE_LOG=1）：到图（含失败）顺序，与 send 顺序对照就能看出
@@ -5201,7 +5309,7 @@ impl App {
             key.px_size
         );
         self.thumb_pending.remove(&key);
-        self.thumb_failed.insert(key);
+        self.mark_thumb_failed(key);
         // 负缓存已经挡住后续请求，这一行不会再自己变；立刻重画一次，
         // 否则它会一直空着直到下次窗口尺寸/排序变化。
         self.thumb_needs_refresh = true;
@@ -8311,6 +8419,82 @@ impl App {
         let raw = crate::ops::actions::load_or_create();
         self.actions = crate::ops::actions::heal_full(&raw);
     }
+    /// `ROVE_LOG=2` 内存明细（节流 2 秒）。
+    ///
+    /// 分项打印常驻占用，用来对比优化前后到底是哪一块变小了——任务管理器
+    /// 只给一个总数，看不出索引 / 缩略图 / 标签页各占多少。
+    ///
+    /// 三个采样点：启动完成、每次进入/刷新目录、空闲时每 15 秒。
+    /// 翻目录时最多每 2 秒一条 —— 静默级别下不产生任何开销，看内存时才开。
+    fn log_memory_snapshot(&mut self) {
+        if !log_enabled(2) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if self
+            .last_mem_log
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(2))
+        {
+            return;
+        }
+        self.last_mem_log = Some(now);
+        let where_txt = self
+            .state
+            .tabs
+            .get(self.state.active_tab)
+            .and_then(|t| t.panes.get(t.active_pane))
+            .and_then(|p| p.path.as_ref())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "—".to_string());
+
+        let (idx_entries, idx_heap, idx_ready) = crate::search::index::try_shared()
+            .and_then(|i| {
+                i.try_read()
+                    .ok()
+                    .map(|g| (g.entries.len(), g.heap_bytes, g.ready))
+            })
+            .unwrap_or((0, 0, false));
+        let disk = crate::search::index::cache_file_size().unwrap_or(0);
+        let mut tab_count = 0usize;
+        let mut pane_count = 0usize;
+        let mut entry_total = 0usize;
+        let mut pinyin_total = 0usize;
+        let mut deep_total = 0usize;
+        let mut history_total = 0usize;
+        let mut memo_total = 0usize;
+        for tab in &self.state.tabs {
+            tab_count += 1;
+            for pane in &tab.panes {
+                pane_count += 1;
+                entry_total += pane.entries.len();
+                pinyin_total += pane.pinyin_cache.len();
+                deep_total += pane.deep_entries.len();
+                history_total += pane.history.len();
+                memo_total += pane.path_scroll_memo.len();
+            }
+        }
+        let (ws, priv_bytes) = crate::sys::mem::usage().unwrap_or((0, 0));
+        crate::logv!(
+            "[mem] {where_txt} | 进程 工作集 {:.1}MB / 私有 {:.1}MB | 索引 {} 条 ~{}MB（就绪={} 磁盘 {}MB） | 缩略图 {} 张 {:.1}MB（负缓存 {}） | 标签 {} 个 / 窗格 {}，条目共 {} 拼音共 {} 深度 {} | 滚动记忆 {} 历史 {} 页",
+            ws as f64 / (1024.0 * 1024.0),
+            priv_bytes as f64 / (1024.0 * 1024.0),
+            idx_entries,
+            idx_heap / (1024 * 1024),
+            idx_ready,
+            disk / (1024 * 1024),
+            self.thumb_cache.len(),
+            self.thumb_cache_bytes as f64 / (1024.0 * 1024.0),
+            self.thumb_failed.len(),
+            tab_count,
+            pane_count,
+            entry_total,
+            pinyin_total,
+            deep_total,
+            memo_total,
+            history_total,
+        );
+    }
+
     /// 搜索索引看板指标：优先 `try_read`，绝不在 UI 线程阻塞等待构建写锁。
     ///
     /// `with_drives` 为 false 时只刷新高频指标（条目数 / 大小 / 状态），
@@ -8319,9 +8503,9 @@ impl App {
         let snapshot = crate::search::index::try_shared().and_then(|i| {
             i.try_read()
                 .ok()
-                .map(|g| (g.ready, g.entries.len(), g.built_at))
+                .map(|g| (g.ready, g.entries.len(), g.built_at, g.heap_bytes))
         });
-        let (is_ready, entry_count, built_at) = snapshot.unwrap_or((false, 0, None));
+        let (is_ready, entry_count, built_at, heap_bytes) = snapshot.unwrap_or((false, 0, None, 0));
 
         self.ui.set_search_ready(is_ready);
         let status_text = if is_ready {
@@ -8333,8 +8517,13 @@ impl App {
         };
         self.ui.set_search_status_text(status_text);
         self.ui.set_search_items_count(format!("{entry_count}").into());
-        let real_bytes = crate::search::index::cache_file_size()
-            .unwrap_or_else(|| (entry_count * INDEX_ENTRY_BYTES) as u64);
+        // 这张卡显示的是**常驻内存**（用户关心的是任务管理器里的数字），
+        // 磁盘上的 index.bin 只是它的来源，比内存小一半多。
+        let real_bytes = if heap_bytes > 0 {
+            heap_bytes as u64
+        } else {
+            (entry_count * INDEX_ENTRY_BYTES) as u64
+        };
         self.ui.set_search_size_text(fs::format_size_bytes(real_bytes).into());
         let en = !i18n::is_chinese(&self.config.language);
         let last_scan = if is_ready {
@@ -11856,9 +12045,72 @@ impl App {
         self.submit_job(kind);
     }
 
-    fn background_pointer_event(&mut self, event: &PointerEvent, _x: f32, _y: f32) {
+    fn background_pointer_event(&mut self, event: &PointerEvent, x: f32, y: f32) {
         if event.kind != PointerEventKind::Down {
             return;
+        }
+        // 每次新按下都复位：上一下的兜底标记不能留到下一轮。
+        self.bg_hit_row = false;
+        // 兜底：按下点其实正压在某个条目上，却落到了空白层。
+        //
+        // 实测（ROVE_LOG=2）：原生右键菜单关闭后的第一次点击、以及排序后刷新
+        // 完的第一次点击，会绕过行自己的 TouchArea 直接进到这里 —— 日志里
+        // `at=(860,378)` 落在第 12 行内，紧接着同一位置的第二次点击才记
+        // `[select] row down index=12`。玩家观感就是「第一次点击被吞了」。
+        // 这里按单击选中处理，行为与行上的点击一致（不含拖出与改名意图）。
+        if event.button == PointerEventButton::Left {
+            if let Some(di) = self.row_index_at(x, y) {
+                let Some(path) = self
+                    .state
+                    .active()
+                    .active()
+                    .display_entry(di)
+                    .map(|e| e.path.clone())
+                else {
+                    return;
+                };
+                // 双击判定必须和行上的点击共用同一套状态：否则「被吃掉的第一下
+                // + 立刻双击」的第二下会被当成第一次按下，只是选中而不打开。
+                self.last_left_press_row = Some(path.clone());
+                self.bg_hit_row = true;
+                let now = std::time::Instant::now();
+                if self.last_click.as_ref().is_some_and(|(p, t)| {
+                    *p == path && t.elapsed().as_millis() < effective_double_click_ms() as u128
+                }) {
+                    self.last_click = None;
+                    self.cancel_rename_defer();
+                    logv!("[select] background hit row {} at=({:.0},{:.0}) -> 双击打开", di, x, y);
+                    self.activate_row(di);
+                    return;
+                }
+                self.last_click = Some((path.clone(), now));
+                self.pending_single_click = None;
+                let ctrl = key_down(VK_CONTROL);
+                let tab = self.state.active_mut().active_mut();
+                if ctrl {
+                    if !tab.selection.remove(&path) {
+                        tab.selection.insert(path.clone());
+                    }
+                    tab.anchor = Some(path);
+                } else {
+                    tab.selection.clear();
+                    tab.selection.insert(path.clone());
+                    tab.anchor = Some(path);
+                }
+                self.visible_cache = None;
+                self.visible_cache_right = None;
+                logv!(
+                    "[select] background hit row {} at=({:.0},{:.0}) ctrl={} sel={}",
+                    di,
+                    x,
+                    y,
+                    ctrl,
+                    self.state.active().active().selection.len()
+                );
+                self.refresh_visible_rows();
+                self.sync_status();
+                return;
+            }
         }
         // 点了空白：连续按下链断了，下次点名称只算第一次按下；挂起的改名也撤掉。
         self.last_left_press_row = None;
@@ -11875,9 +12127,13 @@ impl App {
                     None
                 };
                 logv!(
-                    "[select] rubber-band down additive={} base={}",
+                    "[select] rubber-band down additive={} base={} at=({:.0},{:.0}) rows={} view={}",
                     additive,
-                    self.rubber_band_base.as_ref().map_or(0, |b| b.len())
+                    self.rubber_band_base.as_ref().map_or(0, |b| b.len()),
+                    x,
+                    y,
+                    self.state.active().active().display.len(),
+                    self.config.view_mode
                 );
                 if !additive {
                     let tab = self.state.active_mut().active_mut();
@@ -11908,17 +12164,31 @@ impl App {
                 }
                 let target = MenuScope::Background;
                 self.menu_scope = Some(target.clone());
-                // 原生菜单是阻塞调用：返回即「菜单已收起」，此时 Shell 的新建动词
-                // 多半已经执行（或即将通过事件循环执行），所以推迟 250ms 主动
-                // 重载一次目录 —— 比等 1 秒的 mtime 轮询更快，也不依赖目录 mtime
-                // 是否被 Windows 及时更新。
-                self.open_menu(target);
-                if self.shell_new_watch.is_some() {
-                    self.shell_new_reload_at =
-                        Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
-                }
+                // 菜单推迟到**抬手**再弹（`open_deferred_background_menu`）。
+                //
+                // 在按下这一刻就弹菜单的话：菜单是独立窗口，它会吃掉属于这次
+                // 按下的抬手事件，Slint 记下的「这一下落在哪个元素上」就再也
+                // 清不掉 —— 之后任意一次按下都会被派给空白层，表现为右键菜单
+                // （排序方式在这里）之后的第一下点击不选中、第一下拖动变框选，
+                // 而且等多久都不会自愈。
+                self.deferred_bg_menu = Some(target);
             }
             _ => {}
+        }
+    }
+
+    /// 空白处右键抬手：真正弹出推迟的那份菜单。
+    fn open_deferred_background_menu(&mut self) {
+        let Some(target) = self.deferred_bg_menu.take() else {
+            return;
+        };
+        // 原生菜单返回即「菜单已收起」，此时 Shell 的新建动词多半已经执行
+        // （或即将通过事件循环执行），所以推迟 250ms 主动重载一次目录 ——
+        // 比等 1 秒的 mtime 轮询更快，也不依赖目录 mtime 是否被 Windows 及时更新。
+        self.open_menu(target);
+        if self.shell_new_watch.is_some() {
+            self.shell_new_reload_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(250));
         }
     }
 
@@ -11942,6 +12212,19 @@ impl App {
             }
         }
         hits
+    }
+
+    /// 点 (x, y)（flick 内容坐标）落在哪个显示条目上。
+    fn row_index_at(&self, x: f32, y: f32) -> Option<usize> {
+        let geom = RubberGeom::read(&self.ui, self.state.active().active_pane == 1);
+        let tab = self.state.active().active();
+        for di in 0..tab.display.len() {
+            let (ix, iy, iw, ih) = geom.rect(di);
+            if ix <= x && x < ix + iw && iy <= y && y < iy + ih {
+                return Some(di);
+            }
+        }
+        None
     }
 
     /// 框选的「焦点项」，即后续 Shift 连续选择的锚点。
@@ -11982,6 +12265,13 @@ impl App {
     fn handle_rubber_band_select(&mut self, x1: f32, y1: f32, x2: f32, y2: f32) {
         // 4px 以内视为点击 / 误触，或 UI 传零矩形表示 cancel：恢复按下前的选择。
         let dragged = (x1 - x2).abs() > 4.0 || (y1 - y2).abs() > 4.0;
+        // 这一下按下其实压在条目上（走了兜底），刚刚已经选中它了：
+        // 空白层的「单击＝点空白取消选择」不能在这里再跑一遍。
+        if !dragged && self.bg_hit_row {
+            self.bg_hit_row = false;
+            self.rubber_band_base = None;
+            return;
+        }
         let hits = if dragged {
             self.rubber_band_hits(x1, y1, x2, y2)
         } else {
@@ -12438,6 +12728,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                     // 探测在线程里跑：有变化才会经 40ms 轮询重绘侧栏。
                     app.request_sidebar_probe();
                     app.maybe_idle_rescan();
+                    app.log_memory_snapshot();
                 }
             });
     }
@@ -13559,10 +13850,15 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
     }
     {
         let app = Rc::downgrade(app);
+        let app_r = app.clone();
         upgrade().on_file_background_pointer_event(move |event, x, y| {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut()
                 .background_pointer_event(&event, x, y);
+        });
+        upgrade().on_file_background_right_up(move || {
+            let Some(app) = app_r.upgrade() else { return };
+            app.borrow_mut().open_deferred_background_menu();
         });
     }
     {
@@ -16184,14 +16480,21 @@ fn create_session(
         // 「在文件夹中显示」：必须在 reload_active 之前挂上，否则列举结果回来时
         // 没有目标可匹配（结果可能同帧就到，来不及补挂）。
         app.arm_reveal(initial_reveal);
-        app.reload_active();
+        // 恢复会话时上面已经给每个面板都发过列举请求，这里再刷一次就是同一目录
+        // 列两遍（网络盘上等于双倍等待 + 双倍 IO，日志里表现为同一 tab 两条
+        // request_listing）。新开的标签/navigate 分支自己会请求，不必兜底。
+        if !restored_last_tabs {
+            app.reload_active();
+        }
         // 启动即预热全盘索引：懒加载会让首次搜索撞上冷启动（等待扫描），
         // 且状态栏空等。shared() 是幂等的（OnceLock），常驻进程重复调用无副作用。
         //
         // 位置很关键：它要读十几万条缓存（实测约 300ms），而上面那次
         // `sync_file_list` 已经把窗格登记给 Shell 了。冷启动时「打开文件所在
         // 位置」的选中请求就在等这一步，绝不能让它挡在登记之前。
+        logln!("[boot] index warm-up start");
         let _ = crate::search::index::shared();
+        logln!("[boot] index warm-up done");
         // 启动时窗口还没显示，标签条其实一个像素都没布局（视口宽度为 0），
         // 恢复出来的「当前标签」可能落在可视区外，用户看不到自己在哪一页。
         // 这里只丢一个目标下标，TabBar 内部会等布局落定后补滚
@@ -16240,6 +16543,7 @@ fn create_session(
     app.borrow().ui.window().set_maximized(app.borrow().config.window_maximized);
     app.borrow().ui.set_win_maximized(!app.borrow().config.window_maximized);
 
+    logln!("[boot] showing window");
     app.borrow().ui.show().unwrap();
 
     // 强制立即重绘：让首次 RedrawRequested 尽快触发，及时应用首次启动 75% 居中
@@ -16256,8 +16560,11 @@ fn create_session(
     // 「第一次列举结果回来 → sync_file_list」，网络盘上就是好几秒之后 ——
     // 冷启动时浏览器/下载器的「打开文件所在位置」早就等不及了。
     app.borrow().publish_shell_windows();
+    logln!("[boot] shell registration done");
 
     logln!("session created");
+    // 启动就采一条：哪怕只开几秒也能看到「地板」是多少。
+    app.borrow_mut().log_memory_snapshot();
     SESSION_ALIVE.store(true, std::sync::atomic::Ordering::Release);
 }
 

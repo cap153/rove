@@ -22,12 +22,28 @@ pub fn char_pinyins(ch: char) -> Vec<&'static str> {
 }
 
 /// 一个条目的预计算拼音字段。
+///
+/// **不含**反向定位表（`indices`）：那张表按「每个字 10 字节」计费，中文名的
+/// 开销比字段本身还大，而它只在「屏幕上几十行要做命中高亮」时才用得上。
+/// 全盘索引上百万条、每个目录几千条都常驻，存它就是白占内存；
+/// 高亮时按名字现算（见 [`indices_for`]），代价只有微秒级。
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-#[allow(dead_code)] // indices 反向映射供后续命中高亮使用
 pub struct PinyinFields {
     pub full: Box<str>,
+    /// 简拼。**空串表示「与 `full` 相同」**：纯 ASCII 名的快路径里简拼和全拼
+    /// 本来就是同一份小写名字，再各存一份等于把文件名存三遍。
     pub abbr: Box<str>,
-    indices: Vec<FieldIndicesEntry>,
+}
+
+impl PinyinFields {
+    /// 简拼视图：ASCII 快路径下 `abbr` 是空的，此时简拼就是 `full`。
+    fn abbr_str(&self) -> &str {
+        if self.abbr.is_empty() {
+            &self.full
+        } else {
+            &self.abbr
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -41,44 +57,40 @@ struct FieldIndicesEntry {
     full_end: u16,
 }
 
-impl PinyinFields {
-    #[allow(dead_code)]
-    fn lookup(&self, idx: usize, abbr: bool) -> Option<usize> {
-        let idx = u16::try_from(idx).ok()?;
-        let start = |e: &FieldIndicesEntry| {
-            if abbr {
-                e.abbr_start
-            } else {
-                e.full_start
-            }
-        };
-        let end = |e: &FieldIndicesEntry| {
-            if abbr {
-                e.abbr_end
-            } else {
-                e.full_end
-            }
-        };
-        let pos = self.indices.partition_point(|e| start(e) <= idx);
-        let entry = pos.checked_sub(1).and_then(|p| self.indices.get(p))?;
-        (start(entry) <= idx && idx < end(entry)).then(|| entry.name_idx as usize)
-    }
+/// 计算 name 的全拼 / 简拼；需要反向定位表时用 [`indices_for`]。
+pub fn pinyin_fields(input: &str) -> PinyinFields {
+    walk(input, false).0
 }
 
-/// 计算 name 的全拼 / 简拼 / 反向索引。
-pub fn pinyin_fields(input: &str) -> PinyinFields {
+/// 只为高亮反查计算「简拼/全拼字符位置 → 原文第几个字」的定位表。
+///
+/// 拼接顺序与 [`walk`] 完全一致，所以这些 offset 能对上 [`pinyin_fields`]
+/// 算出来的 `full` / `abbr`。
+fn indices_for(input: &str) -> Vec<FieldIndicesEntry> {
+    walk(input, true).1
+}
+
+/// 遍历一遍名字，同时产出拼音字段与（可选的）反向定位表。
+fn walk(input: &str, collect_indices: bool) -> (PinyinFields, Vec<FieldIndicesEntry>) {
     if input.is_ascii() {
         let lower = input.to_ascii_lowercase();
-        return PinyinFields {
-            full: lower.clone().into(),
-            abbr: lower.into(),
-            indices: Vec::new(),
-        };
+        // 简拼留空 = 与 full 相同（见 `PinyinFields::abbr_str`）。
+        return (
+            PinyinFields {
+                full: lower.into(),
+                abbr: Box::default(),
+            },
+            Vec::new(),
+        );
     }
 
     let mut full = String::with_capacity(input.len() + 8);
     let mut abbr = String::with_capacity(input.len());
-    let mut indices = Vec::with_capacity(input.len());
+    let mut indices = if collect_indices {
+        Vec::with_capacity(input.len())
+    } else {
+        Vec::new()
+    };
     let char_len = |s: &str| s.chars().count() as u16;
 
     for (name_idx, ch) in input.chars().enumerate() {
@@ -94,13 +106,15 @@ pub fn pinyin_fields(input: &str) -> PinyinFields {
                 let letter = py.first_letter();
                 if seen_plain.insert(plain) {
                     full.push_str(plain);
-                    indices.push(FieldIndicesEntry {
-                        name_idx: name_idx as u16,
-                        abbr_start: abbr_start + seen_abbr.len() as u16,
-                        abbr_end: abbr_start + seen_abbr.len() as u16 + 1,
-                        full_start: char_len(&full) - char_len(plain),
-                        full_end: char_len(&full),
-                    });
+                    if collect_indices {
+                        indices.push(FieldIndicesEntry {
+                            name_idx: name_idx as u16,
+                            abbr_start: abbr_start + seen_abbr.len() as u16,
+                            abbr_end: abbr_start + seen_abbr.len() as u16 + 1,
+                            full_start: char_len(&full) - char_len(plain),
+                            full_end: char_len(&full),
+                        });
+                    }
                     handled = true;
                 }
                 if seen_abbr.insert(letter) {
@@ -114,22 +128,48 @@ pub fn pinyin_fields(input: &str) -> PinyinFields {
         if !handled {
             full.push(ch.to_ascii_lowercase());
             abbr.push(ch.to_ascii_lowercase());
-            indices.push(FieldIndicesEntry {
-                name_idx: name_idx as u16,
-                abbr_start,
-                abbr_end: char_len(&abbr),
-                full_start,
-                full_end: char_len(&full),
-            });
+            if collect_indices {
+                indices.push(FieldIndicesEntry {
+                    name_idx: name_idx as u16,
+                    abbr_start,
+                    abbr_end: char_len(&abbr),
+                    full_start,
+                    full_end: char_len(&full),
+                });
+            }
         }
     }
 
     indices.sort_by_key(|e| (e.abbr_start, e.full_start));
-    PinyinFields {
-        full: full.into(),
-        abbr: abbr.into(),
+    (
+        PinyinFields {
+            full: full.into(),
+            abbr: abbr.into(),
+        },
         indices,
-    }
+    )
+}
+
+/// 定位表反查：全拼/简拼里的第 `idx` 个字符来自原文的第几个字。
+fn lookup_indices(indices: &[FieldIndicesEntry], idx: usize, abbr: bool) -> Option<usize> {
+    let idx = u16::try_from(idx).ok()?;
+    let start = |e: &FieldIndicesEntry| {
+        if abbr {
+            e.abbr_start
+        } else {
+            e.full_start
+        }
+    };
+    let end = |e: &FieldIndicesEntry| {
+        if abbr {
+            e.abbr_end
+        } else {
+            e.full_end
+        }
+    };
+    let pos = indices.partition_point(|e| start(e) <= idx);
+    let entry = pos.checked_sub(1).and_then(|p| indices.get(p))?;
+    (start(entry) <= idx && idx < end(entry)).then(|| entry.name_idx as usize)
 }
 
 /// 查询是否匹配一个条目（name / 全拼 / 简拼任一命中即可）。
@@ -149,7 +189,7 @@ pub fn matches_query(
         return true;
     }
     if matcher
-        .fuzzy_match(Utf32Str::new(&fields.abbr, buf_c), q)
+        .fuzzy_match(Utf32Str::new(fields.abbr_str(), buf_c), q)
         .is_some()
     {
         return true;
@@ -171,7 +211,7 @@ pub fn score(
     let query_owned = query_lower.to_lowercase();
     let q = Utf32Str::new(&query_owned, buf_a);
     let mut best = matcher.fuzzy_match(Utf32Str::new(name, buf_b), q);
-    if let Some(s) = matcher.fuzzy_match(Utf32Str::new(&fields.abbr, buf_c), q) {
+    if let Some(s) = matcher.fuzzy_match(Utf32Str::new(fields.abbr_str(), buf_c), q) {
         best = Some(best.map_or(s, |b| b.max(s)));
     }
     if let Some(s) = matcher.fuzzy_match(Utf32Str::new(&fields.full, buf_b), q) {
@@ -194,6 +234,8 @@ pub fn highlight_ranges(
     let q = Utf32Str::new(&query_owned, buf_a);
     let total = name.chars().count();
     let mut idx_buf: Vec<u32> = Vec::new();
+    // 反向定位表按需现算（只有当前可见的几十行会走到这里）。
+    let mut indices: Option<Vec<FieldIndicesEntry>> = None;
 
     // 1) 原文命中:indices 直接就是 name 的 char 索引。
     if matcher
@@ -204,12 +246,13 @@ pub fn highlight_ranges(
     }
     // 2) 简拼命中:abbr 的 char 索引 → 反查 name 字符位置。
     if matcher
-        .fuzzy_indices(Utf32Str::new(&fields.abbr, buf_c), q, &mut idx_buf)
+        .fuzzy_indices(Utf32Str::new(fields.abbr_str(), buf_c), q, &mut idx_buf)
         .is_some()
     {
+        let table = indices.get_or_insert_with(|| indices_for(name));
         let mapped: Vec<usize> = idx_buf
             .iter()
-            .filter_map(|&i| fields.lookup(i as usize, true))
+            .filter_map(|&i| lookup_indices(table, i as usize, true))
             .collect();
         return merge_ranges(mapped, total);
     }
@@ -218,9 +261,10 @@ pub fn highlight_ranges(
         .fuzzy_indices(Utf32Str::new(&fields.full, buf_b), q, &mut idx_buf)
         .is_some()
     {
+        let table = indices.get_or_insert_with(|| indices_for(name));
         let mapped: Vec<usize> = idx_buf
             .iter()
-            .filter_map(|&i| fields.lookup(i as usize, false))
+            .filter_map(|&i| lookup_indices(table, i as usize, false))
             .collect();
         return merge_ranges(mapped, total);
     }
@@ -307,7 +351,10 @@ mod tests {
     fn ascii_fast_path() {
         let f = pinyin_fields("Firefox");
         assert_eq!(&*f.full, "firefox");
-        assert!(f.indices.is_empty());
+        // 简拼留空表示「与 full 相同」，不再重复存一份小写名。
+        assert!(f.abbr.is_empty());
+        assert_eq!(f.abbr_str(), "firefox");
+        assert!(indices_for("Firefox").is_empty());
     }
 
     #[test]

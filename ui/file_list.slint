@@ -216,6 +216,8 @@ export component FileList inherits Rectangle {
     /// 排查用：重命名输入框的生命周期/焦点状态（只在重命名期间输出）。
     callback rename-dbg(kind: string, has-focus: bool);
     callback background-pointer-event(event: PointerEvent, x: length, y: length);
+    /// 空白处右键**抬手**：到这一步才真正弹原生菜单（见 pointer-event 的说明）。
+    callback background-right-up();
     callback rename-committed(path: string, new_name: string);
     callback rename-cancelled();
     /// 排查用：图标视图名字区/浮层的全部尺寸与判断结果（仅几何或展开目标变化时上报）。
@@ -1174,6 +1176,16 @@ export component FileList inherits Rectangle {
                             // cancel：传零尺寸矩形，等价于撤销本轮框选。
                             root.rubber-band-selected(root.sel-x1, root.sel-y1, root.sel-x1, root.sel-y1);
                         }
+                        return EventResult.accept;
+                    }
+
+                    // 右键菜单必须在**抬手**才弹：菜单是另一个窗口，它会拿走
+                    // 属于这次按下的抬手事件，Slint 记下的「这一下是哪个元素
+                    // 按下的」就永远清不掉 —— 之后任意一次按下都会被派给这个
+                    // 元素。表现为排序 / 右键菜单之后的第一下点击或拖动落到
+                    // 空白层（选中不生效、拖动变成框选），等多久都一样。
+                    if (event.kind == PointerEventKind.up && event.button == PointerEventButton.right) {
+                        root.background-right-up();
                         return EventResult.accept;
                     }
 

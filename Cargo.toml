@@ -108,6 +108,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_IO",
     "Win32_Storage_FileSystem",
     "Win32_NetworkManagement_WNet",
+    # K32GetProcessMemoryInfo：`[mem]` 诊断日志打印进程自身工作集 / 私有字节。
+    "Win32_System_ProcessStatus",
     "Win32_Security",
 ] }
 

@@ -500,6 +500,8 @@ out property <length> row-height-out: file-list.row-height-out;
     callback file_scroll_changed_right(offset: length);
     callback split_ratio_changed(ratio: float);
     callback file_background_pointer_event(event: PointerEvent, x: length, y: length);
+    /// 空白处右键抬手（菜单推迟到这里才弹）。
+    callback file_background_right_up();
     callback file_rubber_band_selected(x1: length, y1: length, x2: length, y2: length);
     callback file_rubber_band_move(x1: length, y1: length, x2: length, y2: length);
     callback file_rename_committed(path: string, new_name: string);
@@ -1399,6 +1401,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                         root.file_background_pointer_event(event, x, y);
                     }
+                    background_right_up() => { root.file_background_right_up(); }
                     rubber_band_selected(x1, y1, x2, y2) => {
                         root.file_rubber_band_selected(x1, y1, x2, y2);
                     }
@@ -1572,6 +1575,7 @@ out property <length> row-height-out: file-list.row-height-out;
                                 root.file_background_pointer_event(event, x, y);
                             }
                         }
+                        background_right_up() => { root.file_background_right_up(); }
                         rename_committed(path, new-name) => {
                             root.file_rename_committed(path, new-name);
                         }

@@ -6,6 +6,7 @@
 //!   Information / AppData）避免噪声与超长扫描；
 //! - 总量上限 [`MAX_ENTRIES`]（达上限即停止，防止极端磁盘拖垮内存）。
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -33,6 +34,25 @@ pub struct GlobalIndex {
     pub ready: bool,
     /// 最近一次构建完成的时刻（用于设置页展示「上次同步」）。
     pub built_at: Option<std::time::SystemTime>,
+    /// 常驻内存估算（含堆上字符串）。设置页的「索引大小」与 `ROVE_LOG=1`
+    /// 的内存明细都用它——以前这里按 80 B/条估算，实测约 220 B/条，
+    /// 显示出来的数字比真实占用小 3 倍，看着安心其实是假的。
+    pub heap_bytes: usize,
+}
+
+/// 估算索引常驻内存：结构体内联 + 四条堆字符串（路径 / 名字 / 全拼 / 简拼）。
+pub fn estimate_heap(entries: &[IndexEntry]) -> usize {
+    let inline = std::mem::size_of::<IndexEntry>();
+    entries
+        .iter()
+        .map(|e| {
+            inline
+                + e.path.as_os_str().len()
+                + e.name.len()
+                + e.fields.full.len()
+                + e.fields.abbr.len()
+        })
+        .sum()
 }
 
 /// 一次全局索引查询的结果。
@@ -109,6 +129,18 @@ impl GlobalIndex {
 /// 共享句柄。
 pub type SharedIndex = Arc<RwLock<GlobalIndex>>;
 
+/// 索引缓存文件头魔数（8 字节，后面紧跟 4 字节小端格式版本）。
+///
+/// **必须有**。以前 `index.bin` 就是裸露的 bincode 数据，而 bincode 不带字段名：
+/// 只要 `IndexEntry` 的布局改一次（比如去掉反向定位表），旧数据就会被按新布局
+/// 「错位解析」——上一条的 `indices` 长度被当成 `is_dir`，后面的字节再被当成
+/// 下一条的 Vec 长度，于是启动时试图一次性分配几个 GB，界面永远出不来
+/// （真机复现过两次，日志停在 `request_listing` 之后再无输出）。
+/// 带上魔数与版本号后，旧文件在读任何条目之前就被判为过期，正常走重建。
+const CACHE_MAGIC: [u8; 8] = *b"ROVEIDX1";
+/// 缓存格式版本。**`IndexEntry` 布局有任何变化都必须 +1**。
+const CACHE_VERSION: u32 = 2;
+
 /// 全局索引单例（首次调用初始化，后台线程异步填充）。
 static INDEX: std::sync::OnceLock<SharedIndex> = std::sync::OnceLock::new();
 /// 构建轮次：新轮次启动会令旧轮次在下次检查时自行退出并丢弃结果。
@@ -173,31 +205,66 @@ fn save_cache(entries: &[IndexEntry]) -> std::io::Result<()> {
     }
     let tmp_path = path.with_extension("bin.tmp");
     let file = std::fs::File::create(&tmp_path)?;
-    let writer = std::io::BufWriter::new(file);
-    bincode::serialize_into(writer, entries)
+    let mut writer = std::io::BufWriter::new(file);
+    writer.write_all(&CACHE_MAGIC)?;
+    writer.write_all(&CACHE_VERSION.to_le_bytes())?;
+    bincode::serialize_into(&mut writer, entries)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    writer.flush()?;
     std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
-/// 启动时瞬时读取磁盘缓存，15ms 喂饱内存索引。
+/// 启动时读取磁盘缓存，喂饱内存索引。
+///
+/// **整文件读进内存再从切片解析**，不用 `bincode::deserialize_from(reader)`：
+/// 流式解析遇到格式错位的垃圾数据时，会把错误的长度前缀当成真实长度去预分配，
+/// 启动线程就卡在那儿（真机复现过：日志停在 `request_listing` 之后再无输出，
+/// 进程活着但窗口永远不出现）。切片解析的语义是「恰好读完全部字节」，
+/// 任何错位都会立刻返回错误。
 pub fn load_cache(idx: &SharedIndex) -> bool {
     let path = cache_path();
-    let Ok(file) = std::fs::File::open(&path) else {
+    let Ok(bytes) = std::fs::read(&path) else {
         return false;
     };
-    let mtime = file.metadata().ok().and_then(|m| m.modified().ok());
-    let reader = std::io::BufReader::new(file);
-    let Ok(entries): Result<Vec<IndexEntry>, _> = bincode::deserialize_from(reader) else {
+    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+    if bytes.len() < 12 {
+        logln!("index: cache too short ({} B), rebuild", bytes.len());
+        return false;
+    }
+    // 先验文件头：旧版本 / 别的程序写的文件一律不解析（见 CACHE_MAGIC 注释）。
+    if bytes[..8] != CACHE_MAGIC {
+        logln!("index: cache has no rove header (old format), rebuild");
+        return false;
+    }
+    let ver = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    if ver != CACHE_VERSION {
+        logln!("index: cache format v{ver} != v{CACHE_VERSION}, rebuild");
+        return false;
+    }
+    let Ok(mut entries): Result<Vec<IndexEntry>, _> = bincode::deserialize(&bytes[12..]) else {
+        logln!("index: cache deserialize failed, rebuild");
         return false;
     };
+    drop(bytes);
+    // 兜底：解析成功也不该超过上限（截断而不是整个丢掉）。
+    if entries.len() > MAX_ENTRIES {
+        logln!("index: cache has {} entries > cap, truncating", entries.len());
+        entries.truncate(MAX_ENTRIES);
+        entries.shrink_to_fit();
+    }
     let count = entries.len();
+    let heap = estimate_heap(&entries);
     if let Ok(mut w) = idx.write() {
         w.entries = entries;
         w.ready = true;
         w.built_at = mtime.or_else(|| Some(std::time::SystemTime::now()));
+        w.heap_bytes = heap;
     }
-    logln!("index: loaded {} cached entries from disk in instant start", count);
+    logln!(
+        "index: loaded {count} cached entries from disk (resident ~{} MB)",
+        heap / (1024 * 1024)
+    );
     true
 }
 
@@ -222,7 +289,10 @@ pub fn rebuild() -> SharedIndex {
         }
     }
     if let Ok(mut w) = idx.write() {
-        w.entries.clear();
+        // `clear()` 只把长度归零，旧的百万级容量数组会一直挂着：
+        // 重建期等于新旧两份同时驻留。换成空 Vec 立刻把容量还给分配器。
+        w.entries = Vec::new();
+        w.heap_bytes = 0;
         w.ready = false;
         w.built_at = None;
     }
@@ -311,12 +381,18 @@ fn spawn_builder(idx: SharedIndex) {
 
             // 1 微秒原子提交：写入主索引 live 槽
             let now = std::time::SystemTime::now();
+            let heap = estimate_heap(&entries);
             if let Ok(mut w) = idx.write() {
                 w.entries = entries;
                 w.ready = true;
                 w.built_at = Some(now);
+                w.heap_bytes = heap;
             }
-            logln!("global index built and committed: {} entries", count);
+            logln!(
+                "global index built and committed: {} entries (~{} MB resident)",
+                count,
+                heap / (1024 * 1024)
+            );
             // 通知 UI 索引就绪。用 Slint 原生跨线程投递，而非定时器轮询：
             // 零空转开销，且就绪与刷新落在同一事件循环 tick（微秒级，无视觉延迟）。
             // 事件循环尚未启动时会返回 Err——那种情况下用户还无法交互，
