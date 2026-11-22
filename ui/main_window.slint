@@ -1,7 +1,7 @@
 import { I18n } from "i18n.slint";
 // 让根组件把全局导出给 Rust（否则 include_modules! 不会生成公开类型）。
 export { I18n } from "i18n.slint";
-import { Theme, FileRow, GridLine, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup, SettingsDriveItem } from "common.slint";
+import { Theme, FileRow, GridLine, TabInfo, SidebarItem, StagingItem, BreadcrumbSegment, IconSearch, IconClose, IconRefresh, IconNavArrow, IconPlus, IconSplit, SettingsNavItem, SettingsActionGroup, SettingsShortcutGroup, SettingsDriveItem, TypeFilterItem } from "common.slint";
 import { TabBar } from "tab_bar.slint";
 import { Sidebar } from "sidebar.slint";
 import { FileList } from "file_list.slint";
@@ -473,6 +473,15 @@ out property <length> row-height-out: file-list.row-height-out;
     callback file_wheel_view(delta_y: length) -> bool;
     callback file_row_double_clicked(index: int);
     callback file_header_clicked(key: string);
+    /// 「类型」表头小箭头：打开筛选下拉（窗格号）。
+    callback file_type_filter_open(pane: int);
+    callback file_type_filter_pick(pane: int, index: int, toggle: bool);
+    callback file_type_filter_close();
+    /// 筛选下拉挂在哪个窗格（-1 = 关闭）。
+    in-out property <int> type-filter-pane: -1;
+    in-out property <bool> type-filter-active: false;
+    in-out property <bool> type-filter-active-right: false;
+    in-out property <[TypeFilterItem]> type-filter-items: [];
     callback file_col_resized(pane: int, index: int, width: length, name-w: length);
     callback file_scroll_changed(offset: length);
     /// 排查用：滚动位置变化时连同几何一并上报（Rust 仅在重命名期间落日志）。
@@ -1307,6 +1316,9 @@ out property <length> row-height-out: file-list.row-height-out;
                         edge-inset: root.is-split ? 3px : 7px;
                         visible: true;
                         rows: root.file-rows;
+                        type-filter-open: root.type-filter-pane == 0;
+                        type-filter-active: root.type-filter-active;
+                        type-filter-items: root.type-filter-items;
                     expand-index: root.file-expand-index;
                     rename-row: root.rename-pane == 0 ? root.file-rename-row : -1;
                     hover-expand-index: root.file-hover-expand-index;
@@ -1347,6 +1359,16 @@ out property <length> row-height-out: file-list.row-height-out;
                     header_clicked(key) => {
                         root.pane_focused(0);
                         root.file_header_clicked(key);
+                    }
+                    type-filter-open-request() => {
+                        root.pane_focused(0);
+                        root.file_type_filter_open(0);
+                    }
+                    type-filter-pick(index, toggle) => {
+                        root.file_type_filter_pick(0, index, toggle);
+                    }
+                    type-filter-close() => {
+                        root.file_type_filter_close();
                     }
                     scroll_changed(offset) => {
                         root.file_scroll_changed(offset);
@@ -1457,6 +1479,9 @@ out property <length> row-height-out: file-list.row-height-out;
                         height: 100%;
                         edge-inset: 7px;
                         rows: root.file-rows-right;
+                        type-filter-open: root.type-filter-pane == 1;
+                        type-filter-active: root.type-filter-active-right;
+                        type-filter-items: root.type-filter-items;
                         expand-index: root.file-expand-index-right;
                         rename-row: root.rename-pane == 1 ? root.file-rename-row : -1;
                         hover-expand-index: root.file-hover-expand-index-right;
@@ -1503,6 +1528,16 @@ out property <length> row-height-out: file-list.row-height-out;
                         header_clicked(key) => {
                             root.pane_focused(1);
                             root.file_header_clicked(key);
+                        }
+                        type-filter-open-request() => {
+                            root.pane_focused(1);
+                            root.file_type_filter_open(1);
+                        }
+                        type-filter-pick(index, toggle) => {
+                            root.file_type_filter_pick(1, index, toggle);
+                        }
+                        type-filter-close() => {
+                            root.file_type_filter_close();
                         }
                         scroll_changed(offset) => {
                             root.file_scroll_changed_right(offset);

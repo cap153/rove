@@ -73,6 +73,15 @@ pub struct PaneState {
     pub display: Vec<usize>,
     pub sort: SortState,
     pub filter: String,
+    /// 类型筛选（表头「类型」右侧的小箭头下拉）：空 = 不过滤。
+    /// 元素是类型键 —— 目录统一为 `"dir"`，文件是小写扩展名（无扩展名为 `"noext"`）。
+    /// 与搜索框的 `filter` 是两套独立的收窄条件，同时生效（AND）。
+    pub type_filter: Vec<String>,
+    /// 与 `history` 平行：每个页面各自的类型筛选。
+    /// 与 `history_filters` 同理 —— 筛选也要能前进/后退。
+    pub history_types: Vec<Vec<String>>,
+    /// 进入类型筛选前的滚动位置（清空筛选时回到这里，而不是弹回顶部）。
+    pub pre_type_scroll_y: f32,
     /// 选择集（按路径，跨排序/过滤稳定）。
     pub selection: HashSet<PathBuf>,
     /// 范围选择锚点（路径）。
@@ -109,6 +118,17 @@ pub struct PaneState {
     pub search_total: Option<usize>,
 }
 
+/// 条目在类型筛选里的键：目录统一 `dir`，文件是小写扩展名，无扩展名为 `noext`。
+pub fn type_key(e: &FileEntry) -> &str {
+    if e.is_dir {
+        "dir"
+    } else if e.ext.is_empty() {
+        "noext"
+    } else {
+        e.ext.as_str()
+    }
+}
+
 impl PaneState {
     pub fn new(path: Option<PathBuf>, sort: SortState) -> Self {
         Self {
@@ -124,6 +144,9 @@ impl PaneState {
             display: Vec::new(),
             sort, // 核心修改：使用传入的排序状态
             filter: String::new(),
+            type_filter: Vec::new(),
+            history_types: vec![Vec::new()],
+            pre_type_scroll_y: 0.0,
             selection: HashSet::new(),
             anchor: None,
             scroll_y: 0.0,
@@ -169,9 +192,11 @@ impl PaneState {
         let n = self.history_index + 1;
         self.history.truncate(n);
         self.history_filters.truncate(n);
+        self.history_types.truncate(n);
         self.history_scroll.truncate(n);
         self.history.push(path.clone());
         self.history_filters.push(String::new());
+        self.history_types.push(Vec::new());
         let restored = self.path_scroll_memo.get(&path).copied().unwrap_or(0.0);
         self.history_scroll.push(restored);
         self.history_index = self.history.len() - 1;
@@ -185,7 +210,9 @@ impl PaneState {
         self.generation += 1;
         self.loading = true;
         self.filter.clear();
+        self.type_filter.clear();
         self.pre_filter_scroll_y = 0.0;
+        self.pre_type_scroll_y = 0.0;
         self.search_total = None;
         self.clear_deep();
     }
@@ -210,6 +237,8 @@ impl PaneState {
             .get(index)
             .cloned()
             .unwrap_or_default();
+        // 类型筛选同样按页面恢复：后退能回到「筛之前」的全量列表。
+        self.type_filter = self.history_types.get(index).cloned().unwrap_or_default();
         self.selection.clear();
         self.anchor = None;
 
@@ -239,9 +268,13 @@ impl PaneState {
         if was_empty && !now_empty {
             // 记住搜索前的滚动位置，清空搜索框时回到这里。
             self.pre_filter_scroll_y = self.scroll_y;
-            self.push_search_page(text.to_string(), 0.0);
+            self.push_search_page(text.to_string(), 0.0, self.type_filter.clone());
         } else if !was_empty && now_empty {
-            self.push_search_page(String::new(), self.pre_filter_scroll_y);
+            self.push_search_page(
+                String::new(),
+                self.pre_filter_scroll_y,
+                self.type_filter.clone(),
+            );
         } else if !now_empty {
             if let Some(f) = self.history_filters.get_mut(self.history_index) {
                 *f = text.to_string();
@@ -250,16 +283,46 @@ impl PaneState {
         self.filter = text.to_string();
     }
 
-    fn push_search_page(&mut self, filter: String, scroll: f32) {
+    fn push_search_page(&mut self, filter: String, scroll: f32, types: Vec<String>) {
         let n = self.history_index + 1;
         self.history.truncate(n);
         self.history_filters.truncate(n);
+        self.history_types.truncate(n);
         self.history_scroll.truncate(n);
         self.history.push(self.path.clone());
         self.history_filters.push(filter);
+        self.history_types.push(types);
         self.history_scroll.push(scroll);
         self.history_index = self.history.len() - 1;
         self.scroll_y = scroll;
+    }
+
+    /// 类型筛选变化：与搜索词同样的历史规则 ——
+    /// 「开始筛」「清空筛」各记成一个可前进/后退的页面，筛选途中继续勾选只改本页。
+    pub fn set_type_filter(&mut self, keys: Vec<String>) {
+        if keys == self.type_filter {
+            return;
+        }
+        let was_empty = self.type_filter.is_empty();
+        let now_empty = keys.is_empty();
+        if let Some(s) = self.history_scroll.get_mut(self.history_index) {
+            *s = self.scroll_y;
+        }
+        if was_empty && !now_empty {
+            // 记住筛选前的滚动位置，清空筛选时回到这里。
+            self.pre_type_scroll_y = self.scroll_y;
+            self.push_search_page(self.filter.clone(), 0.0, keys.clone());
+        } else if !was_empty && now_empty {
+            self.push_search_page(
+                self.filter.clone(),
+                self.pre_type_scroll_y,
+                keys.clone(),
+            );
+        }
+        self.type_filter = keys.clone();
+        if let Some(t) = self.history_types.get_mut(self.history_index) {
+            *t = keys;
+        }
     }
 
     /// 上一级目录（盘符根之上为"此电脑"）。
@@ -318,7 +381,9 @@ impl PaneState {
         let (_, clean_query) = crate::search::parse_drive_prefix(&self.filter);
         let query = clean_query.trim().to_lowercase();
         if query.is_empty() {
-            self.display = (0..self.entries.len()).collect();
+            self.display = (0..self.entries.len())
+                .filter(|&i| self.matches_type_filter(&self.entries[i]))
+                .collect();
             return;
         }
         // 拼音缓存由后台线程算（大目录里同步算要十几到几十毫秒，会在输入
@@ -331,7 +396,9 @@ impl PaneState {
         let mut scored: Vec<(usize, u16)> = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
             let fields = self.pinyin_cache.get(i).unwrap_or(&no_pinyin);
-            if crate::search::matches_query(&e.name, fields, &query, &mut matcher, &mut bufs) {
+            if self.matches_type_filter(e)
+                && crate::search::matches_query(&e.name, fields, &query, &mut matcher, &mut bufs)
+            {
                 let s = crate::search::score(&e.name, fields, &query, &mut matcher, &mut bufs)
                     .unwrap_or(0);
                 scored.push((i, s));
@@ -350,11 +417,21 @@ impl PaneState {
         // 拼音命中）。此时绝不能把列表清空 —— 那会让界面闪一下「此文件夹为空」。
         // 先退回「全部条目」给用户看，缓存到手后 App 会再调一次本函数把结果收窄。
         if self.pinyin_cache.len() != self.entries.len() && scored.is_empty() {
-            self.display = (0..self.entries.len() + self.deep_entries.len()).collect();
+            // 类型筛选照样生效，否则「筛了只剩 PDF」时兜底会把全部条目又倒回来。
+            // 深度结果由后台按查询词自己过滤，类型键不在那边判定，原样并入。
+            self.display = (0..self.entries.len())
+                .filter(|&i| self.matches_type_filter(&self.entries[i]))
+                .chain(local_len..local_len + self.deep_entries.len())
+                .collect();
             return;
         }
         scored.sort_by(|a, b| b.1.cmp(&a.1));
         self.display = scored.into_iter().map(|(i, _)| i).collect();
+    }
+
+    /// 条目是否通过类型筛选（空筛选集 = 全通过）。
+    pub fn matches_type_filter(&self, e: &FileEntry) -> bool {
+        self.type_filter.is_empty() || self.type_filter.iter().any(|k| k == type_key(e))
     }
 
     /// 显示下标 → 条目。不依赖拼音缓存（普通导航时缓存可能未构建）。
@@ -569,6 +646,7 @@ impl AppState {
                 pane.path = Some(current.clone());
                 pane.history = vec![Some(current)];
                 pane.history_filters = vec![String::new()];
+                pane.history_types = vec![Vec::new()];
                 pane.history_scroll = vec![0.0];
             }
         }
@@ -686,6 +764,86 @@ mod tests {
 
     fn pane() -> PaneState {
         PaneState::new(Some(PathBuf::from("C:\\work")), SortState::default())
+    }
+
+    /// 类型筛选键：目录统一 `dir`，文件是小写扩展名，无扩展名 `noext`。
+    #[test]
+    fn type_key_separates_dirs_files_and_extensionless() {
+        let dir = crate::fs::dir::test_entry("子目录", true, 0);
+        assert_eq!(type_key(&dir), "dir");
+        let mut pdf = crate::fs::dir::test_entry("a.PDF", false, 0);
+        pdf.ext = "pdf".into();
+        assert_eq!(type_key(&pdf), "pdf");
+        let plain = crate::fs::dir::test_entry("LICENSE", false, 0);
+        assert_eq!(type_key(&plain), "noext");
+    }
+
+    /// 类型筛选按扩展名/目录收窄，并且与搜索词是「且」的关系。
+    #[test]
+    fn type_filter_narrows_display_and_combines_with_search() {
+        let mut p = pane();
+        let mut pdf = crate::fs::dir::test_entry("报告.pdf", false, 0);
+        pdf.ext = "pdf".into();
+        let mut txt = crate::fs::dir::test_entry("readme.txt", false, 0);
+        txt.ext = "txt".into();
+        let folder = crate::fs::dir::test_entry("子目录", true, 0);
+        p.entries = vec![folder, pdf, txt];
+        // 拼音缓存长度对齐（默认值即可）：否则 rebuild_display 会走
+        // 「拼音没算好先显示全部」的兜底分支，测不到真正的匹配路径。
+        p.pinyin_cache = vec![Default::default(); 3];
+
+        p.type_filter = vec!["pdf".into()];
+        p.rebuild_display();
+        assert_eq!(p.display, vec![1]);
+
+        // 与搜索词同时生效：类型对上但名字对不上，仍是空。
+        p.filter = "readme".into();
+        p.rebuild_display();
+        assert!(p.display.is_empty());
+        p.filter.clear();
+
+        // 只筛目录。
+        p.type_filter = vec!["dir".into()];
+        p.rebuild_display();
+        assert_eq!(p.display, vec![0]);
+
+        // 多选：pdf + txt。
+        p.type_filter = vec!["pdf".into(), "txt".into()];
+        p.rebuild_display();
+        assert_eq!(p.display, vec![1, 2]);
+
+        // 空筛选集 = 不过滤。
+        p.type_filter.clear();
+        p.rebuild_display();
+        assert_eq!(p.display, vec![0, 1, 2]);
+    }
+
+    /// 类型筛选要能前进/后退：开始筛压一页、清空筛再压一页、中途改只改本页。
+    #[test]
+    fn type_filter_participates_in_history() {
+        let mut p = pane();
+        p.entries = vec![crate::fs::dir::test_entry("a.pdf", false, 0)];
+        p.set_type_filter(vec!["pdf".into()]);
+        assert_eq!(p.history.len(), 2, "开始筛选应压入一页");
+        assert_eq!(p.history_types[1], vec!["pdf".to_string()]);
+        assert!(p.can_go_back());
+
+        // 中途改筛选：不新增历史页，只更新本页。
+        p.set_type_filter(vec!["pdf".into(), "txt".into()]);
+        assert_eq!(p.history.len(), 2);
+        assert_eq!(p.history_types[1].len(), 2);
+
+        // 后退：回到筛之前的全量页，筛选被清掉。
+        p.jump_to(0);
+        assert!(p.type_filter.is_empty());
+        // 前进：筛选恢复。
+        p.jump_to(1);
+        assert_eq!(p.type_filter, vec!["pdf".to_string(), "txt".to_string()]);
+
+        // 清空筛选 = 再压一页。
+        p.set_type_filter(Vec::new());
+        assert!(p.type_filter.is_empty());
+        assert!(p.history_types[p.history_index].is_empty());
     }
 
     /// 拼音缓存没算好时用纯文本兜底，算好后拼音命中随之补上。

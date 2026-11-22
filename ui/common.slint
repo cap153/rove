@@ -127,6 +127,13 @@ export struct SidebarItem {
     icon: image,
 }
 
+/// 「类型」表头下拉里的一行：文案 / 数量 / 是否勾选。
+export struct TypeFilterItem {
+    label: string,
+    count: int,
+    checked: bool,
+}
+
 export struct StagingItem {
     path: string,
     name: string,

@@ -1,5 +1,5 @@
 import { I18n } from "i18n.slint";
-import { Theme, FileRow, GridLine, HighlightName } from "common.slint";
+import { Theme, FileRow, GridLine, HighlightName, TypeFilterItem } from "common.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
 
 // 可排序表头单元格（公共部分）。
@@ -8,7 +8,12 @@ component SortCell inherits Rectangle {
     in property <string> label;
     in property <string> active-key;
     in property <bool> ascending;
+    /// 标题右侧是否带「筛选」小箭头（目前只有「类型」列有）。
+    in property <bool> show-filter: false;
+    /// 该列当前是否正在筛选（箭头变强调色，用户一眼能看出列表被收窄了）。
+    in property <bool> filter-active: false;
     callback clicked(string);
+    callback filter-clicked();
 
     height: 100%;
 
@@ -24,23 +29,43 @@ component SortCell inherits Rectangle {
         overflow: elide;
     }
 
-    // 当前排序列显示方向箭头。
-    if (root.active_key == root.key) : Text {
+    // 列右侧那个三角箭头：既是排序方向指示，也是「类型」列的筛选入口。
+    //  · 本列正在排序 → ▲/▼ 强调色；
+    //  · 「类型」列没在排序 → 常驻一个暗色 ▼，提示这里还能点开筛选；
+    //  · 正在筛选 → 变成强调色。
+    // 不再额外画一个小箭头（那会变成两个三角，而且容易被列宽拖拽手柄盖住）。
+    if (root.active_key == root.key || root.show-filter) : Text {
         x: root.width - 16px;
         width: 12px;
         height: parent.height;
-        text: root.ascending ? "▲" : "▼";
-        color: Theme.accent;
+        text: (root.active_key == root.key && root.ascending) ? "▲" : "▼";
+        color: (root.active_key == root.key || root.filter-active)
+            ? Theme.accent
+            : Theme.text-secondary;
         font-size: 8px;
         vertical-alignment: center;
         horizontal-alignment: center;
     }
 
+    // 整格：切换排序。
     TouchArea {
         width: 100%;
         height: 100%;
         clicked => {
             root.clicked(root.key);
+        }
+    }
+
+    // 「类型」列的箭头单独一块热区：点它开筛选，点别处仍然是排序。
+    // 必须声明在排序 TouchArea **之后** —— 后声明的在上层，否则点不动
+    // （之前的 bug 就是被整格热区盖住了）。
+    if (root.show-filter) : TouchArea {
+        x: root.width - 18px;
+        width: 16px;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => {
+            root.filter-clicked();
         }
     }
 }
@@ -171,6 +196,17 @@ export component FileList inherits Rectangle {
     callback wheel-view(delta-y: length) -> bool;
     callback row-double-clicked(index: int);
     callback header-clicked(key: string);
+    /// 「类型」表头右侧小箭头被点：请求打开筛选下拉。
+    callback type-filter-open-request();
+    /// 下拉里点了一行：`toggle` = 点的是前面的勾选框（多选），否则是点名称（单选）。
+    callback type-filter-pick(index: int, toggle: bool);
+    callback type-filter-close();
+    /// 筛选下拉是否展开（由 Rust 驱动：只有聚焦的那个窗格会开）。
+    in-out property <bool> type-filter-open: false;
+    /// 该窗格当前是否处于类型筛选状态（表头箭头变色）。
+    in property <bool> type-filter-active: false;
+    /// 下拉内容：当前目录里真实存在的类型 + 数量 + 勾选。
+    in property <[TypeFilterItem]> type-filter-items: [];
     callback scroll-changed(offset: length);
     /// 排查用：滚动位置变化时连同几何一并上报（Rust 仅在重命名期间落日志）。
     callback scroll-dbg(offset: length, content-h: length, view-h: length, min-y: length, content-y: length);
@@ -762,8 +798,14 @@ export component FileList inherits Rectangle {
                     label: I18n.strings[70];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
+                    // 「此电脑」视图没有真实的文件类型（都是磁盘），不给筛选。
+                    show-filter: !root.is-computer-view;
+                    filter-active: root.type-filter-active;
                     clicked(k) => {
                         root.header-clicked(k);
+                    }
+                    filter-clicked() => {
+                        root.type-filter-open-request();
                     }
                 }
                 SortCell {
@@ -2520,6 +2562,134 @@ export component FileList inherits Rectangle {
                         root.hv-press-armed = false;
                     }
                     return EventResult.reject;
+                }
+            }
+        }
+    }
+
+    // ---- 「类型」表头筛选下拉 ----
+    // 只有聚焦的那个窗格会开（`type-filter-open` 由 Rust 下发）。
+    // 先放一层透明遮罩：点列表任意处（含下拉以外）先关掉下拉，
+    // 与资源管理器一致 —— 这一下点击不穿透到下面的行。
+    if (root.type-filter-open) : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        background: transparent;
+
+        TouchArea {
+            width: 100%;
+            height: 100%;
+            clicked => {
+                root.type-filter-close();
+            }
+        }
+    }
+    if (root.type-filter-open) : Rectangle {
+        private property <length> row-h: 28px;
+        private property <length> pad-y: 6px;
+        private property <length> menu-w: min(240px, max(160px, root.width - 32px));
+        private property <length> menu-h: min(
+            root.type-filter-items.length * self.row-h + self.pad-y * 2,
+            max(120px, root.height - 40px)
+        );
+        // 贴着「类型」列标题左边缘，但绝不超出列表右侧。
+        x: max(0px, min(flick.content-x + root.col-type-x + 8px, root.width - self.menu-w - 8px));
+        // 略微压住表头下沿（-2px）：完全齐平时圆角+阴影仍会看出一条缝，
+        // 压一点点才显得是「从表头长出来的」。
+        y: 28px;
+        width: self.menu-w;
+        height: self.menu-h;
+        background: Theme.bg-popup;
+        border-radius: 10px;
+        border-width: 1px;
+        // 亮色不用强调色描边（否则一片绿框），与设置页下拉同一套规则。
+        border-color: Theme.dark ? Theme.accent.transparentize(0.45) : Theme.border;
+        drop-shadow-blur: 18px;
+        drop-shadow-color: #00000038;
+        drop-shadow-offset-y: 4px;
+        clip: true;
+
+        Flickable {
+            x: 0px;
+            y: parent.pad-y;
+            width: parent.width;
+            height: parent.height - parent.pad-y * 2;
+            content-width: parent.width;
+            content-height: root.type-filter-items.length * parent.row-h;
+            interactive: self.content-height > self.height;
+
+            for item[i] in root.type-filter-items : Rectangle {
+                y: i * 28px;
+                width: parent.width;
+                height: 28px;
+                background: row-ta.has-hover ? Theme.bg-hover : transparent;
+
+                // 勾选框（点它 = 多选；点名称 = 单选）
+                Rectangle {
+                    x: 10px;
+                    y: (parent.height - 16px) / 2;
+                    width: 16px;
+                    height: 16px;
+                    border-radius: 4px;
+                    background: item.checked ? Theme.accent : Theme.bg-input;
+                    border-width: 1px;
+                    border-color: item.checked ? Theme.accent : Theme.border;
+
+                    if (item.checked) : Path {
+                        x: 2.5px;
+                        y: 2.5px;
+                        width: parent.width - 5px;
+                        height: parent.height - 5px;
+                        viewbox-width: 11;
+                        viewbox-height: 11;
+                        stroke: #FFFFFF;
+                        stroke-width: 1.6px;
+                        stroke-line-cap: round;
+                        stroke-line-join: round;
+                        commands: "M 1.6 5.8 L 4.3 8.5 L 9.4 2.6";
+                    }
+                }
+
+                Text {
+                    x: 34px;
+                    width: parent.width - 34px - 42px;
+                    height: parent.height;
+                    text: item.label;
+                    color: Theme.text-primary;
+                    font-size: 12px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
+                Text {
+                    x: parent.width - 42px;
+                    width: 32px;
+                    height: parent.height;
+                    text: "\{item.count}";
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    horizontal-alignment: right;
+                }
+
+                row-ta := TouchArea {
+                    x: 28px;
+                    width: parent.width - 28px;
+                    height: 100%;
+                    clicked => {
+                        root.type-filter-pick(i, false);
+                    }
+                }
+                // 后声明 → 盖在名称区左侧，勾选框前面那一条算「多选」。
+                box-ta := TouchArea {
+                    x: 0px;
+                    width: 28px;
+                    height: 100%;
+                    clicked => {
+                        root.type-filter-pick(i, true);
+                    }
                 }
             }
         }

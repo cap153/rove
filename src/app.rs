@@ -298,6 +298,14 @@ enum MenuScope {
 }
 
 /// 目录列举请求。
+/// 类型筛选下拉里的一行（Rust 侧）。文案是给人看的类型名，
+/// `keys` 是它的真实筛选键集合（`dir` / 小写扩展名 / `noext`）。
+struct TypeFilterGroup {
+    label: String,
+    keys: Vec<String>,
+    count: usize,
+}
+
 struct ListRequest {
     tab_id: u32,
     /// 目标分屏面板下标（0 / 1）：分屏时两栏各自请求、各自回填。
@@ -797,6 +805,14 @@ pub struct App {
     /// 每个字符都会触发一次「全目录模糊匹配 + 打分 + 重排」；几万条的目录里
     /// 逐字重建会明显卡手，攒 150ms 再跑一次。
     pending_search: Option<(String, std::time::Instant)>,
+    /// 类型筛选下拉当前挂在哪个窗格上（`None` = 没开）。
+    type_filter_pane: Option<usize>,
+    /// 下拉每行背后的真实类型键。
+    ///
+    /// 下拉模型里只有「文案 / 数量 / 勾选」——文案是给人看的类型名（`PNG 图像`），
+    /// 而筛选判定要用扩展名。同一个类型名可能对应多个扩展名（jpg/jpeg 都叫
+    /// 「JPEG 图像」），所以点击回投时必须靠这张表还原成键集合。
+    type_filter_groups: Vec<TypeFilterGroup>,
     /// 侧边栏数据指纹，避免无变化时重建模型打断滚动。
     sidebar_fingerprint: u64,
     /// 左栏本帧真正写进行模型的窗口 (first, count)。
@@ -1167,6 +1183,8 @@ impl App {
             mtime_probe_busy: false,
             time_text_memo: std::collections::HashMap::new(),
             pending_search: None,
+            type_filter_pane: None,
+            type_filter_groups: Vec::new(),
             sidebar_fingerprint: 0,
             visible_cache: None,
             visible_cache_right: None,
@@ -1478,6 +1496,11 @@ impl App {
     /// 列举结果到达：代号匹配才应用。
     fn apply_list_result(&mut self, result: ListResult) {
         logv!("list_result tab={} gen={} n={}", result.tab_id, result.generation, result.entries.len());
+        // 列表内容换了（刷新/外部变更/新目录）：下拉里的类型行已经过时，
+        // 留着会让「点的行 ↔ 实际类型」错位，直接关掉。
+        if result.tab_id == self.state.tabs[self.state.active_tab].id {
+            self.close_type_filter_menu();
+        }
         // 新内容到了：连续按下链断掉（否则「上一目录点过 A，进来点同名 A 的名称」
         // 会被当成第二次按下直接进重命名）。
         self.last_left_press_row = None;
@@ -2032,6 +2055,7 @@ impl App {
         logv!("search query: {text:?}");
         let is_root = self.state.active().active().path.is_none();
         // 记录搜索页面（可前进/后退）以及搜索前的滚动位置。
+        self.close_type_filter_menu();
         self.state
             .active_mut()
             .active_mut()
@@ -2069,6 +2093,144 @@ impl App {
                 p.scroll_y = 0.0;
             }
             push_scroll(&self.ui, pane, 0.0);
+        }
+    }
+
+    /// 打开「类型」表头下拉：列出当前目录里真实存在的类型。
+    ///
+    /// 与搜索框是两套独立条件（AND）：搜索框按名字收窄，这里按扩展名收窄。
+    /// 空目录不开 —— 开了也只能给一个空盒子。
+    fn open_type_filter_menu(&mut self, pane_index: usize) {
+        if self.state.active().kind != crate::state::TabKind::Explorer {
+            return;
+        }
+        let has_entries = self
+            .state
+            .active()
+            .panes
+            .get(pane_index)
+            .is_some_and(|p| !p.entries.is_empty());
+        if !has_entries {
+            logv!("[type-filter] 空目录，不打开下拉 pane={pane_index}");
+            return;
+        }
+        self.sync_type_filter_menu(pane_index);
+        self.type_filter_pane = Some(pane_index);
+        self.ui.set_type_filter_pane(pane_index as i32);
+    }
+
+    /// 重建下拉模型（勾选状态跟着当前筛选走）。
+    fn sync_type_filter_menu(&mut self, pane_index: usize) {
+        let Some(pane) = self.state.active().panes.get(pane_index) else {
+            return;
+        };
+        // 分组按「类型名」而不是扩展名：与列表「类型」列显示的一致，
+        // jpg/jpeg 这种同名的会并成一行（资源管理器也是这么分的）。
+        let mut groups: Vec<TypeFilterGroup> = Vec::new();
+        let mut index_of: std::collections::HashMap<String, usize> = Default::default();
+        for e in &pane.entries {
+            let label = self.tr_type(&e.type_text).to_string();
+            let key = crate::state::type_key(e).to_string();
+            let slot = *index_of.entry(label.clone()).or_insert_with(|| {
+                groups.push(TypeFilterGroup {
+                    label,
+                    keys: Vec::new(),
+                    count: 0,
+                });
+                groups.len() - 1
+            });
+            let g = &mut groups[slot];
+            g.count += 1;
+            if !g.keys.contains(&key) {
+                g.keys.push(key);
+            }
+        }
+        // 目录行固定排最前（资源管理器一致），其余按类型名排。
+        groups.sort_by(|a, b| {
+            let ad = a.keys.iter().any(|k| k == "dir");
+            let bd = b.keys.iter().any(|k| k == "dir");
+            bd.cmp(&ad).then_with(|| a.label.cmp(&b.label))
+        });
+        let active = !pane.type_filter.is_empty();
+        let items: Vec<TypeFilterItem> = groups
+            .iter()
+            .map(|g| TypeFilterItem {
+                label: g.label.clone().into(),
+                count: g.count as i32,
+                // 一行代表一组扩展名：整组都选中才算勾上。
+                checked: active && g.keys.iter().all(|k| pane.type_filter.contains(k)),
+            })
+            .collect();
+        self.ui
+            .set_type_filter_items(ModelRc::new(VecModel::from(items)));
+        self.type_filter_groups = groups;
+    }
+
+    /// 下拉里点了一行：`toggle = true` 是点前面的勾选框（多选/取消），
+    /// `false` 是点名称（单选；点已经在筛的那个名称则取消筛选）。
+    fn type_filter_pick(&mut self, pane_index: usize, index: i32, toggle: bool) {
+        if index < 0 {
+            return;
+        }
+        let Some(group) = self.type_filter_groups.get(index as usize) else {
+            return;
+        };
+        let group_keys = group.keys.clone();
+        let current = self
+            .state
+            .active()
+            .panes
+            .get(pane_index)
+            .map(|p| p.type_filter.clone())
+            .unwrap_or_default();
+        let all_selected = group_keys.iter().all(|k| current.contains(k));
+        let mut keys = current.clone();
+        if toggle {
+            if all_selected {
+                keys.retain(|k| !group_keys.contains(k));
+            } else {
+                for key in group_keys {
+                    if !keys.contains(&key) {
+                        keys.push(key);
+                    }
+                }
+            }
+        } else if all_selected && current.len() == group_keys.len() {
+            // 再点一次「唯一已筛选」的名称 = 取消筛选。
+            keys.clear();
+        } else {
+            keys = group_keys;
+        }
+        self.apply_type_filter(pane_index, keys);
+        // 点名称是「一次选定」：选完就收起来（勾选框那条路保持展开，
+        // 方便连着勾好几类）。
+        if !toggle {
+            self.close_type_filter_menu();
+        }
+    }
+
+    /// 应用类型筛选：与搜索词一样记进历史页（可前进/后退），随后重建可见行。
+    fn apply_type_filter(&mut self, pane_index: usize, keys: Vec<String>) {
+        if let Some(pane) = self.state.active_mut().panes.get_mut(pane_index) {
+            pane.set_type_filter(keys);
+            pane.rebuild_display();
+        }
+        self.visible_cache = None;
+        self.visible_cache_right = None;
+        self.sync_file_list();
+        self.sync_status();
+        // 筛选改了历史页，前进/后退按钮的可用状态要跟着变。
+        self.sync_nav();
+        // 下拉开着的时候就地刷新勾选（资源管理器勾完不关菜单）。
+        if self.type_filter_pane == Some(pane_index) {
+            self.sync_type_filter_menu(pane_index);
+        }
+    }
+
+    /// 关掉类型筛选下拉（筛选结果本身保留）。
+    fn close_type_filter_menu(&mut self) {
+        if self.type_filter_pane.take().is_some() {
+            self.ui.set_type_filter_pane(-1);
         }
     }
 
@@ -3961,6 +4123,8 @@ impl App {
         // 3. 更新视图配置（注意：不再这里清 scroll_y / 滚到顶部）
         self.config.view_mode = mode.to_string();
         self.config.save();
+        // 表头只在详细信息视图存在：切走就没人能再操作这个下拉了。
+        self.close_type_filter_menu();
         self.ui.set_view_mode(mode.into());
         self.visible_cache = None;
         self.visible_cache_right = None;
@@ -4618,6 +4782,8 @@ impl App {
             is_computer1,
             single0,
             single1,
+            type_active0,
+            type_active1,
         ) = {
             let tab = self.state.active();
             let panes = &tab.panes;
@@ -4656,11 +4822,16 @@ impl App {
                 // 多选（>=2）时一律禁用，避免满屏浮层。
                 panes[0].selection.len() <= 1,
                 panes.get(1).map(|p| p.selection.len() <= 1).unwrap_or(false),
+                // 表头「类型」箭头的变色按栏判定（分屏时两栏可以各筛各的）。
+                !panes[0].type_filter.is_empty(),
+                panes.get(1).is_some_and(|p| !p.type_filter.is_empty()),
             )
         };
         // 多选时不弹名称浮层（左右栏各自判定）。
         self.ui.set_file_single_selection(single0);
         self.ui.set_file_single_selection_right(single1);
+        self.ui.set_type_filter_active(type_active0);
+        self.ui.set_type_filter_active_right(type_active1);
         self.ui.set_sort_key(sort_key.into());
         self.ui.set_sort_ascending(sort_asc);
         self.ui.set_sort_key_right(sort_key_right.unwrap_or(sort_key).into());
@@ -6377,6 +6548,8 @@ impl App {
 
     /// 切换标签后的完整同步。
     fn sync_active_tab(&mut self) {
+        // 类型下拉属于上一个标签的那个窗格，切标签就关掉。
+        self.close_type_filter_menu();
         // 打开保护伞：切换标签时，Slint 会因内容高度变化对 Flickable 自动 Clamp，
         // 触发残留的 scroll-changed 事件；此刻置位可避免其把旧标签的巨大坐标
         // 写进新标签的 scroll_y（否则表现为切标签白屏）。
@@ -6446,6 +6619,9 @@ impl App {
         // 搜索框马上要被改写成新面板的值：先把旧面板挂起的搜索词结算掉。
         self.flush_pending_search();
         let mut request = None;
+        // 关分屏会直接删掉右栏：挂在右栏上的类型下拉必须先收，
+        // 否则遮罩层还盖在左栏上、看起来像卡死了。
+        self.close_type_filter_menu();
         {
             let tab = self.state.active_mut();
             if tab.kind != crate::state::TabKind::Explorer {
@@ -6535,6 +6711,8 @@ impl App {
 
     /// 聚焦某一分屏面板（0 / 1），顶部地址栏与工具栏随之切换数据源。
     fn focus_pane(&mut self, index: usize) {
+        // 类型下拉挂在某一栏上：焦点换栏后它列的是旧栏的类型，关掉。
+        self.close_type_filter_menu();
         // 搜索框跟着聚焦面板走：切走之前先把旧面板挂起的搜索词结算掉。
         self.flush_pending_search();
         let active_tab = self.state.active_tab;
@@ -10870,6 +11048,8 @@ impl App {
     }
 
     fn sync_after_navigate(&mut self) {
+        // 换目录了：类型下拉里列的是上一个目录的类型，必须关掉。
+        self.close_type_filter_menu();
         // 导航时取消挂起的延迟重命名：导航会换目录/选择集，原路径可能不再有效，
         // 否则几百毫秒后会在新页面里误弹出重命名。
         self.cancel_rename_defer();
@@ -12504,6 +12684,18 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         }
         // 原生菜单打开时前台在菜单线程的窗口上，按键根本不会到 Rove；这里不再需要菜单开关。
 
+        // 类型筛选下拉开着：Esc 只关下拉（资源管理器同款），
+        // 不要继续落到「Esc 清空选择」这类全局动作上。
+        if app.type_filter_pane.is_some()
+            && matches!(
+                logical_key,
+                Key::Named(slint::winit_030::winit::keyboard::NamedKey::Escape)
+            )
+        {
+            app.close_type_filter_menu();
+            return EventResult::PreventDefault;
+        }
+
         let ctrl = key_down(VK_CONTROL);
         let shift = key_down(VK_SHIFT);
         let alt = key_down(VK_MENU);
@@ -13037,6 +13229,29 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         upgrade().on_file_header_clicked(move |key| {
             let Some(app) = app.upgrade() else { return };
             app.borrow_mut().header_clicked(key.as_ref());
+            // 排序会改列表顺序，下拉跟着关掉（否则它挂在一个已经变了的位置上）。
+            app.borrow_mut().close_type_filter_menu();
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_type_filter_open(move |pane| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().open_type_filter_menu(pane.max(0) as usize);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_type_filter_pick(move |pane, index, toggle| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().type_filter_pick(pane.max(0) as usize, index, toggle);
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_file_type_filter_close(move || {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().close_type_filter_menu();
         });
     }
     {
