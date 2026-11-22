@@ -581,13 +581,225 @@ mod imp {
         if clean.is_empty() || clean.contains(':') || clean.contains('>') {
             return None;
         }
+        // 每次按键刷新都会走这里，逐个比对显示名要调外壳，结果要缓存。
+        if let Ok(cache) = leaf_cache().lock() {
+            if let Some(hit) = cache.get(clean) {
+                return hit.clone();
+            }
+        }
+        let got = resolve_leaf_uncached(clean);
+        if let Ok(mut cache) = leaf_cache().lock() {
+            if cache.len() >= 64 {
+                cache.clear();
+            }
+            cache.insert(clean.to_string(), got.clone());
+        }
+        got
+    }
+
+    fn resolve_leaf_uncached(clean: &str) -> Option<PathBuf> {
         let profile = std::env::var("USERPROFILE").ok()?;
-        let p = Path::new(&profile).join(clean);
+        let profile = Path::new(&profile);
         // 漫游配置文件可能把 USERPROFILE 指到网络上：界面线程上不做这种 IO。
-        if crate::fs::dir::is_remote_path(&p) {
+        if crate::fs::dir::is_remote_path(profile) {
             return None;
         }
-        p.is_dir().then_some(p)
+        let direct = profile.join(clean);
+        if direct.is_dir() {
+            return Some(direct);
+        }
+        // 「文档」「桌面」「下载」这类是**本地化显示名**，真实目录叫 Documents /
+        // Desktop / Downloads，直接拼路径必然找不到。先查已知文件夹（能跟着
+        // OneDrive 重定向走），再扫用户目录一层，都用外壳显示名比对。
+        for dir in known_dirs() {
+            if matches_leaf(&dir, clean, true) {
+                return Some(dir);
+            }
+        }
+        for dir in profile_children(profile) {
+            if matches_leaf(&dir, clean, false) {
+                return Some(dir);
+            }
+        }
+        None
+    }
+
+    fn leaf_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>> {
+        static CACHE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>,
+        > = std::sync::OnceLock::new();
+        CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+    }
+
+    /// 中文系统里外壳给出的名字（`Documents` → 「文档」）。
+    ///
+    /// 为什么硬编码而不全靠外壳 API：这台机器上 `SHLoadIndirectString` /
+    /// `IShellItem::GetDisplayName` / `SHGetKnownFolderItem` 全都回英文
+    /// `Documents`，而文件对话框地址栏显示的偏偏是「文档」—— 对话框用的
+    /// 是它自己的命名资源。既然对不上，就用一张小表兜住实际会遇到的名字。
+    const ALIASES: &[(&str, &[&str])] = &[
+        ("Documents", &["文档", "我的文档"]),
+        ("Desktop", &["桌面"]),
+        ("Downloads", &["下载"]),
+        ("Pictures", &["图片", "我的图片"]),
+        ("Music", &["音乐", "我的音乐"]),
+        ("Videos", &["视频", "我的视频"]),
+        ("Favorites", &["收藏夹"]),
+    ];
+
+    /// 目录名（或它的外壳显示名 / 本地化名 / 中文别名）是否等于 `leaf`。
+    ///
+    /// `shell_names` 决定要不要额外问外壳两个显示名：那两次是 COM 调用，只在
+    /// 已知文件夹（最多 7 个）上做；用户目录下的几十个子目录只比名字，否则
+    /// 第一次遇到认不出的面包屑就会在界面线程上多花几十毫秒。
+    fn matches_leaf(dir: &Path, leaf: &str, shell_names: bool) -> bool {
+        if let Some(name) = dir.file_name().and_then(|n| n.to_str()) {
+            if name.eq_ignore_ascii_case(leaf) {
+                return true;
+            }
+            if let Some((_, alts)) = ALIASES
+                .iter()
+                .find(|(real, _)| real.eq_ignore_ascii_case(name))
+            {
+                if alts.contains(&leaf) {
+                    return true;
+                }
+            }
+        }
+        if !shell_names {
+            return false;
+        }
+        // 网络路径上取显示名可能卡在 SMB 上，而这里跑在界面线程。
+        if crate::fs::dir::is_remote_path(dir) {
+            return false;
+        }
+        display_name(dir).as_deref() == Some(leaf) || localized_name(dir).as_deref() == Some(leaf)
+    }
+
+    /// 外壳显示名（中文系统里 `Documents` → 「文档」）。
+    ///
+    /// 不用 `SHGetFileInfoW(SHGFI_DISPLAYNAME)`：对目录它常返回空串。走
+    /// `IShellItem::GetDisplayName(NORMALDISPLAY)` 才拿得到本地化名字。
+    #[cfg(windows)]
+    fn display_name(dir: &Path) -> Option<String> {
+        use windows::core::{PCWSTR, PWSTR};
+        use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+        use windows::Win32::UI::Shell::{IShellItem, SHCreateItemFromParsingName, SIGDN_NORMALDISPLAY};
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+            let wide: Vec<u16> = dir
+                .as_os_str()
+                .to_string_lossy()
+                .encode_utf16()
+                .chain([0])
+                .collect();
+            let item: IShellItem =
+                SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()?;
+            let name: PWSTR = item.GetDisplayName(SIGDN_NORMALDISPLAY).ok()?;
+            let len = (0..).take_while(|&i| *name.0.add(i) != 0).count();
+            let text = String::from_utf16_lossy(std::slice::from_raw_parts(name.0, len));
+            CoTaskMemFree(Some(name.0 as *const _));
+            Some(text)
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn display_name(_dir: &Path) -> Option<String> {
+        None
+    }
+
+    /// 文件夹的**本地化**名字（`desktop.ini` 的 `LocalizedResourceName`），
+    /// 也就是文件对话框地址栏/面包屑里显示的那一串（`Documents` → 「文档」）。
+    ///
+    /// 这是唯一跟对话框所见一致的名字来源：`IShellItem` 的 NORMALDISPLAY 在
+    /// 英文文件名的情况下还是回英文。
+    #[cfg(windows)]
+    fn localized_name(dir: &Path) -> Option<String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::UI::Shell::{SHGetLocalizedName, SHLoadIndirectString};
+        let wide: Vec<u16> = dir
+            .as_os_str()
+            .to_string_lossy()
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        let mut module = [0u16; 1024];
+        let mut resid = 0i32;
+        unsafe {
+            SHGetLocalizedName(PCWSTR(wide.as_ptr()), &mut module, &mut resid).ok()?;
+            let mlen = module.iter().position(|&c| c == 0).unwrap_or(0);
+            if mlen == 0 {
+                return None;
+            }
+            // `@模块,-资源号` 是间接字符串的写法：少了 `@` 会把原文原样吐回来。
+            let mut indirect: Vec<u16> = "@".encode_utf16().collect();
+            indirect.extend(String::from_utf16_lossy(&module[..mlen]).encode_utf16());
+            indirect.extend(format!(",-{resid}").encode_utf16());
+            indirect.push(0);
+            let mut out = [0u16; 256];
+            SHLoadIndirectString(PCWSTR(indirect.as_ptr()), &mut out, None).ok()?;
+            let len = out.iter().position(|&c| c == 0).unwrap_or(0);
+            if len == 0 {
+                return None;
+            }
+            Some(String::from_utf16_lossy(&out[..len]))
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn localized_name(_dir: &Path) -> Option<String> {
+        None
+    }
+
+    /// 已知文件夹的真实路径（跟随用户的重定向设置）。
+    #[cfg(windows)]
+    fn known_dirs() -> Vec<PathBuf> {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{
+            FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Favorites,
+            FOLDERID_Music, FOLDERID_Pictures, FOLDERID_Videos, SHGetKnownFolderPath,
+        };
+        const IDS: [&windows::core::GUID; 7] = [
+            &FOLDERID_Documents,
+            &FOLDERID_Desktop,
+            &FOLDERID_Downloads,
+            &FOLDERID_Pictures,
+            &FOLDERID_Music,
+            &FOLDERID_Videos,
+            &FOLDERID_Favorites,
+        ];
+        let mut out = Vec::with_capacity(IDS.len());
+        for id in IDS {
+            unsafe {
+                let wide = match SHGetKnownFolderPath(id, Default::default(), None) {
+                    Ok(w) => w,
+                    Err(_) => continue,
+                };
+                let len = (0..).take_while(|&i| *wide.0.add(i) != 0).count();
+                let text = String::from_utf16_lossy(std::slice::from_raw_parts(wide.0, len));
+                CoTaskMemFree(Some(wide.0 as *const _));
+                out.push(PathBuf::from(text));
+            }
+        }
+        out
+    }
+
+    #[cfg(not(windows))]
+    fn known_dirs() -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+
+    /// 用户目录下的一层子目录（名字是英文，显示名可能是中文）。
+    fn profile_children(profile: &Path) -> Vec<PathBuf> {
+        let Ok(rd) = std::fs::read_dir(profile) else {
+            return Vec::new();
+        };
+        rd.flatten()
+            .map(|e| e.path())
+            .filter(|p| !crate::fs::dir::is_remote_path(p) && p.is_dir())
+            .take(64)
+            .collect()
     }
 
     /// 最近一次由本程序驱动跳转的目录（同一个对话框、同一进程，10 分钟内有效）。

@@ -4378,7 +4378,7 @@ impl App {
         let entries: Vec<FileEntry> = result
             .hits
             .into_iter()
-            .map(|(e, _)| FileEntry::from_path(&e.path, e.is_dir, 0, None, false))
+            .map(|h| FileEntry::from_path(&h.path, h.is_dir, 0, None, false))
             .collect();
         let shown = entries.len();
         let tab = self.state.active_mut();
@@ -4507,7 +4507,7 @@ impl App {
             return;
         }
         let count = crate::search::index::try_shared()
-            .and_then(|i| i.try_read().ok().map(|g| g.entries.len()))
+            .and_then(|i| i.try_read().ok().map(|g| g.len()))
             .unwrap_or(0);
         logln!("index: manual rescan finished, {count} entries");
         self.set_status_job(self.trf("索引重建完成：{} 项", &[count.to_string()]));
@@ -8565,7 +8565,7 @@ impl App {
             .and_then(|i| {
                 i.try_read()
                     .ok()
-                    .map(|g| (g.entries.len(), g.heap_bytes, g.ready))
+                    .map(|g| (g.len(), g.heap_bytes, g.ready))
             })
             .unwrap_or((0, 0, false));
         let disk = crate::search::index::cache_file_size().unwrap_or(0);
@@ -8589,13 +8589,13 @@ impl App {
         }
         let (ws, priv_bytes) = crate::sys::mem::usage().unwrap_or((0, 0));
         crate::logv!(
-            "[mem] {where_txt} | 进程 工作集 {:.1}MB / 私有 {:.1}MB | 索引 {} 条 ~{}MB（就绪={} 磁盘 {}MB） | 缩略图 {} 张 {:.1}MB（负缓存 {}） | 标签 {} 个 / 窗格 {}，条目共 {} 拼音共 {} 深度 {} | 滚动记忆 {} 历史 {} 页",
+            "[mem] {where_txt} | 进程 工作集 {:.1}MB / 私有 {:.1}MB | 索引 {} 条 映射 {:.1}MB（就绪={} 磁盘 {:.1}MB） | 缩略图 {} 张 {:.1}MB（负缓存 {}） | 标签 {} 个 / 窗格 {}，条目共 {} 拼音共 {} 深度 {} | 滚动记忆 {} 历史 {} 页",
             ws as f64 / (1024.0 * 1024.0),
             priv_bytes as f64 / (1024.0 * 1024.0),
             idx_entries,
-            idx_heap / (1024 * 1024),
+            idx_heap as f64 / (1024.0 * 1024.0),
             idx_ready,
-            disk / (1024 * 1024),
+            disk as f64 / (1024.0 * 1024.0),
             self.thumb_cache.len(),
             self.thumb_cache_bytes as f64 / (1024.0 * 1024.0),
             self.thumb_failed.len(),
@@ -8617,7 +8617,7 @@ impl App {
         let snapshot = crate::search::index::try_shared().and_then(|i| {
             i.try_read()
                 .ok()
-                .map(|g| (g.ready, g.entries.len(), g.built_at, g.heap_bytes))
+                .map(|g| (g.ready, g.len(), g.built_at, g.heap_bytes))
         });
         let (is_ready, entry_count, built_at, heap_bytes) = snapshot.unwrap_or((false, 0, None, 0));
 
@@ -8631,8 +8631,8 @@ impl App {
         };
         self.ui.set_search_status_text(status_text);
         self.ui.set_search_items_count(format!("{entry_count}").into());
-        // 这张卡显示的是**常驻内存**（用户关心的是任务管理器里的数字），
-        // 磁盘上的 index.bin 只是它的来源，比内存小一半多。
+        // 这张卡显示的是**索引文件大小**：索引现在是映射在磁盘上的定长记录，
+        // 真正驻留多少页由系统按需决定（远小于文件）。
         let real_bytes = if heap_bytes > 0 {
             heap_bytes as u64
         } else {

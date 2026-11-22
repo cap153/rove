@@ -236,15 +236,16 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
                 query,
                 res.hits.len(),
                 res.total,
-                res.hits.iter().filter(|(e, _)| e.is_dir).count()
+                res.hits.iter().filter(|h| h.is_dir).count()
             );
-            for (entry, score) in res.hits {
+            for entry in res.hits {
                 if entry.is_dir {
-                    let key = path_key(&entry.path);
+                    let crate::search::index::Hit { path, name, fields, score, .. } = entry;
+                    let key = path_key(&path);
                     if !seen.contains(&key) {
                         let parts = crate::search::highlight_parts(
-                            &entry.name,
-                            &entry.fields,
+                            &name,
+                            &fields,
                             &query_lower,
                             &mut matcher,
                             &mut bufs,
@@ -252,8 +253,8 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
                         let is_history = history_map.contains_key(&key);
                         let last_time = *history_map.get(&key).unwrap_or(&0);
                         hits.push(JumpHit {
-                            name: entry.name.clone(),
-                            path: entry.path.clone(),
+                            name: name.clone(),
+                            path,
                             score,
                             name_parts: parts,
                             is_local: false,

@@ -13,11 +13,15 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::pinyin_fields;
 
-/// 索引条目上限（防失控）。MFT 路径下每条约 80B（路径 + 名称 + 拼音字段），
-/// 100 万条约 80MB，足以覆盖绝大多数家用电脑的全盘文件量。
+/// 索引条目上限（防失控）。落盘后每条约 60–90 B（名字 + 拼音各一份，路径靠
+/// 父指针重建），100 万条约 60–90 MB 磁盘、常驻只占其中被查询碰到的那几页。
 pub const MAX_ENTRIES: usize = 1_000_000;
 
-/// 一条全局索引记录。
+/// 一条全局索引记录（**构建期**形态：带完整路径，MFT / walker 直接往里填）。
+///
+/// 落盘时会被压成「父指针 + 名字池」（见 [`encode`]）：路径不再逐条存，
+/// 对外查询的那一份永远是映射文件，内存里不留全路径 —— 这是把常驻内存
+/// 从"每条一份完整路径"降下来的关键。
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct IndexEntry {
     pub path: PathBuf,
@@ -26,62 +30,212 @@ pub struct IndexEntry {
     pub is_dir: bool,
 }
 
+/// 一条定长记录占用的字节数（布局见 [`encode`]）。
+const REC_SIZE: usize = 20;
+/// `parent` 取这个值表示「名字槽里装的是完整路径」：盘符根与孤儿条目。
+const REC_ROOT: u32 = u32::MAX;
+/// 缓存文件头长度。
+const HEADER_LEN: usize = 40;
+
+/// 映射好的只读索引视图。
+struct View {
+    map: crate::search::mapfile::Mapped,
+    /// 记录区起点（字节偏移）。
+    records: usize,
+    /// 字符串池起点（字节偏移）。
+    pool: usize,
+    count: u32,
+    /// 构建时刻（Unix 秒）。
+    built_unix: u64,
+}
+
+impl View {
+    fn bytes(&self) -> &[u8] {
+        self.map.bytes()
+    }
+
+    /// 第 `i` 条记录的定长字节。
+    fn rec(&self, i: u32) -> &[u8] {
+        let at = self.records + i as usize * REC_SIZE;
+        &self.bytes()[at..at + REC_SIZE]
+    }
+
+    /// 记录里的字符串槽：池子里的 `u16 长度 + UTF-8`。
+    fn slot(&self, off: u32) -> &str {
+        let at = self.pool + off as usize;
+        let b = self.bytes();
+        if at + 2 > b.len() {
+            return "";
+        }
+        let len = u16::from_le_bytes([b[at], b[at + 1]]) as usize;
+        let from = at + 2;
+        match b.get(from..from + len) {
+            // 建库写入的都是按字符边界切好的 UTF-8，这里再校验一次更稳。
+            Some(bytes) => std::str::from_utf8(bytes).unwrap_or(""),
+            None => "",
+        }
+    }
+
+    /// 一条记录的 (父下标, 名字或完整路径)。
+    fn parts(&self, i: u32) -> (u32, &str) {
+        let r = self.rec(i);
+        (
+            u32::from_le_bytes([r[0], r[1], r[2], r[3]]),
+            self.slot(u32::from_le_bytes([r[4], r[5], r[6], r[7]])),
+        )
+    }
+
+    /// 按父指针拼出完整路径。只对进入结果集的条目调用（≤ `limit` 条）。
+    fn path_of(&self, mut id: u32) -> PathBuf {
+        let mut parts: Vec<&str> = Vec::new();
+        let mut base: Option<&str> = None;
+        // 深度上限防脏数据成环。取 256：`C:\a\a\a\…` 这种极端深链仍能在
+        // 260 字符的路径上限内凑满 100 多层，上限给小了会拼出**没有盘符的相对
+        // 路径**（静默错数据）——所以超限时宁可不给路径。
+        for _ in 0..256 {
+            let (parent, text) = self.parts(id);
+            if parent == REC_ROOT {
+                base = Some(text);
+                break;
+            }
+            parts.push(text);
+            id = parent;
+        }
+        let Some(base) = base else {
+            return PathBuf::new();
+        };
+        let mut out = String::with_capacity(base.len() + parts.iter().map(|p| p.len() + 1).sum::<usize>());
+        out.push_str(base);
+        for part in parts.iter().rev() {
+            if !out.ends_with('\\') {
+                out.push('\\');
+            }
+            out.push_str(part);
+        }
+        PathBuf::from(out)
+    }
+}
+
+/// 查询期看到的一行：字段全是借用切片，零拷贝、零分配。
+struct Row<'a> {
+    id: u32,
+    name: &'a str,
+    full: &'a str,
+    abbr: &'a str,
+    is_dir: bool,
+    /// 盘符 'A'..'Z'；0 = 未知。
+    vol: u8,
+}
+
 /// 全局索引（后台构建，读多写少）。
 #[derive(Default)]
 pub struct GlobalIndex {
+    /// 构建期条目（MFT / walker 往这里填）。提交后清空。
     pub entries: Vec<IndexEntry>,
-    /// 索引是否已构建完成（false = 构建中）。
+    /// 已映射的只读索引：对外查询走这个。
+    view: Option<View>,
+    /// 索引是否已构建完成（false = 构建中 / 未加载）。
     pub ready: bool,
     /// 最近一次构建完成的时刻（用于设置页展示「上次同步」）。
     pub built_at: Option<std::time::SystemTime>,
-    /// 常驻内存估算（含堆上字符串）。设置页的「索引大小」与 `ROVE_LOG=1`
-    /// 的内存明细都用它——以前这里按 80 B/条估算，实测约 220 B/条，
-    /// 显示出来的数字比真实占用小 3 倍，看着安心其实是假的。
+    /// 索引占用 = 映射文件大小。真正驻留多少由系统按需分页决定（远小于此）。
     pub heap_bytes: usize,
 }
 
-/// 估算索引常驻内存：结构体内联 + 四条堆字符串（路径 / 名字 / 全拼 / 简拼）。
-pub fn estimate_heap(entries: &[IndexEntry]) -> usize {
-    let inline = std::mem::size_of::<IndexEntry>();
-    entries
-        .iter()
-        .map(|e| {
-            inline
-                + e.path.as_os_str().len()
-                + e.name.len()
-                + e.fields.full.len()
-                + e.fields.abbr.len()
-        })
-        .sum()
-}
-
-/// 一次全局索引查询的结果。
-pub struct SearchHits<'a> {
-    /// 按得分降序的前 `limit` 条命中。
-    pub hits: Vec<(&'a IndexEntry, u16)>,
-    /// 命中总数（**未截断**）。`hits.len() < total` 表示结果被 `limit` 截断，
-    /// 调用方应据此在状态栏提示用户。
-    pub total: usize,
-}
-
 impl GlobalIndex {
+    /// 条目数（映射优先，其次构建期条目）。
+    pub fn len(&self) -> usize {
+        match &self.view {
+            Some(v) => v.count as usize,
+            None => self.entries.len(),
+        }
+    }
+
+    /// 遍历所有条目（映射区直接读，或退化为内存条目）。
+    fn for_each_row(&self, mut f: impl FnMut(Row<'_>)) {
+        if let Some(v) = &self.view {
+            for i in 0..v.count {
+                let r = v.rec(i);
+                f(Row {
+                    id: i,
+                    name: v.slot(u32::from_le_bytes([r[4], r[5], r[6], r[7]])),
+                    full: v.slot(u32::from_le_bytes([r[8], r[9], r[10], r[11]])),
+                    abbr: v.slot(u32::from_le_bytes([r[12], r[13], r[14], r[15]])),
+                    is_dir: u16::from_le_bytes([r[16], r[17]]) & 1 != 0,
+                    vol: r[18],
+                });
+            }
+            return;
+        }
+        for (i, e) in self.entries.iter().enumerate() {
+            f(Row {
+                id: i as u32,
+                name: &e.name,
+                full: &e.fields.full,
+                // 空简拼表示「与全拼相同」（纯 ASCII 名的快路径）。
+                abbr: if e.fields.abbr.is_empty() { &e.fields.full } else { &e.fields.abbr },
+                is_dir: e.is_dir,
+                vol: drive_letter_of(&e.path),
+            });
+        }
+    }
+
+    /// 取一条命中条目的展示字段（只在收集结果时调用，条数 ≤ `limit`）。
+    fn describe(&self, id: u32) -> (String, String, String, bool) {
+        if let Some(v) = &self.view {
+            let (parent, text) = v.parts(id);
+            let r = v.rec(id);
+            // 盘符根 / 孤儿条目的名字槽装的是完整路径，展示时只取末段。
+            let name = if parent == REC_ROOT {
+                text.rsplit('\\').find(|p| !p.is_empty()).unwrap_or(text).to_string()
+            } else {
+                text.to_string()
+            };
+            return (
+                name,
+                v.slot(u32::from_le_bytes([r[8], r[9], r[10], r[11]])).to_string(),
+                v.slot(u32::from_le_bytes([r[12], r[13], r[14], r[15]])).to_string(),
+                u16::from_le_bytes([r[16], r[17]]) & 1 != 0,
+            );
+        }
+        match self.entries.get(id as usize) {
+            Some(e) => (
+                e.name.clone(),
+                e.fields.full.to_string(),
+                e.fields.abbr.to_string(),
+                e.is_dir,
+            ),
+            None => (String::new(), String::new(), String::new(), false),
+        }
+    }
+
+    fn path_of(&self, id: u32) -> PathBuf {
+        match &self.view {
+            Some(v) => v.path_of(id),
+            None => self
+                .entries
+                .get(id as usize)
+                .map(|e| e.path.clone())
+                .unwrap_or_default(),
+        }
+    }
+
     /// 拼音/模糊查询，按得分排序取前 `limit` 条，并回报未截断的命中总数。
-    /// 支持盘符限定前缀（如 `c: videos`）：非目标盘一票否决；仅输入盘符（如 `c:`）时返回该盘全部条目。
-    pub fn search(&self, query: &str, limit: usize) -> SearchHits<'_> {
+    /// 支持盘符限定前缀（如 `c: videos`）：非目标盘一票否决；仅输入盘符时返回该盘全部条目。
+    pub fn search(&self, query: &str, limit: usize) -> SearchHits {
         self.search_filtered(query, limit, false)
     }
 
     /// 只返回文件夹的查询（吸附窗专用）。
     ///
-    /// 关键点：**过滤必须发生在截断之前**。吸附窗只列文件夹，旧写法是先取
-    /// 前 `limit` 名再筛 `is_dir`，于是同一个词命中一堆文件时（如 `power`
-    /// 命中几十个 `power*.py`），这些文件会把分数相近的文件夹挤出前 `limit`
-    /// 名，界面表现为「输入 power 一条文件夹都没有，输全名 powershell 才有」。
-    pub fn search_dirs(&self, query: &str, limit: usize) -> SearchHits<'_> {
+    /// 关键点：**过滤必须发生在截断之前**。吸附窗只列文件夹，先取前 `limit`
+    /// 名再筛 `is_dir` 会让同名文件占满名额，界面表现为「输入 power 一条
+    /// 文件夹都没有，输全名 powershell 才有」。
+    pub fn search_dirs(&self, query: &str, limit: usize) -> SearchHits {
         self.search_filtered(query, limit, true)
     }
 
-    fn search_filtered(&self, query: &str, limit: usize, dirs_only: bool) -> SearchHits<'_> {
+    fn search_filtered(&self, query: &str, limit: usize, dirs_only: bool) -> SearchHits {
         let (drive_filter, clean_query) = crate::search::parse_drive_prefix(query);
         let query_lower = clean_query.to_lowercase();
 
@@ -89,41 +243,155 @@ impl GlobalIndex {
             return SearchHits { hits: Vec::new(), total: 0 };
         }
 
+        let want_drive = drive_filter.map(|c| c.to_ascii_uppercase() as u8);
         let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
         let mut bufs = (Vec::new(), Vec::new(), Vec::new());
-        let mut scored: Vec<(&IndexEntry, u16)> = self
-            .entries
-            .iter()
-            .filter_map(|e| {
-                // 0. 只要文件夹时先筛掉文件：截断在排序之后，这里的过滤必须在
-                //    收集阶段就完成，否则文件会占满 `limit` 个名额。
-                if dirs_only && !e.is_dir {
-                    return None;
+        let mut scored: Vec<(u32, u16)> = Vec::new();
+        self.for_each_row(|row| {
+            // 0. 只要文件夹时先筛掉文件：过滤必须在收集阶段完成（见上文）。
+            if dirs_only && !row.is_dir {
+                return;
+            }
+            // 1. 指定了盘符时，非目标盘一票否决。
+            if let Some(want) = want_drive {
+                if row.vol != want {
+                    return;
                 }
-                // 1. 若指定了盘符，非目标盘一票否决
-                if let Some(target_drive) = drive_filter {
-                    let path_str = e.path.to_string_lossy();
-                    let matches_drive = path_str.chars().next().is_some_and(|c| c.eq_ignore_ascii_case(&target_drive))
-                        && path_str.chars().nth(1) == Some(':');
-                    if !matches_drive {
-                        return None;
-                    }
-                }
-
-                // 2. 若仅输入了盘符（如 "c:"），直接返回该盘条目
-                if query_lower.is_empty() {
-                    Some((e, 100u16))
-                } else {
-                    crate::search::score(&e.name, &e.fields, &query_lower, &mut matcher, &mut bufs)
-                        .map(|s| (e, s))
-                }
-            })
-            .collect();
+            }
+            let hit = if query_lower.is_empty() {
+                Some(100u16)
+            } else {
+                crate::search::score_parts(
+                    row.name,
+                    row.abbr,
+                    row.full,
+                    &query_lower,
+                    &mut matcher,
+                    &mut bufs,
+                )
+            };
+            if let Some(score) = hit {
+                scored.push((row.id, score));
+            }
+        });
         scored.sort_by(|a, b| b.1.cmp(&a.1));
         let total = scored.len();
         scored.truncate(limit);
-        SearchHits { hits: scored, total }
+        let hits = scored
+            .into_iter()
+            .map(|(id, score)| {
+                let (name, full, abbr, is_dir) = self.describe(id);
+                Hit {
+                    path: self.path_of(id),
+                    name,
+                    fields: crate::search::PinyinFields {
+                        full: full.into(),
+                        abbr: abbr.into(),
+                    },
+                    is_dir,
+                    score,
+                }
+            })
+            .collect();
+        SearchHits { hits, total }
     }
+}
+
+/// 一条命中（路径已按需拼好，拼音字段是拷贝出来的，条数 ≤ `limit`）。
+pub struct Hit {
+    pub path: PathBuf,
+    pub name: String,
+    pub fields: crate::search::PinyinFields,
+    pub is_dir: bool,
+    pub score: u16,
+}
+
+/// 一次全局索引查询的结果。
+pub struct SearchHits {
+    /// 按得分降序的前 `limit` 条命中。
+    pub hits: Vec<Hit>,
+    /// 命中总数（**未截断**）。`hits.len() < total` 表示结果被 `limit` 截断，
+    /// 调用方应据此在状态栏提示用户。
+    pub total: usize,
+}
+
+/// 路径的盘符（大写）。非盘符路径返回 0。
+fn drive_letter_of(path: &Path) -> u8 {
+    let s = path.to_string_lossy();
+    let mut it = s.chars();
+    match (it.next(), it.next()) {
+        (Some(c), Some(':')) => c.to_ascii_uppercase() as u8,
+        _ => 0,
+    }
+}
+
+/// 把字符串写进池子：`u16 长度 + UTF-8`，返回偏移。
+fn push_slot(pool: &mut Vec<u8>, text: &str) -> u32 {
+    let bytes = text.as_bytes();
+    // 槽长度用 u16；Windows 单个文件名/路径远达不到 64 KB，极端情况截断。
+    // **必须在字符边界上截断**：截在多字节字符中间会让整个池子不再是合法
+    // UTF-8，加载时被判为损坏从而每次启动都重建（真机复现过）。
+    let mut len = bytes.len().min(u16::MAX as usize);
+    while len > 0 && !text.is_char_boundary(len) {
+        len -= 1;
+    }
+    let off = pool.len() as u32;
+    pool.extend_from_slice(&(len as u16).to_le_bytes());
+    pool.extend_from_slice(&bytes[..len]);
+    off
+}
+
+/// 内存条目 → 定长记录 + 字符串池。
+///
+/// 每条记录 20 字节（小端）：
+///
+/// ```text
+/// 0..4   parent   父记录下标；u32::MAX = 名字槽里装的是完整路径
+/// 4..8   name     名字（或完整路径）槽偏移
+/// 8..12  full     全拼槽偏移
+/// 12..16 abbr     简拼槽偏移（空串 = 与全拼相同）
+/// 16..18 flags    bit0 = 目录
+/// 18     vol      盘符 'A'..'Z'；0 = 未知
+/// 19     pad
+/// ```
+///
+/// 父指针让"每条都存一份完整路径"变成"每个目录存一次名字"：15 万个文件
+/// 都挂在 `C:\Users\...\Videos\` 下时，那串前缀只存在于父记录里一次。
+fn encode(entries: &[IndexEntry]) -> (Vec<u8>, Vec<u8>, u32) {
+    use std::collections::HashMap;
+    let mut dirs: HashMap<&Path, u32> = HashMap::with_capacity(entries.len() / 8 + 16);
+    for (i, e) in entries.iter().enumerate() {
+        if e.is_dir {
+            dirs.insert(e.path.as_path(), i as u32);
+        }
+    }
+    let mut recs: Vec<u8> = Vec::with_capacity(entries.len() * REC_SIZE);
+    let mut pool: Vec<u8> = Vec::with_capacity(entries.len() * 24);
+    for (i, e) in entries.iter().enumerate() {
+        // 父目录不在索引里（被排除 / 没扫到）就当孤儿：整条存自己的完整路径。
+        let parent = e
+            .path
+            .parent()
+            .and_then(|p| dirs.get(p).copied())
+            .filter(|&p| p != i as u32)
+            .unwrap_or(REC_ROOT);
+        let name = if parent == REC_ROOT {
+            e.path.to_string_lossy()
+        } else {
+            e.name.as_str().into()
+        };
+        let name_off = push_slot(&mut pool, &name);
+        let full_off = push_slot(&mut pool, &e.fields.full);
+        let abbr_off = push_slot(&mut pool, &e.fields.abbr);
+        recs.extend_from_slice(&parent.to_le_bytes());
+        recs.extend_from_slice(&name_off.to_le_bytes());
+        recs.extend_from_slice(&full_off.to_le_bytes());
+        recs.extend_from_slice(&abbr_off.to_le_bytes());
+        recs.extend_from_slice(&(e.is_dir as u16).to_le_bytes());
+        recs.push(drive_letter_of(&e.path));
+        recs.push(0);
+    }
+    (recs, pool, entries.len() as u32)
 }
 
 /// 共享句柄。
@@ -139,7 +407,7 @@ pub type SharedIndex = Arc<RwLock<GlobalIndex>>;
 /// 带上魔数与版本号后，旧文件在读任何条目之前就被判为过期，正常走重建。
 const CACHE_MAGIC: [u8; 8] = *b"ROVEIDX1";
 /// 缓存格式版本。**`IndexEntry` 布局有任何变化都必须 +1**。
-const CACHE_VERSION: u32 = 2;
+const CACHE_VERSION: u32 = 3;
 
 /// 全局索引单例（首次调用初始化，后台线程异步填充）。
 static INDEX: std::sync::OnceLock<SharedIndex> = std::sync::OnceLock::new();
@@ -324,9 +592,9 @@ pub fn idle_for() -> Option<std::time::Duration> {
 
 /// 把内存里的索引还给系统（磁盘缓存 `index.bin` 原样保留，下次用再读）。
 ///
-/// 只在空闲足够久之后调用：常驻的内存要 30 MB（上百万条时两百多兆），
-/// 而多数人一天也用不上一次全盘搜索。再次搜索时会重新读盘（约 0.3 s，
-/// 后台线程执行，不卡输入），所以这里不需要保守。
+/// 只在空闲足够久之后调用。多数人一天也用不上一次全盘搜索，而映射着的文件
+/// 会让系统一直替它保留一部分页缓存。再次搜索时重新映射是瞬间完成的
+/// （不解析、不复制），所以这里不需要保守。
 ///
 /// 正在构建时（`ready == false`）不动：那会儿条目还是一半的，清了反而添乱。
 pub fn unload() {
@@ -336,17 +604,21 @@ pub fn unload() {
     let Ok(mut w) = idx.write() else {
         return;
     };
-    if !w.ready || w.entries.is_empty() {
+    if !w.ready || w.len() == 0 {
         return;
     }
     let freed = w.heap_bytes;
+    w.view = None;
     w.entries = Vec::new();
     w.heap_bytes = 0;
     w.ready = false;
     w.built_at = None;
     LOADED.store(false, Ordering::Relaxed);
     drop(w);
-    logln!("index: unloaded, freed ~{} MB (disk cache kept)", freed / (1024 * 1024));
+    logln!(
+        "index: unloaded, released {:.1} MB mapping (disk cache kept)",
+        freed as f64 / (1024.0 * 1024.0)
+    );
 }
 
 /// 持久化缓存文件路径：%LOCALAPPDATA%\Rove\index.bin
@@ -363,74 +635,122 @@ pub fn cache_file_size() -> Option<u64> {
     std::fs::metadata(cache_path()).ok().map(|m| m.len())
 }
 
-/// 将条目序列化写入暂存文件 index.bin.tmp，并原子重命名为 index.bin。
+/// 把索引写成「定长记录 + 字符串池」并原子落盘（`index.bin.tmp` → `index.bin`）。
+///
+/// 头 40 字节：魔数 8 + 版本 4 + 条数 4 + 记录长度 4 + 保留 4 + 池偏移 8 + 构建时刻 8。
 fn save_cache(entries: &[IndexEntry]) -> std::io::Result<()> {
+    let (recs, pool, count) = encode(entries);
     let path = cache_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
     let tmp_path = path.with_extension("bin.tmp");
-    let file = std::fs::File::create(&tmp_path)?;
-    let mut writer = std::io::BufWriter::new(file);
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp_path)?);
+    let built_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     writer.write_all(&CACHE_MAGIC)?;
     writer.write_all(&CACHE_VERSION.to_le_bytes())?;
-    bincode::serialize_into(&mut writer, entries)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    writer.write_all(&count.to_le_bytes())?;
+    writer.write_all(&(REC_SIZE as u32).to_le_bytes())?;
+    writer.write_all(&0u32.to_le_bytes())?;
+    writer.write_all(&((HEADER_LEN + recs.len()) as u64).to_le_bytes())?;
+    writer.write_all(&built_unix.to_le_bytes())?;
+    writer.write_all(&recs)?;
+    writer.write_all(&pool)?;
     writer.flush()?;
+    drop(writer);
     std::fs::rename(&tmp_path, &path)?;
     Ok(())
 }
 
-/// 启动时读取磁盘缓存，喂饱内存索引。
+fn u32_at(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]])
+}
+
+fn u64_at(b: &[u8], at: usize) -> u64 {
+    let mut v = [0u8; 8];
+    v.copy_from_slice(&b[at..at + 8]);
+    u64::from_le_bytes(v)
+}
+
+/// 打开并校验映射（不解析、不复制）。
 ///
-/// **整文件读进内存再从切片解析**，不用 `bincode::deserialize_from(reader)`：
-/// 流式解析遇到格式错位的垃圾数据时，会把错误的长度前缀当成真实长度去预分配，
-/// 启动线程就卡在那儿（真机复现过：日志停在 `request_listing` 之后再无输出，
-/// 进程活着但窗口永远不出现）。切片解析的语义是「恰好读完全部字节」，
-/// 任何错位都会立刻返回错误。
-pub fn load_cache(idx: &SharedIndex) -> bool {
-    let path = cache_path();
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
-    };
-    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-    if bytes.len() < 12 {
-        logln!("index: cache too short ({} B), rebuild", bytes.len());
-        return false;
+/// 任何一项对不上（旧版本 / 半截文件 / 被别的程序改写）都返回 `None`，
+/// 调用方据此重建 —— 与缓存头魔数的初衷一致。
+fn open_view(path: &Path) -> Option<View> {
+    let map = crate::search::mapfile::Mapped::open(path).ok().flatten()?;
+    let len = map.bytes().len();
+    if len < HEADER_LEN {
+        logln!("index: cache too short ({len} B), rebuild");
+        return None;
     }
-    // 先验文件头：旧版本 / 别的程序写的文件一律不解析（见 CACHE_MAGIC 注释）。
+    // 校验只在借用期内做，随后把 `map` 移进 `View`（借用结束才能 move）。
+    let (count, pool, built_unix) = {
+    let bytes = map.bytes();
     if bytes[..8] != CACHE_MAGIC {
         logln!("index: cache has no rove header (old format), rebuild");
-        return false;
+        return None;
     }
-    let ver = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+    let ver = u32_at(bytes, 8);
     if ver != CACHE_VERSION {
         logln!("index: cache format v{ver} != v{CACHE_VERSION}, rebuild");
-        return false;
+        return None;
     }
-    let Ok(mut entries): Result<Vec<IndexEntry>, _> = bincode::deserialize(&bytes[12..]) else {
-        logln!("index: cache deserialize failed, rebuild");
+    let rec_size = u32_at(bytes, 16) as usize;
+    if rec_size != REC_SIZE {
+        logln!("index: cache record size {rec_size} != {REC_SIZE}, rebuild");
+        return None;
+    }
+    let mut count = u32_at(bytes, 12);
+    let pool = u64_at(bytes, 24) as usize;
+    let records_end = HEADER_LEN.checked_add(count as usize * REC_SIZE)?;
+    if pool < records_end || pool > len {
+        logln!("index: cache layout invalid (pool {pool}, records end {records_end}, len {len}), rebuild");
+        return None;
+    }
+    if count as usize > MAX_ENTRIES {
+        logln!("index: cache has {count} entries > cap, truncating view");
+        count = MAX_ENTRIES as u32;
+    }
+    // 注意：**不能**把整池当成一个字符串校验 —— 池是「u16 长度 + 文本」的
+    // 拼接，长度前缀本身就是任意字节，整池必然含非法 UTF-8 序列（踩过这个坑）。
+    // 每个槽在读取时各自校验（见 `View::slot`）。
+    (count, pool, u64_at(bytes, 32))
+    };
+    Some(View {
+        map,
+        records: HEADER_LEN,
+        pool,
+        count,
+        built_unix,
+    })
+}
+
+/// 启动 / 按需加载：把磁盘缓存**映射**进来（不读进内存）。
+pub fn load_cache(idx: &SharedIndex) -> bool {
+    let path = cache_path();
+    let Some(view) = open_view(&path) else {
         return false;
     };
-    drop(bytes);
-    // 兜底：解析成功也不该超过上限（截断而不是整个丢掉）。
-    if entries.len() > MAX_ENTRIES {
-        logln!("index: cache has {} entries > cap, truncating", entries.len());
-        entries.truncate(MAX_ENTRIES);
-        entries.shrink_to_fit();
-    }
-    let count = entries.len();
-    let heap = estimate_heap(&entries);
+    let count = view.count;
+    let bytes = view.map.bytes().len();
+    let mtime = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+    let built = std::time::UNIX_EPOCH
+        .checked_add(std::time::Duration::from_secs(view.built_unix))
+        .or(mtime)
+        .or_else(|| Some(std::time::SystemTime::now()));
     if let Ok(mut w) = idx.write() {
-        w.entries = entries;
+        w.view = Some(view);
         w.ready = true;
-        w.built_at = mtime.or_else(|| Some(std::time::SystemTime::now()));
-        w.heap_bytes = heap;
+        w.built_at = built;
+        w.heap_bytes = bytes;
     }
     LOADED.store(true, Ordering::Relaxed);
     logln!(
-        "index: loaded {count} cached entries from disk (resident ~{} MB)",
-        heap / (1024 * 1024)
+        "index: mapped {count} cached entries from disk ({:.1} MB file, resident pages on demand)",
+        bytes as f64 / (1024.0 * 1024.0)
     );
     true
 }
@@ -459,6 +779,7 @@ pub fn rebuild() -> SharedIndex {
         // `clear()` 只把长度归零，旧的百万级容量数组会一直挂着：
         // 重建期等于新旧两份同时驻留。换成空 Vec 立刻把容量还给分配器。
         w.entries = Vec::new();
+        w.view = None;
         w.heap_bytes = 0;
         w.ready = false;
         w.built_at = None;
@@ -541,27 +862,55 @@ fn spawn_builder(idx: SharedIndex) {
             let entries = std::mem::take(&mut staging_guard.entries);
             drop(staging_guard);
 
-            // 原子落盘：写 index.bin.tmp -> 原地 rename 到 index.bin
-            if let Err(e) = save_cache(&entries) {
-                logln!("index: save cache failed: {e}");
-            } else {
-                crate::logv!("index: saved {} entries to disk cache", entries.len());
+            // 覆盖 index.bin 之前必须先丢掉旧映射：Windows 不允许替换一个还有
+            // 活动映射的文件（改名前一次 rebuild 就白干了）。这里有约 0.2 s
+            // 的空窗期，但 `BUILDING` 仍为真，搜索只会看到"构建中"。
+            if let Ok(mut w) = idx.write() {
+                w.view = None;
+                w.entries = Vec::new();
             }
 
-            // 1 微秒原子提交：写入主索引 live 槽
+            // 原子落盘：写 index.bin.tmp -> 原地 rename 到 index.bin
+            let saved = match save_cache(&entries) {
+                Ok(()) => {
+                    crate::logv!("index: saved {} entries to disk cache", entries.len());
+                    true
+                }
+                Err(e) => {
+                    logln!("!! index: save cache failed: {e}");
+                    false
+                }
+            };
+
+            // 提交。正常路径：把刚写好的文件映射进来（不读进内存），构建期的
+            // 条目随即丢掉。落盘或映射任一步失败都**不能**提交一个空索引 ——
+            // 那会让之后每次搜索都返回 0 条，而状态栏还显示「已就绪」。这种
+            // 情况退回构建期条目，代价只是常驻内存。
             let now = std::time::SystemTime::now();
-            let heap = estimate_heap(&entries);
+            let view = if saved { open_view(&cache_path()) } else { None };
+            if view.is_none() && saved {
+                logln!("!! index: mapping the fresh cache failed, keeping in-memory entries");
+            }
+            let mapped = view.as_ref().map(|v| v.bytes().len()).unwrap_or(0);
+            let have_view = view.is_some();
             if let Ok(mut w) = idx.write() {
-                w.entries = entries;
+                w.view = view;
+                if have_view {
+                    w.entries = Vec::new();
+                    w.heap_bytes = mapped;
+                } else {
+                    w.entries = entries;
+                    w.heap_bytes = 0;
+                }
                 w.ready = true;
                 w.built_at = Some(now);
-                w.heap_bytes = heap;
             }
             LOADED.store(true, Ordering::Relaxed);
             logln!(
-                "global index built and committed: {} entries (~{} MB resident)",
+                "global index built and committed: {} entries ({:.1} MB on disk, mapped={})",
                 count,
-                heap / (1024 * 1024)
+                mapped as f64 / (1024.0 * 1024.0),
+                have_view
             );
             // 通知 UI 索引就绪。用 Slint 原生跨线程投递，而非定时器轮询：
             // 零空转开销，且就绪与刷新落在同一事件循环 tick（微秒级，无视觉延迟）。
@@ -844,11 +1193,11 @@ mod tests {
         // 前提：只取 1 条时被文件占住。
         let all = idx.search("power", 1);
         assert_eq!(all.hits.len(), 1);
-        assert!(!all.hits[0].0.is_dir, "前提：文件应占满前几名");
+        assert!(!all.hits[0].is_dir, "前提：文件应占满前几名");
         // 只要文件夹：同名文件夹必须还在。
         let dirs = idx.search_dirs("power", 1);
         assert_eq!(dirs.hits.len(), 1, "文件夹被文件挤出结果了");
-        assert_eq!(dirs.hits[0].0.name, "PowerShell");
+        assert_eq!(dirs.hits[0].name, "PowerShell");
         assert_eq!(dirs.total, 1, "total 应是过滤后的文件夹总数");
     }
 

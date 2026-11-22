@@ -207,14 +207,30 @@ pub fn score(
     matcher: &mut Matcher,
     bufs: &mut (Vec<char>, Vec<char>, Vec<char>),
 ) -> Option<u16> {
+    score_parts(name, fields.abbr_str(), &fields.full, query_lower, matcher, bufs)
+}
+
+/// 同上，但拼音字段是**借用**的切片。
+///
+/// 全局索引现在是映射在磁盘文件上的：名字和拼音都在映射区里，拿不到
+/// `PinyinFields`（那是 `Box<str>` 所有权类型）。为此多开一个纯借用版本，
+/// 避免为了打一次分就把每条记录的名字和拼音复制一遍。
+pub fn score_parts(
+    name: &str,
+    abbr: &str,
+    full: &str,
+    query_lower: &str,
+    matcher: &mut Matcher,
+    bufs: &mut (Vec<char>, Vec<char>, Vec<char>),
+) -> Option<u16> {
     let (buf_a, buf_b, buf_c) = bufs;
     let query_owned = query_lower.to_lowercase();
     let q = Utf32Str::new(&query_owned, buf_a);
     let mut best = matcher.fuzzy_match(Utf32Str::new(name, buf_b), q);
-    if let Some(s) = matcher.fuzzy_match(Utf32Str::new(fields.abbr_str(), buf_c), q) {
+    if let Some(s) = matcher.fuzzy_match(Utf32Str::new(abbr, buf_c), q) {
         best = Some(best.map_or(s, |b| b.max(s)));
     }
-    if let Some(s) = matcher.fuzzy_match(Utf32Str::new(&fields.full, buf_b), q) {
+    if let Some(s) = matcher.fuzzy_match(Utf32Str::new(full, buf_b), q) {
         best = Some(best.map_or(s, |b| b.max(s)));
     }
     best
@@ -490,5 +506,6 @@ pub fn parse_drive_prefix(query: &str) -> (Option<char>, &str) {
 
 pub mod filter;
 pub mod index;
+pub mod mapfile;
 pub mod mft;
 pub mod jump;
