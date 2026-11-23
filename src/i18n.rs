@@ -323,6 +323,7 @@ pub const ZH: &[&str] = &[
     "恢复删除",                 // 312
     "恢复新建",                 // 313
     "恢复重命名",               // 314
+    "搜索中不能拖放到当前分屏，请拖到具体的文件夹上", // 315
 ];
 
 pub const EN: &[&str] = &[
@@ -641,6 +642,7 @@ pub const EN: &[&str] = &[
     "Redo delete",
     "Redo new folder",
     "Redo rename",
+    "Can't drop into this pane while searching; drop it on a folder instead",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -753,6 +755,12 @@ mod tests {
         assert_eq!(EN[313], "Redo new folder");
         assert_eq!(ZH[314], "恢复重命名");
         assert_eq!(EN[314], "Redo rename");
+        // 搜索状态下拖回本栏的拒绝提示。
+        assert_eq!(ZH[315], "搜索中不能拖放到当前分屏，请拖到具体的文件夹上");
+        assert_eq!(
+            EN[315],
+            "Can't drop into this pane while searching; drop it on a folder instead"
+        );
         // 空白处右键菜单的撤销 / 重做文字是 Rust 侧按记录类型拼出来的，
         // 每种记录都得能在字典里查到，否则英文界面会冒出中文。
         let kinds = [

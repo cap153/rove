@@ -2492,15 +2492,26 @@ impl App {
     /// 启动/重置当前标签的深度搜索（filter 变化时调用）。
     /// 空查询仅清空残留结果；有效查询在代号递增后发往工作线程。
     fn start_deep_search(&mut self) {
-        let tab = self.state.active_mut();
-        tab.active_mut().clear_deep();
-        let (tab_id, pane, generation, deep_generation, root, query) = (
+        let (tab_index, pane_index) = (self.state.active_tab, self.state.active().active_pane);
+        self.start_deep_search_for(tab_index, pane_index);
+    }
+
+    /// 同上，但指定面板：文件任务改动了某个搜索面板的子树之后要把它重跑一遍，
+    /// 否则结果里会同时留着「旧位置的同一条」和「新位置的那一条」。
+    fn start_deep_search_for(&mut self, tab_index: usize, pane_index: usize) {
+        let Some(tab) = self.state.tabs.get_mut(tab_index) else {
+            return;
+        };
+        let Some(pane) = tab.panes.get_mut(pane_index) else {
+            return;
+        };
+        pane.clear_deep();
+        let (tab_id, generation, deep_generation, root, query) = (
             tab.id,
-            tab.active_pane,
-            tab.active_mut().generation,
-            tab.active_mut().deep_generation,
-            tab.active_mut().path.clone(),
-            tab.active_mut().filter.trim().to_string(),
+            pane.generation,
+            pane.deep_generation,
+            pane.path.clone(),
+            pane.filter.trim().to_string(),
         );
         // 「此电脑」/ 回收站虚拟目录没有子树搜索。
         let Some(root) = root else {
@@ -2513,14 +2524,16 @@ impl App {
         }
         let _ = self.deep_tx.send(DeepRequest {
             tab_id,
-            pane,
+            pane: pane_index,
             generation,
             deep_generation,
             root,
             query,
             want: crate::search::index::DEEP_BATCH,
         });
-        self.state.active_mut().active_mut().deep_searching = true;
+        if let Some(pane) = self.state.tabs[tab_index].panes.get_mut(pane_index) {
+            pane.deep_searching = true;
+        }
     }
 
     /// 给「有搜索词但拼音缓存还没算好」的面板派一次后台计算。
@@ -2728,11 +2741,28 @@ impl App {
             result.query
         );
         // 追加，不是替换：一个查询会分很多批回来，替换会让前一批凭空消失。
-        let added = !result.items.is_empty();
-        pane.deep_entries
-            .extend(result.items.iter().map(|i| i.entry.clone()));
-        pane.deep_pinyin
-            .extend(result.items.into_iter().map(|i| i.fields));
+        //
+        // 但**同一路径只收一次**：走查是边扫边读，文件在扫描途中被移动/复制时，
+        // 旧目录和新目录各可能报一遍，列表里就出现两个一模一样的文件。
+        let mut seen: std::collections::HashSet<PathBuf> = pane
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .chain(pane.deep_entries.iter().map(|e| e.path.clone()))
+            .collect();
+        let before = result.items.len();
+        let items = dedupe_deep_batch(result.items, &mut seen);
+        if items.len() != before {
+            logv!(
+                "[deep] 去掉重复路径 {} 条（本批 {} → {}）",
+                before - items.len(),
+                before,
+                items.len()
+            );
+        }
+        let added = !items.is_empty();
+        pane.deep_entries.extend(items.iter().map(|i| i.entry.clone()));
+        pane.deep_pinyin.extend(items.into_iter().map(|i| i.fields));
         pane.deep_searching = !result.done;
         pane.deep_capped = result.capped;
         pane.deep_scanned = result.scanned;
@@ -3122,20 +3152,35 @@ fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
 /// 立刻换口味（连打几个字只做最后一次），旧扫描整个丢掉。
 /// 排队请求的两分法：新查询（新词优先，只留最后一条）和取消（另放一格，
 /// 绝不和新查询抢那个「最后一个」的位置）。
-fn fold_one(req: &DeepRequest, fresh: &mut Option<DeepRequest>, cancel: &mut Option<DeepRequest>) {
-    if req.want == 0 {
-        *cancel = Some(req.clone());
-    } else {
-        *fresh = Some(req.clone());
-    }
-}
-
 /// 取消只对「同一条任务」生效：标签、窗格、两次代号全对上才算。
 fn same_deep_job(a: &DeepRequest, b: &DeepRequest) -> bool {
     a.tab_id == b.tab_id
         && a.pane == b.pane
         && a.generation == b.generation
         && a.deep_generation == b.deep_generation
+}
+
+/// 同一个面板（标签 + 栏号）的请求：它才是「同一份结果」的竞争者。
+fn same_deep_pane(a: &DeepRequest, b: &DeepRequest) -> bool {
+    a.tab_id == b.tab_id && a.pane == b.pane
+}
+
+/// 把请求放进待跑队列：同一面板只留最新一条（用户连打字时旧的直接扔掉），
+/// 与正在跑的那条完全相同的请求直接忽略（重跑一遍只会白白再扫一趟）。
+fn push_deep_queue(
+    queue: &mut Vec<DeepRequest>,
+    req: DeepRequest,
+    active: Option<&DeepRequest>,
+) {
+    if let Some(act) = active {
+        if same_deep_job(act, &req) {
+            return;
+        }
+    }
+    match queue.iter_mut().find(|r| same_deep_pane(r, &req)) {
+        Some(slot) => *slot = req,
+        None => queue.push(req),
+    }
 }
 
 fn spawn_deep_worker(rx: Receiver<DeepRequest>, tx: Sender<DeepResult>) {
@@ -3145,36 +3190,64 @@ fn spawn_deep_worker(rx: Receiver<DeepRequest>, tx: Sender<DeepResult>) {
             logln!("deepsearch worker started");
             // 当前任务：请求 + 可续跑的扫描状态。
             let mut active: Option<(DeepRequest, crate::search::index::DeepScan)> = None;
+            // 等着跑的请求：工作线程只有一个，**别的面板**的查询必须排队，
+            // 不能像以前那样「只留最后一个」—— 否则分屏两栏同时搜索时，先发的
+            // 那一栏永远等不到结果（被顶掉后只收到一条空 done，子文件夹结果全丢）。
+            let mut queue: Vec<DeepRequest> = Vec::new();
             // 空批次（纯进度）的上报节流，见下面 `batch.is_empty()` 那段。
             let mut last_progress = std::time::Instant::now() - std::time::Duration::from_secs(1);
             loop {
-                // 1) 把队列里积压的请求折叠成最后一个（新词优先）。
+                // 1) 收请求：取消单独拎出来，其余按面板去重后排队。
                 //
-                // 取消（want = 0）**不能**和新请求混在同一个「只留最后一个」的槽里：
-                // 界面丢一条过期结果就会顺手发一个取消，它常常排在新请求后面，
-                // 一折叠就把新请求顶掉了 —— 新查询于是永远没人做。
-                let mut fresh: Option<DeepRequest> = None;
+                // 取消（want = 0）**不能**和普通请求混在同一个槽里：界面丢一条过期
+                // 结果就会顺手发一个取消，它常常排在新请求后面，混在一起会把新请求
+                // 顶掉 —— 新查询于是永远没人做。
                 let mut cancel: Option<DeepRequest> = None;
                 loop {
                     match rx.try_recv() {
-                        Ok(req) => fold_one(&req, &mut fresh, &mut cancel),
+                        Ok(req) => {
+                            if req.want == 0 {
+                                cancel = Some(req);
+                            } else {
+                                push_deep_queue(&mut queue, req, active.as_ref().map(|(r, _)| r));
+                            }
+                        }
                         Err(std::sync::mpsc::TryRecvError::Empty) => break,
                         Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
                     }
                 }
-                if fresh.is_none() {
-                    if let (Some(c), Some((req, _))) = (&cancel, &active) {
-                        // 只停「同一条」：代号对不上说明它已经过期，取消它等于误杀。
-                        if same_deep_job(c, req) {
-                            logv!("[deep] cancelled gen={}", c.deep_generation);
-                            active = None;
+                if let (Some(c), Some((req, _))) = (&cancel, &active) {
+                    // 只停「同一条」：代号对不上说明它已经过期，取消它等于误杀。
+                    if same_deep_job(c, req) {
+                        logv!("[deep] cancelled gen={}", c.deep_generation);
+                        active = None;
+                    }
+                }
+                // 2) 挑这一轮要跑的那条：空着就按先来先到取队首；正跑着时只有
+                // 「同一面板的新请求」才顶掉它（用户连打字），别的面板排队等 ——
+                // 一个面板的搜索不能把别人的结果挤掉。
+                let mut fresh: Option<DeepRequest> = None;
+                match active.as_ref() {
+                    Some((act, _)) => {
+                        if let Some(pos) = queue.iter().position(|r| same_deep_pane(r, act)) {
+                            fresh = Some(queue.remove(pos));
+                        }
+                    }
+                    None => {
+                        if !queue.is_empty() {
+                            fresh = Some(queue.remove(0));
                         }
                     }
                 }
-                if fresh.is_none() && active.is_none() {
+                if fresh.is_none() && active.is_none() && queue.is_empty() {
                     // 闲置：阻塞等一个请求（不烧 CPU）。
                     match rx.recv() {
-                        Ok(req) => fresh = Some(req),
+                        Ok(req) => {
+                            if req.want != 0 {
+                                push_deep_queue(&mut queue, req, None);
+                            }
+                            continue;
+                        }
                         Err(_) => return,
                     }
                 }
@@ -3660,31 +3733,62 @@ mod tests {
     }
 
     /// 真机 bug：连打 `ziya` → `ziyan` 时，界面丢掉一条过期结果会顺手发取消，
-    /// 取消排在新查询后面，而队列只留「最后一个」→ 新查询被顶掉，界面就这样
-    /// 挂着「已扫 0 项」不动了。取消必须单独一格，且不能顶掉新查询。
+    /// 取消排在新查询后面，以前两者共用一个槽 → 新查询被顶掉，界面就这样
+    /// 挂着「已扫 0 项」不动了。取消必须单独处理，且不能顶掉新查询。
     #[test]
     fn cancel_never_swallows_newer_query() {
-        let mut fresh = None;
-        let mut cancel = None;
-        fold_one(&deep_req(4, 300), &mut fresh, &mut cancel);
-        fold_one(&deep_req(3, 0), &mut fresh, &mut cancel);
-        assert_eq!(fresh.as_ref().map(|r| r.deep_generation), Some(4), "新查询必须留下");
-        assert_eq!(cancel.as_ref().map(|r| r.deep_generation), Some(3));
+        let mut queue: Vec<DeepRequest> = Vec::new();
+        push_deep_queue(&mut queue, deep_req(4, 300), None);
+        // 取消不进队列（工作线程单独拎出来），所以队列里只剩新查询。
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].deep_generation, 4, "新查询必须留下");
         // 而且这条取消对不上正在跑的第 4 代任务，不能停它。
         assert!(!same_deep_job(&deep_req(3, 0), &deep_req(4, 300)));
         assert!(same_deep_job(&deep_req(4, 0), &deep_req(4, 300)));
     }
 
-    /// 连着打好几个字：只做最后一个。
+    /// 连着打好几个字：同一面板只留最后一个。
     #[test]
     fn newer_query_replaces_older() {
-        let mut fresh = None;
-        let mut cancel = None;
+        let mut queue: Vec<DeepRequest> = Vec::new();
         for dgen in [1, 2, 3] {
-            fold_one(&deep_req(dgen, 300), &mut fresh, &mut cancel);
+            push_deep_queue(&mut queue, deep_req(dgen, 300), None);
         }
-        assert_eq!(fresh.map(|r| r.deep_generation), Some(3));
-        assert!(cancel.is_none());
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].deep_generation, 3);
+    }
+
+    /// 分屏两栏同时搜索：两个面板的请求都要留着，谁也不能把谁挤掉
+    ///（以前队列只留最后一个，先发的那一栏只收到一条空 done，子文件夹结果全丢）。
+    #[test]
+    fn both_panes_of_a_split_keep_their_request() {
+        let mut queue: Vec<DeepRequest> = Vec::new();
+        let mut left = deep_req(1, 300);
+        left.pane = 0;
+        let mut right = deep_req(1, 300);
+        right.pane = 1;
+        right.root = PathBuf::from("D:\\Music");
+        push_deep_queue(&mut queue, left, None);
+        push_deep_queue(&mut queue, right, None);
+        assert_eq!(queue.len(), 2, "两个面板各自都要有结果");
+        // 同一面板再发一次：只更新它自己那一格，不动别人的。
+        let mut left2 = deep_req(2, 300);
+        left2.pane = 0;
+        push_deep_queue(&mut queue, left2, None);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue[0].deep_generation, 2);
+        assert_eq!(queue[1].pane, 1);
+    }
+
+    /// 与正在跑的那条完全一样的请求不再入队（重跑一趟纯属白扫）。
+    #[test]
+    fn identical_running_request_is_ignored() {
+        let mut queue: Vec<DeepRequest> = Vec::new();
+        let running = deep_req(7, 300);
+        push_deep_queue(&mut queue, deep_req(7, 300), Some(&running));
+        assert!(queue.is_empty());
+        push_deep_queue(&mut queue, deep_req(8, 300), Some(&running));
+        assert_eq!(queue.len(), 1, "同面板的新查询仍然要排队顶掉旧的");
     }
 
     fn stamp(i: i32, thumb: u64) -> RowStamp {
@@ -8184,6 +8288,42 @@ fn drag_sidebar_zones(app: &App) -> Vec<CrumbDrop> {
     out
 }
 
+/// 深搜批次去重：同一个路径只留一条。
+///
+/// 走查是边扫边读（每个目录的 `ReadDir` 迭代器跨批次保留），文件在扫描途中被
+/// 移动或复制时，旧目录和新目录会各报一遍 —— 列表里就是两个一模一样的文件。
+/// `seen` 里带上本地条目和已有深搜结果，跨批次也不会重复。
+fn dedupe_deep_batch(
+    items: Vec<crate::search::index::DeepItem>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> Vec<crate::search::index::DeepItem> {
+    items
+        .into_iter()
+        .filter(|i| seen.insert(i.entry.path.clone()))
+        .collect()
+}
+
+/// 面包屑「往上跳」之后该单选哪个条目：被点那一段的**后一段**。
+///
+/// 不能直接拿当前目录当孩子 —— 连跳两级时当前目录并不在被点目录的下一层，
+/// 揭示永远落空。虚拟位置（回收站 `recycle://`、Shell 命名空间 `::{GUID}`）
+/// 不在任何普通列表里，白等一轮没有意义，直接跳过。
+fn crumb_child_of(segments: &[String], target: Option<&std::path::Path>) -> Option<PathBuf> {
+    let idx = segments.iter().position(|seg| {
+        let seg_path = if seg.is_empty() {
+            None
+        } else {
+            Some(std::path::Path::new(seg.as_str()))
+        };
+        seg_path == target
+    })?;
+    let next = segments.get(idx + 1)?;
+    if next.is_empty() || next.starts_with("::") || next == "recycle://" {
+        return None;
+    }
+    Some(PathBuf::from(next))
+}
+
 /// 拖到面包屑 / 侧栏条目松手：复用与内部拖放一致的传输管线。
 /// 同盘用移动，跨盘（含网络路径）用复制。
 #[cfg(windows)]
@@ -11954,6 +12094,51 @@ impl App {
             self.request_listing(id, pane, gen, path, sort);
         }
 
+        // 搜索面板：子树里有东西被动了（复制/移动/删除/改名/新建），结果整体
+        // 作废重跑。不重跑的话，被移动的那一条会「旧位置 + 新位置」各留一份，
+        // 列表里就是两个一模一样的文件。只重跑搜索面板，普通目录本来就走重列举。
+        {
+            let mut rerun = Vec::new();
+            for (index, tab) in self.state.tabs.iter().enumerate() {
+                if tab.kind != crate::state::TabKind::Explorer {
+                    continue;
+                }
+                for (pane_idx, pane) in tab.panes.iter().enumerate() {
+                    if pane.filter.trim().is_empty() {
+                        continue;
+                    }
+                    let Some(path) = pane.path.as_deref() else {
+                        continue;
+                    };
+                    if path == fs::drives::recycle_virtual_path() {
+                        continue;
+                    }
+                    // 只认「被改动的目录在搜索子树里」。上级目录被改动（比如从
+                    // 树外面搬进来一个文件）只会影响根目录那一层，那由重新列举
+                    // 负责，深搜不必白扫一趟。
+                    if affected.iter().any(|a| a == path || a.starts_with(path)) {
+                        rerun.push((index, pane_idx));
+                    }
+                }
+            }
+            let rerun_any = !rerun.is_empty();
+            for (ti, pi) in rerun {
+                logv!("[deep] 文件任务改动了子树，重跑搜索 tab={ti} pane={pi}");
+                self.start_deep_search_for(ti, pi);
+                // 这条面板不会走「列举结果到达」那条重建路径（它的目录本身没变），
+                // 必须自己把显示表重算一遍，否则 display 还指着已被清掉的深搜条目。
+                if let Some(pane) = self.state.tabs[ti].panes.get_mut(pi) {
+                    pane.rebuild_display();
+                }
+            }
+            if rerun_any {
+                self.visible_cache = None;
+                self.visible_cache_right = None;
+                self.sync_file_list();
+                self.sync_status();
+            }
+        }
+
         // 如果当前有标签页因刷新而处于 loading 状态，同步更新 UI。
         if self.state.tabs.iter().any(|t| t.active().loading) {
             self.sync_file_list();
@@ -12329,6 +12514,33 @@ impl App {
         self.sync_tabs();
         self.sync_file_list();
         push_scroll(&self.ui, pane_index, scroll);
+    }
+
+    /// 点面包屑跳转：回到某个上级目录后，把「我是从哪个文件夹上来的」
+    /// 单选出来并滚进可视区 —— 与「上一级」(`nav_up`) 完全同一套收尾。
+    ///
+    /// 孩子取的是「被点那一段的后一段」，不是当前目录：连跳两级时当前目录
+    /// 并不在被点目录的下一层，拿它去揭示永远选不中。
+    fn navigate_breadcrumb(&mut self, target: Option<PathBuf>) {
+        // 点的就是当前那一格：什么都不做（不重载、不滚、不压历史）。
+        // 例外：正处在搜索页 —— 那时这一下以前会「重新进这个目录并清掉搜索词」，
+        // 行为不变，别把用户退出搜索的路给堵掉。
+        {
+            let active = self.state.active().active();
+            if target == active.path && active.filter.trim().is_empty() {
+                return;
+            }
+        }
+        let crumbs = self.ui.get_breadcrumbs();
+        let segs: Vec<String> = (0..crumbs.row_count())
+            .filter_map(|i| crumbs.row_data(i))
+            .map(|seg| seg.path.to_string())
+            .collect();
+        let child = crumb_child_of(&segs, target.as_deref());
+        if let Some(child) = child.as_ref() {
+            logv!("[nav] crumb: select {:?}", child);
+        }
+        self.navigate_active_reveal(target, child);
     }
 
     fn nav_up(&mut self) {
@@ -12936,6 +13148,7 @@ impl App {
         };
 
         // 3. 如果命中了文件夹，目标改为该文件夹
+        let mut dropped_on_dir = false;
         if target_row >= 0 {
             let hit_dir = self
                 .state
@@ -12947,12 +13160,33 @@ impl App {
                 .map(|e| e.path.clone());
             if let Some(dir) = hit_dir {
                 target_dir = dir;
+                dropped_on_dir = true;
             }
         }
 
         // 4. 防止原地拖放或拖入自身子目录
         if paths.iter().all(|p| p.parent() == Some(target_dir.as_path())) {
             return; // 同一目录下移动/复制，直接忽略
+        }
+        // 搜索状态下落到本栏空白处 = 目标就是搜索根目录：结果里子文件夹中的
+        // 文件会被搬到根上，属于误操作，直接拒绝。落到具体文件夹行（上面
+        // 命中 dir）仍然允许；别的分屏、别的程序完全不受影响。
+        if !dropped_on_dir
+            && self
+                .state
+                .active()
+                .panes
+                .get(target_pane)
+                .is_some_and(|p| !p.filter.is_empty())
+            && paths.iter().any(|p| p.starts_with(&target_dir))
+        {
+            logln!(
+                "[drag] !! 搜索中拖回本栏被拒：{} 项 -> {:?}",
+                paths.len(),
+                target_dir
+            );
+            self.set_status_job(self.tr("搜索中不能拖放到当前分屏，请拖到具体的文件夹上"));
+            return;
         }
         if paths.iter().any(|p| p == &target_dir || target_dir.starts_with(p)) {
             self.set_status_job(self.tr("无法将文件夹移动到自身或其子文件夹中"));
@@ -14261,7 +14495,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             } else {
                 Some(PathBuf::from(path))
             };
-            app.borrow_mut().navigate_active(target);
+            app.borrow_mut().navigate_breadcrumb(target);
         });
     }
     {
@@ -17455,6 +17689,124 @@ fn is_address_bar_command(text: &str) -> bool {
 /// 会话已存在时的新开标签要求由 `queue_shell_tab` 负责，跟这里无关。
 fn initial_path_opens_new_tab(restored_last_tabs: bool) -> bool {
     restored_last_tabs
+}
+
+#[cfg(test)]
+mod deep_dedupe_tests {
+    use super::dedupe_deep_batch;
+    use crate::fs::FileEntry;
+    use crate::search::PinyinFields;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+
+    fn item(path: &str) -> crate::search::index::DeepItem {
+        crate::search::index::DeepItem {
+            entry: FileEntry::from_path(std::path::Path::new(path), false, 0, None, false),
+            fields: PinyinFields::default(),
+        }
+    }
+
+    /// 同一路径在同一批里出现两次（旧目录、新目录各报一遍）只留一条。
+    #[test]
+    fn same_path_in_one_batch_kept_once() {
+        let mut seen = HashSet::new();
+        let out = dedupe_deep_batch(
+            vec![item("C:\\r\\sub\\a.txt"), item("C:\\r\\sub\\a.txt")],
+            &mut seen,
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    /// 已有结果（本地条目 + 之前的深搜批次）里的路径也不许再来一遍。
+    #[test]
+    fn already_seen_paths_are_skipped_across_batches() {
+        let mut seen: HashSet<PathBuf> = HashSet::new();
+        seen.insert(PathBuf::from("C:\\r\\a.txt"));
+        let first = dedupe_deep_batch(vec![item("C:\\r\\a.txt")], &mut seen);
+        assert!(first.is_empty(), "本地/上一批已有的路径不该重复");
+        let second = dedupe_deep_batch(vec![item("C:\\r\\sub\\b.txt")], &mut seen);
+        assert_eq!(second.len(), 1);
+        // seen 必须被写回：下一批再来同一条仍然要挡住。
+        let again = dedupe_deep_batch(vec![item("C:\\r\\sub\\b.txt")], &mut seen);
+        assert!(again.is_empty());
+    }
+
+    /// 不同路径（哪怕同名）是真的两条结果，不能误杀。
+    #[test]
+    fn same_name_in_different_dirs_is_kept() {
+        let mut seen = HashSet::new();
+        let out = dedupe_deep_batch(
+            vec![item("C:\\r\\a\\x.txt"), item("C:\\r\\b\\x.txt")],
+            &mut seen,
+        );
+        assert_eq!(out.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod crumb_child_tests {
+    use super::crumb_child_of;
+    use std::path::Path;
+
+    fn segs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// 上一级：孩子就是当前目录（和 nav_up 一致）。
+    #[test]
+    fn parent_click_selects_current_dir() {
+        let s = segs(&["", "C:\\", "C:\\a", "C:\\a\\b"]);
+        assert_eq!(
+            crumb_child_of(&s, Some(Path::new("C:\\a"))),
+            Some(std::path::PathBuf::from("C:\\a\\b"))
+        );
+    }
+
+    /// 连跳两级：孩子是被点目录的后一段，不是当前目录。
+    #[test]
+    fn multi_level_click_selects_intermediate_dir() {
+        let s = segs(&["", "C:\\", "C:\\a", "C:\\a\\b", "C:\\a\\b\\c"]);
+        assert_eq!(
+            crumb_child_of(&s, Some(Path::new("C:\\a"))),
+            Some(std::path::PathBuf::from("C:\\a\\b"))
+        );
+    }
+
+    /// 点「此电脑」：孩子是刚才所在的盘符，回到盘符列表后单选它。
+    #[test]
+    fn this_pc_click_selects_drive() {
+        let s = segs(&["", "C:\\", "C:\\a"]);
+        assert_eq!(
+            crumb_child_of(&s, None),
+            Some(std::path::PathBuf::from("C:\\"))
+        );
+    }
+
+    /// 回收站是虚拟位置：跳回「此电脑」时不能拿 `recycle://` 去揭示。
+    #[test]
+    fn recycle_click_back_has_no_child() {
+        let s = segs(&["", "recycle://"]);
+        assert_eq!(crumb_child_of(&s, None), None);
+        // 点在回收站那一格上（已在站内）：也没有孩子可揭示。
+        assert_eq!(crumb_child_of(&s, Some(Path::new("recycle://"))), None);
+    }
+
+    /// 网络路径按 服务器 / 共享 拆段，跳服务器根时孩子是共享目录。
+    #[test]
+    fn network_click_selects_share() {
+        let s = segs(&["", "\\\\srv", "\\\\srv\\share", "\\\\srv\\share\\a"]);
+        assert_eq!(
+            crumb_child_of(&s, Some(Path::new("\\\\srv"))),
+            Some(std::path::PathBuf::from("\\\\srv\\share"))
+        );
+    }
+
+    /// 点的是最后一段（自己）：回到原位，没有孩子。
+    #[test]
+    fn last_segment_has_no_child() {
+        let s = segs(&["", "C:\\", "C:\\a"]);
+        assert_eq!(crumb_child_of(&s, Some(Path::new("C:\\a"))), None);
+    }
 }
 
 #[cfg(test)]
