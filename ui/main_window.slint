@@ -467,8 +467,8 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 仅在用户拖拽结束时上报（落盘用）；窗口尺寸变化导致的被动收缩不上报。
     callback sidebar_width_changed(float);
     callback file_row_pointer_event(index: int, event: PointerEvent, x: length, y: length, on_name: bool);
-    callback file_name_overlay_clicked();
-    callback file_name_overlay_right_clicked();
+    callback file_name_overlay_clicked(pane: int, owner: int, hit: int, x: length, y: length);
+    callback file_name_overlay_right_clicked(pane: int, owner: int, hit: int, x: length, y: length);
     callback file_overlay_hover(pane: int, inside: bool);
     /// 图标格子悬停（pane, 显示索引；index=-1 表示离开格子）。
     callback file_hover_row(pane: int, index: int);
@@ -1349,8 +1349,8 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                         root.file_row_pointer_event(index, event, x, y, on_name);
                     }
-                    name_overlay_clicked() => { root.file_name_overlay_clicked(); }
-                    name_overlay_right_clicked() => { root.file_name_overlay_right_clicked(); }
+                    name_overlay_clicked(owner, hit, x, y) => { root.file_name_overlay_clicked(0, owner, hit, x, y); }
+                    name_overlay_right_clicked(owner, hit, x, y) => { root.file_name_overlay_right_clicked(0, owner, hit, x, y); }
                     overlay-hover(inside) => { root.file_overlay_hover(0, inside); }
                     hover_row(index) => { root.file_hover_row(0, index); }
                     row_double_clicked(index) => {
@@ -1519,8 +1519,8 @@ out property <length> row-height-out: file-list.row-height-out;
                                 root.file_row_pointer_event(index, event, x, y, on_name);
                             }
                         }
-                        name_overlay_clicked() => { root.file_name_overlay_clicked(); }
-                        name_overlay_right_clicked() => { root.file_name_overlay_right_clicked(); }
+                        name_overlay_clicked(owner, hit, x, y) => { root.file_name_overlay_clicked(1, owner, hit, x, y); }
+                        name_overlay_right_clicked(owner, hit, x, y) => { root.file_name_overlay_right_clicked(1, owner, hit, x, y); }
                         overlay-hover(inside) => { root.file_overlay_hover(1, inside); }
                         hover_row(index) => { root.file_hover_row(1, index); }
                         row_double_clicked(index) => {

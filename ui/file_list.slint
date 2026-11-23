@@ -148,10 +148,14 @@ export component FileList inherits Rectangle {
         }
         return false;
     }
-    callback name-overlay-clicked();
-    /// 在名称浮层上点右键：浮层盖住的格子可能压根不在浮层范围内（浮层比格子宽，
-    /// 还常常伸出到邻居/空白上），所以右键也要由浮层自己转发给 Rust 开菜单。
-    callback name-overlay-right-clicked();
+    /// 浮层被点击 / 右键。带上 `hit`：浮层**下方那一刻真正压着的格子**行号
+    /// （-1 = 空白）。浮层比格子高，向下伸进下一行是常态，光按「浮层属于谁」
+    /// 转发的话，点在下一行（或空白）上会被算成浮层主人的那一行 —— 表现为
+    /// 「单选了某文件后，右键别的文件/空白却弹出它的菜单」。
+    /// `owner` = 浮层自己的条目索引：Rust 侧不能再靠「悬停优先」重新推一遍，
+    /// 因为回调到达时悬停索引可能已经被清掉/换人，那样就会认成别的条目。
+    callback name-overlay-clicked(owner: int, hit: int, x: length, y: length);
+    callback name-overlay-right-clicked(owner: int, hit: int, x: length, y: length);
     /// 「点的是文字本身，还是浮层里的空白」判定。
     ///
     /// 浮层框固定 1.05 倍格宽，短名字周围留着一大片白；以前整块都算「再次点击
@@ -393,6 +397,16 @@ export component FileList inherits Rectangle {
     private property <bool> ex-press-armed: false;
     private property <length> ex-press-x: 0px;
     private property <length> ex-press-y: 0px;
+    /// 右键「已按住」：右键菜单必须推迟到抬手才弹（见下方 TouchArea 里的说明）。
+    private property <bool> ex-r-armed: false;
+    /// 名称浮层是否接鼠标。
+    ///
+    /// 中/大/超大图标的名字会被截断，浮层显示完整多行名，框会**往格子外面长**：
+    /// 这种浮层只能是纯绘图层 —— 一旦接事件，在名字上按下就再也拖不出文件
+    /// （行那边收不到按下），而它的可交互区域本来也只是「浮层框 ∩ 自己那一格」，
+    /// 那块地方本来就属于下面那一行，删掉输入行为完全一样。
+    /// 详细/列表/小图标的浮层只有一行、不伸出格子，保持原样。
+    private property <bool> ex-takes-input: !root.is-icons-view || root.view-mode == "icons-small";
 
     /// 排查用：把“为什么截断 / 浮层为什么这样”的全部数字拼成一行。
     public function name-debug-info() -> string {
@@ -424,6 +438,8 @@ export component FileList inherits Rectangle {
         // 否则之后一次没有 down 的 up 也会触发点击回调（表现为莫名重进改名）。
         root.ex-press-armed = false;
         root.hv-press-armed = false;
+        root.ex-r-armed = false;
+        root.hv-r-armed = false;
     }
     /// 相对格子**居中**（含最左/最右列）。
     /// 浮层宽 1.1 倍格宽，居中后每侧只向外伸出 0.05 × item-w；而网格的
@@ -449,6 +465,9 @@ export component FileList inherits Rectangle {
     /// 滚动时是连续滑动而不是「跨过某一行突然翻面」。
     /// 顶边再夹 4px：名字长到比整个面板还高时优先保住行首。
     private property <length> ex-box-y: max(4px, min(root.ex-natural-y, root.height - 4px - root.ex-box-h));
+    /// 只有压在主人自己格子上时才接事件（见 overlay-hit-rect）。
+    private property <[length]> ex-hit: root.overlay-hit-rect(root.expand-index,
+        root.ex-box-x, root.ex-box-y, root.ex-box-w, root.ex-box-h);
 
     // 悬停浮层的同一套几何（与选中浮层完全对称，只是换了索引/行/宽）。
     private property <length> hv-item-x: root.cell-x(root.hv-col);
@@ -456,6 +475,7 @@ export component FileList inherits Rectangle {
     private property <length> hv-box-h: max(root.hover-expand-lines.length * root.line-h + 14px, 30px);
 
     private property <bool> hv-press-armed: false;
+    private property <bool> hv-r-armed: false;
     private property <length> hv-press-x: 0px;
     private property <length> hv-press-y: 0px;
     private property <length> hv-want-x: hv-item-x + (root.item-w - hv-box-w) / 2;
@@ -469,6 +489,9 @@ export component FileList inherits Rectangle {
     private property <bool> hv-in-view: root.hv-cell-bottom > flick.y + 2px
         && root.hv-cell-top < flick.y + flick.height - 2px;
     private property <length> hv-box-y: max(4px, min(root.hv-natural-y, root.height - 4px - root.hv-box-h));
+    /// 悬停浮层同 ex-hit。
+    private property <[length]> hv-hit: root.overlay-hit-rect(root.hover-expand-index,
+        root.hv-box-x, root.hv-box-y, root.hv-box-w, root.hv-box-h);
 
     /// 命中测试：接收相对于 FileList 自身的局部坐标 (lx, ly)
     public function row-hit-test(lx: length, ly: length) -> int {
@@ -507,7 +530,7 @@ export component FileList inherits Rectangle {
     }
 
     /// 获取指定单元格相对于 FileList 的坐标几何 [x, y, width, height]
-    public function get-item-rect(idx: int) -> [length] {
+    pure public function get-item-rect(idx: int) -> [length] {
         let header-h = root.view-mode == "details" ? 30px : 0px;
         if (root.is-icons-view) {
             let col = Math.mod(idx, root.cells-per-row);
@@ -524,6 +547,27 @@ export component FileList inherits Rectangle {
             let h = root.row-h;
             return [x, y, w, h];
         }
+    }
+
+    /// 名称浮层的**可交互区域**：浮层框与自己那一格（详细信息视图是一行）的交集。
+    ///
+    /// 浮层比格子宽、名字长时还会往下伸出好几行，这是常态；但伸出去的那部分
+    /// 只能「看得见」，绝不能吃事件 —— 否则右键/拖拽落在邻居文件或空白上时，
+    /// 事件被浮层截走，判定对象就成了被单选/悬停的那一条。
+    /// 返回的是**相对浮层框**的 [x, y, w, h]（空交集时宽高为 0）。
+    pure function overlay-hit-rect(idx: int, bx: length, by: length, bw: length, bh: length) -> [length] {
+        if (idx < 0) {
+            return [0px, 0px, 0px, 0px];
+        }
+        let cell = root.get-item-rect(idx);
+        let x0 = max(bx, cell[0]);
+        let y0 = max(by, cell[1]);
+        let x1 = min(bx + bw, cell[0] + cell[2]);
+        let y1 = min(by + bh, cell[1] + cell[3]);
+        if (x1 <= x0 || y1 <= y0) {
+            return [0px, 0px, 0px, 0px];
+        }
+        return [x0 - bx, y0 - by, x1 - x0, y1 - y0];
     }
 
     /// 拖出上膛：行被按下、可能即将拖出时置真，禁用 flick 的交互滚动，
@@ -2398,8 +2442,14 @@ export component FileList inherits Rectangle {
             // 只认文字上的点击：框里的空白处返回 reject，让事件继续落到下面的
             // 格子/背景（等同点空白），不再误触发重命名。
             TouchArea {
-                width: 100%;
-                height: 100%;
+                enabled: root.ex-takes-input;
+                // 只占「浮层框 ∩ 自己那一格」：伸到邻居/空白上的那部分不接事件，
+                // 直接落给下面的行或背景。原先写 100%×100% 就是「右键别的文件
+                // 却弹出被单选文件的菜单」「从邻居起手拖不动」的根。
+                x: max(0px, root.ex-hit[0] - 4px);
+                y: max(0px, root.ex-hit[1] - 6px);
+                width: max(0px, root.ex-hit[2]);
+                height: max(0px, root.ex-hit[3]);
                 // 防闪烁：浮层是后声明的同级元素、盖住了名称区，鼠标下移到
                 // 文件名上时格子自己的 TouchArea 会收到 has-hover=false，
                 // 于是浮层消失 → 鼠标又落回格子 → 浮层再出现，来回抖。
@@ -2409,8 +2459,17 @@ export component FileList inherits Rectangle {
                     root.overlay-hover(self.has-hover);
                 }
                 pointer-event(e) => {
+                    // 落点下面真正压着哪一行：浮层往下伸出自己的格子时，
+                    // 那里其实属于下一行（或空白），不能再算成本条目的点击。
+                    // 交点相对浮层框，再换回 FileList 根坐标（也能纠正原先
+                    // 漏加的 4/6px 内边距 —— 差几像素就会在格子边界上判错行）。
+                    let cx = root.ex-box-x + root.ex-hit[0] + self.mouse-x;
+                    let cy = root.ex-box-y + root.ex-hit[1] + self.mouse-y;
+                    let hit = root.row-hit-test(cx, cy);
+                    let mine = hit == root.expand-index;
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
-                        if (root.name-text-hit(self.mouse-x, self.mouse-y, self.width,
+                        if (mine && root.name-text-hit(root.ex-hit[0] - 4px + self.mouse-x,
+                                root.ex-hit[1] - 6px + self.mouse-y, root.ex-box-w - 8px,
                                 root.expand-line-ws)) {
                             root.ex-press-armed = true;
                             root.ex-press-x = self.mouse-x;
@@ -2418,6 +2477,8 @@ export component FileList inherits Rectangle {
                             return EventResult.accept;
                         }
                         root.ex-press-armed = false;
+                        // 不在自己的格子上：让事件落给下面的行/背景，
+                        // 否则从邻居起手拖拽会完全拖不动。
                         return EventResult.reject;
                     }
                     if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left
@@ -2426,12 +2487,23 @@ export component FileList inherits Rectangle {
                         let moved = abs(self.mouse-x - root.ex-press-x)
                             + abs(self.mouse-y - root.ex-press-y);
                         if (moved <= 6px) {
-                            root.name-overlay-clicked();
+                            root.name-overlay-clicked(root.expand-index, hit, cx, cy);
                         }
                         return EventResult.accept;
                     }
+                    // 右键菜单必须在**抬手**才弹：菜单是独立窗口，它会吃掉这次按下的
+                    // 抬手事件，Slint 记下的「这一下落在哪个元素上」就再也清不掉 ——
+                    // 之后任意一次按下都被派给同一个元素（右键 A 却弹出 B 的菜单）。
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
-                        root.name-overlay-right-clicked();
+                        root.ex-r-armed = true;
+                        return EventResult.accept;
+                    }
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                        let armed = root.ex-r-armed;
+                        root.ex-r-armed = false;
+                        if (armed) {
+                            root.name-overlay-right-clicked(root.expand-index, hit, cx, cy);
+                        }
                         return EventResult.accept;
                     }
                     if (e.kind == PointerEventKind.cancel) {
@@ -2556,14 +2628,22 @@ export component FileList inherits Rectangle {
 
             // 悬停浮层同样可以被点击：单击选中该文件（同样只认文字上的点击）。
             TouchArea {
-                width: 100%;
-                height: 100%;
+                enabled: root.ex-takes-input;
+                x: max(0px, root.hv-hit[0] - 4px);
+                y: max(0px, root.hv-hit[1] - 6px);
+                width: max(0px, root.hv-hit[2]);
+                height: max(0px, root.hv-hit[3]);
                 changed has-hover => {
                     root.overlay-hover(self.has-hover);
                 }
                 pointer-event(e) => {
+                    let cx = root.hv-box-x + root.hv-hit[0] + self.mouse-x;
+                    let cy = root.hv-box-y + root.hv-hit[1] + self.mouse-y;
+                    let hit = root.row-hit-test(cx, cy);
+                    let mine = hit == root.hover-expand-index;
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
-                        if (root.name-text-hit(self.mouse-x, self.mouse-y, self.width,
+                        if (mine && root.name-text-hit(root.hv-hit[0] - 4px + self.mouse-x,
+                                root.hv-hit[1] - 6px + self.mouse-y, root.hv-box-w - 8px,
                                 root.hover-expand-line-ws)) {
                             root.hv-press-armed = true;
                             root.hv-press-x = self.mouse-x;
@@ -2579,12 +2659,20 @@ export component FileList inherits Rectangle {
                         let moved = abs(self.mouse-x - root.hv-press-x)
                             + abs(self.mouse-y - root.hv-press-y);
                         if (moved <= 6px) {
-                            root.name-overlay-clicked();
+                            root.name-overlay-clicked(root.hover-expand-index, hit, cx, cy);
                         }
                         return EventResult.accept;
                     }
                     if (e.kind == PointerEventKind.down && e.button == PointerEventButton.right) {
-                        root.name-overlay-right-clicked();
+                        root.hv-r-armed = true;
+                        return EventResult.accept;
+                    }
+                    if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                        let armed = root.hv-r-armed;
+                        root.hv-r-armed = false;
+                        if (armed) {
+                            root.name-overlay-right-clicked(root.hover-expand-index, hit, cx, cy);
+                        }
                         return EventResult.accept;
                     }
                     if (e.kind == PointerEventKind.cancel) {

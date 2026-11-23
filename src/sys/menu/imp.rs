@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{MenuAction, MenuNode, Options, Sink, Target};
 
@@ -28,7 +28,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, AllowSetForegroundWindow, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DeleteMenu, DestroyMenu, DispatchMessageW, GetCursorPos, GetForegroundWindow,
+    DeleteMenu, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow,
     GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu,
     IsWindow, PostMessageW, RegisterClassW, SendMessageTimeoutW, SetForegroundWindow,
     SetWindowPos, ShowWindow,
@@ -78,6 +78,9 @@ const MENU_STALL_MS: u64 = 1_500;
 /// 以前这里写 20 秒：第一条右键被第三方扩展卡住后，之后二十秒里每次右键都
 /// 被静默忽略，用户只会以为右键坏了，转头去任务管理器杀进程。
 const MENU_BUILD_GRACE_MS: u64 = 800;
+/// 构建阶段的硬上限：就算线程还能回 ping（有的扩展自己泵消息），
+/// 5 秒还弹不出来的菜单用户早就不想要了，放弃它换新的。
+const MENU_BUILD_MAX_MS: u64 = 5_000;
 /// 探测超时：正常线程几毫秒就回，等 400ms 还没回就是真卡死了。
 const PING_TIMEOUT_MS: u32 = 400;
 
@@ -112,6 +115,32 @@ static BUSY_GEN: AtomicU64 = AtomicU64::new(0);
 static BUSY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
 /// 菜单线程代数：老线程恢复时不许覆盖 `HOST`。
 static HOST_GEN: AtomicU64 = AtomicU64::new(0);
+/// 有一条宿主线程正在起来的路上（还没把窗口建出来）。
+///
+/// 建窗口可能要等好几秒 —— 卡死的老线程握着进程级的锁（loader lock 等），
+/// 新的 `CreateWindowExW` 得排队。这期间**不能让 UI 线程干等**（真机日志：
+/// 每次右键卡 5 秒，用户看到的是一整窗没反应），也不能每点一次就再开一条线程。
+static HOST_STARTING: AtomicBool = AtomicBool::new(false);
+/// 这条「正在起来」的线程是什么时候派出去的（毫秒）。
+static HOST_START_MS: AtomicU64 = AtomicU64::new(0);
+/// 建宿主窗口最多给多久。超了就当它卡死，允许另开一条。
+///
+/// 这台机器建窗口本来就要好几秒（全局钩子拖的），所以不能给太紧：判错成
+/// 「进程被拖坏」会白白换掉一个好好的进程。
+const HOST_START_TIMEOUT_MS: u64 = 10_000;
+/// 本进程**曾经**有过一条能用的宿主窗口。
+///
+/// 判毒只在「从来没有过」时成立：进程级锁被卡死的扩展攥着时，新线程一行代码
+/// 都跑不到，宿主窗口永远建不出来。反过来，如果已经有过宿主（右键能用），
+/// 只是后来补的备用窗口慢了几秒，那跟「进程被拖坏」毫无关系，绝不能触发
+/// 静默换进程。
+static HAD_HOST: AtomicBool = AtomicBool::new(false);
+/// 备用宿主窗口：已建好、空闲，随时可以顶上去。
+///
+/// 真机日志里恢复慢的根因就是「放弃一条线程 → 新线程建窗口要好几秒 → 这
+/// 几秒里每次右键都被忽略」。有了备用窗口，放弃的瞬间就能顶上一个现成的，
+/// 下一次右键立刻有菜单。
+static SPARE: AtomicIsize = AtomicIsize::new(0);
 /// 已经放弃过多少条卡死的宿主线程。
 ///
 /// 卡在第三方扩展里的线程**无法回收**（没有 API 能安全杀掉一个卡在原生调用里
@@ -133,6 +162,24 @@ const MAX_ABANDONED: u32 = 6;
 static SHOWN: AtomicBool = AtomicBool::new(false);
 /// 已经彻底停手（右键菜单不再可用）。UI 侧据此决定要不要找个时机静默重启进程。
 static GAVE_UP: AtomicBool = AtomicBool::new(false);
+/// 最近一次「系统菜单建不完、线程被判死」的时刻（0 = 从没发生过）。
+static LAST_ABANDON_MS: AtomicU64 = AtomicU64::new(0);
+/// 最近一次**带系统菜单**的弹出正常走完的时刻。
+static LAST_OK_MS: AtomicU64 = AtomicU64::new(0);
+/// 判死之后这段时间内不再邀请系统菜单上场。
+const SHELL_COOLDOWN_MS: u64 = 120_000;
+/// 系统菜单把线程拖死过几次；够两次就本次运行不再请它上场。
+///
+/// 每拖死一次就漏一条线程（回收不了），而 `MAX_ABANDONED` 到顶后右键会**永久**
+/// 不可用。两次之后彻底不用系统菜单，等于拿「打开方式 / 发送到」换「右键永远能用」。
+static SHELL_FAILS: AtomicU32 = AtomicU32::new(0);
+const MAX_SHELL_FAILS: u32 = 2;
+/// 进程被拖坏：派出去的宿主线程根本起不来。
+///
+/// 卡死的扩展握着进程级的锁（loader lock）时，`std::thread::spawn` 能成功但
+/// 新线程永远拿不到锁、一行代码都跑不到 —— 之后网络枚举、索引、右键全部哑掉。
+/// 这种进程没救了，只能换一个新的（见 app.rs 的自我修复）。
+static POISONED: AtomicBool = AtomicBool::new(false);
 /// 被放弃的那一代菜单任务。卡在第三方扩展里的线程**迟早会返回**，然后照样
 /// 把菜单弹出来 —— 那会是一个没人要的幽灵菜单（用户点它还有效，更糟）。
 /// 判死时把代数记在这儿，`run_menu` 弹出前对一下，被放弃的一律不弹。
@@ -175,6 +222,60 @@ fn end_busy(gen: u64) {
     }
 }
 
+/// 系统菜单刚刚卡死过？（两分钟内没再成功出过一次带系统项的菜单就算）
+///
+/// 这台机器的实际情形：某个第三方外壳扩展在 `QueryContextMenu` 里永远不返回，
+/// 每次都把菜单线程拖死。判死之后如果还继续请系统菜单，用户右键一次死一次。
+/// 所以冷却期内只弹 Rove 自己的菜单项 —— 少了「打开方式 / 发送到」这些，
+/// 但至少右键立刻有反应，别的功能都还能用。
+pub(crate) fn shell_unhealthy() -> bool {
+    if SHELL_FAILS.load(Ordering::Acquire) >= MAX_SHELL_FAILS {
+        return true;
+    }
+    let abandoned = LAST_ABANDON_MS.load(Ordering::Acquire);
+    if abandoned == 0 {
+        return false;
+    }
+    if LAST_OK_MS.load(Ordering::Acquire) > abandoned {
+        return false;
+    }
+    now_ms().saturating_sub(abandoned) < SHELL_COOLDOWN_MS
+}
+
+/// UI 线程周期调用：不点右键也能发现「进程被拖坏」。
+///
+/// 判据和 `ensure_host` 里那条一样 —— 派出去建窗口的线程过了时限还没露头，
+/// 说明新线程根本跑不起来（进程级的锁被卡死的扩展攥着）。
+pub(crate) fn tick() {
+    if POISONED.load(Ordering::Acquire)
+        || !HOST_STARTING.load(Ordering::Acquire)
+        || HAD_HOST.load(Ordering::Acquire)
+    {
+        return;
+    }
+    let age = now_ms().saturating_sub(HOST_START_MS.load(Ordering::Acquire));
+    if age >= HOST_START_TIMEOUT_MS {
+        POISONED.store(true, Ordering::Release);
+        crate::logal!(
+            "[menu] !! 宿主线程 {}ms 都没起来，进程多半已被卡死的扩展拖坏",
+            age
+        );
+    }
+}
+
+/// 进程是不是已经被卡死的扩展拖坏了（新线程都起不来）。
+pub(crate) fn poisoned() -> bool {
+    POISONED.load(Ordering::Acquire)
+}
+
+/// 开机就把菜单宿主线程叫起来。
+///
+/// 真机日志：第一条右键时宿主线程要花 4 秒多才建出窗口（那台机器的窗口创建
+/// 被各种全局钩子拖得很慢），于是第一次右键白点了。提前建好就没这个问题。
+pub(crate) fn prewarm() {
+    let _ = ensure_host();
+}
+
 /// 右键菜单是不是已经彻底放弃了（卡死线程到上限）。只有这时才值得换个进程。
 pub(crate) fn exhausted() -> bool {
     GAVE_UP.load(Ordering::Acquire)
@@ -201,6 +302,11 @@ thread_local! {
     /// Rove 自己建的子菜单句柄。关键词过滤只针对系统菜单项，
     /// 这些子菜单连同里面的内容一律不碰。
     static APP_POPUPS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
+    /// 本线程是第几代菜单宿主（BUSY 记账用）。
+    static SELF_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// 本线程自己的窗口。卡死被放弃的老线程若干分钟后会自己「活过来」，
+    /// 那时它手里的窗口已经没人认了：不许它取走新线程的请求，也不许它动 BUSY。
+    static SELF_HWND: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
 }
 
 /// 弹出原生菜单。`owner` 是主窗口 HWND（用于菜单关闭后归还前台权）；
@@ -218,22 +324,50 @@ pub(crate) fn open(
     // 所以挂得太久的要探测一次：没回应就放弃这条线程，换一条新的。
     if BUSY.load(Ordering::Acquire) {
         let age = now_ms().saturating_sub(BUSY_SINCE_MS.load(Ordering::Acquire));
-        // 构建阶段（还没弹出来）被拖住是常见的「慢」，要更长的沉默才算死；
-        // 有菜单在屏幕上时线程在跑消息循环，探测能回，根本走不到这里。
         let shown = SHOWN.load(Ordering::Acquire);
         let limit = if shown { MENU_STALL_MS } else { MENU_BUILD_GRACE_MS };
-        // 构建阶段超时**不必再问 ping**：不少第三方扩展自己会泵消息，
-        // `SendMessageTimeout` 照样能立刻回「我还活着」，于是「死了没」永远判成
-        // 「活着」→ BUSY 永远不复位 → 之后每次右键都被静默忽略（真机日志：
-        // menu_busy 从 21 秒一路涨到 76 秒，右键从此没反应，关窗口也销毁不掉）。
-        let stuck_building = !shown;
-        if age > limit && (stuck_building || !host_responsive(HOST.load(Ordering::Acquire))) {
+        // 还在等宿主窗口建出来的阶段：请求已经排队，等它起来自己会取走，
+        // 不算「卡死」（否则慢一点的宿主启动会把放弃名额白白烧光，
+        // 6 条烧完右键就彻底不再恢复）。
+        if HOST.load(Ordering::Acquire) == 0 && HOST_STARTING.load(Ordering::Acquire) {
+            return true;
+        }
+        // 判死规则：
+        //  · 菜单已经在屏幕上 → 线程在跑消息循环，ping 不该超时；
+        //  · 构建阶段 → 先探活。能回 ping 的是「慢」（有的第三方扩展自己泵消息），
+        //    别换线程；但超过硬上限照样放弃。
+        let alive = host_responsive(HOST.load(Ordering::Acquire));
+        let dead = if shown {
+            !alive
+        } else {
+            !alive || age > MENU_BUILD_MAX_MS
+        };
+        if age > limit && dead {
             let abandoned = ABANDONED.fetch_add(1, Ordering::AcqRel) + 1;
+            LAST_ABANDON_MS.store(now_ms().max(1), Ordering::Release);
+            let fails = SHELL_FAILS.fetch_add(1, Ordering::AcqRel) + 1;
+            if fails >= MAX_SHELL_FAILS {
+                crate::logal!(
+                    "[menu] 系统菜单已经拖死线程 {fails} 次，本次运行不再请它上场（只弹 Rove 自己的项）"
+                );
+            }
             ABORTED_GEN.store(BUSY_GEN.load(Ordering::Acquire), Ordering::Release);
             // `SHOWN` 是进程级的：卡死在 `TrackPopupMenuEx` 里的线程永远不会复位
             // 它，留着 true 就会让后面每次右键都按「菜单已在屏幕上」的时限判活。
             SHOWN.store(false, Ordering::Release);
             HOST.store(0, Ordering::Release);
+            // 挂着的那条请求属于已经判死的线程，跑起来只会是幽灵菜单。
+            JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            // 现成的备用窗口立刻顶上：这条右键马上就能弹出来，
+            // 不用再等一个新线程慢慢建窗口。
+            let spare = SPARE.swap(0, Ordering::AcqRel);
+            if spare != 0 {
+                HOST.store(spare, Ordering::Release);
+                // 备用窗口建出来之后主题可能已经切过：让它下次弹出前重新上色。
+                HOST_DARK.store(!DARK.load(Ordering::Acquire), Ordering::Release);
+                crate::logv!("[menu] 备用宿主窗口顶上 {:#x}", spare);
+                ensure_spare();
+            }
             BUSY.store(false, Ordering::Release);
             if abandoned > MAX_ABANDONED {
                 // 卡死的线程回收不了，攒多了只会白占内存：彻底停手，别再造新的。
@@ -246,6 +380,9 @@ pub(crate) fn open(
             crate::logal!(
                 "[menu] 菜单线程无响应 {age}ms（多半是第三方菜单扩展卡死），重建线程（第 {abandoned} 条）"
             );
+            // 这次右键别排给这条刚判死的线程：调用方会用「只含 Rove 自己项」
+            // 的菜单立刻重试一次（备用窗口已经在顶上，是瞬时的）。
+            return false;
         } else {
             return true;
         }
@@ -257,11 +394,9 @@ pub(crate) fn open(
     }
     let gen = BUSY_GEN.fetch_add(1, Ordering::AcqRel) + 1;
     BUSY_SINCE_MS.store(now_ms(), Ordering::Release);
-    let Some(host) = ensure_host() else {
-        crate::logln!("[menu] 原生菜单线程不可用，本次右键被忽略");
-        end_busy(gen);
-        return false;
-    };
+    // 拿到的是「已经建好的宿主」（可能为 0 = 还在起来），建好与否不重要：
+    // 下面入队后会再读一次。
+    let _ = ensure_host();
     JOBS.lock().unwrap_or_else(|e| e.into_inner()).push(Job {
         gen,
         target,
@@ -270,6 +405,16 @@ pub(crate) fn open(
         owner,
         sink,
     });
+    // 入队后再取一次句柄：宿主线程可能刚好在这一瞬间上岗，而它上岗时发的
+    // `WM_APP_OPEN_MENU` 早于我们入队 —— 那条消息会白跑一趟（队列还是空的），
+    // 之后没人再来取，这次右键就永远不弹。补发一条覆盖这个窗口。
+    let host = HOST.load(Ordering::Acquire);
+    if host == 0 {
+        // 宿主线程还在起来的路上。请求已经入队，它把窗口建好之后会自己来取
+        // （见 `host_thread`）。UI 线程在这里**一秒都不等**。
+        crate::logv!("[menu] host not ready yet, request queued");
+        return true;
+    }
     let ok = unsafe {
         PostMessageW(
             Some(HWND(host as *mut _)),
@@ -279,7 +424,12 @@ pub(crate) fn open(
         )
     };
     if ok.is_err() {
+        // 宿主窗口已经不在了（线程退出 / 窗口被销毁）：把句柄清掉，
+        // 否则之后每次右键都往一个死窗口投递，永远没人再来建。
+        let _ = HOST.compare_exchange(host, 0, Ordering::AcqRel, Ordering::Acquire);
+        JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
         end_busy(gen);
+        crate::logal!("[menu] 宿主窗口已失效，下次右键重建");
         return false;
     }
     true
@@ -699,33 +849,100 @@ pub fn set_dark(dark: bool) {
     apply_tray_theme();
 }
 
-fn ensure_host() -> Option<isize> {
+/// 取（必要时派出）菜单宿主线程。返回**当前已经建好的**宿主窗口句柄，
+/// 0 表示「还没有，线程正在起来」。
+///
+/// 以前这里会阻塞等最多 5 秒等线程回报句柄。真机日志里那是一条死路：
+/// 卡死的第三方菜单扩展握着进程级的锁，新线程建窗口要排队好几秒，
+/// 于是每次右键 UI 线程被冻 5 秒，连关闭按钮和托盘都没反应。
+/// 现在一律不等：请求留在 `JOBS` 里，宿主建好窗口后自己来取。
+fn ensure_host() -> isize {
     let existing = HOST.load(Ordering::Acquire);
     if existing != 0 {
-        return Some(existing);
+        return existing;
+    }
+    let spare = SPARE.swap(0, Ordering::AcqRel);
+    if spare != 0 {
+        HOST.store(spare, Ordering::Release);
+        HOST_DARK.store(!DARK.load(Ordering::Acquire), Ordering::Release);
+        crate::logv!("[menu] 备用宿主窗口顶上 {:#x}", spare);
+        ensure_spare();
+        return spare;
     }
     let _guard = START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let existing = HOST.load(Ordering::Acquire);
     if existing != 0 {
-        return Some(existing);
+        return existing;
     }
-    let (tx, rx) = std::sync::mpsc::channel();
+    if HOST_STARTING.load(Ordering::Acquire) {
+        let age = now_ms().saturating_sub(HOST_START_MS.load(Ordering::Acquire));
+        if age < HOST_START_TIMEOUT_MS {
+            // 已经有一条在路上，给它时间。
+            return 0;
+        }
+        // 派出去太久还没建出窗口：新线程根本没跑起来 —— 进程级的锁被卡死的
+        // 扩展攥着（真机：之后网络枚举 / 索引 / 右键全哑）。标死，交给自我修复。
+        // 只在「本进程从来没有过宿主窗口」时才这么判：有过就说明线程能起来，
+        // 这条只是慢（备用窗口也会走这条路），换进程没有意义。
+        if !HAD_HOST.load(Ordering::Acquire) {
+            POISONED.store(true, Ordering::Release);
+            crate::logal!(
+                "[menu] !! 宿主线程 {}ms 都没起来，进程多半已被卡死的扩展拖坏",
+                age
+            );
+        } else {
+            crate::logv!("[menu] 备用宿主线程 {}ms 还没建出窗口（不判毒）", age);
+        }
+    }
+    spawn_host_thread();
+    0
+}
+
+/// 派一条宿主线程出去。它建好窗口后优先当宿主，宿主义务已满就当备用。
+fn spawn_host_thread() -> bool {
     let gen = HOST_GEN.fetch_add(1, Ordering::AcqRel) + 1;
-    std::thread::Builder::new()
+    HOST_STARTING.store(true, Ordering::Release);
+    HOST_START_MS.store(now_ms(), Ordering::Release);
+    let spawned = std::thread::Builder::new()
         .name("rove-menu".into())
-        .spawn(move || host_thread(tx, gen))
-        .ok()?;
-    rx.recv_timeout(Duration::from_secs(5)).ok().flatten()
+        .spawn(move || host_thread(gen));
+    if spawned.is_err() {
+        HOST_STARTING.store(false, Ordering::Release);
+        crate::logal!("[menu] 菜单宿主线程创建失败");
+        return false;
+    }
+    true
+}
+
+/// 保证有一条**现成的备用窗口**等着接手。
+///
+/// 卡死一次就要换一条线程，而那台机器上新线程建窗口要好几秒。提前备一个，
+/// 换的时候就是瞬时的 —— 用户右键不会再「这几秒没反应」。
+fn ensure_spare() {
+    if SPARE.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let _guard = START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if SPARE.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    if HOST_STARTING.load(Ordering::Acquire) {
+        // 已经有一条在路上：它要是抢不到宿主义务，会自己当备用。
+        return;
+    }
+    spawn_host_thread();
 }
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(Some(0)).collect()
 }
 
-fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>, gen: u64) {
+fn host_thread(gen: u64) {
     unsafe {
+        crate::logv!("[menu] host thread gen={} start", gen);
         // OleInitialize = STA COM + OLE（剪贴板延迟渲染靠它）。
-        let _ = OleInitialize(None);
+        let hr = OleInitialize(None);
+        crate::logv!("[menu] host gen={} ole hr={:?}", gen, hr);
         let class_name = windows::core::w!("Rove.NativeMenuHost");
         let wc = WNDCLASSW {
             lpfnWndProc: Some(host_proc),
@@ -768,14 +985,47 @@ fn host_thread(ready: std::sync::mpsc::Sender<Option<isize>>, gen: u64) {
             None
         };
         let Some(hwnd) = hwnd else {
-            let _ = ready.send(None);
+            // 建不出窗口：排着的请求等不到人处理，直接作废，别让 BUSY 悬着。
+            crate::logal!("[menu] 菜单宿主窗口创建失败");
+            HOST_STARTING.store(false, Ordering::Release);
+            JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+            BUSY.store(false, Ordering::Release);
             return;
         };
+        let self_hwnd = hwnd.0 as isize;
+        SELF_GEN.with(|g| g.set(gen));
+        SELF_HWND.with(|h| h.set(self_hwnd));
         theme_host(hwnd, want_dark);
-        if HOST_GEN.load(Ordering::Acquire) == gen {
-            HOST.store(hwnd.0 as isize, Ordering::Release);
+        // 谁先建好窗口谁上岗：宿主义务空着就当宿主，否则当备用，
+        // 都满了就销毁自己退出（不白占一个窗口）。
+        let role_host = HOST
+            .compare_exchange(0, self_hwnd, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        let role_spare = !role_host
+            && SPARE
+                .compare_exchange(0, self_hwnd, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+        HOST_STARTING.store(false, Ordering::Release);
+        if !role_host && !role_spare {
+            crate::logv!("[menu] 多余的宿主窗口，销毁 {:#x}", self_hwnd);
+            let _ = DestroyWindow(hwnd);
+            return;
         }
-        let _ = ready.send(Some(hwnd.0 as isize));
+        if role_host {
+            HAD_HOST.store(true, Ordering::Release);
+        }
+        crate::logln!(
+            "[menu] 宿主窗口就绪 {:#x} 角色={}",
+            self_hwnd,
+            if role_host { "host" } else { "spare" }
+        );
+        if role_host {
+            // 建窗口期间 UI 线程照常接右键，请求都在 `JOBS` 里躺着：这里催一下，
+            // 让它们立刻被取走（没有请求时这条消息只是顺手复位 BUSY）。
+            let _ = PostMessageW(Some(hwnd), WM_APP_OPEN_MENU, WPARAM(0), LPARAM(0));
+        }
+        // 无论当宿主还是备用都补一条备用窗口：有备无患，换线程才是瞬时的。
+        ensure_spare();
 
         let mut msg = MSG::default();
         while GetMessageW(&mut msg, None, 0, 0).as_bool() {
@@ -805,13 +1055,24 @@ unsafe extern "system" fn host_proc(
         return LRESULT(0);
     }
     if msg == WM_APP_OPEN_MENU {
+        let self_gen = SELF_GEN.with(|g| g.get());
+        // 按**窗口**认身份：被换下去的老线程（哪怕它自己活过来了）和备用窗口
+        // 都不许接活，否则会出现幽灵菜单或者把 BUSY 记到别人头上。
+        let self_hwnd = SELF_HWND.with(|h| h.get());
+        if self_hwnd == 0 || self_hwnd != HOST.load(Ordering::Acquire) {
+            // 被换掉的老线程：请求留给新线程，BUSY 也只在还是自己那一代时才清。
+            end_busy(self_gen);
+            return LRESULT(0);
+        }
         // 一次性取走全部入队请求，只执行最新那一条（旧的在 BUSY 竞态下
         // 可能残留，不能让它延迟弹出来）。
         let job = JOBS.lock().unwrap_or_else(|e| e.into_inner()).drain(..).last();
         if let Some(job) = job {
+            // 现在开始 Track：先补一条备用窗口，万一这次卡死也有人接手。
+            ensure_spare();
             run_menu(hwnd, job);
         } else {
-            BUSY.store(false, Ordering::Release);
+            end_busy(self_gen);
         }
         return LRESULT(0);
     }
@@ -1410,6 +1671,10 @@ fn run_menu(host: HWND, job: Job) {
     SHOWN.store(true, Ordering::Release);
     let chosen = unsafe { TrackPopupMenuEx(hmenu, flags, point.x, point.y, host, None) }.0 as u32;
     SHOWN.store(false, Ordering::Release);
+    if menu.is_some() {
+        // 带系统项的菜单走完了：说明外壳扩展这次没卡，冷却解除。
+        LAST_OK_MS.store(now_ms().max(1), Ordering::Release);
+    }
     ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = None);
     ACTIVE.with(|active| *active.borrow_mut() = None);
     ACTIVE_VIEW.with(|slot| *slot.borrow_mut() = None);

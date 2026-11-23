@@ -110,7 +110,8 @@ pub struct Options {
 /// 返回 false 表示菜单线程不可用（调用方记日志并放弃本次菜单）。
 #[cfg(windows)]
 pub(crate) use imp::{
-    apply_tray_theme, busy_for_ms, exhausted, open, purge_recycle_items, set_dark,
+    apply_tray_theme, busy_for_ms, exhausted, open, poisoned, prewarm, purge_recycle_items,
+    set_dark, shell_unhealthy, tick,
 };
 
 /// 非 Windows：没有菜单线程，永远不忙。
@@ -124,6 +125,24 @@ pub(crate) fn busy_for_ms() -> Option<u64> {
 pub(crate) fn exhausted() -> bool {
     false
 }
+
+/// 非 Windows：没有系统菜单，也就谈不上「刚卡过」。
+#[cfg(not(windows))]
+pub(crate) fn shell_unhealthy() -> bool {
+    false
+}
+
+/// 非 Windows：没有菜单宿主线程。
+#[cfg(not(windows))]
+pub(crate) fn prewarm() {}
+
+#[cfg(not(windows))]
+pub(crate) fn poisoned() -> bool {
+    false
+}
+
+#[cfg(not(windows))]
+pub(crate) fn tick() {}
 
 #[cfg(not(windows))]
 pub fn open(_: Target, _: Vec<MenuNode>, _: Options, _: isize, _: Sink) -> bool {

@@ -203,17 +203,182 @@ pub(crate) fn log_write(msg: &str) {
 /// * `L2` —— `ROVE_LOG=2`：逐条/逐帧的流量日志（缩略图、登记、行补丁…）。
 pub(crate) fn log_write_lvl(lvl: &str, msg: &str) {
     use std::io::Write as _;
+    // L1 才降噪：`L0` 是必须查清的偶发故障（本来就极少），`L2` 是用户显式
+    // 开到「逐条」的详细档，两者都不该被动折叠。
+    let mut folded = 0u32;
+    let mut global_folded = 0u32;
+    if lvl == "L1" {
+        match l1_admit(msg) {
+            Some((same, global)) => {
+                folded = same;
+                global_folded = global;
+            }
+            // 这一条被折叠掉了：只记账，不写盘。
+            None => return,
+        }
+    }
     let path = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.join("rove.log")))
         .unwrap_or_else(|| std::env::temp_dir().join("rove.log"));
+    maybe_rotate_log(&path);
     // 必须先拼成整行、再一次 write_all：`write_fmt` 会按格式片段分多次
     // write_all，多个后台线程并发写日志时会把两行交错成一团
     // （表现为时间戳重复、两行粘成一行）。
-    let line = format!("[rove:{lvl}] {} {}\n", log_stamp(), msg);
+    let mut line = format!("[rove:{lvl}] {} {}", log_stamp(), msg);
+    if global_folded > 0 {
+        line.push_str(&format!("（上一秒日志过密，另有 {global_folded} 行已折叠）"));
+    }
+    if folded > 0 {
+        line.push_str(&format!("（上一窗口同类已折叠 {folded} 条）"));
+    }
+    line.push('\n');
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
         let _ = f.write_all(line.as_bytes());
     }
+}
+
+/// L1 的防爆措施：**同一类**日志最多连续灌这么多次，超过就折叠成计数。
+///
+/// `ROVE_LOG=1` 是给用户/排查开的一档「日常事件」，一个卡住的循环、一次
+/// 40ms 轮询里忘了节流的一行、拖着一列文件反复触发的一次逻辑，都能在一秒内
+/// 刷出成千上万行，把真正的问题埋掉（还会把日志文件撑大）。所以：
+///
+/// * 按**标签**（`[menu]` / `[rows]` / `[thumb]` …）发令牌，容量 6、每秒回 6 个；
+///   折叠掉的数量攒着，等下一条同类放行时补一句「已折叠 N 条」。
+/// * 全局限额每秒 240 行（所有标签合计），超了就整段丢弃并计数。
+///
+/// 被折叠的永远是**重复**：每个标签每分钟的头几条、状态变化、``!!`` 异常
+/// （走 `L0`，完全不经过这里）都不受影响。
+const L1_BURST: f32 = 6.0;
+const L1_REFILL_PER_SEC: f32 = 6.0;
+const L1_GLOBAL_BURST: f32 = 240.0;
+const L1_GLOBAL_REFILL_PER_SEC: f32 = 240.0;
+/// 最多记多少个不同标签的桶（超出的标签共用最后那个桶，照样被限流）。
+const L1_MAX_TAGS: usize = 48;
+
+struct L1Bucket {
+    tag: String,
+    tokens: f32,
+    last_ms: u64,
+    folded: u32,
+}
+
+struct L1State {
+    buckets: Vec<L1Bucket>,
+    global_tokens: f32,
+    global_last_ms: u64,
+    global_folded: u32,
+}
+
+fn l1_state() -> &'static std::sync::Mutex<L1State> {
+    static STATE: std::sync::OnceLock<std::sync::Mutex<L1State>> = std::sync::OnceLock::new();
+    STATE.get_or_init(|| {
+        std::sync::Mutex::new(L1State {
+            buckets: Vec::new(),
+            global_tokens: L1_GLOBAL_BURST,
+            global_last_ms: 0,
+            global_folded: 0,
+        })
+    })
+}
+
+/// 取这条 L1 日志的「标签」（第一个方括号里的词）；没有标签就按第一个词算，
+/// 这样 `index: rebuild …` 这种也归得到一起。
+fn l1_tag(msg: &str) -> &str {
+    if let Some(rest) = msg.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest.get(..end).unwrap_or("other");
+        }
+    }
+    match msg.split([' ', ':']).next() {
+        Some("") | None => "other",
+        Some(word) => word,
+    }
+}
+
+/// 补令牌：返回补完之后的令牌数（顺便把 `last_ms` 推到现在）。
+fn refill(tokens: f32, last_ms: &mut u64, now: u64, burst: f32, per_sec: f32) -> f32 {
+    let elapsed = now.saturating_sub(*last_ms) as f32 / 1000.0;
+    *last_ms = now;
+    (tokens + elapsed * per_sec).min(burst)
+}
+
+/// 这一条 L1 该不该写。`Some((同类折叠数, 全局折叠数))` = 写，
+/// `None` = 折叠掉。
+fn l1_admit(msg: &str) -> Option<(u32, u32)> {
+    let now = now_ms();
+    let mut st = match l1_state().lock() {
+        Ok(g) => g,
+        // 锁中毒（某次日志里 panic）也不能因为写日志把程序拖垮。
+        Err(e) => e.into_inner(),
+    };
+    st.global_tokens = refill(
+        st.global_tokens,
+        &mut st.global_last_ms,
+        now,
+        L1_GLOBAL_BURST,
+        L1_GLOBAL_REFILL_PER_SEC,
+    );
+    if st.global_tokens < 1.0 {
+        st.global_folded = st.global_folded.saturating_add(1);
+        return None;
+    }
+    let tag = l1_tag(msg).to_string();
+    let idx = match st.buckets.iter().position(|b| b.tag == tag) {
+        Some(i) => i,
+        None => {
+            if st.buckets.len() >= L1_MAX_TAGS {
+                st.buckets.len() - 1
+            } else {
+                st.buckets.push(L1Bucket {
+                    tag,
+                    tokens: L1_BURST,
+                    last_ms: now,
+                    folded: 0,
+                });
+                st.buckets.len() - 1
+            }
+        }
+    };
+    let bucket = &mut st.buckets[idx];
+    bucket.tokens = refill(bucket.tokens, &mut bucket.last_ms, now, L1_BURST, L1_REFILL_PER_SEC);
+    if st.buckets[idx].tokens < 1.0 {
+        st.buckets[idx].folded = st.buckets[idx].folded.saturating_add(1);
+        return None;
+    }
+    st.buckets[idx].tokens -= 1.0;
+    st.global_tokens -= 1.0;
+    let same = std::mem::take(&mut st.buckets[idx].folded);
+    let global = std::mem::take(&mut st.global_folded);
+    Some((same, global))
+}
+
+/// 日志文件上限：到顶就把它改名成 `rove.log.old`（旧的直接覆盖），重新开始。
+/// 排查日志没人清，一次 `ROVE_LOG=2` 的长会话就能写到几十上百 MB。
+const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
+static LOG_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LOG_ROTATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 每 512 行检查一次大小（`metadata` 也要系统调用，不必每行都问）。
+fn maybe_rotate_log(path: &std::path::Path) {
+    use std::sync::atomic::Ordering;
+    if LOG_WRITES.fetch_add(1, Ordering::Relaxed) % 512 != 0 {
+        return;
+    }
+    let Ok(meta) = std::fs::metadata(path) else { return };
+    if meta.len() < MAX_LOG_BYTES {
+        return;
+    }
+    let Ok(guard) = LOG_ROTATE_LOCK.lock() else { return };
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "rove.log".into());
+    let old = path.with_file_name(format!("{name}.old"));
+    // 别的线程可能正开着它写：Windows 上 rename 会失败，那就下次再来。
+    let _ = std::fs::rename(path, &old);
+    drop(guard);
 }
 
 /// 单调的毫秒时钟，只用于日志节流（不参与任何逻辑判定）。
@@ -1008,6 +1173,8 @@ pub struct App {
     bg_hit_row: bool,
     /// 空白处右键按下时先存下菜单，等抬手再弹（见 `background_pointer_event`）。
     deferred_bg_menu: Option<MenuScope>,
+    /// 行内右键：按下时只记下要弹的菜单，抬手才真的弹（见 `row_pointer_event`）。
+    pending_row_menu: Option<MenuScope>,
     /// 空白处左键按下的位置（视口坐标）：抬手时用来区分「点一下」和「拖着框选」。
     blank_press: Option<(f32, f32)>,
     /// 空白处上一次单击的 (时刻, x, y, 窗格)：两次够近才算双击 → 回上一级。
@@ -1306,6 +1473,7 @@ impl App {
             rubber_band_base: None,
             bg_hit_row: false,
             deferred_bg_menu: None,
+            pending_row_menu: None,
             pending_global_search: None,
             autofit_key: [None, None],
             cur_col_widths: [
@@ -8744,13 +8912,44 @@ impl App {
     fn open_menu(&mut self, target: MenuScope) {
         #[cfg(windows)]
         {
-            let native_target = self.shell_menu_target(&target);
+            match &target {
+                MenuScope::Selection(paths) => logln!(
+                    "[menu] open selection n={} first={:?} pane={}",
+                    paths.len(),
+                    paths.first(),
+                    self.state.active().active_pane
+                ),
+                MenuScope::Background => logln!(
+                    "[menu] open background pane={} path={:?}",
+                    self.state.active().active_pane,
+                    self.state.active().active().path
+                ),
+            }
+            let mut native_target = self.shell_menu_target(&target);
+            // 系统菜单刚把菜单线程拖死过：这次只弹 Rove 自己的项。
+            // 卡死的源头是第三方外壳扩展（一直在 `QueryContextMenu` 里不出来），
+            // 不请它上场就不会再卡，代价是暂时没有「打开方式 / 发送到」这些系统项。
+            if crate::sys::menu::shell_unhealthy() && !matches!(native_target, crate::sys::menu::Target::AppOnly) {
+                logln!("[menu] 系统菜单刚卡过，本次只显示 Rove 自己的菜单项");
+                native_target = crate::sys::menu::Target::AppOnly;
+            }
             let shell_present = !matches!(native_target, crate::sys::menu::Target::AppOnly);
             let nodes = self.build_app_nodes(&target, shell_present);
             // Shift + 右键 = 扩展动词（「以管理员身份运行」这类）。
             let extended = key_down(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT as i32);
-            if !self.open_native_menu(native_target, nodes, extended) {
-                logln!("[menu] 原生菜单不可用，本次右键被忽略");
+            if !self.open_native_menu(native_target.clone(), nodes, extended) {
+                if crate::sys::menu::shell_unhealthy() {
+                    // 上一次右键刚把系统菜单判死（某个外壳扩展卡在
+                    // `QueryContextMenu` 里）。立刻改用只含 Rove 自己项的菜单重试：
+                    // 备用宿主窗口已经在顶上，这一步是瞬时的。
+                    logln!("[menu] 刚判死系统菜单，改弹 Rove 自己的菜单项");
+                    let nodes = self.build_app_nodes(&target, false);
+                    if !self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, extended) {
+                        logln!("[menu] 原生菜单不可用，本次右键被忽略");
+                    }
+                } else {
+                    logln!("[menu] 原生菜单不可用，本次右键被忽略");
+                }
             }
         }
         #[cfg(not(windows))]
@@ -8872,6 +9071,26 @@ impl App {
         let raw = crate::ops::actions::load_or_create();
         self.actions = crate::ops::actions::heal_full(&raw);
     }
+    /// 菜单健康检查：进程被卡死的扩展拖坏时自我修复（静默换一个新进程）。
+    ///
+    /// 必须放在 UI 线程的周期回调里：要看 `jobs` 有没有任务在跑，交班也只能
+    /// 在本线程做（被拖坏的进程根本开不出能跑起来的新线程）。
+    fn check_menu_health(&mut self) {
+        crate::sys::menu::tick();
+        if !crate::sys::menu::poisoned() || self.jobs.is_running() {
+            return;
+        }
+        if QUITTING.load(std::sync::atomic::Ordering::Acquire)
+            || HANDOFF_DONE.swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        crate::logal!("[menu] !! 进程已被卡死的扩展拖坏（新线程都起不来），静默换一个新进程");
+        // 这里**不能再开线程**：被抓住的正是「新线程起不来」这把锁。
+        // 交班本身只用 CreateProcess + 等标记文件，直接在本线程做完更稳。
+        restart_handoff_show();
+    }
+
     /// `ROVE_LOG=2` 内存明细（节流 2 秒）。
     ///
     /// 分项打印常驻占用，用来对比优化前后到底是哪一块变小了——任务管理器
@@ -10718,30 +10937,127 @@ impl App {
     ///
     /// 选中/重命名层与悬停层是两套属性，只有 `hover-expand-index` 或
     /// `expand-index` 有值时才有浮层；悬停优先（鼠标下的那一层才是用户看的那层）。
-    fn expand_overlay_target(&self) -> Option<(usize, usize, PathBuf)> {
-        let hv0 = self.ui.get_file_hover_expand_index();
-        let hv1 = self.ui.get_file_hover_expand_index_right();
-        let ex0 = self.ui.get_file_expand_index();
-        let ex1 = self.ui.get_file_expand_index_right();
-        let (pane, target) = if hv0 >= 0 {
-            (0usize, hv0)
-        } else if hv1 >= 0 {
-            (1usize, hv1)
-        } else if ex0 >= 0 {
-            (0usize, ex0)
-        } else if ex1 >= 0 {
-            (1usize, ex1)
+    /// 空白处右键按下：记快照 + 置背景菜单范围（菜单推迟到抬手才弹）。
+    ///
+    /// 抽出来是因为名称浮层盖住空白时也要走同一套：那里没有行元素，
+    /// 事件只能由浮层转交。
+    fn background_right_press(&mut self) {
+        logln!(
+            "[menu] background right-press pane={} path={:?}",
+            self.state.active().active_pane,
+            self.state.active().active().path
+        );
+        self.menu_anchor_path = None;
+        // 记下当前目录快照：系统菜单里的「新建 → 文本文档」由 Shell 自己
+        // 执行，Rove 拿不到新文件路径。菜单结束后列举结果回来再做 diff。
+        if let Some(dir) = self.state.active().active().path.clone() {
+            let before: std::collections::HashSet<PathBuf> = self
+                .state
+                .active()
+                .active()
+                .entries
+                .iter()
+                .map(|e| e.path.clone())
+                .collect();
+            self.shell_new_watch = Some((dir, before, std::time::Instant::now()));
         } else {
-            return None;
-        };
-        let path = self
-            .state
+            self.shell_new_watch = None;
+        }
+        self.menu_scope = Some(MenuScope::Background);
+        self.deferred_bg_menu = Some(MenuScope::Background);
+        // 行内右键挂起的那份也作废：两种菜单不可能同时算数。
+        self.pending_row_menu = None;
+    }
+
+    /// 某一栏第 `index` 个显示条目对应的路径。
+    fn overlay_hit_row(&self, pane: usize, index: usize) -> Option<PathBuf> {
+        self.state
             .active()
             .panes
             .get(pane)
-            .and_then(|p| p.display_entry(target as usize))
-            .map(|e| e.path.clone())?;
-        Some((pane, target as usize, path))
+            .and_then(|p| p.display_entry(index))
+            .map(|e| e.path.clone())
+    }
+
+    /// 在某一栏的某一行上「右键」：没选中就先单选它，然后弹出选中集菜单。
+    fn row_right_click(&mut self, pane: usize, index: usize) {
+        if self.state.active().active_pane != pane {
+            self.focus_pane(pane);
+        }
+        let Some(path) = self.overlay_hit_row(pane, index) else {
+            return;
+        };
+        logln!(
+            "[menu] row right-click pane={} idx={} path={} sel={}",
+            pane,
+            index,
+            path.display(),
+            self.state.active().active().selection.len()
+        );
+        // 上一次空白右键若没等到抬手（菜单把 up 吃掉了），这里必须作废，
+        // 否则它会在下一次空白抬手时冒出来。挂着的行内右键同理。
+        self.deferred_bg_menu = None;
+        self.pending_row_menu = None;
+        self.last_left_press_row = None;
+        if !self.state.active().active().selection.contains(&path) {
+            let tab = self.state.active_mut().active_mut();
+            tab.selection.clear();
+            tab.selection.insert(path.clone());
+            tab.anchor = Some(path.clone());
+        }
+        self.menu_anchor_path = Some(path);
+        let target = MenuScope::Selection(self.state.active().active().selected_paths());
+        self.menu_scope = Some(target.clone());
+        self.visible_cache = None;
+        self.visible_cache_right = None;
+        self.refresh_visible_rows();
+        self.sync_status();
+        self.open_menu(target);
+    }
+
+    /// 在某一栏的某一行上「单击」：只做单选，不进重命名。
+    fn row_left_click_select(&mut self, pane: usize, index: usize) {
+        if self.state.active().active_pane != pane {
+            self.focus_pane(pane);
+        }
+        let Some(path) = self.overlay_hit_row(pane, index) else {
+            return;
+        };
+        logln!(
+            "[click] overlay selects neighbour pane={} idx={} path={}",
+            pane,
+            index,
+            path.display()
+        );
+        {
+            let tab = self.state.active_mut().active_mut();
+            tab.selection.clear();
+            tab.selection.insert(path.clone());
+            tab.anchor = Some(path.clone());
+        }
+        self.pending_single_click = None;
+        self.last_left_press_row = Some(path.clone());
+        self.last_click = Some((path, std::time::Instant::now()));
+        self.cancel_rename_defer();
+        self.visible_cache = None;
+        self.visible_cache_right = None;
+        self.refresh_visible_rows();
+        self.sync_status();
+    }
+
+    /// 浮层相关的两个索引（选中层 / 悬停层），只用于诊断日志。
+    fn overlay_indices(&self, pane: usize) -> (i32, i32) {
+        if pane == 1 {
+            (
+                self.ui.get_file_expand_index_right(),
+                self.ui.get_file_hover_expand_index_right(),
+            )
+        } else {
+            (
+                self.ui.get_file_expand_index(),
+                self.ui.get_file_hover_expand_index(),
+            )
+        }
     }
 
     /// 打开选中项。
@@ -12195,6 +12511,20 @@ impl App {
             }
             _ => {}
         }
+        // 行内右键：按下时只把菜单对象准备好，抬手才弹。菜单是独立窗口，
+        // 会吃掉这次按下的抬手事件 —— 在按下时就弹，Slint 记下的「这一下
+        // 落在哪个元素上」永远清不掉，之后任意一次按下都被派给同一行
+        // （右键 A 却弹出 B 的菜单，而且换哪一行都一样）。
+        if event.kind == PointerEventKind::Up && event.button == PointerEventButton::Right {
+            if let Some(target) = self.pending_row_menu.take() {
+                logln!("[menu] row right-up open");
+                self.open_menu(target);
+            }
+            return;
+        }
+        if event.kind == PointerEventKind::Cancel {
+            self.pending_row_menu = None;
+        }
         if event.kind != PointerEventKind::Down {
             return;
         }
@@ -12205,6 +12535,12 @@ impl App {
         };
         match event.button {
             PointerEventButton::Right => {
+                logln!(
+                    "[menu] row right-press idx={} path={} sel={}",
+                    index,
+                    path.display(),
+                    self.state.active().active().selection.len()
+                );
                 // 右键打断「同一行连续按下」链条：菜单之后随手点一下名称只算第一次
                 // 按下，不会直接进重命名。
                 self.last_left_press_row = None;
@@ -12224,9 +12560,10 @@ impl App {
                 self.visible_cache_right = None;
                 self.refresh_visible_rows();
                 self.sync_status();
-                self.open_menu(target);
+                self.pending_row_menu = Some(target);
             }
             PointerEventButton::Left => {
+                self.pending_row_menu = None;
                 // 这一下是不是「同一行的连续第二次按下」（见 `last_left_press_row`）。
                 let second_press_on_row =
                     self.last_left_press_row.as_deref() == Some(path.as_path());
@@ -12371,6 +12708,13 @@ impl App {
 
     /// 任务 2.3：发起 OLE 拖放循环（阻塞至释放）。
     fn begin_drag_out(&mut self, paths: Vec<PathBuf>) {
+        logln!(
+            "[drag] begin n={} first={:?} pane={} sel={}",
+            paths.len(),
+            paths.first(),
+            self.state.active().active_pane,
+            self.state.active().active().selection.len()
+        );
         if paths.is_empty() {
             return;
         }
@@ -12785,24 +13129,7 @@ impl App {
                 }
             }
             PointerEventButton::Right => {
-                self.menu_anchor_path = None;
-                // 记下当前目录快照：系统菜单里的「新建 → 文本文档」由 Shell 自己
-                // 执行，Rove 拿不到新文件路径。菜单结束后列举结果回来再做 diff。
-                if let Some(dir) = self.state.active().active().path.clone() {
-                    let before: std::collections::HashSet<PathBuf> = self
-                        .state
-                        .active()
-                        .active()
-                        .entries
-                        .iter()
-                        .map(|e| e.path.clone())
-                        .collect();
-                    self.shell_new_watch = Some((dir, before, std::time::Instant::now()));
-                } else {
-                    self.shell_new_watch = None;
-                }
-                let target = MenuScope::Background;
-                self.menu_scope = Some(target.clone());
+                self.background_right_press();
                 // 菜单推迟到**抬手**再弹（`open_deferred_background_menu`）。
                 //
                 // 在按下这一刻就弹菜单的话：菜单是独立窗口，它会吃掉属于这次
@@ -12810,7 +13137,7 @@ impl App {
                 // 清不掉 —— 之后任意一次按下都会被派给空白层，表现为右键菜单
                 // （排序方式在这里）之后的第一下点击不选中、第一下拖动变框选，
                 // 而且等多久都不会自愈。
-                self.deferred_bg_menu = Some(target);
+                self.deferred_bg_menu = Some(MenuScope::Background);
             }
             _ => {}
         }
@@ -13018,6 +13345,10 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
 
     // 读失败的目录（网络共享慎一下）自动重试，同样搭这趟 40ms 轮询。
     app.borrow_mut().maybe_retry_failed_listing();
+
+    // 右键菜单的健康检查（只读几个原子量）。搭这趟 40ms 轮询，是为了被卡死的
+    // 扩展拖坏进程后能在一秒内自我修复，而不是等 15 秒那条周期定时器。
+    app.borrow_mut().check_menu_health();
 
     // 搜索框防抖：攒够 150ms 再跑一次全目录匹配。
     // 用 40ms 轮询判到期，省一个单独的定时器；到期前用户又敲了字会重新计时。
@@ -14024,14 +14355,54 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.borrow_mut()
                 .row_pointer_event(index as usize, &event, x, y, on_name);
         });
-        upgrade().on_file_name_overlay_right_clicked(move || {
+        upgrade().on_file_name_overlay_right_clicked(move |pane, owner, hit, x, y| {
             let Some(app) = overlay_right_app.upgrade() else { return };
             let mut app = app.borrow_mut();
-            // 名称浮层比格子宽、还常伸出到邻居/空白上：那里没有行元素，
-            // 右键落到浮层上原本什么都不会发生。这里等价于「右键那一行」。
-            let Some((pane, _, path)) = app.expand_overlay_target() else {
+            let pane = pane.max(0) as usize;
+            // `hit` 是浮层下面那一刻真正压着的行（-1 = 空白）。浮层向下伸出
+            // 自己的格子是常态，落在别处时要按**那里的**行/空白处理，
+            // 不能一律当成浮层主人那一行（那正是「右键别的文件却弹出它的菜单」）。
+            let (expand, hover) = app.overlay_indices(pane);
+            logln!(
+                "[menu] overlay right-click pane={} owner={} hit={} expand={} hover={} at=({:.0},{:.0})",
+                pane,
+                owner,
+                hit,
+                expand,
+                hover,
+                x,
+                y
+            );
+            if hit < 0 {
+                // 浮层盖住空白：按「空白」处理。这个回调本身就在抬手时刻，
+                // 所以直接弹（不再推迟到下一次抬手）。
+                // 先切到浮层所在的那一栏：空白菜单的目录快照 / 「新建」都按
+                // 活动栏算，栏没切就会拿错目录。
+                if app.state.active().active_pane != pane {
+                    app.focus_pane(pane);
+                }
+                app.background_right_press();
+                app.open_deferred_background_menu();
+                return;
+            }
+            // 主人是谁由 Slint 直接告诉我们（`owner`）。原先是回调到达时按
+            // 「悬停优先」再推一遍，而那一刻悬停索引可能已经被清成 -1 或换了人 ——
+            // 推错就是「右键 A 弹出 B」。
+            let under = app.overlay_hit_row(pane, hit as usize);
+            if owner != hit {
+                // 落点压在别的格子上：完全按行内右键走。
+                if under.is_some() {
+                    app.row_right_click(pane, hit as usize);
+                }
+                return;
+            }
+            let Some(path) = app.overlay_hit_row(pane, owner as usize) else {
                 return;
             };
+            // 浮层吃掉了这次按下：行那边不会收到 Up，残留的拖拽手势要在这里清掉，
+            // 否则它会在之后某次移动里被当成「拖出这个文件」。
+            app.drag_pending = None;
+            app.ui.invoke_set_drag_armed(false);
             // 菜单的操作对象是「活动栏的选中集」，所以先把浮层所在的栏切过去。
             if app.state.active().active_pane != pane {
                 app.focus_pane(pane);
@@ -14044,8 +14415,14 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 tab.selection.insert(path.clone());
                 tab.anchor = Some(path.clone());
             }
+            app.deferred_bg_menu = None;
             app.menu_anchor_path = Some(path.clone());
             let target = MenuScope::Selection(app.state.active().active().selected_paths());
+            logln!(
+                "[menu] overlay own-row right-click path={} sel={}",
+                path.display(),
+                app.state.active().active().selection.len()
+            );
             app.menu_scope = Some(target.clone());
             app.visible_cache = None;
             app.visible_cache_right = None;
@@ -14053,18 +14430,41 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.sync_status();
             app.open_menu(target);
         });
-        upgrade().on_file_name_overlay_clicked(move || {
+        upgrade().on_file_name_overlay_clicked(move |pane, owner, hit, x, y| {
             let Some(app) = overlay_app.upgrade() else { return };
             let mut app = app.borrow_mut();
+            let pane = pane.max(0) as usize;
+            let (expand, hover) = app.overlay_indices(pane);
+            logln!(
+                "[click] overlay click pane={} owner={} hit={} expand={} hover={} at=({:.0},{:.0})",
+                pane,
+                owner,
+                hit,
+                expand,
+                hover,
+                x,
+                y
+            );
+            // 同右键：落点在别的格子上时按那一行处理（单击选中），不做重命名。
+            if hit < 0 {
+                logln!("[click] overlay click on blank, ignored");
+                return;
+            }
+            let under = app.overlay_hit_row(pane, hit as usize);
+            if owner != hit {
+                if under.is_some() {
+                    app.row_left_click_select(pane, hit as usize);
+                }
+                return;
+            }
             // 浮层里的 TouchArea 吃掉了点击，格子那边收不到，所以这里要自己处理：
             //  · 该文件还没被选中 → 先选中它（单击选中，与点图标一致）；
             //  · 已经是唯一选中项 → 进入重命名（原有行为）。
             // 不做这一步的话，仅因悬停而弹出的浮层被单击后会毫无反应。
             //
-            // 选中/重命名层和悬停层是两套属性：悬停弹出来的那一层只有
-            // hover-expand-index 有值，所以两者都看（悬停优先）——这里统一走
-            // `expand_overlay_target()`，与右键那条共用同一份解析。
-            let Some((pane, target, path)) = app.expand_overlay_target() else {
+            // 主人用 Slint 传来的 `owner`（理由同右键那条：事后重推会推错）。
+            let target = owner.max(0) as usize;
+            let Some(path) = app.overlay_hit_row(pane, target) else {
                 return;
             };
             if app.state.active().active_pane != pane {
@@ -15813,7 +16213,77 @@ fn restart_marker_path() -> PathBuf {
 /// 顺序必须是「先起新进程 → 新进程绑上管道并落标记 → 旧进程才退出」：
 /// 管道是单实例的，反过来就会两边都绑不上，托盘图标直接消失。
 /// 握手拿不到标记就把子进程杀掉，继续用旧进程 —— 宁可不重启，也不能把守护弄丢。
-fn restart_handoff() {
+/// 立刻终止本进程。`std::process::exit` 要跑完所有 atexit / DLL 卸载，
+/// 在已经卡死的进程里可能**永远不返回**（真机日志：exit 之后 3 秒都没走掉，
+/// 于是新进程抢不到管道，托盘图标也还挂在这个僵尸身上）。
+fn hard_exit() -> ! {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, TerminateProcess};
+        let _ = TerminateProcess(GetCurrentProcess(), 0);
+    }
+    std::process::exit(0);
+}
+
+/// 盯住会话销毁：卡死就硬退出，绝不留下「窗口没了但进程还赖着」的僵尸。
+///
+/// 僵尸的危害不只是占内存：管道、托盘图标都在它手里，用户再点快捷方式只会
+/// 转发给这个已经废掉的进程 —— 表现为「新启动的 Rove 右键菜单打不开」，
+/// 只有重启电脑才能救。
+fn spawn_destroy_guard(job_running: bool) {
+    let _ = std::thread::Builder::new()
+        .name("rove-close-guard".into())
+        .spawn(move || {
+            for _ in 0..80 {
+                std::thread::sleep(Duration::from_millis(100));
+                // 正常走完的销毁会把 CLOSING_AT 清掉。
+                if CLOSING_AT.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                    return;
+                }
+            }
+            if job_running {
+                // 有复制/移动在跑：任务线程是进程级的，会话销毁后它还在走。
+                // 硬终止会把它拦腰砍断（半截文件、移动做到一半），宁可与僵尸共存。
+                logal!("[close] 销毁会话 8 秒没完成，但还有任务在跑；不硬终止");
+                return;
+            }
+            logal!("[close] 销毁会话 8 秒没完成，硬终止本进程（免得霸占 IPC 和托盘图标）");
+            if !QUITTING.load(std::sync::atomic::Ordering::Acquire) {
+                let marker = restart_marker_path();
+                if spawn_handoff_child().is_some() {
+                    // 给接班进程两秒走到交接点，之后再硬退出（退出本身可能卡死）。
+                    for _ in 0..20 {
+                        std::thread::sleep(Duration::from_millis(100));
+                        if marker.exists() {
+                            break;
+                        }
+                    }
+                }
+            }
+            hard_exit();
+        });
+}
+
+/// 只负责拉起接班进程并等它就位（不等本进程退出）。返回子进程句柄。
+fn spawn_handoff_child() -> Option<std::process::Child> {
+    let Ok(exe) = std::env::current_exe() else {
+        logal!("[restart] 拿不到自身路径，放弃重启");
+        return None;
+    };
+    let marker = restart_marker_path();
+    let _ = std::fs::remove_file(&marker);
+    let child = std::process::Command::new(&exe)
+        .arg("--background")
+        .arg("--await-pipe")
+        .arg("--await-pid")
+        .arg(std::process::id().to_string())
+        .spawn()
+        .ok()?;
+    Some(child)
+}
+
+/// 自我修复用：接班进程要**把窗口显示出来**（用户还在用着，不能变成只剩托盘）。
+fn restart_handoff_show() {
     let Ok(exe) = std::env::current_exe() else {
         logal!("[restart] 拿不到自身路径，放弃重启");
         return;
@@ -15821,7 +16291,6 @@ fn restart_handoff() {
     let marker = restart_marker_path();
     let _ = std::fs::remove_file(&marker);
     let child = std::process::Command::new(&exe)
-        .arg("--background")
         .arg("--await-pipe")
         .arg("--await-pid")
         .arg(std::process::id().to_string())
@@ -15833,10 +16302,8 @@ fn restart_handoff() {
     for _ in 0..80 {
         std::thread::sleep(Duration::from_millis(100));
         if marker.exists() {
-            // 此刻只知道「子进程起来并走到交接点」，真正绑上管道要等本进程退出之后
-            // （管道单实例），所以这里说的是「就位」而不是「已接管」。
-            logal!("[restart] 新进程已就位，退出旧进程以释放 IPC（回收卡死的菜单线程）");
-            std::process::exit(0);
+            logal!("[restart] 新进程已就位（带窗口），退出这个被拖坏的进程");
+            hard_exit();
         }
         if matches!(child.try_wait(), Ok(Some(_))) {
             break;
@@ -15846,6 +16313,33 @@ fn restart_handoff() {
     let _ = std::fs::remove_file(&marker);
     logal!("[restart] 新进程没能接管 IPC，继续用旧进程");
 }
+
+fn restart_handoff() {
+    let marker = restart_marker_path();
+    let Some(mut child) = spawn_handoff_child() else {
+        logal!("[restart] 子进程启动失败，继续用旧进程");
+        return;
+    };
+    for _ in 0..80 {
+        std::thread::sleep(Duration::from_millis(100));
+        if marker.exists() {
+            // 此刻只知道「子进程起来并走到交接点」，真正绑上管道要等本进程退出之后
+            // （管道单实例），所以这里说的是「就位」而不是「已接管」。
+            logal!("[restart] 新进程已就位，退出旧进程以释放 IPC（回收卡死的菜单线程）");
+            hard_exit();
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+    }
+    let _ = child.kill();
+    let _ = std::fs::remove_file(&marker);
+    logal!("[restart] 新进程没能接管 IPC，继续用旧进程");
+}
+
+/// 关窗时会话销毁的忍耐上限：原生菜单已经被占住这么久，几乎可以肯定
+/// `drop(session)` 会卡死（真机日志实证），这时直接换进程更划算。
+const MENU_CLOSE_STUCK_MS: u64 = 3_000;
 
 /// 用户主动「退出」时置上：这条路径绝不能再拉起接班进程，否则退出会把应用又拖回来。
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -16591,7 +17085,10 @@ pub fn run() {
     // 先交前台许可：本进程是资源管理器拉起的，带着这个权限，窗口却由守护进程显示。
     crate::daemon::hand_over_foreground();
     // 后台启动绝不走转发：转发路径会唤醒并前置窗口，登录瞬间就弹一个窗口。
-    if !background {
+    // 交班子进程同样绝不转发：它的任务恰恰是「等老进程交出管道，然后自己接管」，
+    // 转发给那个快死的老进程只会把自己立刻送回坟墓 —— 老进程等不到交接标记，
+    // 修复/重启流程静默失效（真机现象：自我修复从来没成功过）。
+    if !background && !await_pipe {
         let forwarded = crate::daemon::try_forward(&request);
         // forwarded=true：请求交给已在运行的守护进程，本进程随即退出，
         // 后续日志在**它的** exe 目录里 —— 排查时据此判断该去哪看。
@@ -16699,6 +17196,11 @@ pub fn run() {
     // UI 卡死留证据：心跳 + 看门狗（先装定时器再装看门狗）。
     install_ui_heartbeat();
     start_ui_watchdog();
+
+    // 菜单宿主线程开机就建好：这台机器上它建窗口要好几秒（全局钩子拖的），
+    // 等到第一次右键才建就会白点一次。
+    #[cfg(windows)]
+    crate::sys::menu::prewarm();
 
     // 事件循环常驻：窗口全部销毁后保持空闲（0% CPU），
     // 等待管道唤醒/托盘点击重建 UI；退出由托盘菜单触发。
@@ -16953,6 +17455,52 @@ fn is_address_bar_command(text: &str) -> bool {
 /// 会话已存在时的新开标签要求由 `queue_shell_tab` 负责，跟这里无关。
 fn initial_path_opens_new_tab(restored_last_tabs: bool) -> bool {
     restored_last_tabs
+}
+
+#[cfg(test)]
+mod log_fold_tests {
+    use super::{l1_admit, l1_tag};
+
+    /// 标签取第一个方括号里的词；没有方括号就按第一个词归堆，
+    /// 否则所有无标签的行会挤进同一个桶互相限流。
+    #[test]
+    fn tag_is_bracketed_word_or_first_token() {
+        assert_eq!(l1_tag("[menu] row right-press idx=3"), "menu");
+        assert_eq!(l1_tag("[thumb] 慢请求 12ms"), "thumb");
+        assert_eq!(l1_tag("index: rebuild"), "index");
+        assert_eq!(l1_tag("running persistent event loop"), "running");
+        assert_eq!(l1_tag(""), "other");
+    }
+
+    /// 同一标签连着灌：只放行开头的少量，其余折叠成计数（不能一条条写盘）。
+    #[test]
+    fn same_tag_burst_is_folded() {
+        let tag = "[test-fold-burst]";
+        let mut admitted = 0;
+        let mut folded = 0u32;
+        for _ in 0..40 {
+            match l1_admit(&format!("{tag} x")) {
+                Some((_, _)) => admitted += 1,
+                None => folded += 1,
+            }
+        }
+        assert!(admitted >= 1, "至少放行一条，否则日志全瞎");
+        assert!(admitted <= 8, "一秒内同一标签最多放行一个容量（{admitted}）");
+        assert_eq!(folded, 40 - admitted, "其余全部折叠，一条不漏账");
+    }
+
+    /// 不同标签各自记账：一个标签被折叠不该连累别的。
+    #[test]
+    fn other_tags_are_not_starved_by_one_hot_tag() {
+        let hot = "[test-fold-hot]";
+        for _ in 0..40 {
+            let _ = l1_admit(&format!("{hot} x"));
+        }
+        assert!(
+            l1_admit("[test-fold-cold] y").is_some(),
+            "热点标签不能把冷门标签一起饿死"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -17680,10 +18228,30 @@ pub fn destroy_session() {
     // 菜单线程卡到上限（右键已经不可用）时，趁这个安全时刻换一个新进程。
     // 有任务在跑就不动：重启会杀掉进行中的复制 / 移动。
     // `ROVE_FORCE_RESTART=1` 只为验证交接流程用（正常人碰不到「卡满 4 次」）。
+    let jobs_running = app.borrow().jobs.is_running();
+    let menu_stuck_ms = crate::sys::menu::busy_for_ms().unwrap_or(0);
     let restart_wanted = !QUITTING.load(std::sync::atomic::Ordering::Acquire)
         && (crate::sys::menu::exhausted() || std::env::var_os("ROVE_FORCE_RESTART").is_some())
-        && !app.borrow().jobs.is_running();
+        && !jobs_running;
     logv!("[close] step 2/4 restart_wanted={} -> dropping session", restart_wanted);
+    // 菜单线程被第三方扩展占死时，销毁会话会**停在 `drop` 里再也不回来**
+    // （真机日志：这一行之后一个字都没有，窗口关不掉、托盘也唤不醒）。
+    // 存档已经全部落盘，这时不再尝试销毁，直接交给接班进程。
+    if !QUITTING.load(std::sync::atomic::Ordering::Acquire)
+        && !jobs_running
+        && menu_stuck_ms > MENU_CLOSE_STUCK_MS
+    {
+        logal!(
+            "[close] 菜单线程被占死 {}ms，跳过会话销毁，直接换进程",
+            menu_stuck_ms
+        );
+        restart_handoff();
+        logal!("[close] 接班进程没起来，仍尝试销毁会话");
+    }
+    // 会话销毁本身也可能卡死（真机：卡在 `drop(session)` 里再也不回来，
+    // 于是本进程赖着不放 IPC 和托盘图标，新进程只能转发给这个僵尸）。
+    // 交给一个后台线程盯着：真的卡住就硬终止，绝不留下第二个僵尸。
+    spawn_destroy_guard(jobs_running);
     drop(app);
     logv!("[close] step 3/4 session dropped");
     // 审计：组件 drop 之后主窗口应该已经不在了（IsWindow 返回 0）。
