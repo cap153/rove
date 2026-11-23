@@ -184,7 +184,16 @@ pub struct Config {
     /// 是否已把新增的默认隐藏菜单项补进旧版 `context_menu_hide`。
     /// 只补一次，之后用户在设置页删除这些项不会被启动逻辑强行加回来。
     pub context_menu_hide_seeded: bool,
+    /// 默认隐藏项补种的代次（0 = 老配置）。
+    ///
+    /// 每次给 `default_context_menu_hide()` 加新关键词就把代次加一，老配置
+    /// 启动时按代次补齐缺少的那几条 —— 用单个整数而不是一串 bool，加一条
+    /// 就多一个字段的写法撑不了多久。
+    pub context_menu_hide_gen: u32,
 }
+
+/// 当前默认隐藏项的补种代次（与 `Config::load` 里的补齐逻辑对应）。
+pub const CONTEXT_MENU_HIDE_GEN: u32 = 5;
 
 /// 侧边栏「网络位置」里的一条用户自定义项。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -256,6 +265,11 @@ pub fn default_sidebar_order() -> Vec<String> {
 /// rove 侧边栏，两者语义不同，不能让用户误点。
 /// 用 `!` 精确匹配，避免连带藏掉「复制到文件夹」这类变体。
 /// 中英两份都列：系统语言不同时靠另一份生效。
+///
+/// 最后两条「撤销 / Undo」刻意**不带** `!`：Shell 那一项的文字跟着上一次
+/// 操作变（「撤销复制」「撤销移动」「撤销删除」/ "Undo Copy"…），精确匹配
+/// 一条都藏不掉。Rove 自己有撤销栈（Ctrl+Z），系统那项走的是 Explorer 的
+/// 历史，对不上，点下去只会让人以为撤销失灵。
 pub fn default_context_menu_hide() -> Vec<String> {
     [
         "!Copy",
@@ -270,6 +284,16 @@ pub fn default_context_menu_hide() -> Vec<String> {
         "!固定到快速访问",
         "!Folder",
         "!文件夹(F)",
+        // 系统菜单那两项「删除(D)」/ "Delete" 走 Explorer 的删除，Rove 记不了账
+        // （撤销栈里没有它），Rove 自己的删除项排在「剪切」下面，所以精确藏掉。
+        "!删除(D)",
+        "!Delete",
+        "Undo",
+        "撤销",
+        // 重做也按包含匹配：Shell 那项的文字同样会跟着操作变
+        // （「恢复复制」「恢复移动」/ "Redo Copy"…），跟撤销那两条一致。
+        "Redo",
+        "恢复",
     ]
     .iter()
     .map(|s| s.to_string())
@@ -321,6 +345,7 @@ impl Default for Config {
             sidebar_width_repaired: false,
             quick_items: default_quick_items(),
             context_menu_hide_seeded: true,
+            context_menu_hide_gen: CONTEXT_MENU_HIDE_GEN,
         }
     }
 }
@@ -675,6 +700,36 @@ impl Config {
             config.context_menu_hide_seeded = true;
             config.save();
         }
+        // 逐代补齐默认隐藏项：老配置里的数组已经存在，跑不到上面的补种分支。
+        // 每代只补自己那几条，缺哪条补哪条，用户删掉过的不会被反复塞回来
+        // （代次已经推到最新，下次不再补）。
+        config.context_menu_hide_gen = json
+            .get("context_menu_hide_gen")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32;
+        let seeds: [(u32, &[&str]); 3] = [
+            (3, &["Undo", "撤销"]),
+            (4, &["Redo", "恢复"]),
+            (5, &["!删除(D)", "!Delete"]),
+        ];
+        if config.context_menu_hide_gen < CONTEXT_MENU_HIDE_GEN {
+            for (gen, keywords) in seeds {
+                if config.context_menu_hide_gen >= gen {
+                    continue;
+                }
+                for kw in keywords {
+                    if !config
+                        .context_menu_hide
+                        .iter()
+                        .any(|k| k.eq_ignore_ascii_case(kw))
+                    {
+                        config.context_menu_hide.push(kw.to_string());
+                    }
+                }
+            }
+            config.context_menu_hide_gen = CONTEXT_MENU_HIDE_GEN;
+            config.save();
+        }
         config
     }
 
@@ -755,6 +810,7 @@ impl Config {
                 .map(|q| serde_json::json!({ "id": q.id, "label": q.label, "path": q.path }))
                 .collect::<Vec<_>>(),
             "context_menu_hide_seeded": self.context_menu_hide_seeded,
+            "context_menu_hide_gen": self.context_menu_hide_gen,
         });
         let text = serde_json::to_string_pretty(&json).unwrap_or_default();
         let _ = std::fs::write(&path, text);

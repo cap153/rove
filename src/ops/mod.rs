@@ -7,6 +7,7 @@ pub mod jobs;
 pub mod keymap;
 #[cfg(windows)]
 pub mod thumbs;
+pub mod undo;
 
 /// 「启动外部程序失败」的提示，由 UI 线程轮询取走（见 `take_launch_errors`）。
 ///

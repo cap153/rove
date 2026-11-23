@@ -106,6 +106,7 @@ It only writes the current user's registry (`HKCU`), needs no administrator righ
 
 ## 9. Smaller differences worth knowing
 
+- **`Ctrl+Z` undoes and `Ctrl+Y` redoes the last file operation** (copy, move, rename, new folder, delete to the Recycle Bin). Undo only knows about operations Rove itself performed, so files deleted by other programs cannot be undone; a batch rename is reverted as one step.
 - **Almost every shortcut is rebindable,** and you can add extra bindings per action, with per-item or global reset to defaults. (`Esc` to clear the filter is fixed.)
 - **Sort state is kept separately** for This PC, the Recycle Bin, and normal folders, so they never leak into each other. (There is no grouping.)
 - Thumbnails for images, videos and PDFs are cached in **memory and on disk**, so large folders stay smooth. (Network paths are not cached.)

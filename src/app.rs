@@ -1026,6 +1026,8 @@ pub struct App {
     cur_col_widths: [[f32; 4]; 2],
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
+    /// 撤销 / 重做栈（见 `ops::undo`）。
+    pub undo: crate::ops::undo::UndoStack,
     /// 用户最后一次自己滚动列表（滚轮 / 拖滚动条）的时刻。
     /// 「空闲时静默重排」靠它避开正在滚动的情形，否则滚到一半列表自己跳一下。
     pub last_scroll: Option<Instant>,
@@ -1321,6 +1323,7 @@ impl App {
                 ],
             ],
             size_sort_pending: false,
+            undo: crate::ops::undo::UndoStack::new(),
             last_scroll: None,
             list_geom: (-1.0, 0, -1.0, false, -1.0, -1.0),
             recording_shortcut: None,
@@ -8634,7 +8637,19 @@ impl App {
                 let (paste_paths, paste_move) = self.paste_state();
                 // 「属性」不在这里：真实文件夹由系统菜单提供，
                 // 虚拟根（此电脑 / 回收站）本来也拿不到它。
-                vec![
+                let mut nodes: Vec<MenuNode> = Vec::new();
+                // 撤销 / 重做摆最顶上：栈里有东西才出现，撤销永远在恢复上面。
+                // 回收站走的是上面的专用菜单，拿不到这里。
+                if let Some(kind) = self.undo.peek_undo() {
+                    nodes.push(item("undo", self.tr(kind.undo_label()).as_str(), true));
+                }
+                if let Some(kind) = self.undo.peek_redo() {
+                    nodes.push(item("redo", self.tr(kind.redo_label()).as_str(), true));
+                }
+                if !nodes.is_empty() {
+                    nodes.push(MenuNode::Separator);
+                }
+                nodes.extend([
                     MenuNode::Item {
                         key: CMD_PASTE.to_string(),
                         label: if paste_move {
@@ -8664,7 +8679,8 @@ impl App {
                         children: self.sort_menu_nodes(),
                     },
                     MenuNode::Separator,
-                ]
+                ]);
+                nodes
             }
         }
     }
@@ -10491,6 +10507,12 @@ impl App {
                     self.reveal_pane = Some(self.state.active().active_pane);
                 }
                 self.state.cut_paths.remove(path);
+                // 记账**不能**挂在下面「找到显示位置」那个 if 里：改名时条目
+                // 可能根本不在当前列表里（搜索 / 类型筛选过滤掉了，或者列举还
+                // 没到），那样这次改名就悄悄进不了撤销栈。
+                self.undo.record(crate::ops::undo::Kind::Rename {
+                    pairs: vec![(path.to_path_buf(), new_path.clone())],
+                });
                 if let Some(idx) = pin_index {
                     logv!("[rename] pin new={:?} at display index {}", new_path, idx);
                     self.rename_pin = Some((
@@ -10895,6 +10917,16 @@ impl App {
             return;
         }
 
+        // 0.2 空白处右键菜单最顶上的撤销 / 重做（不依赖选中项和当前目录）。
+        if id == "undo" {
+            self.history_action(false);
+            return;
+        }
+        if id == "redo" {
+            self.history_action(true);
+            return;
+        }
+
         // 1. 视图模式切换（优先执行！不依赖选中的文件 target，杜绝工具栏调用被拦截）
         if let Some(mode) = id.strip_prefix("view:") {
             self.set_view_mode(mode);
@@ -10971,6 +11003,12 @@ impl App {
                 }
                 "builtin.move" => {
                     self.copy_selection(true);
+                    return;
+                }
+                // 与 Del 键同一条路径（删除到回收站）。系统菜单那一项不记账，
+                // 所以默认藏掉它、改用这一条，撤销栈才能覆盖删除。
+                "builtin.trash" => {
+                    self.delete_selection(true);
                     return;
                 }
                 "builtin.stage" => {
@@ -11459,6 +11497,12 @@ impl App {
                 // 显式复位 scroll_select：它是全局状态，若上一次粘贴的 scroll_to_paths
                 // 因路径改名没匹配上就不会被消费，残留到本次新建 → 把选择集换成
                 // 别处、看起来「没选中」或「选中错行」。
+                self.undo.record(crate::ops::undo::Kind::Create {
+                    dirs: vec![crate::ops::undo::CreatedDir {
+                        id: crate::ops::undo::capture_dir_id(&path),
+                        path: path.clone(),
+                    }],
+                });
                 self.scroll_to_paths = vec![path.clone()];
                 self.scroll_select = false;
                 self.reveal_pane = Some(self.state.active().active_pane);
@@ -11491,6 +11535,44 @@ impl App {
         ok
     }
 
+    /// Ctrl+Z / Ctrl+Y：撤销 / 重做最近一次文件操作。
+    ///
+    /// 撤销本身也是一次文件任务（要动磁盘、可能弹 Shell 对话框），所以走同一条
+    /// 任务队列，跟复制 / 删除互斥。栈顶那条记录要等任务**真的提交成功**才移动，
+    /// 否则「有任务在跑」时按一下 Ctrl+Z 就把记录弄丢了。
+    fn history_action(&mut self, redo: bool) {
+        let entry = if redo {
+            self.undo.peek_redo().cloned()
+        } else {
+            self.undo.peek_undo().cloned()
+        };
+        let Some(entry) = entry else {
+            logv!("[undo] 栈是空的 redo={}", redo);
+            self.set_status_job(self.tr(if redo {
+                "没有可重做的操作"
+            } else {
+                "没有可撤销的操作"
+            }));
+            return;
+        };
+        logv!(
+            "[undo] submit redo={} kind={:?} undo_left={} redo_left={}",
+            redo,
+            entry,
+            self.undo.can_undo(),
+            self.undo.can_redo()
+        );
+        if !self.submit_job(JobKind::History { redo, entry }) {
+            return;
+        }
+        // 提交成功才搬记录：失败时记录留在原处，下次还能再试。
+        if redo {
+            self.undo.take_redo();
+        } else {
+            self.undo.take_undo();
+        }
+    }
+
     fn set_status_job(&self, message: impl Into<SharedString>) {
         let message = message.into();
         // 危险提示用红色：失败、名称超限、删除（含删除取消）等需要一眼看到。
@@ -11499,8 +11581,36 @@ impl App {
     }
 
     /// 任务完成后的处理：刷新受影响目录。
-    fn on_job_finished(&mut self, summary: JobSummary) {
+    fn on_job_finished(&mut self, mut summary: JobSummary) {
         self.shell_op_running = false;
+        // 撤销栈：普通操作成功就记一笔；撤销 / 重做任务只有失败时才把记录退回原处
+        // （成功时提交那一步已经搬过了）。
+        if let Some(kind) = summary.recorded.take() {
+            self.undo.record(kind);
+        }
+        if summary.clear_undo {
+            self.undo.clear();
+        }
+        if let Some((redo, _)) = summary.history.take() {
+            if summary.failed > 0 && !summary.cancelled {
+                // 用户取消：什么都没动，记录放回去还能再试。
+                // 真正的失败（比如回收站里已经找不到那批文件）就把它扔掉 ——
+                // 留在栈顶会让之后每一次 Ctrl+Z 都重试同一条、次次失败，
+                // 更早的历史等于永远撤不到。
+                logv!("[undo] 这次记录失败，作废 redo={}", redo);
+                if redo {
+                    self.undo.drop_undo();
+                } else {
+                    self.undo.drop_redo();
+                }
+            } else if summary.failed > 0 {
+                if redo {
+                    self.undo.restore_redo();
+                } else {
+                    self.undo.restore_undo();
+                }
+            }
+        }
         // 复制/移动是逐个落地的：任务期间发起的列举可能只含一部分新文件，
         // 它们的结果可能在这个函数之后才到。给一小段保护期，只拦“不完整”的
         // 列举；完整的那次（本函数稍后发起的重载）照常立即消费。
@@ -13598,7 +13708,7 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
         if app.shell_op_running
             && matches!(
                 action.as_str(),
-                "open" | "delete" | "delete_perm" | "rename" | "paste" | "copy" | "cut"
+                "open" | "delete" | "delete_perm" | "rename" | "paste" | "copy" | "cut" | "undo" | "redo"
             )
         {
             if !app.shell_key_suppressed_logged {
@@ -13635,6 +13745,8 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             "copy" => app.copy_selection(false),
             "cut" => app.copy_selection(true),
             "paste" => app.paste_clipboard(),
+            "undo" => app.history_action(false),
+            "redo" => app.history_action(true),
             "select_all" => app.select_all(),
             "close_tab" => app.close_tab_or_unsplit(),
             _ => return EventResult::Propagate,
@@ -18609,6 +18721,12 @@ fn batch_sync_pane(done: &[crate::ops::batch_rename::PlanItem]) {
     let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
         return;
     };
+    // 批量改名也进撤销栈：一次 Ctrl+Z 把整批名字改回去。
+    app.borrow_mut()
+        .undo
+        .record(crate::ops::undo::Kind::Rename {
+            pairs: done.iter().map(|d| (d.from.clone(), d.to.clone())).collect(),
+        });
     let refresh_here = {
         let mut app = app.borrow_mut();
         let tab = app.state.active_mut();

@@ -33,6 +33,8 @@ pub const DEFAULT_SHORTCUTS: &[ShortcutMeta] = &[
     ShortcutMeta { id: "cut", name: "剪切", group: "编辑与选择", default_chord: "Ctrl+X", is_readonly: false },
     ShortcutMeta { id: "paste", name: "粘贴", group: "编辑与选择", default_chord: "Ctrl+V", is_readonly: false },
     ShortcutMeta { id: "select_all", name: "全选", group: "编辑与选择", default_chord: "Ctrl+A", is_readonly: false },
+    ShortcutMeta { id: "undo", name: "撤销", group: "编辑与选择", default_chord: "Ctrl+Z", is_readonly: false },
+    ShortcutMeta { id: "redo", name: "重做", group: "编辑与选择", default_chord: "Ctrl+Y", is_readonly: false },
     // 标签页
     ShortcutMeta { id: "close_tab", name: "关闭当前标签", group: "标签页", default_chord: "Ctrl+W", is_readonly: false },
 ];

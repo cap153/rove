@@ -244,6 +244,58 @@ mod tests {
         assert!(!hit("Open", &[]));
     }
 
+    /// Shell 的撤销项文字跟着上一次操作变，只能靠包含匹配全藏掉；
+    /// 同时不能误伤名字里带「撤销」字样的第三方项以外的东西 —— 这里只钉
+    /// 「必须藏掉」的那几种写法。
+    #[test]
+    fn default_keywords_hide_every_shell_undo_variant() {
+        let kw = crate::config::default_context_menu_hide();
+        for label in [
+            "Undo",
+            "Undo Copy",
+            "Undo Move",
+            "Undo Delete",
+            "Undo Rename",
+            "撤销",
+            "撤销复制",
+            "撤销移动",
+            "撤销删除",
+            "撤销重命名",
+        ] {
+            assert!(
+                keyword_hit(&normalize_label(label), &kw),
+                "默认项应当藏掉撤销变体 {label}"
+            );
+        }
+    }
+
+    /// 系统菜单的删除项走 Explorer 的删除，Rove 记不了账，默认精确藏掉
+    /// （Rove 自己的「删除」排在剪切下面，不受影响）。
+    #[test]
+    fn default_keywords_hide_the_shell_delete_item() {
+        let kw = crate::config::default_context_menu_hide();
+        for label in ["删除(D)", "Delete"] {
+            assert!(
+                keyword_hit(&normalize_label(label), &kw),
+                "默认项应当藏掉 {label}"
+            );
+        }
+        // 精确匹配：只是文字里含「删除」的项不能被连带藏掉。
+        assert!(!hit("删除到文件夹", &["!删除(D)"]));
+    }
+
+    /// 重做项跟撤销项一样按包含匹配：Shell 的文字会跟着上一次操作变。
+    #[test]
+    fn default_keywords_hide_every_shell_redo_variant() {
+        let kw = crate::config::default_context_menu_hide();
+        for label in ["Redo", "Redo Copy", "Redo Move", "Redo Delete", "恢复", "恢复复制", "恢复移动"] {
+            assert!(
+                keyword_hit(&normalize_label(label), &kw),
+                "默认项应当藏掉重做变体 {label}"
+            );
+        }
+    }
+
     #[test]
     fn default_keywords_hide_only_the_standard_four() {
         let kw = crate::config::default_context_menu_hide();

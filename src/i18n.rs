@@ -311,6 +311,18 @@ pub const ZH: &[&str] = &[
     "前进",                    // 300
     "上一级",                  // 301
     "正在搜索…已扫 {} 项",     // 302
+    "没有可撤销的操作",         // 303
+    "没有可重做的操作",         // 304
+    "撤销复制",                 // 305
+    "撤销移动",                 // 306
+    "撤销删除",                 // 307
+    "撤销新建",                 // 308
+    "撤销重命名",               // 309
+    "恢复复制",                 // 310
+    "恢复移动",                 // 311
+    "恢复删除",                 // 312
+    "恢复新建",                 // 313
+    "恢复重命名",               // 314
 ];
 
 pub const EN: &[&str] = &[
@@ -617,6 +629,18 @@ pub const EN: &[&str] = &[
     "Forward",
     "Up one level",
     "Searching… scanned {} items",
+    "Nothing to undo",
+    "Nothing to redo",
+    "Undo copy",
+    "Undo move",
+    "Undo delete",
+    "Undo new folder",
+    "Undo rename",
+    "Redo copy",
+    "Redo move",
+    "Redo delete",
+    "Redo new folder",
+    "Redo rename",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -703,6 +727,54 @@ mod tests {
         // 搜索中的空列表占位文案（`ui/file_list.slint` 的默认值仍是 61）。
         assert_eq!(ZH[302], "正在搜索…已扫 {} 项");
         assert_eq!(EN[302], "Searching… scanned {} items");
+        // Ctrl+Z / Ctrl+Y 的空栈提示（追加在末尾，303 / 304）。
+        assert_eq!(ZH[303], "没有可撤销的操作");
+        assert_eq!(EN[303], "Nothing to undo");
+        assert_eq!(ZH[304], "没有可重做的操作");
+        assert_eq!(EN[304], "Nothing to redo");
+        // 空白处右键菜单里的撤销 / 重做项（追加在末尾，305–314）。
+        assert_eq!(ZH[305], "撤销复制");
+        assert_eq!(EN[305], "Undo copy");
+        assert_eq!(ZH[306], "撤销移动");
+        assert_eq!(EN[306], "Undo move");
+        assert_eq!(ZH[307], "撤销删除");
+        assert_eq!(EN[307], "Undo delete");
+        assert_eq!(ZH[308], "撤销新建");
+        assert_eq!(EN[308], "Undo new folder");
+        assert_eq!(ZH[309], "撤销重命名");
+        assert_eq!(EN[309], "Undo rename");
+        assert_eq!(ZH[310], "恢复复制");
+        assert_eq!(EN[310], "Redo copy");
+        assert_eq!(ZH[311], "恢复移动");
+        assert_eq!(EN[311], "Redo move");
+        assert_eq!(ZH[312], "恢复删除");
+        assert_eq!(EN[312], "Redo delete");
+        assert_eq!(ZH[313], "恢复新建");
+        assert_eq!(EN[313], "Redo new folder");
+        assert_eq!(ZH[314], "恢复重命名");
+        assert_eq!(EN[314], "Redo rename");
+        // 空白处右键菜单的撤销 / 重做文字是 Rust 侧按记录类型拼出来的，
+        // 每种记录都得能在字典里查到，否则英文界面会冒出中文。
+        let kinds = [
+            crate::ops::undo::Kind::Trash { paths: vec![] },
+            crate::ops::undo::Kind::Copy {
+                sources: vec![],
+                dest: std::path::PathBuf::new(),
+                created: vec![],
+            },
+            crate::ops::undo::Kind::Move { pairs: vec![] },
+            crate::ops::undo::Kind::Rename { pairs: vec![] },
+            crate::ops::undo::Kind::Create { dirs: vec![] },
+        ];
+        let mut seen: Vec<&str> = Vec::new();
+        for kind in kinds.iter() {
+            for label in [kind.undo_label(), kind.redo_label()] {
+                assert!(!seen.contains(&label), "两种记录不能共用一个菜单文字：{label}");
+                seen.push(label);
+                assert_eq!(text("zh-CN", label).as_str(), label, "{label} 不在中文表里");
+                assert_ne!(text("en", label).as_str(), label, "{label} 没有英文翻译");
+            }
+        }
         // 通用页「接管资源管理器」开关（ui/settings_page.slint 硬编码 238/239）。
         assert_eq!(ZH[238], "接管资源管理器");
         assert_eq!(EN[238], "Take over Explorer");

@@ -87,6 +87,22 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             group: "".into(),
             builtin: true,
         },
+        // 「删除」紧跟在「剪切」下面：它与复制/剪切同一类（作用于选中项），
+        // 而且必须走 Rove 自己的任务队列 —— 系统菜单那一项调的是 Explorer 的
+        // 删除，Rove 记不了账（撤销栈里没有它），所以默认把它藏掉。
+        ActionEntry {
+            id: "builtin.trash".into(),
+            label: "删除".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
         // 「复制路径」放在「剪切」下面：菜单按本函数顺序输出一级项，
         // 复制 / 剪切 / 复制路径 三个密切相关，摆在一起更好认。
         ActionEntry {
@@ -631,6 +647,25 @@ fn split_args(s: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    /// 「删除」必须紧跟在「剪切」下面，而且必须存在：系统菜单那一项不记账，
+    /// 删掉这一条等价于把右键菜单里的删除功能弄丢。
+    #[test]
+    fn trash_sits_right_below_cut() {
+        let entries = builtin_actions();
+        let ids: Vec<&str> = entries.iter().map(|a| a.id.as_str()).collect();
+        let cut = ids
+            .iter()
+            .position(|id| *id == "builtin.move")
+            .expect("剪切项不见了");
+        assert_eq!(ids[cut + 1], "builtin.trash");
+        let entry = builtin_actions()
+            .into_iter()
+            .find(|a| a.id == "builtin.trash")
+            .unwrap();
+        assert_eq!(entry.label, "删除");
+        assert!(entry.enabled && entry.target == "any");
+    }
+
     fn test_entry() -> ActionEntry {
         ActionEntry {
             id: "user.test".into(),
@@ -747,17 +782,19 @@ mod tests {
         assert!(!f.matches_selection(&[], |_| None));
     }
 
-    /// 「复制路径」紧跟在「剪切」下面（复制 / 剪切 / 复制路径 三项相邻）：
+    /// 一级菜单前四项的顺序：复制 / 剪切 / 删除 / 复制路径。
     /// heal_full 会把内置动作按本函数顺序重排，所以只靠这里的顺序就成。
     #[test]
     fn copy_path_sits_right_below_cut() {
         let actions = builtin_actions();
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(
-            &ids[..4],
+            &ids[..5],
             &[
                 "builtin.copy",
                 "builtin.move",
+                // 「删除」插在剪切下面（系统那一项不记账，见 default_context_menu_hide）。
+                "builtin.trash",
                 "builtin.copy_path",
                 // 批量重命名紧跟「复制路径」：一级菜单里也在这个位置。
                 "builtin.batch_rename",
