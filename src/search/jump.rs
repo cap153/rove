@@ -152,7 +152,16 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
             let score_opt = if query_lower.is_empty() {
                 Some(100u16)
             } else {
-                crate::search::score(&name, &fields, &query_lower, &mut matcher, &mut bufs)
+                // 吸附窗只搜文件夹，但仍走带加权的统一入口：同一目录下的长短
+                // 名字要按「名字短优先」排，和主窗口一致。
+                crate::search::score_ranked(
+                    &name,
+                    &fields,
+                    &query_lower,
+                    &mut matcher,
+                    &mut bufs,
+                    true,
+                )
             };
 
             if let Some(score) = score_opt {
@@ -194,9 +203,14 @@ pub fn search(query: &str, current_dir: Option<&Path>) -> Vec<JumpHit> {
                     let name = entry.file_name().to_string_lossy().into_owned();
                     let path = entry.path();
                     let fields = crate::search::pinyin_fields(&name);
-                    if let Some(score) =
-                        crate::search::score(&name, &fields, &query_lower, &mut matcher, &mut bufs)
-                    {
+                    if let Some(score) = crate::search::score_ranked(
+                        &name,
+                        &fields,
+                        &query_lower,
+                        &mut matcher,
+                        &mut bufs,
+                        true,
+                    ) {
                         let key = path_key(&path);
                         if !seen.insert(key.clone()) {
                             continue;

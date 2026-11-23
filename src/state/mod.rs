@@ -113,6 +113,16 @@ pub struct PaneState {
     pub deep_generation: u64,
     /// 深度搜索进行中（状态栏提示）。
     pub deep_searching: bool,
+    /// 结果是被上限掐停的（不是真的扫完）：状态栏要说清楚还有多少没收。
+    pub deep_capped: bool,
+    /// 深搜已经扫过多少个条目（按时间节流回传，只用于状态栏进度）。
+    pub deep_scanned: usize,
+    /// 流式结果只追加、还没重排：等用户停手（或扫描结束）再整体排一次。
+    ///
+    /// 和「按大小排序」那套是同一个思路（`App::size_sort_pending`）：每批结果
+    /// 都整体重排，用户正在看的那一行会被后插进来的高分条目挤走，屏幕上就是
+    /// 列表一直在跳。搜索期间只往末尾接，排序留到不打扰人的时候做。
+    pub deep_sort_pending: bool,
     /// 全局索引搜索的未截断命中总数；`Some(n)` 且 `display.len() < n` 时，
     /// 状态栏提示「结果已截断」。
     pub search_total: Option<usize>,
@@ -160,6 +170,9 @@ impl PaneState {
             deep_pinyin: Vec::new(),
             deep_generation: 0,
             deep_searching: false,
+            deep_capped: false,
+            deep_scanned: 0,
+            deep_sort_pending: false,
             search_total: None,
         }
     }
@@ -178,6 +191,9 @@ impl PaneState {
         self.deep_entries.clear();
         self.deep_pinyin.clear();
         self.deep_searching = false;
+        self.deep_capped = false;
+        self.deep_scanned = 0;
+        self.deep_sort_pending = false;
         self.deep_generation += 1;
     }
 
@@ -373,7 +389,7 @@ impl PaneState {
         self.pinyin_pending = None;
     }
 
-    /// 重建过滤后的可见下标表（拼音模糊匹配 + 打分排序）。
+    /// 重建过滤后的可见下标表（拼音/字面匹配 + 打分排序）。
     /// 下标空间 = 本地条目 [0, entries.len()) ⊕ 深度结果（深度条目已由
     /// 后台按同一查询过滤，直接并入统一打分排序）。
     pub fn rebuild_display(&mut self) {
@@ -399,8 +415,17 @@ impl PaneState {
             if self.matches_type_filter(e)
                 && crate::search::matches_query(&e.name, fields, &query, &mut matcher, &mut bufs)
             {
-                let s = crate::search::score(&e.name, fields, &query, &mut matcher, &mut bufs)
-                    .unwrap_or(0);
+                // 加分（文件夹 +40、短名优先）跟着分数一起排：同分时文件夹在前，
+                // 这也是资源管理器 / pulse 的次序。
+                let s = crate::search::score_ranked(
+                    &e.name,
+                    fields,
+                    &query,
+                    &mut matcher,
+                    &mut bufs,
+                    e.is_dir,
+                )
+                .unwrap_or(0);
                 scored.push((i, s));
             }
         }
@@ -409,7 +434,9 @@ impl PaneState {
             let s = self
                 .deep_pinyin
                 .get(j)
-                .and_then(|f| crate::search::score(&e.name, f, &query, &mut matcher, &mut bufs))
+                .and_then(|f| {
+                    crate::search::score_ranked(&e.name, f, &query, &mut matcher, &mut bufs, e.is_dir)
+                })
                 .unwrap_or(0);
             scored.push((local_len + j, s));
         }
@@ -429,6 +456,86 @@ impl PaneState {
         self.display = scored.into_iter().map(|(i, _)| i).collect();
     }
 
+    /// 搜索结果流式到达时用：**不动已有顺序**，只把新出现的命中接到末尾。
+    ///
+    /// 深搜结果在后台已经按同一查询过滤过，这里只需重新判定本地条目（拼音缓存
+    /// 可能刚算好，命中集合会比上一批大）。真正按得分重排留给
+    /// `rebuild_display`，由 App 在用户停手或扫描结束时调用。
+    pub fn extend_display_streaming(&mut self) {
+        let (_, clean_query) = crate::search::parse_drive_prefix(&self.filter);
+        let query = clean_query.trim().to_lowercase();
+        if query.is_empty() {
+            self.rebuild_display();
+            return;
+        }
+        let local_len = self.entries.len();
+        let total = local_len + self.deep_entries.len();
+        // 拼音缓存没算好时只做「纯文本」判定会漏掉拼音命中，进而把已经显示的
+        // 条目踢掉（闪一下空列表再回来）—— 那种情况保留原样，等缓存到了再说。
+        let pinyin_ready = self.pinyin_cache.len() == local_len;
+        let no_pinyin = crate::search::PinyinFields::default();
+        let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let mut bufs = (Vec::new(), Vec::new(), Vec::new());
+        let mut keep: Vec<usize> = Vec::with_capacity(self.display.len());
+        let mut present = vec![false; total];
+        for &idx in &self.display {
+            let hit = if idx >= local_len {
+                // 深度结果本来就是这次查询的命中。
+                true
+            } else if !pinyin_ready {
+                true
+            } else {
+                // 条目表刚被换掉（列举结果更新）而显示表还没重建时，旧下标可能
+                // 越界 —— 取不到就当它已作废，绝不让这里 panic。
+                match self.entries.get(idx) {
+                    Some(e) => {
+                        self.matches_type_filter(e)
+                            && crate::search::matches_query(
+                                &e.name,
+                                self.pinyin_cache.get(idx).unwrap_or(&no_pinyin),
+                                &query,
+                                &mut matcher,
+                                &mut bufs,
+                            )
+                    }
+                    None => false,
+                }
+            };
+            if hit && idx < total && !present[idx] {
+                present[idx] = true;
+                keep.push(idx);
+            }
+        }
+        // 本地条目里新命中的（上一批之后拼音缓存/类型筛选变化带来的）。
+        if pinyin_ready {
+            for i in 0..local_len {
+                if present[i] {
+                    continue;
+                }
+                let e = &self.entries[i];
+                if self.matches_type_filter(e)
+                    && crate::search::matches_query(
+                        &e.name,
+                        self.pinyin_cache.get(i).unwrap_or(&no_pinyin),
+                        &query,
+                        &mut matcher,
+                        &mut bufs,
+                    )
+                {
+                    present[i] = true;
+                    keep.push(i);
+                }
+            }
+        }
+        // 末尾接上这一批新到的深度结果（保持到达顺序）。
+        for idx in local_len..total {
+            if !present[idx] {
+                keep.push(idx);
+            }
+        }
+        self.display = keep;
+    }
+
     /// 条目是否通过类型筛选（空筛选集 = 全通过）。
     pub fn matches_type_filter(&self, e: &FileEntry) -> bool {
         self.type_filter.is_empty() || self.type_filter.iter().any(|k| k == type_key(e))
@@ -443,6 +550,18 @@ impl PaneState {
         } else {
             self.deep_entries.get(idx - local)
         }
+    }
+
+    /// 当前显示的**全部**条目路径，顺序与显示一致（含深度搜索结果）。
+    ///
+    /// 全选 / 反选 / Shift 范围的锚点都必须用它：`entries` 里只有本地条目，
+    /// 搜索时深层结果在 `deep_entries` 里，直接查 `entries` 会漏掉它们
+    ///（真机表现：搜索后 `Ctrl+A` 只选了本地那几条，按住 Shift 点第二个
+    /// 文件毫无反应）。
+    pub fn displayed_paths(&self) -> Vec<PathBuf> {
+        (0..self.display.len())
+            .filter_map(|di| self.display_entry(di).map(|e| e.path.clone()))
+            .collect()
     }
 
     /// 显示下标 → (条目, 拼音字段)，仅高亮渲染使用。
@@ -764,6 +883,60 @@ mod tests {
 
     fn pane() -> PaneState {
         PaneState::new(Some(PathBuf::from("C:\\work")), SortState::default())
+    }
+
+    /// 全选 / 反选 / Shift 范围用的「显示路径」必须带上深度搜索结果。
+    ///
+    /// 真机两条：搜索后 `Ctrl+A` 只选了本地那几条；按住 Shift 点第二个文件
+    /// 毫无反应（锚点只在 `entries` 里找，深层结果找不到）。
+    #[test]
+    fn displayed_paths_include_deep_entries() {
+        let mut p = pane();
+        p.entries = vec![
+            crate::fs::dir::test_entry("本地命中.mp4", false, 0),
+            crate::fs::dir::test_entry("别的.mp4", false, 0),
+        ];
+        p.deep_entries = vec![crate::fs::dir::test_entry("深层命中.mp4", false, 0)];
+        p.filter = "命中".into();
+        p.rebuild_display();
+
+        let paths: Vec<String> = p
+            .displayed_paths()
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            paths,
+            vec!["本地命中.mp4".to_string(), "深层命中.mp4".to_string()],
+            "显示序列里的深层结果不能漏"
+        );
+    }
+
+    /// 流式搜索：新到的结果**接在末尾**，不打断已有顺序；排序等用户停手。
+    ///
+    /// 真机反馈是「列表一直在跳」——每批都整体按分数重排，正在看的那一行会被
+    /// 后面插进来的高分条目挤走。这里先追加，再由 App 的空闲防抖排一次。
+    #[test]
+    fn streaming_results_append_without_reordering() {
+        let mut p = pane();
+        p.filter = "ziyan".into();
+        p.entries.clear();
+        p.deep_entries = vec![crate::fs::dir::test_entry("子様.mp4", false, 0)];
+        p.deep_pinyin = vec![crate::search::pinyin_fields("子様.mp4")];
+        p.rebuild_display();
+        assert_eq!(p.display, vec![0]);
+
+        // 高得多的命中后到：追加，不许插队。
+        p.deep_entries
+            .push(crate::fs::dir::test_entry("紫颜-小仙紫.mp4", false, 0));
+        p.deep_pinyin
+            .push(crate::search::pinyin_fields("紫颜-小仙紫.mp4"));
+        p.extend_display_streaming();
+        assert_eq!(p.display, vec![0, 1], "已有顺序不能被打乱");
+
+        // 停手后整体重排：高分回到最前。
+        p.rebuild_display();
+        assert_eq!(p.display, vec![1, 0]);
     }
 
     /// 类型筛选键：目录统一 `dir`，文件是小写扩展名，无扩展名 `noext`。

@@ -220,7 +220,7 @@ impl GlobalIndex {
         }
     }
 
-    /// 拼音/模糊查询，按得分排序取前 `limit` 条，并回报未截断的命中总数。
+    /// 拼音/字面查询，按得分排序取前 `limit` 条，并回报未截断的命中总数。
     /// 支持盘符限定前缀（如 `c: videos`）：非目标盘一票否决；仅输入盘符时返回该盘全部条目。
     pub fn search(&self, query: &str, limit: usize) -> SearchHits {
         self.search_filtered(query, limit, false)
@@ -261,13 +261,14 @@ impl GlobalIndex {
             let hit = if query_lower.is_empty() {
                 Some(100u16)
             } else {
-                crate::search::score_parts(
+                crate::search::score_parts_ranked(
                     row.name,
                     row.abbr,
                     row.full,
                     &query_lower,
                     &mut matcher,
                     &mut bufs,
+                    row.is_dir,
                 )
             };
             if let Some(score) = hit {
@@ -1073,94 +1074,286 @@ pub struct DeepItem {
     pub fields: crate::search::PinyinFields,
 }
 
-/// 深度扫描条目上限(防失控;配合 worker 无中断,上限要保守)。
-const DEEP_MAX_ENTRIES: usize = 20_000;
-/// 深度搜索结果上限。
-pub const DEEP_MAX_RESULTS: usize = 300;
-/// 递归深度上限。
-const DEEP_MAX_DEPTH: usize = 10;
+/// 一次回传给 UI 的条数。
+///
+/// 注意：这**不是**「往下滚一页再来 300 条」的分页，后台线程会一批接一批地
+/// 一直送到 `is_done()`（上限或扫完）为止。分这么多批只为了两件事：
+/// 第一批几百毫秒内就能上屏、且每批之间让 UI 线程喘口气（反思：以前注释
+/// 写「滚到底再放出 300 条」，跟实际行为不符，读者会以为结果能无限续下去）。
+pub const DEEP_BATCH: usize = 300;
+/// 单批最多扫多少个条目：保证第一批够快、按键盘时不断流。
+const DEEP_BATCH_SCAN: usize = 20_000;
 
-/// 在 `root` 子树中递归查找名称匹配 `query_lower` 的条目。
-/// 直接子项(depth 0)不返回——它们已在当前视图列表中,由本地过滤负责。
-struct DeepScan {
-    out: Vec<DeepItem>,
+/// 一批最多干这么久。**这不是性能调优，是响应性问题**：网络盘 / 机械盘上
+/// 光是 `read_dir` 翻两万个条目就可能要几十秒，期间工作线程不回到主循环，
+/// 新请求（用户接着打下一个字）和取消都排不上队 —— 真机表现是输入框已经
+/// 写着 `ziyan`，列表却停在上一轮的结果上二十多秒不动。
+///
+/// 切成 60ms 一片之后，无论盘多慢，工作线程至少每 60ms 回一次主循环，
+/// 请求最多晚 60ms 被接手，进度也每 60ms 刷新一次。
+const DEEP_SLICE: std::time::Duration = std::time::Duration::from_millis(60);
+/// 一个查询累计最多扫多少条目（在大盘根目录上搜索不至于跑十几分钟）。
+const DEEP_MAX_ENTRIES: usize = 500_000;
+/// 「低档命中」的配额：子串/简拼/全拼这些只是**沾边**的结果，
+/// 一千条足够翻了（Pulse 的全局搜索干脆只给 200 条）。
+///
+/// 高档命中（整串相等 / 名字以查询开头）**不占这个配额**：用户按前缀搜自己
+/// 命名的一批视频，那是「把这一堆找齐」的正经用法，不该被当成噪音掐掉。
+pub const DEEP_MAX_RESULTS: usize = 1_000;
+/// 绝对上限（高档命中也算）：防的是搜单个 `a` 时整棵树几乎全命中、把内存
+/// 和列表重建拖垮。1 万条已经远超一次能处理的量。
+pub const DEEP_MAX_TOTAL: usize = 10_000;
+/// 递归深度上限（防 junction / 挂载点绕成环）。
+const DEEP_MAX_DEPTH: usize = 16;
+
+/// 可中断、可续跑的深度搜索（文件夹视图的子树递归）。
+///
+/// 以前是全有全无：一次走完（超过 20k 条目或攒到 300 条就停），一趟就完。
+/// 现在拆成状态机：队列里存**待扫描的目录**，每调一次 `next_batch` 就往前推
+/// 一批，扫完（或到上限）才 `done`。这样批次之间可以中断——用户改词时不
+/// 必等整棵树扫完，旧扫描直接丢掉。
+///
+/// 遍历用**深度优先**（后进先出）：名字在很深的子目录里（`合集\2024\03\bengugu`）
+/// 也只要扫过同一条路径上的几层就能碰到，不会被同一层里的大目录挡在后面。
+/// 顺序本身不影响排序 —— 结果按得分重排，精确同名的那条一出现就跳到第一行。
+pub struct DeepScan {
+    query: String,
+    /// 名字本身命中查询的目录：**优先深入**。用户要找的东西常常就在同名/近名
+    /// 文件夹里，先进这些目录就能早点把高分结果放出来，而不是等整盘扫完
+    /// （真机：整盘搜 `ziyan` 头一条要等 10 秒、扫过 6.4 万项）。
+    hot: std::collections::VecDeque<(PathBuf, usize)>,
+    /// 其余目录（原来的深度优先队列）。
+    cold: std::collections::VecDeque<(PathBuf, usize)>,
+    /// 正在读的那个目录（+ 它的深度）。批次在目录中间用完时**保留这个迭代器**，
+    /// 下一批从断点继续——否则重新 `read_dir` 会把已经返回过的条目再报一遍。
+    cur: Option<(std::fs::ReadDir, usize)>,
+    /// 累计扫过的条目数（跨批次）。
     scanned: usize,
+    /// 累计回传过的条数（跨批次，含高档命中）。
+    emitted: usize,
+    /// 其中「低档命中」的条数：只有这部分受 `DEEP_MAX_RESULTS` 约束。
+    weak: usize,
+    done: bool,
+    matcher: nucleo_matcher::Matcher,
+    bufs: (Vec<char>, Vec<char>, Vec<char>),
 }
 
-pub fn deep_scan(root: &Path, query_lower: &str) -> Vec<DeepItem> {
-    let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
-    let mut bufs = (Vec::new(), Vec::new(), Vec::new());
-    let mut st = DeepScan {
-        out: Vec::with_capacity(64),
-        scanned: 0,
-    };
-    deep_walk(root, 0, query_lower, &mut matcher, &mut bufs, &mut st);
-    st.out
+impl DeepScan {
+    /// `root` 的直接子项不返回（它们就在当前视图里，由本地过滤负责），
+    /// 只把 root 的子目录排进队列。
+    pub fn new(root: &Path, query_lower: &str) -> Self {
+        let mut hot = std::collections::VecDeque::new();
+        let mut cold = std::collections::VecDeque::new();
+        let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let mut bufs = (Vec::new(), Vec::new(), Vec::new());
+        if let Ok(entries) = std::fs::read_dir(root) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !is_walkable_dir(&entry, &name) {
+                    continue;
+                }
+                let bucket = if dir_name_matches(&name, query_lower, &mut matcher, &mut bufs) {
+                    &mut hot
+                } else {
+                    &mut cold
+                };
+                bucket.push_back((entry.path(), 1));
+            }
+        }
+        Self {
+            query: query_lower.to_string(),
+            done: hot.is_empty() && cold.is_empty(),
+            hot,
+            cold,
+            cur: None,
+            scanned: 0,
+            emitted: 0,
+            weak: 0,
+            matcher,
+            bufs,
+        }
+    }
+
+    /// 还要不要再扫：队列空了**且**手上没有读一半的目录，或到了累计上限。
+    ///
+    /// 「队列空」不等于「扫完」：批次可能正好在一个目录中间用完，那个目录的
+    /// 迭代器还在 `cur` 里等着继续。
+    pub fn is_done(&self) -> bool {
+        self.done || self.capped() || (self.hot.is_empty() && self.cold.is_empty() && self.cur.is_none())
+    }
+
+    /// 撞到上限了（扫的条目太多 / 低档结果太多 / 总量太多）。
+    fn capped(&self) -> bool {
+        self.scanned >= DEEP_MAX_ENTRIES
+            || self.weak >= DEEP_MAX_RESULTS
+            || self.emitted >= DEEP_MAX_TOTAL
+    }
+
+    /// 已经扫过多少个条目（跨批次）。界面拿它显示「搜到哪了」。
+    pub fn scanned(&self) -> usize {
+        self.scanned
+    }
+
+    /// 是不是被上限掐停的（而不是真的扫完了）。状态栏要据此说明结果不完整。
+    pub fn hit_cap(&self) -> bool {
+        self.capped()
+    }
+
+    /// 续跑一批：最多返回 `want` 条，最多扫 `DEEP_BATCH_SCAN` 个条目。
+    ///
+    /// 扫到 `want` 条就停，剩下的目录 / 目录里剩下的条目留到下一次调用 ——
+    /// 这也是「改词立刻换扫描」能生效的原因：被中断时丢掉的只是队列，
+    /// 已经回传的结果不受影响。
+    pub fn next_batch(&mut self, want: usize) -> Vec<DeepItem> {
+        let started = std::time::Instant::now();
+        let mut out: Vec<DeepItem> = Vec::new();
+        let mut scanned_here = 0usize;
+        // 本批里「低档命中」的条数。
+        let mut weak_here = 0usize;
+        loop {
+            if scanned_here >= DEEP_BATCH_SCAN || self.capped() || started.elapsed() >= DEEP_SLICE {
+                break;
+            }
+            if self.cur.is_none() {
+                // 名字命中查询的目录先走完，再回到普通目录。
+                let next = self.hot.pop_front().or_else(|| self.cold.pop_front());
+                let Some((dir, depth)) = next else {
+                    self.done = true;
+                    break;
+                };
+                match std::fs::read_dir(&dir) {
+                    Ok(iter) => self.cur = Some((iter, depth)),
+                    Err(_) => continue,
+                }
+            }
+            let Some((iter, depth)) = self.cur.as_mut() else {
+                break;
+            };
+            let mut exhausted = false;
+            let mut quota_hit = false;
+            loop {
+                if scanned_here >= DEEP_BATCH_SCAN
+                    || self.scanned >= DEEP_MAX_ENTRIES
+                    || started.elapsed() >= DEEP_SLICE
+                {
+                    break;
+                }
+                let Some(Ok(entry)) = iter.next() else {
+                    exhausted = true;
+                    break;
+                };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
+                let path = entry.path();
+                let depth = *depth;
+                self.scanned += 1;
+                scanned_here += 1;
+                // 中文/日文查询只走字面匹配，拼音串一点用不上：这里就别为每个
+                // 条目（含子目录）现算一遍拼音了。整盘遍历时这是最贵的一步。
+                let fields = if self.query.is_ascii() {
+                    crate::search::pinyin_fields(&name)
+                } else {
+                    crate::search::PinyinFields::default()
+                };
+                if ft.is_dir() && is_walkable_dir(&entry, &name) && depth < DEEP_MAX_DEPTH {
+                    // 目录名本身就命中查询（`紫颜` 之于 `ziyan`）→ 丢进热队列，
+                    // 下一个就进它；否则照旧深度优先（插队头，先把子树走完）。
+                    let hot = crate::search::matches_query(
+                        &name,
+                        &fields,
+                        &self.query,
+                        &mut self.matcher,
+                        &mut self.bufs,
+                    );
+                    let bucket = if hot { &mut self.hot } else { &mut self.cold };
+                    bucket.push_front((path.clone(), depth + 1));
+                }
+                // 打分（而不是只问「匹配吗」）：要区分高档命中（整串相等 / 名字
+                // 以查询开头）和只是沾边的低档命中，两者的配额不同。
+                let Some(score) = crate::search::score_ranked(
+                    &name,
+                    &fields,
+                    &self.query,
+                    &mut self.matcher,
+                    &mut self.bufs,
+                    ft.is_dir(),
+                ) else {
+                    if out.len() >= want {
+                        break;
+                    }
+                    continue;
+                };
+                let strong = score >= crate::search::SCORE_PREFIX;
+                if !strong && self.weak + weak_here >= DEEP_MAX_RESULTS {
+                    // 低档配额用完：连这一批也不用再扫了（否则还要白翻两万个
+                    // 条目、把后面的边角料全过滤一遍才返回）。
+                    quota_hit = true;
+                    break;
+                }
+                let meta = std::fs::symlink_metadata(&path).ok();
+                let size = if ft.is_dir() {
+                    0
+                } else {
+                    meta.as_ref().map(|m| m.len()).unwrap_or(0)
+                };
+                let modified = meta.and_then(|m| m.modified().ok());
+                // 绝对上限卡在**条**上，不是卡在批次边界上：否则最后一批会整批
+                // 塞进来（上限 1 万时会跑到 10 200 条）。
+                if self.emitted + out.len() >= DEEP_MAX_TOTAL {
+                    break;
+                }
+                if !strong {
+                    weak_here += 1;
+                }
+                out.push(DeepItem {
+                    entry: crate::fs::FileEntry::from_path(&path, ft.is_dir(), size, modified, false),
+                    fields,
+                });
+                if out.len() >= want {
+                    break;
+                }
+            }
+            if exhausted {
+                self.cur = None;
+            }
+            if out.len() >= want || quota_hit {
+                break;
+            }
+        }
+        if self.cur.is_none() && self.hot.is_empty() && self.cold.is_empty() {
+            self.done = true;
+        }
+        if self.capped() {
+            self.done = true;
+        }
+        self.emitted += out.len();
+        self.weak += weak_here;
+        out
+    }
 }
 
-fn deep_walk(
-    dir: &Path,
-    depth: usize,
+/// 目录名本身是不是命中查询（命中就往热队列放，优先深入）。
+fn dir_name_matches(
+    name: &str,
     query_lower: &str,
     matcher: &mut nucleo_matcher::Matcher,
     bufs: &mut (Vec<char>, Vec<char>, Vec<char>),
-    st: &mut DeepScan,
-) {
-    if depth > DEEP_MAX_DEPTH
-        || st.scanned >= DEEP_MAX_ENTRIES
-        || st.out.len() >= DEEP_MAX_RESULTS
-    {
-        return;
+) -> bool {
+    let fields = crate::search::pinyin_fields(name);
+    crate::search::matches_query(name, &fields, query_lower, matcher, bufs)
+}
+
+/// 目录是否值得继续往下走：隐藏目录与系统噪声目录不进入（与全局索引一致）。
+fn is_walkable_dir(entry: &std::fs::DirEntry, name: &str) -> bool {
+    if entry.file_type().map(|t| !t.is_dir()).unwrap_or(true) {
+        return false;
     }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    let mut subdirs: Vec<PathBuf> = Vec::new();
-    for entry in entries.flatten() {
-        if st.scanned >= DEEP_MAX_ENTRIES || st.out.len() >= DEEP_MAX_RESULTS {
-            break;
-        }
-        let Ok(ft) = entry.file_type() else {
-            continue;
-        };
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if ft.is_dir() {
-            // 隐藏目录与系统噪声目录不进入(与全局索引一致)。
-            if name.starts_with('.') && name.len() > 1 {
-                continue;
-            }
-            if is_skipped(&name) {
-                continue;
-            }
-            subdirs.push(path.clone());
-        }
-        st.scanned += 1;
-        // depth 0 = 当前视图的直接子项,本地过滤已覆盖,不重复返回。
-        if depth == 0 {
-            continue;
-        }
-        let fields = pinyin_fields(&name);
-        if crate::search::matches_query(&name, &fields, query_lower, matcher, bufs) {
-            let meta = std::fs::symlink_metadata(&path).ok();
-            let size = if ft.is_dir() {
-                0
-            } else {
-                meta.as_ref().map(|m| m.len()).unwrap_or(0)
-            };
-            let modified = meta.and_then(|m| m.modified().ok());
-            st.out.push(DeepItem {
-                entry: crate::fs::FileEntry::from_path(&path, ft.is_dir(), size, modified, false),
-                fields,
-            });
-        }
+    if name.starts_with('.') && name.len() > 1 {
+        return false;
     }
-    for sub in subdirs {
-        if st.scanned >= DEEP_MAX_ENTRIES || st.out.len() >= DEEP_MAX_RESULTS {
-            break;
-        }
-        deep_walk(&sub, depth + 1, query_lower, matcher, bufs, st);
-    }
+    !is_skipped(name)
 }
 
 #[cfg(test)]
@@ -1176,20 +1369,190 @@ mod tests {
         }
     }
 
+    fn named(name: &str, is_dir: bool) -> IndexEntry {
+        IndexEntry {
+            is_dir,
+            ..entry(name)
+        }
+    }
+
     /// 吸附窗只要文件夹：过滤必须在截断之前，否则文件占满名额会让文件夹消失。
+    /// 深度搜索必须能「分批续跑」：第一批只给 `want` 条，剩下的还在队列里，
+    /// 再调一次能继续拿到，扫完才 `is_done`（批次由后台线程连续拉，
+    /// 不是等用户滚动）。
+    #[test]
+    fn deep_scan_resumes_between_batches() {
+        let root = std::env::temp_dir().join(format!("rove-deep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        std::fs::create_dir_all(root.join("a").join("nest")).unwrap();
+        // 直接子项不算深度结果（它们就在当前视图里）。
+        std::fs::write(root.join("bengugu.txt"), b"x").unwrap();
+        // 深度结果 3 条：一级 2 条 + 二级 1 条。
+        std::fs::write(root.join("a").join("bengugu-1.mp4"), b"x").unwrap();
+        std::fs::write(root.join("a").join("nest").join("bengugu-2.mp4"), b"x").unwrap();
+        std::fs::write(root.join("b").join("bengugu-3.mp4"), b"x").unwrap();
+
+        let mut scan = DeepScan::new(&root, "bengugu");
+        assert!(!scan.is_done(), "还没扫完就先报完了");
+        let first = scan.next_batch(2);
+        assert_eq!(first.len(), 2, "第一批只该给 2 条");
+        let rest = scan.next_batch(10);
+        assert_eq!(rest.len(), 1, "第二批该给剩下那 1 条");
+        assert!(scan.is_done());
+        assert!(scan.next_batch(10).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 名字埋在很深的子目录里也必须能在**第一批**就碰到。
+    ///
+    /// 造一棵「每层都有几十个无关文件」的树，把 `bengugu` 放在第 5 层：
+    /// 深度优先走同一条路径上的几层就到，不会被同层的大目录挡在后面。
+    #[test]
+    fn deep_scan_reaches_deeply_nested_name() {
+        let root = std::env::temp_dir().join(format!("rove-deep-nest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let mut level = root.clone();
+        for d in 0..5 {
+            for i in 0..40 {
+                let _ = std::fs::write(
+                    level.join(format!("其他素材-{d}-{i}.mp4")),
+                    b"x",
+                );
+            }
+            level = level.join(format!("合集{d}"));
+            std::fs::create_dir_all(&level).unwrap();
+        }
+        std::fs::create_dir_all(level.join("bengugu")).unwrap();
+        // 根目录再挂 20 个各 40 个文件的旁支：广度优先得先扫完这 800 条才轮到
+        // 第 5 层，深度优先只要顺着链走 5 层。
+        for i in 0..20 {
+            let side = root.join(format!("旁支{i}"));
+            std::fs::create_dir_all(&side).unwrap();
+            for j in 0..40 {
+                let _ = std::fs::write(side.join(format!("旁支{i}-{j}.mp4")), b"x");
+            }
+        }
+
+        // 遍历顺序取决于 `read_dir` 给的顺序，所以这里不赌「第几个扫到」。
+        // 深度优先真正保证的是**子树扫完才回到兄弟**：同一个旁支的条目必须
+        // 连成一段，不会和别的旁支交替出现 —— 否则深层命中会被上层的大目录
+        // 无限推后（用户看到的「怎么半天只有一个」）。
+        let mut scan = DeepScan::new(&root, ".mp4");
+        let mut order: Vec<String> = Vec::new();
+        while !scan.is_done() {
+            for item in scan.next_batch(DEEP_BATCH) {
+                order.push(item.entry.name.clone());
+            }
+        }
+        assert!(!order.is_empty(), "一条都没扫到，fixture 有问题");
+        for i in 0..20 {
+            let at: Vec<usize> = order
+                .iter()
+                .enumerate()
+                .filter(|(_, n)| n.starts_with(&format!("旁支{i}-")))
+                .map(|(idx, _)| idx)
+                .collect();
+            assert!(!at.is_empty(), "旁支{i} 的文件一个都没扫到");
+            assert_eq!(
+                at.last().unwrap() - at.first().unwrap() + 1,
+                at.len(),
+                "旁支{i} 的文件被别的目录打断了（深度优先没生效）"
+            );
+        }
+
+        // 再确认深层可命中：直系链上的 bengugu 也能扫到。
+        let mut scan = DeepScan::new(&root, "bengugu");
+        let mut found = false;
+        while !scan.is_done() && !found {
+            found = scan
+                .next_batch(DEEP_BATCH)
+                .iter()
+                .any(|i| i.entry.is_dir && i.entry.name == "bengugu");
+        }
+        assert!(found, "第 5 层的 bengugu 一直没被扫到");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 攒一批文件：`n` 个，名字由闭包给。
+    fn fixture_files(tag: &str, n: usize, name_of: impl Fn(usize) -> String) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("rove-deep-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // 根目录的直接子项由本地过滤负责，深搜只扫子目录，所以文件放进一层子目录。
+        let sub = root.join("合集");
+        std::fs::create_dir_all(&sub).unwrap();
+        for i in 0..n {
+            let _ = std::fs::write(sub.join(name_of(i)), b"x");
+        }
+        root
+    }
+
+    /// 跑完整个扫描，返回 (总条数, 批次数)。
+    fn drain(scan: &mut DeepScan) -> (usize, usize) {
+        let mut total = 0usize;
+        let mut batches = 0usize;
+        while !scan.is_done() {
+            batches += 1;
+            total += scan.next_batch(DEEP_BATCH).len();
+            if batches > 200 {
+                panic!("批次失控：{total}");
+            }
+        }
+        (total, batches)
+    }
+
+    /// 低档命中（只是沾边）必须卡在配额上，而且卡在**条**上不是批次边界上：
+    /// 以前每批 300 条整批塞进来再看上限，1 万的上限实测能跑到 10 200 条。
+    #[test]
+    fn deep_scan_stops_exactly_at_weak_cap() {
+        let root = fixture_files("weak-cap", DEEP_MAX_RESULTS + 137, |i| {
+            format!("zz-beam-{i}.mp4")
+        });
+        let mut scan = DeepScan::new(&root, "beam");
+        let (total, batches) = drain(&mut scan);
+        assert_eq!(total, DEEP_MAX_RESULTS, "低档命中必须正好停在配额上");
+        assert!(scan.hit_cap(), "被上限掐停的要能问出来（状态栏要说话）");
+        assert!(batches <= DEEP_MAX_RESULTS / DEEP_BATCH + 1);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 高档命中（名字以查询开头）不占配额：用户按前缀搜自己命名的一批视频，
+    /// 要的是「全找齐」，不是前 1000 个。900 多条必须一条不少地全回来。
+    #[test]
+    fn deep_scan_prefix_hits_are_not_capped() {
+        let n = DEEP_MAX_RESULTS + 437;
+        let root = fixture_files("prefix-cap", n, |i| format!("beam-{i}.mp4"));
+        let mut scan = DeepScan::new(&root, "beam");
+        let (total, _) = drain(&mut scan);
+        assert_eq!(total, n, "前缀命中不该被配额掐掉");
+        assert!(!scan.hit_cap(), "这不是被上限掐停的");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 但绝对上限还在：搜「沾边」的词最多到 `DEEP_MAX_TOTAL` 条就收手。
+    #[test]
+    fn deep_scan_hard_cap_bounds_memory() {
+        // 前缀命中不受配额限制，靠绝对上限兜住。
+        let root = fixture_files("hard-cap", DEEP_MAX_TOTAL + 200, |i| {
+            format!("beam-{i}.mp4")
+        });
+        let mut scan = DeepScan::new(&root, "beam");
+        let (total, _) = drain(&mut scan);
+        assert!(total <= DEEP_MAX_TOTAL, "绝对上限没兜住：{total}");
+        assert!(scan.hit_cap());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn search_dirs_filters_before_truncating() {
         let mut idx = GlobalIndex::default();
-        // 分数相同的一堆文件排在前面（sort_by 稳定，同分保持插入顺序）。
-        for i in 0..60 {
-            idx.entries.push(entry(&format!("power{i:02}")));
+        // 完全同名的一堆文件稳居榜首（整串相等 > 前缀），把名额占满。
+        for _ in 0..60 {
+            idx.entries.push(entry("power"));
         }
-        idx.entries.push(IndexEntry {
-            path: PathBuf::from("D:\\docs\\PowerShell"),
-            name: "PowerShell".to_string(),
-            fields: crate::search::pinyin_fields("PowerShell"),
-            is_dir: true,
-        });
+        idx.entries.push(named("PowerShell", true));
         // 前提：只取 1 条时被文件占住。
         let all = idx.search("power", 1);
         assert_eq!(all.hits.len(), 1);

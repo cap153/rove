@@ -310,6 +310,7 @@ pub const ZH: &[&str] = &[
     "后退",                    // 299
     "前进",                    // 300
     "上一级",                  // 301
+    "正在搜索…已扫 {} 项",     // 302
 ];
 
 pub const EN: &[&str] = &[
@@ -615,6 +616,7 @@ pub const EN: &[&str] = &[
     "Back",
     "Forward",
     "Up one level",
+    "Searching… scanned {} items",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -698,6 +700,9 @@ mod tests {
         // 新增文案必须追加在数组末尾、不能插队，否则这个下标会指向别的词。
         assert_eq!(ZH[237], "盘符");
         assert_eq!(EN[237], "Drive");
+        // 搜索中的空列表占位文案（`ui/file_list.slint` 的默认值仍是 61）。
+        assert_eq!(ZH[302], "正在搜索…已扫 {} 项");
+        assert_eq!(EN[302], "Searching… scanned {} items");
         // 通用页「接管资源管理器」开关（ui/settings_page.slint 硬编码 238/239）。
         assert_eq!(ZH[238], "接管资源管理器");
         assert_eq!(EN[238], "Take over Explorer");

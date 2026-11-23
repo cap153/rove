@@ -119,6 +119,9 @@ export component FileList inherits Rectangle {
     in-out property <[FileRow]> rows: [];
     /// 完整条目数（虚拟视口高度 = total-count * row-h）。
     in-out property <int> total-count: 0;
+    /// 空列表占位文案。搜索中由 Rust 换成「正在搜索…已扫 N 项」，
+    /// 让「此文件夹为空」不再和「还在扫」混为一谈。
+    in property <string> empty-text: I18n.strings[61];
     in-out property <string> sort-key: "name"; // "name" | "size" | "modified" | "type"
     in-out property <bool> sort-ascending: true;
     /// 非空时，对应路径的行进入内联重命名态。
@@ -2279,7 +2282,7 @@ export component FileList inherits Rectangle {
             width: 100%;
 
             Text {
-                text: I18n.strings[61];
+                text: root.empty-text;
                 color: Theme.text-secondary;
                 font-size: 14px;
                 horizontal-alignment: center;

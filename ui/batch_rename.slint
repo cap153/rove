@@ -33,6 +33,8 @@ export struct RenameRow {
     // 手写窗口化：Rust 已经算好每行的绝对位置和高度，这里只负责按位置画。
     y: length,
     h: length,
+    // 名字列的宽度（Rust 也按它折行，两边必须是同一个数）。
+    col-w: length,
 }
 
 component Check inherits Rectangle {
@@ -220,14 +222,22 @@ component RowView inherits Rectangle {
     in property <RenameRow> data;
     callback toggled(int, bool);
 
-    // 行高跟着名字的行数走：一行就是一行的高度，绝不为了照顾长的把短的撑高。
-    // 具体数值由 Rust 算好（它要据此累计每行的位置），这里只做排版。
+    // 行内几何全部用绝对坐标，**一个布局容器都不用**。
+    //
+    // 之前两列放在 HorizontalLayout 里靠 `horizontal-stretch: 1` 平分，实际
+    // 平分不了：Slint 先按内容的首选宽度分配、再按 min-width 收缩，长名字那一
+    // 行就会把左列挤窄、右列被推到窗口边缘之外裁掉，整行看着「错位」。
+    // 现在列宽由 Rust 算好后随行数据下来，两边折行与画图用的是同一个数，
+    // 每一行、每一个名字都严格对齐。
+    //
+    // 44px = 行左内边距 6 + 勾选框 16 + 间距 8 + 两列间距 8 + 行右内边距 6。
     property <length> row-height: data.h;
 
     height: data.h;
     // 绝对定位：y 由 Rust 按整份清单累计给出，这样模型里只有附近几十行时
     // 滚动位置也不会错乱。
     y: data.y;
+    width: 100%;
     background: bg.has-hover ? Theme.bg-hover : transparent;
 
     // 整行可点（勾选框在自己那层之上，点它只切换一次）。
@@ -235,87 +245,92 @@ component RowView inherits Rectangle {
         clicked => { root.toggled(data.id, !data.checked); }
     }
 
-    HorizontalLayout {
-        padding-left: 6px;
-        padding-right: 6px;
-        spacing: 8px;
-
-        VerticalLayout {
-            alignment: center;
-            Check {
-                checked: data.checked;
-                toggled => { root.toggled(data.id, !data.checked); }
-            }
+    VerticalLayout {
+        x: 6px;
+        y: 0px;
+        width: 16px;
+        height: data.h;
+        alignment: center;
+        Check {
+            checked: data.checked;
+            toggled => { root.toggled(data.id, !data.checked); }
         }
+    }
 
-        // 原始名：命中片段用强调色，长名字自动折行（行数不限）。
-        Rectangle {
-            horizontal-stretch: 1;
-            clip: true;
-            background: transparent;
-            VerticalLayout {
-                alignment: start;
-                padding-top: (root.row-height - 17px * data.orig.length) / 2;
-                for line in data.orig: HorizontalLayout {
-                    spacing: 0px;
-                    for part[j] in line: Text {
-                        text: part.text;
-                        color: part.hot ? Theme.accent : Theme.text-secondary;
-                        font-size: 12.5px;
-                        vertical-alignment: center;
-                        // 除最后一段外宽度钉死，最后一段吸收整行剩余空间：
-                        // 否则布局会把余量平摊到片段之间，高亮片段左右就出现大缝
-                        //（名字里有括号时最明显）。
-                        min-width: j == line.length - 1 ? 0px : self.preferred-width;
-                        max-width: j == line.length - 1 ? 100000px : self.preferred-width;
-                        horizontal-stretch: j == line.length - 1 ? 1 : 0;
-                        overflow: elide;
-                    }
+    // 原始名：命中片段用强调色，长名字自动折行（行数由 Rust 定）。
+    Rectangle {
+        x: 30px;
+        y: 0px;
+        width: data.col-w;
+        height: data.h;
+        clip: true;
+        background: transparent;
+        VerticalLayout {
+            alignment: start;
+            padding-top: (root.row-height - 17px * data.orig.length) / 2;
+            for line in data.orig: HorizontalLayout {
+                spacing: 0px;
+                for part[j] in line: Text {
+                    text: part.text;
+                    color: part.hot ? Theme.accent : Theme.text-secondary;
+                    font-size: 12.5px;
+                    vertical-alignment: center;
+                    // 除最后一段外宽度钉死，最后一段吸收整行剩余空间：
+                    // 否则布局会把余量平摊到片段之间，高亮片段左右就出现大缝
+                    //（名字里有括号时最明显）。
+                    min-width: j == line.length - 1 ? 0px : self.preferred-width;
+                    max-width: j == line.length - 1 ? 100000px : self.preferred-width;
+                    horizontal-stretch: j == line.length - 1 ? 1 : 0;
+                    overflow: elide;
                 }
             }
         }
+    }
 
-        // 新名字：替换进去的片段用强调色；非法/冲突用危险色并给出原因。
-        Rectangle {
-            horizontal-stretch: 1;
-            clip: true;
-            background: transparent;
-            HorizontalLayout {
-                spacing: 6px;
-                Rectangle {
-                    horizontal-stretch: 1;
-                    clip: true;
-                    background: transparent;
-                    VerticalLayout {
-                        alignment: start;
-                        padding-top: (root.row-height - 17px * data.new.length) / 2;
-                        for line in data.new: HorizontalLayout {
-                            spacing: 0px;
-                            for part[j] in line: Text {
-                                min-width: j == line.length - 1 ? 0px : self.preferred-width;
-                                max-width: j == line.length - 1 ? 100000px : self.preferred-width;
-                                horizontal-stretch: j == line.length - 1 ? 1 : 0;
-                                overflow: elide;
-                                text: part.text;
-                                color: (data.state == 2 || data.state == 3)
-                                    ? Theme.danger
-                                    : (part.hot ? Theme.accent : Theme.text-primary);
-                                font-size: 12.5px;
-                                vertical-alignment: center;
-                                wrap: no-wrap;
-                            }
+    // 新名字：替换进去的片段用强调色；非法/冲突用危险色并给出原因。
+    Rectangle {
+        x: 38px + data.col-w;
+        y: 0px;
+        width: data.col-w;
+        height: data.h;
+        clip: true;
+        background: transparent;
+        HorizontalLayout {
+            spacing: 6px;
+            Rectangle {
+                horizontal-stretch: 1;
+                min-width: 0px;
+                clip: true;
+                background: transparent;
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: (root.row-height - 17px * data.new.length) / 2;
+                    for line in data.new: HorizontalLayout {
+                        spacing: 0px;
+                        for part[j] in line: Text {
+                            min-width: j == line.length - 1 ? 0px : self.preferred-width;
+                            max-width: j == line.length - 1 ? 100000px : self.preferred-width;
+                            horizontal-stretch: j == line.length - 1 ? 1 : 0;
+                            overflow: elide;
+                            text: part.text;
+                            color: (data.state == 2 || data.state == 3)
+                                ? Theme.danger
+                                : (part.hot ? Theme.accent : Theme.text-primary);
+                            font-size: 12.5px;
+                            vertical-alignment: center;
+                            wrap: no-wrap;
                         }
                     }
                 }
-                Text {
-                    visible: data.reason != "";
-                    text: data.reason;
-                    color: Theme.danger;
-                    font-size: 11px;
-                    vertical-alignment: center;
-                    horizontal-alignment: right;
-                    min-width: 0px;
-                }
+            }
+            Text {
+                visible: data.reason != "";
+                text: data.reason;
+                color: Theme.danger;
+                font-size: 11px;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                min-width: 0px;
             }
         }
     }
@@ -331,6 +346,9 @@ export component BatchRenameWindow inherits Window {
     min-height: 460px;
     preferred-width: 1280px;
     preferred-height: 820px;
+
+    /// 名字列宽（Rust 按窗口宽度算，折行用的也是它）。
+    in property <length> col-w: 200px;
 
     /// 所有行加起来的像素高度（Rust 算好推来）。自绘滚动条与滚动范围都靠它，
     /// 因为 Flickable 用 `for` 循环填内容时不会自动算内容尺寸。
@@ -603,6 +621,9 @@ export component BatchRenameWindow inherits Window {
                 // 列表区。
                 Rectangle {
                     horizontal-stretch: 1;
+                    // 不写 min-width 时 Slint 会把「内容的期望宽度」当成最小宽度，
+                    // 长名字能把整块列表顶到窗口外面去（右列就跑到边框外被裁掉）。
+                    min-width: 0px;
                     background: Theme.bg-list;
 
                     VerticalLayout {
@@ -643,44 +664,44 @@ export component BatchRenameWindow inherits Window {
                             }
                         }
 
-                        // 表头：几何必须与 RowView 完全一致（同样的左边距、间距、
-                        // 复选框宽度、两列各占一半），标题才会正对下面的名字。
-                        // 右侧多留 14px 给滚动条 + 6px 行内边距。
+                        // 表头：几何与 RowView 用同一套绝对坐标（col-w 由 Rust 给），
+                        // 标题才会正对下面的名字列。
                         Rectangle {
                             height: 30px;
                             background: Theme.bg-toolbar;
 
-                            HorizontalLayout {
-                                padding-left: 6px;
-                                // 6px 行内边距 + 9px 滚动条宽度：名字列与表头对齐。
-                                padding-right: 15px;
-                                spacing: 8px;
-
-                                VerticalLayout {
-                                    alignment: center;
-                                    Check {
-                                        checked: root.all-checked;
-                                        toggled => { root.all-toggled(!root.all-checked); }
-                                    }
+                            VerticalLayout {
+                                x: 6px;
+                                y: 0px;
+                                width: 16px;
+                                height: parent.height;
+                                alignment: center;
+                                Check {
+                                    checked: root.all-checked;
+                                    toggled => { root.all-toggled(!root.all-checked); }
                                 }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: root.text-original + " (" + root.orig-count + ")";
-                                    color: Theme.text-primary;
-                                    font-size: 12px;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: root.text-renamed + " (" + root.renamed-count + ")";
-                                    color: Theme.text-primary;
-                                    font-size: 12px;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                    // 直接顶到最右边：不用再去凑和名字列的起始位置。
-                                    horizontal-alignment: right;
-                                }
+                            }
+                            Text {
+                                x: 30px;
+                                width: root.col-w;
+                                height: parent.height;
+                                text: root.text-original + " (" + root.orig-count + ")";
+                                color: Theme.text-primary;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                x: 38px + root.col-w;
+                                width: root.col-w;
+                                height: parent.height;
+                                text: root.text-renamed + " (" + root.renamed-count + ")";
+                                color: Theme.text-primary;
+                                font-size: 12px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                                overflow: elide;
                             }
 
                             Rectangle {
@@ -695,6 +716,7 @@ export component BatchRenameWindow inherits Window {
                         // 系统配色，系统深色 + Rove 浅色时会在白底上出现黑槽。
                         Rectangle {
                             vertical-stretch: 1;
+                            min-width: 0px;
                             clip: true;
 
                             // 滚轮兜底：行上的 TouchArea 只管点击，滚轮会冒泡到这里，

@@ -69,12 +69,15 @@ static MODE_SET: AtomicBool = AtomicBool::new(false);
 /// `tray-icon` 那个隐藏窗口的句柄（类名固定 `tray_icon_app`）。托盘菜单的配色
 /// 只认它自己的窗口，缓存下来免得每次 `FindWindowW`。
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
-/// 上一份菜单挂着超过这么久，才值得去探测一次（正常操作菜单不会超过它）。
+/// 菜单**已经弹在屏幕上**却挂着：超过它才值得探测一次（正常操作不会超过）。
 const MENU_STALL_MS: u64 = 1_500;
-/// 构建阶段（菜单还没弹出来）的判死时限。
+/// 构建阶段（菜单还没弹出来）的忍耐时限。
 ///
-/// 网络盘上第三方扩展慢是常态，用 1.5 秒会误杀；卡死则远超这个数。
-const MENU_BUILD_STALL_MS: u64 = 20_000;
+/// 正常建菜单几十毫秒。用户右键一次没反应，本能就是「再点一下」——那一下
+/// 就是「卡住了」的信号，必须立刻换线程给他弹出来，而不是让他干等。
+/// 以前这里写 20 秒：第一条右键被第三方扩展卡住后，之后二十秒里每次右键都
+/// 被静默忽略，用户只会以为右键坏了，转头去任务管理器杀进程。
+const MENU_BUILD_GRACE_MS: u64 = 800;
 /// 探测超时：正常线程几毫秒就回，等 400ms 还没回就是真卡死了。
 const PING_TIMEOUT_MS: u32 = 400;
 
@@ -118,7 +121,10 @@ static HOST_GEN: AtomicU64 = AtomicU64::new(0);
 /// 让用户重启 Rove。
 static ABANDONED: AtomicU32 = AtomicU32::new(0);
 /// 最多放弃几条卡死的宿主线程。
-const MAX_ABANDONED: u32 = 3;
+///
+/// 现在判死很激进（0.8 秒），网络盘上「慢」会被当成「死」多放弃几条，
+/// 所以留 6 条余量；每条只占 2MB 虚拟空间，用户重启一次就清零。
+const MAX_ABANDONED: u32 = 6;
 /// 菜单是否已经**弹到屏幕上**（`TrackPopupMenuEx` 已进入）。
 ///
 /// 用来区分两种「没回应」：构建阶段被第三方扩展拖住（还没弹出来，稍后可能自己好）
@@ -127,6 +133,10 @@ const MAX_ABANDONED: u32 = 3;
 static SHOWN: AtomicBool = AtomicBool::new(false);
 /// 已经彻底停手（右键菜单不再可用）。UI 侧据此决定要不要找个时机静默重启进程。
 static GAVE_UP: AtomicBool = AtomicBool::new(false);
+/// 被放弃的那一代菜单任务。卡在第三方扩展里的线程**迟早会返回**，然后照样
+/// 把菜单弹出来 —— 那会是一个没人要的幽灵菜单（用户点它还有效，更糟）。
+/// 判死时把代数记在这儿，`run_menu` 弹出前对一下，被放弃的一律不弹。
+static ABORTED_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// 进程启动起的毫秒数。
 fn now_ms() -> u64 {
@@ -210,13 +220,19 @@ pub(crate) fn open(
         let age = now_ms().saturating_sub(BUSY_SINCE_MS.load(Ordering::Acquire));
         // 构建阶段（还没弹出来）被拖住是常见的「慢」，要更长的沉默才算死；
         // 有菜单在屏幕上时线程在跑消息循环，探测能回，根本走不到这里。
-        let limit = if SHOWN.load(Ordering::Acquire) {
-            MENU_STALL_MS
-        } else {
-            MENU_BUILD_STALL_MS
-        };
-        if age > limit && !host_responsive(HOST.load(Ordering::Acquire)) {
+        let shown = SHOWN.load(Ordering::Acquire);
+        let limit = if shown { MENU_STALL_MS } else { MENU_BUILD_GRACE_MS };
+        // 构建阶段超时**不必再问 ping**：不少第三方扩展自己会泵消息，
+        // `SendMessageTimeout` 照样能立刻回「我还活着」，于是「死了没」永远判成
+        // 「活着」→ BUSY 永远不复位 → 之后每次右键都被静默忽略（真机日志：
+        // menu_busy 从 21 秒一路涨到 76 秒，右键从此没反应，关窗口也销毁不掉）。
+        let stuck_building = !shown;
+        if age > limit && (stuck_building || !host_responsive(HOST.load(Ordering::Acquire))) {
             let abandoned = ABANDONED.fetch_add(1, Ordering::AcqRel) + 1;
+            ABORTED_GEN.store(BUSY_GEN.load(Ordering::Acquire), Ordering::Release);
+            // `SHOWN` 是进程级的：卡死在 `TrackPopupMenuEx` 里的线程永远不会复位
+            // 它，留着 true 就会让后面每次右键都按「菜单已在屏幕上」的时限判活。
+            SHOWN.store(false, Ordering::Release);
             HOST.store(0, Ordering::Release);
             BUSY.store(false, Ordering::Release);
             if abandoned > MAX_ABANDONED {
@@ -1266,6 +1282,11 @@ fn invoke_shell(
 
 fn run_menu(host: HWND, job: Job) {
     let _busy = BusyGuard(job.gen);
+    if ABORTED_GEN.load(Ordering::Acquire) == job.gen {
+        // 这条已经被判死、宿主线程也被换掉了：别再弹（幽灵菜单）。
+        crate::logv!("[menu] gen={} 已放弃，跳过弹出", job.gen);
+        return;
+    }
     // 深浅色兜底对齐：UI 线程切主题的那一刻宿主窗口可能还没建好（`HOST` 还是 0），
     // 那条切换消息就丢了。每次弹菜单前对一次，代价只是一次原子比较。
     let want_dark = DARK.load(Ordering::Acquire);
@@ -1359,6 +1380,16 @@ fn run_menu(host: HWND, job: Job) {
     }
     let _ = append_nodes(hmenu, &job.nodes, &mut next_id, &mut map);
     trim_separators(hmenu);
+
+    // 判死只要 0.8 秒，而慢扩展往往就慢在 `QueryContextMenu` 之后 —— 弹之前
+    // 确认一次：这中间用户又右键了、这条已经被放弃，就别把它弹出来（幽灵菜单）。
+    // 必须放在「挂 ACTIVE / 显示宿主窗口」之前：提前 return 会漏掉 `DestroyMenu`
+    // 和 ACTIVE 复位（弹出菜单句柄泄漏，宿主窗口还会被摆到鼠标位置）。
+    if ABORTED_GEN.load(Ordering::Acquire) == job.gen {
+        crate::logv!("[menu] gen={} 建好时已被放弃，不弹", job.gen);
+        let _ = unsafe { DestroyMenu(hmenu) };
+        return;
+    }
 
     // 4. 显示（阻塞；嵌套消息循环中 host_proc 会转发菜单消息）
     //

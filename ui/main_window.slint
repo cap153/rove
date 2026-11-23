@@ -190,6 +190,9 @@ export component MainWindow inherits Window {
     in-out property <bool> file-is-computer-view: false;
     in-out property <bool> file-is-computer-view-right: false;
     in-out property <int> file-total: 0;
+    /// 空列表占位文案（搜索中会变成「正在搜索…已扫 N 项」）。
+    in-out property <string> file-empty-text: I18n.strings[61];
+    in-out property <string> file-empty-text-right: I18n.strings[61];
     in-out property <bool> file-loading: false;
     /// 图标视图“展开名称”目标（单个选中 / 重命名）：条目绝对索引与完整名称。
     in-out property <int> file-expand-index: -1;
@@ -1332,6 +1335,7 @@ out property <length> row-height-out: file-list.row-height-out;
                     expand-box-w: root.file-expand-box-w;
                     expand-line-ws: root.file-expand-line-ws;
                     total-count: root.file-total;
+                    empty-text: root.file-empty-text;
                     sort-key: root.sort-key;
                     sort-ascending: root.sort-ascending;
                     rename-path: root.rename-pane == 0 ? root.rename-path : "";
@@ -1496,6 +1500,7 @@ out property <length> row-height-out: file-list.row-height-out;
                         expand-box-w: root.file-expand-box-w-right;
                         expand-line-ws: root.file-expand-line-ws-right;
                         total-count: root.file-total-right;
+                        empty-text: root.file-empty-text-right;
                         sort-key: root.sort-key-right;
                         sort-ascending: root.sort-ascending-right;
                         view-mode: root.view-mode;

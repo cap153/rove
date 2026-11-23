@@ -370,6 +370,7 @@ struct PathProbe {
 }
 
 /// 深度搜索请求：在目录子树中递归查找匹配项（文件夹视图搜索）。
+#[derive(Clone)]
 struct DeepRequest {
     tab_id: u32,
     pane: usize,
@@ -377,6 +378,8 @@ struct DeepRequest {
     deep_generation: u64,
     root: PathBuf,
     query: String,
+    /// 本批最多要多少条；`0` = 丢掉当前扫描（结果已经没用了，别白烧 CPU）。
+    want: usize,
 }
 
 /// 深度搜索结果。
@@ -386,7 +389,14 @@ struct DeepResult {
     generation: u64,
     deep_generation: u64,
     query: String,
+    /// 本批新增的命中（**追加**到已有结果，不是替换）。
     items: Vec<crate::search::index::DeepItem>,
+    /// 子文件夹已经搜完，不会再有下一批。
+    done: bool,
+    /// 是被上限掐停的（不是真的扫完），状态栏要说明结果不完整。
+    capped: bool,
+    /// 已经扫过多少个条目（只用于状态栏进度，不改结果）。
+    scanned: usize,
 }
 
 /// 拼音缓存的后台计算结果（大目录里同步算要十几到几十毫秒）。
@@ -827,7 +837,7 @@ pub struct App {
     time_text_memo: std::collections::HashMap<Option<SystemTime>, SharedString>,
     /// 搜索框输入防抖：`(待应用的查询词, 该词最后一次输入的时刻)`。
     ///
-    /// 每个字符都会触发一次「全目录模糊匹配 + 打分 + 重排」；几万条的目录里
+    /// 每个字符都会触发一次「全目录匹配 + 打分 + 重排」；几万条的目录里
     /// 逐字重建会明显卡手，攒 150ms 再跑一次。
     pending_search: Option<(String, std::time::Instant)>,
     /// 类型筛选下拉当前挂在哪个窗格上（`None` = 没开）。
@@ -1016,6 +1026,9 @@ pub struct App {
     cur_col_widths: [[f32; 4]; 2],
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
+    /// 用户最后一次自己滚动列表（滚轮 / 拖滚动条）的时刻。
+    /// 「空闲时静默重排」靠它避开正在滚动的情形，否则滚到一半列表自己跳一下。
+    pub last_scroll: Option<Instant>,
     /// 切换标签时置位，屏蔽切换过程中 Slint 因内容高度变化自动 Clamp 而
     /// 产生的残留 scroll-changed 事件污染新标签数据（否则表现为切标签白屏）。
     syncing_tab: bool,
@@ -1308,6 +1321,7 @@ impl App {
                 ],
             ],
             size_sort_pending: false,
+            last_scroll: None,
             list_geom: (-1.0, 0, -1.0, false, -1.0, -1.0),
             recording_shortcut: None,
             path_probe_tx,
@@ -2333,6 +2347,7 @@ impl App {
             deep_generation,
             root,
             query,
+            want: crate::search::index::DEEP_BATCH,
         });
         self.state.active_mut().active_mut().deep_searching = true;
     }
@@ -2478,13 +2493,28 @@ impl App {
     }
 
     /// 深度搜索结果到达：标签存在、代号与查询都匹配才应用。
+    /// 叫停一条过期结果的扫描。代号必须原样带上：工作线程只认「和我正在跑的
+    /// 这一条同代号」的取消，别的一律忽略，否则会把更新的请求连坐掉。
+    fn cancel_deep(&self, result: &DeepResult) {
+        let _ = self.deep_tx.send(DeepRequest {
+            tab_id: result.tab_id,
+            pane: result.pane,
+            generation: result.generation,
+            deep_generation: result.deep_generation,
+            root: PathBuf::new(),
+            query: String::new(),
+            want: 0,
+        });
+    }
+
     fn apply_deep_result(&mut self, result: DeepResult) {
         logv!(
-            "deep result tab={} gen={} dgen={} n={}",
+            "deep result tab={} gen={} dgen={} n={} done={}",
             result.tab_id,
             result.generation,
             result.deep_generation,
-            result.items.len()
+            result.items.len(),
+            result.done
         );
         let Some(tab_index) = self.state.tab_by_id(result.tab_id) else {
             return;
@@ -2501,6 +2531,12 @@ impl App {
                 result.deep_generation,
                 result.items.len()
             );
+            // 顺手叫停后台扫描：结果已经没人要了，没必要继续翻目录。
+            // **必须带上这条过期结果自己的代号**：以前的取消是「无条件停」，
+            // 而节流折叠只留队列里最后一个请求 —— 用户连打几个字时，取消会
+            // 排在新请求后面、把它一起顶掉，于是新查询永远没人做（真机：
+            // 输入框已经写着 ziyan，状态栏「已扫 0 项」挂着二十多秒）。
+            self.cancel_deep(&result);
             return; // 过期结果
         }
         if pane.filter.trim().to_lowercase() != result.query.trim().to_lowercase() {
@@ -2509,18 +2545,43 @@ impl App {
                 pane.filter,
                 result.query
             );
+            self.cancel_deep(&result);
             return;
         }
         logv!(
-            "[deep] apply pane={} n={} filter={:?}",
+            "[deep] apply pane={} +{} (total {}) done={} filter={:?}",
             result.pane,
             result.items.len(),
+            pane.deep_entries.len() + result.items.len(),
+            result.done,
             result.query
         );
-        pane.deep_entries = result.items.iter().map(|i| i.entry.clone()).collect();
-        pane.deep_pinyin = result.items.into_iter().map(|i| i.fields).collect();
-        pane.deep_searching = false;
-        pane.rebuild_display();
+        // 追加，不是替换：一个查询会分很多批回来，替换会让前一批凭空消失。
+        let added = !result.items.is_empty();
+        pane.deep_entries
+            .extend(result.items.iter().map(|i| i.entry.clone()));
+        pane.deep_pinyin
+            .extend(result.items.into_iter().map(|i| i.fields));
+        pane.deep_searching = !result.done;
+        pane.deep_capped = result.capped;
+        pane.deep_scanned = result.scanned;
+        // 只有「这一批真的带来新条目」才需要动行模型：收尾那种空结果只更新
+        // 状态位，重建一遍纯属白烧 UI 线程。
+        //
+        // 流式期间**只追加不重排**（见 `PaneState::deep_sort_pending`）：每批都
+        // 整体按分数重排，用户正在看的那一行会被后插进来的高分条目挤走，屏幕上
+        // 就是列表一直在跳。排序推迟到「用户停手」或「扫描结束」那一刻。
+        if result.done {
+            // 收尾那一批常常是空的（`n=0 done=true`）：那种情况也要把欠着的
+            // 重排结清，否则列表会一直停在「到达顺序」，直到下一次空闲重排。
+            if added || pane.deep_sort_pending {
+                pane.rebuild_display();
+                pane.deep_sort_pending = false;
+            }
+        } else if added {
+            pane.extend_display_streaming();
+            pane.deep_sort_pending = true;
+        }
         if tab_index == self.state.active_tab {
             self.visible_cache = None;
             self.visible_cache_right = None;
@@ -2880,31 +2941,150 @@ fn spawn_list_worker(rx: Receiver<ListRequest>, tx: Sender<ListResult>) {
 }
 
 /// 启动深度搜索工作线程（文件夹视图子树递归查找）。
-/// 会话私有；扫描有上限（20k 条目 / 300 结果），完成即回传，
-/// 过期结果由 UI 端按代号丢弃，无需中断机制。
+///
+/// 现在**持续回传**：一个查询切成 300 条一批往 UI 送，直到扫完或撞上限
+/// （`DEEP_MAX_RESULTS = 1 000` 条 / `DEEP_MAX_ENTRIES = 50 万` 条目）。
+/// 分批只影响「第一屏多快出现」，不是分页——不会因为你往下滚再续一批；
+/// 到上限时状态栏会说「仅显示前 1000 项」。
+///
+/// 流式期间用户改词怎么办：每批之间 `try_recv`，队列里只要有新请求就
+/// 立刻换口味（连打几个字只做最后一次），旧扫描整个丢掉。
+/// 排队请求的两分法：新查询（新词优先，只留最后一条）和取消（另放一格，
+/// 绝不和新查询抢那个「最后一个」的位置）。
+fn fold_one(req: &DeepRequest, fresh: &mut Option<DeepRequest>, cancel: &mut Option<DeepRequest>) {
+    if req.want == 0 {
+        *cancel = Some(req.clone());
+    } else {
+        *fresh = Some(req.clone());
+    }
+}
+
+/// 取消只对「同一条任务」生效：标签、窗格、两次代号全对上才算。
+fn same_deep_job(a: &DeepRequest, b: &DeepRequest) -> bool {
+    a.tab_id == b.tab_id
+        && a.pane == b.pane
+        && a.generation == b.generation
+        && a.deep_generation == b.deep_generation
+}
+
 fn spawn_deep_worker(rx: Receiver<DeepRequest>, tx: Sender<DeepResult>) {
     std::thread::Builder::new()
         .name("rove-deepsearch".into())
         .spawn(move || {
             logln!("deepsearch worker started");
-            while let Ok(req) = rx.recv() {
-                let query = req.query.trim().to_lowercase();
-                let items = if query.is_empty() {
-                    Vec::new()
-                } else {
+            // 当前任务：请求 + 可续跑的扫描状态。
+            let mut active: Option<(DeepRequest, crate::search::index::DeepScan)> = None;
+            // 空批次（纯进度）的上报节流，见下面 `batch.is_empty()` 那段。
+            let mut last_progress = std::time::Instant::now() - std::time::Duration::from_secs(1);
+            loop {
+                // 1) 把队列里积压的请求折叠成最后一个（新词优先）。
+                //
+                // 取消（want = 0）**不能**和新请求混在同一个「只留最后一个」的槽里：
+                // 界面丢一条过期结果就会顺手发一个取消，它常常排在新请求后面，
+                // 一折叠就把新请求顶掉了 —— 新查询于是永远没人做。
+                let mut fresh: Option<DeepRequest> = None;
+                let mut cancel: Option<DeepRequest> = None;
+                loop {
+                    match rx.try_recv() {
+                        Ok(req) => fold_one(&req, &mut fresh, &mut cancel),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
+                    }
+                }
+                if fresh.is_none() {
+                    if let (Some(c), Some((req, _))) = (&cancel, &active) {
+                        // 只停「同一条」：代号对不上说明它已经过期，取消它等于误杀。
+                        if same_deep_job(c, req) {
+                            logv!("[deep] cancelled gen={}", c.deep_generation);
+                            active = None;
+                        }
+                    }
+                }
+                if fresh.is_none() && active.is_none() {
+                    // 闲置：阻塞等一个请求（不烧 CPU）。
+                    match rx.recv() {
+                        Ok(req) => fresh = Some(req),
+                        Err(_) => return,
+                    }
+                }
+                if let Some(req) = fresh {
+                    // 先把被顶掉的那条扫描收尾：工作线程只有一个，另一栏（或另一个
+                    // 标签）发起新查询时旧任务直接被换掉，那一栏再没人给它 `done`，
+                    // 就会永远挂在「正在搜索…已扫 N 项」。补一条空结果告诉它结束。
+                    if let Some((old, scan)) = active.as_ref() {
+                        if !same_deep_job(old, &req) {
+                            let _ = tx.send(DeepResult {
+                                tab_id: old.tab_id,
+                                pane: old.pane,
+                                generation: old.generation,
+                                deep_generation: old.deep_generation,
+                                query: old.query.clone(),
+                                items: Vec::new(),
+                                done: true,
+                                capped: false,
+                                scanned: scan.scanned(),
+                            });
+                        }
+                    }
+                    let query = req.query.trim().to_lowercase();
+                    if req.want == 0 {
+                        // 取消：结果已经过期，直接丢掉当前扫描。
+                        active = None;
+                        continue;
+                    }
+                    if query.is_empty() || req.root.as_os_str().is_empty() {
+                        let _ = tx.send(DeepResult {
+                            tab_id: req.tab_id,
+                            pane: req.pane,
+                            generation: req.generation,
+                            deep_generation: req.deep_generation,
+                            query: req.query,
+                            items: Vec::new(),
+                            done: true,
+                            capped: false,
+                            scanned: 0,
+                        });
+                        active = None;
+                        continue;
+                    }
                     logln!("deep req tab={} root={:?} q={query}", req.tab_id, req.root);
-                    crate::search::index::deep_scan(&req.root, &query)
+                    let scan = crate::search::index::DeepScan::new(&req.root, &query);
+                    active = Some((req, scan));
+                }
+                let Some((req, scan)) = active.as_mut() else {
+                    continue;
                 };
+                let batch = scan.next_batch(crate::search::index::DEEP_BATCH);
+                let done = scan.is_done();
+                let capped = scan.hit_cap();
+                // 空批次不能每次都送：一个五百万条目的盘里命中很稀，扫完两万个
+                // 条目才凑出 0 条，每次空结果都让 UI 重建一遍行模型、重画一遍状态栏，
+                // 几千次下来界面就等于卡死。但也不能**完全不报**：网络盘 / 大盘上
+                // 命中先出完了、后面几十秒一条都没有，用户看到的就是「卡在 300 条、
+                // 状态栏永远是正在搜索」——所以按时间节流报进度（4 次/秒）。
+                if batch.is_empty() && !done {
+                    if last_progress.elapsed() < std::time::Duration::from_millis(250) {
+                        continue;
+                    }
+                    last_progress = std::time::Instant::now();
+                    logv!("[deep] progress scanned={}", scan.scanned());
+                }
                 let sent = tx.send(DeepResult {
                     tab_id: req.tab_id,
                     pane: req.pane,
                     generation: req.generation,
                     deep_generation: req.deep_generation,
-                    query: req.query,
-                    items,
+                    query: req.query.clone(),
+                    items: batch,
+                    done,
+                    capped,
+                    scanned: scan.scanned(),
                 });
-                if sent.is_err() {
-                    break;
+                if done || sent.is_err() {
+                    active = None;
+                } else {
+                    // 让出一点：UI 线程要处理这一批（重建行模型），别把它挤住。
+                    std::thread::sleep(std::time::Duration::from_millis(2));
                 }
             }
         })
@@ -3295,6 +3475,46 @@ fn drag_gesture_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deep_req(dgen: u64, want: usize) -> DeepRequest {
+        DeepRequest {
+            tab_id: 1,
+            pane: 0,
+            generation: 0,
+            deep_generation: dgen,
+            root: PathBuf::from("O:\\Video"),
+            query: "ziyan".into(),
+            want,
+        }
+    }
+
+    /// 真机 bug：连打 `ziya` → `ziyan` 时，界面丢掉一条过期结果会顺手发取消，
+    /// 取消排在新查询后面，而队列只留「最后一个」→ 新查询被顶掉，界面就这样
+    /// 挂着「已扫 0 项」不动了。取消必须单独一格，且不能顶掉新查询。
+    #[test]
+    fn cancel_never_swallows_newer_query() {
+        let mut fresh = None;
+        let mut cancel = None;
+        fold_one(&deep_req(4, 300), &mut fresh, &mut cancel);
+        fold_one(&deep_req(3, 0), &mut fresh, &mut cancel);
+        assert_eq!(fresh.as_ref().map(|r| r.deep_generation), Some(4), "新查询必须留下");
+        assert_eq!(cancel.as_ref().map(|r| r.deep_generation), Some(3));
+        // 而且这条取消对不上正在跑的第 4 代任务，不能停它。
+        assert!(!same_deep_job(&deep_req(3, 0), &deep_req(4, 300)));
+        assert!(same_deep_job(&deep_req(4, 0), &deep_req(4, 300)));
+    }
+
+    /// 连着打好几个字：只做最后一个。
+    #[test]
+    fn newer_query_replaces_older() {
+        let mut fresh = None;
+        let mut cancel = None;
+        for dgen in [1, 2, 3] {
+            fold_one(&deep_req(dgen, 300), &mut fresh, &mut cancel);
+        }
+        assert_eq!(fresh.map(|r| r.deep_generation), Some(3));
+        assert!(cancel.is_none());
+    }
 
     fn stamp(i: i32, thumb: u64) -> RowStamp {
         RowStamp {
@@ -3841,7 +4061,7 @@ mod tests {
         }
 
         // 单个超长单词放不下一行时只能硬断，但仍要压到 3 行且末行带省略号。
-        let long = format!("{}.mp4", "Supercalifragilistic".repeat(3));
+        let long = format!("{}.mp4", "Supercalifragilistic".repeat(5));
         let out2 = grid_display_name(&long, 116.0, 3);
         let lines: Vec<&str> = out2.split('\n').collect();
         assert_eq!(lines.len(), 3, "超长单词仍应压到 3 行: {out2:?}");
@@ -3849,7 +4069,48 @@ mod tests {
         assert!(lines[2].ends_with('…'), "末行应有省略号: {out2:?}");
     }
 
-    /// 切行要保留高亮分段：搜索命中片段跨行后仍带 hl 标记。
+    /// 批量重命名的折行必须和真实渲染对得上。
+    ///
+    /// 真机遇到的两条：① 右列名字明明放得下却折成两行，整行比左边高一截；
+    /// ② 每行末尾都多出「…」——因为字宽表照 Segoe UI 测，而界面字体是
+    /// Microsoft YaHei UI，拉丁字形宽 8.7%，估出来的每一行都刚好超一点点。
+    /// 所以这条测试守两件事：行数按 YaHei 的真实宽度算，且**任何一行都不许
+    /// 超过列宽**（超过才会被 `overflow: elide` 收成「…」）。
+    #[test]
+    fn batch_rename_wrap_matches_rendered_width() {
+        let new = "eunyoung1238_arostnearosnteaornsteaorsnetoarnsktoarsetnoarsj_Sooplive_20260117_1.mp4";
+        let orig = "eunyoung1238_Sooplive_20260117_1.mp4";
+        // 批量重命名窗口首次打开 = 屏幕 75%；1920x1200 屏、150% 缩放时约 1441 逻辑像素。
+        for win_w in [1441.0, 1600.0, 1900.0] {
+            let col_w = batch_col_w(win_w, 0.0);
+            let budget = batch_wrap_budget(col_w);
+            // 折行预算换算回 12.5px 的真实渲染宽度，必须还在列宽以内。
+            let render_cap = (budget - 11.5) * BATCH_WRAP_SCALE;
+            assert!(
+                render_cap <= col_w,
+                "预算换算回去（{render_cap:.1}）超过列宽 {col_w:.1}（win_w={win_w}）"
+            );
+            for text in [new, orig] {
+                let lines = grid_display_lines(&[(text.to_string(), false)], budget, 12);
+                for line in &lines {
+                    let w: f32 = line.iter().map(|p| est_text_w(std::slice::from_ref(p))).sum();
+                    assert!(
+                        w <= budget,
+                        "这一行 {w:.1} 超过预算 {budget:.1}，渲染时会被收成省略号（win_w={win_w}）"
+                    );
+                }
+            }
+            let orig_lines = grid_display_lines(&[(orig.to_string(), false)], budget, 12).len();
+            assert_eq!(orig_lines, 1, "原名不该折行（win_w={win_w}）");
+        }
+        // 84 个字符在 12.5px YaHei 下约 556px：1441 宽窗口的列只有 550px，
+        // 就是放不下，必须折成两行（以前按 Segoe 估成 470px 才误判为一行）。
+        let narrow = batch_wrap_budget(batch_col_w(1441.0, 0.0));
+        assert!(grid_display_lines(&[(new.to_string(), false)], narrow, 12).len() >= 2);
+        let wide = batch_wrap_budget(batch_col_w(1900.0, 0.0));
+        assert_eq!(grid_display_lines(&[(new.to_string(), false)], wide, 12).len(), 1);
+    }
+
     #[test]
     fn grid_display_lines_keep_highlight_parts() {
         let parts = vec![
@@ -4555,7 +4816,21 @@ impl App {
             });
         }
         if tab.active().deep_searching {
-            left.push_str(if en { " · Searching subfolders…" } else { " · 正在搜索子文件夹…" });
+            // 带上「扫了多少条」：网络盘上命中先出完、后面几十秒一条都没有，
+            // 只写「正在搜索」看起来就是卡死了，有个递增的数字才看得出还在跑。
+            let scanned = fmt_scan_count(tab.active().deep_scanned);
+            left.push_str(&if en {
+                format!(" · Searching subfolders… scanned {scanned}")
+            } else {
+                format!(" · 正在搜索子文件夹…已扫 {scanned} 项")
+            });
+        } else if tab.active().deep_capped {
+            // 上限掐停 ≠ 扫完了：明说「只给了前 N 个」，免得用户以为磁盘上就这么多。
+            left.push_str(if en {
+                " · Result cap reached, narrow the search"
+            } else {
+                " · 结果已达上限，请缩小搜索范围"
+            });
         }
         self.ui.set_status_left(left.into());
         let selected = tab.active().selection_count();
@@ -4984,6 +5259,8 @@ impl App {
             single1,
             type_active0,
             type_active1,
+            empty0,
+            empty1,
         ) = {
             let tab = self.state.active();
             let panes = &tab.panes;
@@ -5025,6 +5302,11 @@ impl App {
                 // 表头「类型」箭头的变色按栏判定（分屏时两栏可以各筛各的）。
                 !panes[0].type_filter.is_empty(),
                 panes.get(1).is_some_and(|p| !p.type_filter.is_empty()),
+                // 空列表占位文案：搜索中要换成「正在搜索…已扫 N 项」，
+                // 否则整盘搜一个小词时「此文件夹为空」会挂在那里几十秒，
+                // 看起来像搜完了、什么都没有。
+                (panes[0].deep_searching, panes[0].deep_scanned),
+                panes.get(1).map(|p| (p.deep_searching, p.deep_scanned)),
             )
         };
         // 多选时不弹名称浮层（左右栏各自判定）。
@@ -5039,6 +5321,10 @@ impl App {
             .set_sort_ascending_right(sort_asc_right.unwrap_or(sort_asc));
         self.ui.set_file_loading(loading0);
         self.ui.set_file_total(total0);
+        self.ui.set_file_empty_text(empty0.0.then(|| self.trf("正在搜索…已扫 {} 项", &[fmt_scan_count(empty0.1)])).unwrap_or_else(|| self.tr("此文件夹为空").to_string()).into());
+        if let Some((searching, scanned)) = empty1 {
+            self.ui.set_file_empty_text_right(searching.then(|| self.trf("正在搜索…已扫 {} 项", &[fmt_scan_count(scanned)])).unwrap_or_else(|| self.tr("此文件夹为空").to_string()).into());
+        }
         self.ui.set_show_path_column(is_recycle0);
         self.ui.set_show_path_column_right(is_recycle1);
         // 视图形态（此电脑无修改时间列、大小列表头叫剩余）也按栏判定，
@@ -7326,26 +7612,56 @@ struct PreRow {
     name_line_ws: Vec<f32>,
 }
 
+/// 状态栏里的扫描量：一万以上换「万」，免得一串数字挤掉别的信息。
+fn fmt_scan_count(n: usize) -> String {
+    if n < 10_000 {
+        n.to_string()
+    } else {
+        format!("{:.1}万", n as f64 / 10_000.0)
+    }
+}
+
 /// 单个字符的估算像素宽（与 file_list.slint 的 11.5px 字号对齐）。
 ///
 /// ASCII 不能再统一按 6px 估：大写与数字明显更宽（「EXID-Up&Down.mp4」这类
 /// 名字会被低估，行宽超出容器后 HorizontalLayout 会压缩末段，把 `.mp4` 的
 /// 尾部裁掉）。这里按字宽细分，宁可估宽一点也不裁字。
+/// 可打印 ASCII（32..=126）在 **Microsoft YaHei UI 11.5px** 下的实测步进宽度。
+///
+/// 字体必须是 YaHei —— 那就是 `Theme.font-family`，界面所有文字都用它。这张表
+/// 早先照 Segoe UI 测过，YaHei 的拉丁字形平均宽 8.7%（`a` 6.36 vs 5.85、
+/// `m` 10.78 vs 9.91、`W` 11.70 vs 10.74），于是每行都算出「刚好放得下」、
+/// 实际却超 8.7%，行尾被 `overflow: elide` 收成「…」。
+///
+/// 也不能按字符类拍脑袋（小写一律 5.9、大写一律 7.4）：同类里 `i`(3.06) 和
+/// `m`(10.78) 差 3.5 倍，估错一个字就多折一行。
+const ASCII_W: [f32; 95] = [
+    3.40, 3.59, 5.01, 7.34, 6.74, 10.23, 10.01, 2.95, 3.84, 3.84,
+    5.23, 8.53, 2.77, 4.98, 2.77, 4.91, 6.74, 6.74, 6.74, 6.74,
+    6.74, 6.74, 6.74, 6.74, 6.74, 6.74, 2.77, 2.77, 8.53, 8.53,
+    8.53, 5.55, 11.86, 8.09, 7.22, 7.69, 8.76, 6.32, 6.11, 8.55,
+    8.89, 3.38, 4.55, 7.30, 5.90, 11.24, 9.35, 9.37, 7.04, 9.37,
+    7.51, 6.64, 6.59, 8.59, 7.78, 11.70, 7.42, 6.94, 7.13, 3.84,
+    4.78, 3.84, 8.53, 5.15, 3.39, 6.36, 7.34, 5.77, 7.36, 6.52,
+    3.99, 7.36, 7.08, 3.06, 3.07, 6.26, 3.06, 10.78, 7.09, 7.31,
+    7.34, 7.36, 4.39, 5.32, 4.28, 7.09, 6.04, 9.08, 5.83, 6.09,
+    5.65, 3.84, 3.09, 3.84, 8.53,
+];
+
 fn est_char_w(c: char) -> f32 {
-    const WIDE_W: f32 = 11.5; // 与 file_list.slint 的 font-size 一致
+    // 与 file_list.slint 的 font-size 一致。
+    const WIDE_W: f32 = 11.50;
     // 符号/emoji 按更保守的 14px 估：连续多个装饰字符（❀♡❤▶）各自回退到
-    // 符号字体时，若仍按 11.5px 计就会累积超宽，整行被水平裁掉两端。
+    // 符号字体时，若仍按 12px 计就会累积超宽，整行被水平裁掉两端。
     const SYMBOL_W: f32 = 14.0;
+    let code = c as u32;
+    if (32..=126).contains(&code) {
+        return ASCII_W[(code - 32) as usize];
+    }
     if c.is_ascii() {
-        match c {
-            ' ' | '\t' => 3.6,
-            'a'..='z' => 5.9,
-            'A'..='Z' => 7.4,
-            '0'..='9' => 6.6,
-            '.' | ',' | ':' | ';' | '\'' | '|' | '!' => 3.6,
-            _ => 6.6,
-        }
-    } else if is_wide_cjk(c) {
+        return 3.6;
+    }
+    if is_wide_cjk(c) {
         WIDE_W
     } else {
         SYMBOL_W
@@ -10482,13 +10798,7 @@ impl App {
     ///
     /// 只反转**当前显示**的条目（搜索/过滤时看不见的保持原状）。
     fn invert_selection(&mut self) {
-        let displayed: Vec<PathBuf> = {
-            let pane = self.state.active().active();
-            pane.display
-                .iter()
-                .filter_map(|&i| pane.entries.get(i).map(|e| e.path.clone()))
-                .collect()
-        };
+        let displayed: Vec<PathBuf> = self.state.active().active().displayed_paths();
         {
             let pane = self.state.active_mut().active_mut();
             for path in displayed {
@@ -10544,13 +10854,8 @@ impl App {
 
     /// 全选当前显示项。
     fn select_all(&mut self) {
-        let selected: HashSet<PathBuf> = {
-            let tab = self.state.active();
-            tab.active().display
-                .iter()
-                .filter_map(|&i| tab.active().entries.get(i).map(|e| e.path.clone()))
-                .collect()
-        };
+        let selected: HashSet<PathBuf> =
+            self.state.active().active().displayed_paths().into_iter().collect();
         self.state.active_mut().active_mut().selection = selected;
         self.visible_cache = None;
         self.visible_cache_right = None;
@@ -10860,10 +11165,7 @@ impl App {
             CMD_REFRESH => self.user_refresh_active(),
             CMD_SELECT_ALL => {
                 let tab = self.state.active_mut().active_mut();
-                let all: Vec<PathBuf> = tab.display
-                    .iter()
-                    .filter_map(|&i| tab.entries.get(i).map(|e| e.path.clone()))
-                    .collect();
+                let all = tab.displayed_paths();
                 tab.selection = all.into_iter().collect();
                 self.refresh_visible_rows();
                 self.sync_status();
@@ -11907,10 +12209,14 @@ impl App {
                     }
                     tab.anchor = Some(path);
                 } else if shift {
-                    let anchor_pos = tab.anchor.clone().and_then(|anchor| {
-                        tab.display
-                            .iter()
-                            .position(|&i| tab.entries.get(i).is_some_and(|e| e.path == anchor))
+                    // 锚点在**显示序列**里找：`entries` 只有本地条目，搜索时
+                    // 深层结果在 `deep_entries` 里，用 `entries` 会找不到锚点，
+                    // Shift 点击就退化成单击（真机：搜索后按住 Shift 点第二个
+                    // 文件毫无反应，Ctrl 点击却正常）。
+                    let anchor = tab.anchor.clone();
+                    let anchor_pos = anchor.and_then(|anchor| {
+                        (0..tab.display.len())
+                            .find(|&di| tab.display_entry(di).is_some_and(|e| e.path == anchor))
                     });
                     match anchor_pos {
                         Some(anchor_pos) => {
@@ -12762,23 +13068,46 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
                 }
 
                 // 核心修复：用户空闲时静默重排，绝不打断当前操作。
-                if app.size_sort_pending {
-                    // 防抖判定：拖拽中 / 列表加载中 / 800ms 内有过点击（大概率在操作）
+                //
+                // 两件事共用同一套防抖（拖拽中 / 列表加载中 / 800ms 内点过东西
+                // 都算「正在操作」）：
+                //   · 目录大小回传后按大小重排；
+                //   · 搜索流式结果的重排（期间列表只追加，见 `deep_sort_pending`）。
+                if app.size_sort_pending
+                    || app
+                        .state
+                        .tabs
+                        .iter()
+                        .any(|t| t.panes.iter().any(|p| p.deep_sort_pending))
+                {
                     let is_interacting = app.drag_pending.is_some()
                         || app.ui.get_file_loading()
                         || app
                             .last_click
                             .as_ref()
-                            .is_some_and(|(_, t)| t.elapsed().as_millis() < 800);
+                            .is_some_and(|(_, t)| t.elapsed().as_millis() < 800)
+                        || app
+                            .last_scroll
+                            .is_some_and(|t| t.elapsed().as_millis() < 600);
 
                     if !is_interacting {
-                        app.size_sort_pending = false;
                         let mut resorted = false;
-                        {
+                        if app.size_sort_pending {
+                            app.size_sort_pending = false;
                             let tab = app.state.active_mut();
                             for pane in &mut tab.panes {
                                 if pane.sort.key == SortKey::Size {
                                     pane.resort();
+                                    pane.rebuild_display();
+                                    resorted = true;
+                                }
+                            }
+                        }
+                        // 搜索：把流式期间追加的结果按得分排一次。
+                        for tab in &mut app.state.tabs {
+                            for pane in &mut tab.panes {
+                                if pane.deep_sort_pending {
+                                    pane.deep_sort_pending = false;
                                     pane.rebuild_display();
                                     resorted = true;
                                 }
@@ -14008,6 +14337,8 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let mut app = app.borrow_mut();
             // 用户真的在滚轮/拖滚动条：立即解除重命名期的假滚动拦截。
             app.rename_scroll_guard = None;
+            // 也记一笔给「空闲时静默重排」用（别在人家滚的时候重排）。
+            app.last_scroll = Some(std::time::Instant::now());
         });
         upgrade().on_file_wheel_view(move |delta| {
             // Slint 的 WheelEvent 不带修饰键，用 Win32 的 GetKeyState 同步轮询。
@@ -15410,6 +15741,11 @@ static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 /// 会话是否存在。给看门狗用：`SESSION` 是 thread_local，从别的线程读永远是空。
 static SESSION_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 会话销毁从哪一刻开始的（毫秒时间戳，0 = 没在销毁）。卡住时看门狗靠它判死。
+static CLOSING_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 已经安排过一次「换进程」。避免卡死期间每秒钟都去拉一个新进程。
+static HANDOFF_DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// 托盘「退出」在销毁会话前调用。
 pub fn note_quitting() {
     QUITTING.store(true, std::sync::atomic::Ordering::Release);
@@ -15477,6 +15813,33 @@ pub fn start_ui_watchdog() {
                     continue;
                 }
                 session_seen = None;
+                // 会话已经销毁（常驻托盘、窗口没了）：事件循环不再跑，心跳当然
+                // 停了 —— 这不是卡死。以前这里照样每 30 秒记一条「UI 线程无响应
+                // session=false」，把真正的问题埋在了噪音里。
+                if !SESSION_ALIVE.load(std::sync::atomic::Ordering::Acquire) {
+                    // 销毁会话卡住了（真机：右键菜单的第三方扩展把菜单线程占死，
+                    // 销毁停在 `drop(session)` 里再没回来）。这时窗口没了、事件
+                    // 循环不转、托盘点了没反应，除任务管理器没有出路 —— 自己换一个
+                    // 新进程，用户至少还能继续用。
+                    let since = CLOSING_AT.load(std::sync::atomic::Ordering::Acquire);
+                    if since != 0
+                        && !QUITTING.load(std::sync::atomic::Ordering::Acquire)
+                        && !HANDOFF_DONE.load(std::sync::atomic::Ordering::Acquire)
+                        && now_ms().saturating_sub(since) > 10_000
+                    {
+                        HANDOFF_DONE.store(true, std::sync::atomic::Ordering::Release);
+                        crate::logal!(
+                            "[watchdog] !! 销毁会话卡了 {}ms（多半是菜单扩展占着不放），换一个新进程",
+                            now_ms().saturating_sub(since)
+                        );
+                        let _ = std::thread::Builder::new()
+                            .name("rove-restart".into())
+                            .spawn(restart_handoff);
+                    }
+                    stalled_for = 0;
+                    reported = false;
+                    continue;
+                }
                 let lag = proc_ms().saturating_sub(beat);
                 // 模态系统对话框（确认框 / 清空回收站）本来就占着 UI 线程，
                 // 那不是卡死，不该记 `!!`。
@@ -17060,6 +17423,9 @@ pub fn destroy_session() {
     };
     logln!("destroy_session running");
     SESSION_ALIVE.store(false, std::sync::atomic::Ordering::Release);
+    // 销毁本该在一瞬间做完。卡住时进程既没有窗口、事件循环也不再转，托盘点了
+    // 没反应，用户只能去任务管理器杀 —— 记下开始时刻，看门狗超时后自己换进程。
+    CLOSING_AT.store(now_ms().max(1), std::sync::atomic::Ordering::Release);
     // 退出存档：窗口几何（逻辑像素）+ 最大化状态 + 上次标签页快照。
     // 统一在销毁出口完成，保证「窗口 X」与「托盘退出」两条路径都能落盘。
     {
@@ -17188,17 +17554,26 @@ pub fn destroy_session() {
         }
         logv!("[close] hide requested + ShowWindow(SW_HIDE) hwnd={:#x}", hwnd);
     }
+    // 有原生菜单挂在那儿（用户正开着右键菜单，或者第三方扩展把菜单线程拖住了）
+    // 时，销毁会话会撞上它：真机日志停在「dirsize SAVE」之后、`session
+    // destroyed` 之前，UI 线程再没回来，托盘也就永远唤不醒窗口。留一条证据。
+    if let Some(ms) = crate::sys::menu::busy_for_ms() {
+        logal!("!! [close] 有原生菜单挂着 {ms}ms，销毁会话可能被它拖住");
+    }
     // 会话销毁时，将累计的目录容量缓存刷写到系统 Temp 目录（重启不丢）。
     if let Ok(mut store) = global_dir_sizes().lock() {
         store.save_to_temp();
     }
+    logv!("[close] step 1/4 dirsize saved");
     // 菜单线程卡到上限（右键已经不可用）时，趁这个安全时刻换一个新进程。
     // 有任务在跑就不动：重启会杀掉进行中的复制 / 移动。
     // `ROVE_FORCE_RESTART=1` 只为验证交接流程用（正常人碰不到「卡满 4 次」）。
     let restart_wanted = !QUITTING.load(std::sync::atomic::Ordering::Acquire)
         && (crate::sys::menu::exhausted() || std::env::var_os("ROVE_FORCE_RESTART").is_some())
         && !app.borrow().jobs.is_running();
+    logv!("[close] step 2/4 restart_wanted={} -> dropping session", restart_wanted);
     drop(app);
+    logv!("[close] step 3/4 session dropped");
     // 审计：组件 drop 之后主窗口应该已经不在了（IsWindow 返回 0）。
     // 如果它还在且仍可见，就说明某个强引用把窗口留在了内存里——这正是
     // 「窗口消失了但还盖着一层透明窗口」的成因，强制藏起来并留证据。
@@ -17226,6 +17601,7 @@ pub fn destroy_session() {
             .spawn(restart_handoff)
             .ok();
     }
+    CLOSING_AT.store(0, std::sync::atomic::Ordering::Release);
     logln!("session destroyed; daemon resident");
 }
 
@@ -17363,6 +17739,8 @@ struct BatchSession {
     previews: Vec<crate::ops::batch_rename::Preview>,
     /// 窗口逻辑宽度：决定名字折行的位置。
     win_w: f32,
+    /// 名字列宽（折行和 Slint 里的绝对坐标共用同一个数）。
+    col_w: f32,
     /// 排好版的可见行（手写窗口化只从这里取视口附近的一小段）。
     laid: Vec<BatchLaidRow>,
     /// 内容总高度。
@@ -17385,6 +17763,8 @@ struct BatchLaidRow {
     h: f32,
     /// 折行时用的预算宽度：窗口宽度变了就得重折。
     budget: f32,
+    /// 名字列宽（与折行预算同源，Slint 按它摆两列）。
+    col_w: f32,
     orig: ModelRc<ModelRc<RenamePart>>,
     new: ModelRc<ModelRc<RenamePart>>,
     /// 折行前的原始片段，用来判断「这一行能不能沿用上一版」。
@@ -17485,6 +17865,7 @@ impl App {
             existing,
             filter: 0,
             win_w: start_w,
+            col_w: 0.0,
             options: crate::ops::batch_rename::Options {
                 search: self.config.batch_rename.search.clone(),
                 replace: self.config.batch_rename.replace.clone(),
@@ -17566,6 +17947,18 @@ impl App {
             .set_size(WindowSize::Logical(LogicalSize::new(start_w, start_h)));
         ui.window()
             .set_position(WindowPosition::Logical(LogicalPosition::new(start_x, start_y)));
+        // 布局是按窗口真实尺寸折行的，而窗口在 show 之后才拿到最终尺寸。
+        // 下一帧再刷一次，列宽/折行才对得上（否则列宽按 0.75 屏宽算，
+        // 窗口被系统拉伸后整行会溢出到窗口外面）。
+        {
+            let weak = ui.as_weak();
+            let state = session.clone();
+            slint::Timer::single_shot(std::time::Duration::from_millis(180), move || {
+                if let Some(ui) = weak.upgrade() {
+                    batch_refresh(&ui, &state);
+                }
+            });
+        }
         logln!("[batch-rename] 打开窗口，{} 项", session.borrow().items.len());
     }
 }
@@ -17742,7 +18135,17 @@ fn batch_wire(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>, id: u64
         let state = state.clone();
         let weak = weak.clone();
         ui.on_resized(move |w| {
-            let w = w as f32;
+            // 回调给的值在窗口 realize 之前是**物理像素**（640 逻辑报成 960），
+            // 之后又不会再有 resize 事件，宽度就永久停在错值上。这里一律以
+            // 窗口自己报的「物理尺寸 ÷ 缩放」为准，拿不到才退回回调值。
+            let mut w = w as f32;
+            if let Some(win) = weak.upgrade() {
+                let sc = win.window().scale_factor().max(0.1);
+                let real = win.window().size().width as f32 / sc;
+                if real > 120.0 {
+                    w = real;
+                }
+            }
             {
                 let mut s = state.borrow_mut();
                 // 拖动边缘时每像素都会回调，宽度没实质变化就不重算。
@@ -17888,12 +18291,22 @@ fn batch_refresh(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>) {
 
     batch_remember(&s);
 
+    // 窗口逻辑宽度**必须从窗口自己取**，不能用 `resized` 回调送来的值：
+    // 那个回调在窗口 realize 之前会用物理像素报一次（640 逻辑 → 报 960），
+    // 之后再没有 resize 事件，宽度就一直停在错的值上，列宽和折行全都按
+    // 一个不存在的窗口宽度算，右列被推到窗口外。
+    let win = ui.window();
+    let scale = win.scale_factor().max(0.1);
+    let real_w = win.size().width as f32 / scale;
+    if real_w > 120.0 {
+        s.win_w = real_w;
+    }
+
     // 折行预算只跟窗口宽度与正则侧栏有关，所有行共用。
     let rail = if s.options.use_regex { 56.0 } else { 0.0 };
-    let col_w = ((s.win_w - rail - 288.0) / 2.0 - 22.0).max(90.0);
-    // grid_display_lines 按 11.5px 字号估算每字宽度，本窗口是 12.5px：
-    // 预算要等比例换算，再留几像素余量，末段才不会被挤成省略号。
-    let budget = col_w / 1.087 - 6.0;
+    let col_w = batch_col_w(s.win_w, rail);
+    s.col_w = col_w;
+    let budget = batch_wrap_budget(col_w);
     let parts = |list: &[(String, bool)]| -> ModelRc<ModelRc<RenamePart>> {
         // 折行直接复用图标视图那套算法（按字符宽度估、优先在分隔符处断行），
         // 只是把字号差换算进可用宽度；不截断，名字完整显示。
@@ -17959,6 +18372,7 @@ fn batch_refresh(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>) {
             y,
             h,
             budget,
+            col_w,
             orig,
             new: new_name,
             orig_raw: p.orig_parts.clone(),
@@ -17997,6 +18411,29 @@ fn batch_refresh(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>) {
         SharedString::default()
     });
     batch_window(ui, state);
+}
+
+/// 批量重命名：名字列的折行预算（单位是 `grid_display_lines` 的 11.5px 字宽）。
+///
+/// 右列的实际宽度 = (窗口 - 正则侧栏) - 控制区 288 - 滚动条 9 - 行内边距 12
+/// - 两处间距 16 - 勾选框 16，再对半分。`grid_display_lines` 按 11.5px 字号估宽，
+/// 本窗口是 12.5px，所以要按 1.087 换算，末尾再留几像素余量。
+/// 原先这串常数是揉在一起的 `- 288` 再 `- 22`，谁对应哪块看不出来；拆开写以后
+/// 窗口一改布局就能照着对。
+fn batch_col_w(win_w: f32, rail: f32) -> f32 {
+    ((win_w - rail - 288.0 - 9.0 - 12.0 - 16.0 - 16.0) / 2.0).max(90.0)
+}
+
+/// 把列宽换成 `grid_display_lines` 用的折行预算（11.5px 字宽世界）。
+///
+/// 换算系数就是 12.5 / 11.5 = 1.087：字宽表本身是 11.5px 实测的，本窗口用 12.5px。
+/// 表必须是 **Microsoft YaHei UI**（界面字体就是它）。之前那张表是照 Segoe UI 测的，
+/// YaHei 的拉丁字形平均宽 8.7%，于是每一行都算出「刚好放得下」而实际超了 8.7%，
+/// 行尾就被 `overflow: elide` 收成「…」。
+const BATCH_WRAP_SCALE: f32 = 1.087;
+
+fn batch_wrap_budget(col_w: f32) -> f32 {
+    col_w / BATCH_WRAP_SCALE - 6.0
 }
 
 /// 视口对应的行区间 `[start, end)`：上下各留 `buffer` 像素的缓冲。
@@ -18054,6 +18491,7 @@ fn batch_window(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>) {
             id: r.item as i32,
             y: r.y,
             h: r.h,
+            col_w: r.col_w,
             orig: r.orig.clone(),
             new: r.new.clone(),
             state: r.state,
@@ -18062,12 +18500,14 @@ fn batch_window(ui: &BatchRenameWindow, state: &Rc<RefCell<BatchSession>>) {
         })
         .collect();
     let total_h = s.laid_h;
+    let col_w = s.col_w;
     // 先放手再碰界面：写属性会同步触发 Slint 回调（可能又回到这里）。
     drop(s);
 
     // 先给内容高度再换行：反过来，Slint 会先用旧的（可能更小的）高度去夹
     // content-y，把正确的滚动位置夹小，回来又把我们的 scroll 改掉。
     ui.set_content_h(total_h);
+    ui.set_col_w(col_w);
     ui.set_rows(ModelRc::new(VecModel::from(rows)));
 }
 
