@@ -36,11 +36,13 @@ pub struct DirId {
     pub index_low: u32,
 }
 
-/// 新建出来的文件夹：路径 + 建它那一刻的身份（采不到时为 None）。
+/// 新建出来的空对象（文件夹 / 空文件）：路径 + 建它那一刻的身份（采不到时为 None）。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreatedDir {
     pub path: PathBuf,
     pub id: Option<DirId>,
+    /// true = 我们建的是一个**空文件**（新建文本文档），false = 文件夹。
+    pub is_file: bool,
 }
 
 /// 采集一个目录的身份。取不到（权限 / 网络路径 / 已经被删）返回 None。
@@ -422,7 +424,11 @@ mod tests {
         stack.record(Kind::Create {
             dirs: paths
                 .into_iter()
-                .map(|path| CreatedDir { path, id: None })
+                .map(|path| CreatedDir {
+                    path,
+                    id: None,
+                    is_file: false,
+                })
                 .collect(),
         });
         match stack.peek_undo() {

@@ -333,6 +333,9 @@ pub const ZH: &[&str] = &[
     // ---- 自建的「打开方式」（321 起）----
     "打开方式",               // 321
     "无法打开「打开方式」：{}", // 322
+    // ---- 空白处右键：新建文本文档（323 起）----
+    "新建文本文档",           // 323
+    "创建文件失败：{}",       // 324
 ];
 
 pub const EN: &[&str] = &[
@@ -659,6 +662,8 @@ pub const EN: &[&str] = &[
     "Couldn't create the shortcut: {}",
     "Open with",
     "Couldn't open the Open-with dialog: {}",
+    "New text document",
+    "Couldn't create the file: {}",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -788,6 +793,11 @@ mod tests {
         assert_eq!(EN[321], "Open with");
         assert_eq!(ZH[322], "无法打开「打开方式」：{}");
         assert_eq!(EN[322], "Couldn't open the Open-with dialog: {}");
+        // 空白处「新建文本文档」（追加在末尾，323–324）。
+        assert_eq!(ZH[323], "新建文本文档");
+        assert_eq!(EN[323], "New text document");
+        assert_eq!(ZH[324], "创建文件失败：{}");
+        assert_eq!(EN[324], "Couldn't create the file: {}");
         assert_eq!(
             EN[315],
             "Can't drop into this pane while searching; drop it on a folder instead"

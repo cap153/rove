@@ -564,8 +564,13 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
                     if dir.path.exists() {
                         return Err(format!("「{}」已经存在了", dir.path.display()));
                     }
-                    std::fs::create_dir_all(&dir.path)
-                        .map_err(|e| format!("{}：{e}", dir.path.display()))?;
+                    if dir.is_file {
+                        std::fs::File::create(&dir.path)
+                            .map_err(|e| format!("{}：{e}", dir.path.display()))?;
+                    } else {
+                        std::fs::create_dir_all(&dir.path)
+                            .map_err(|e| format!("{}：{e}", dir.path.display()))?;
+                    }
                     // 重建出来的是**另一个**对象：身份要重新采一遍，否则下一次
                     // 撤消会拿旧身份去核对，永远核对不上。
                     dir.id = crate::ops::undo::capture_dir_id(&dir.path);
@@ -577,12 +582,21 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
                 // 2. 里面已经有东西了（用户往里放了文件）→ 不删。
                 // 宁可少撤一条并说明原因，也不能把用户后来的东西删掉。
                 let mut removable: Vec<PathBuf> = Vec::new();
-                let mut refused = 0usize;
                 let mut refused_replaced = 0usize;
+                let mut refused_dir_content = 0usize;
+                let mut refused_file_content = 0usize;
+                let mut refused_unreadable = 0usize;
                 for dir in dirs.iter() {
                     match std::fs::symlink_metadata(&dir.path) {
                         // 本来就没了：不需要做什么，也不算失败。
-                        Err(_) => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                        // 读不到 ≠ 不在（没权限 / 被独占 / 盘掉线）：如实报失败，
+                        // 不能当成「已撤消」蒙混过去。
+                        Err(_) => {
+                            refused_unreadable += 1;
+                            crate::logv!("[undo] 读不到新建项，跳过：{:?}", dir.path);
+                            continue;
+                        }
                         Ok(meta) => {
                             let now = crate::ops::undo::capture_dir_id(&dir.path);
                             let same = match (dir.id, now) {
@@ -593,44 +607,74 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
                                 (Some(_), None) => false,
                             };
                             if !same {
-                                refused += 1;
                                 refused_replaced += 1;
                                 crate::logv!(
-                                    "[undo] 新建的文件夹已被换成别的对象，跳过：{:?}",
+                                    "[undo] 新建的项已被换成别的对象，跳过：{:?}",
                                     dir.path
                                 );
                                 continue;
                             }
-                            if !meta.is_dir() {
-                                refused += 1;
-                                refused_replaced += 1;
-                                crate::logv!(
-                                    "[undo] 原位置已经变成文件，跳过：{:?}",
-                                    dir.path
-                                );
-                                continue;
-                            }
-                            let empty = std::fs::read_dir(&dir.path)
-                                .map(|mut it| it.next().is_none())
-                                .unwrap_or(false);
-                            if !empty {
-                                refused += 1;
-                                crate::logv!("[undo] 文件夹里已经有内容，跳过：{:?}", dir.path);
-                                continue;
+                            if dir.is_file {
+                                // 我们建的是一个 0 字节的空文件：用户往里面写了
+                                // 东西就不是「新建」那个对象了，不能删。
+                                if meta.is_dir() {
+                                    refused_replaced += 1;
+                                    crate::logv!(
+                                        "[undo] 原位置已经变成文件夹，跳过：{:?}",
+                                        dir.path
+                                    );
+                                    continue;
+                                }
+                                if meta.len() != 0 {
+                                    refused_file_content += 1;
+                                    crate::logv!(
+                                        "[undo] 新建的文件里已经有内容，跳过：{:?}",
+                                        dir.path
+                                    );
+                                    continue;
+                                }
+                            } else {
+                                if !meta.is_dir() {
+                                    refused_replaced += 1;
+                                    crate::logv!(
+                                        "[undo] 原位置已经变成文件，跳过：{:?}",
+                                        dir.path
+                                    );
+                                    continue;
+                                }
+                                let empty = std::fs::read_dir(&dir.path)
+                                    .map(|mut it| it.next().is_none())
+                                    .unwrap_or(false);
+                                if !empty {
+                                    refused_dir_content += 1;
+                                    crate::logv!(
+                                        "[undo] 文件夹里已经有内容，跳过：{:?}",
+                                        dir.path
+                                    );
+                                    continue;
+                                }
                             }
                             removable.push(dir.path.clone());
                         }
                     }
                 }
                 if removable.is_empty() {
-                    if refused == 0 {
+                    if refused_replaced == 0
+                        && refused_dir_content == 0
+                        && refused_file_content == 0
+                        && refused_unreadable == 0
+                    {
                         // 已经被用户自己删掉了：撤消的目标已经达成。
                         return Ok(0);
                     }
-                    return Err(if refused_replaced == refused {
-                        "这个文件夹已经不是当初新建的那个了，没有删除".into()
-                    } else {
+                    return Err(if refused_unreadable > 0 {
+                        "读不到新建项（可能没有权限或被占用），没有删除".into()
+                    } else if refused_file_content > 0 {
+                        "新建的文件里已经有内容，没有删除".into()
+                    } else if refused_dir_content > 0 {
                         "文件夹里已经有内容，没有删除".into()
+                    } else {
+                        "这个新建项已经不是当初新建的那个了，没有删除".into()
                     });
                 }
                 if crate::sys::shell::shell_delete(&removable, true, 0)? {

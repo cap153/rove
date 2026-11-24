@@ -469,6 +469,8 @@ const THUMB_DISK_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const CMD_PASTE: &str = "paste";
 const CMD_TERMINAL: &str = "terminal";
 const CMD_NEW_FOLDER: &str = "new_folder";
+const CMD_NEW_TXT: &str = "new_txt";
+const CMD_BG_PROPERTIES: &str = "bg_properties";
 const CMD_REFRESH: &str = "refresh";
 const CMD_SELECT_ALL: &str = "select_all";
 const CMD_INVERT_SELECTION: &str = "invert_selection";
@@ -8946,8 +8948,8 @@ impl App {
                 // 实时读系统剪贴板：资源管理器等外部程序随时可能覆盖它，
                 // 不能用进程内的陈旧缓存判断文字与可用性。
                 let (paste_paths, paste_move) = self.paste_state();
-                // 「属性」不在这里：真实文件夹由系统菜单提供，
-                // 虚拟根（此电脑 / 回收站）本来也拿不到它。
+                // 这几条只对真实文件夹有意义；虚拟根（此电脑 / 回收站）拿不到
+                // path，点了只会提示「请先进入一个文件夹」。
                 let mut nodes: Vec<MenuNode> = Vec::new();
                 // 撤消 / 重做摆最顶上：栈里有东西才出现，撤消永远在恢复上面。
                 // 回收站走的是上面的专用菜单，拿不到这里。
@@ -8973,10 +8975,13 @@ impl App {
                         checked: false,
                     },
                     item(CMD_NEW_FOLDER, self.tr("新建文件夹").as_str(), true),
+                    item(CMD_NEW_TXT, self.tr("新建文本文档").as_str(), true),
                     MenuNode::Separator,
                     item(CMD_REFRESH, self.tr("刷新").as_str(), true),
                     item(CMD_SELECT_ALL, self.tr("全选").as_str(), true),
                     item(CMD_INVERT_SELECTION, self.tr("反选").as_str(), true),
+                    // 当前文件夹自己的属性页（选中项的那条在 Selection 菜单里）。
+                    item(CMD_BG_PROPERTIES, self.tr("属性").as_str(), true),
                     item(CMD_MANAGE_ACTIONS, self.tr("管理右键动作").as_str(), true),
                     item(CMD_TERMINAL, self.tr("在此处打开终端").as_str(), true),
                     MenuNode::Submenu {
@@ -11747,6 +11752,8 @@ impl App {
                 }
             }
             CMD_NEW_FOLDER => self.create_folder(),
+            CMD_NEW_TXT => self.create_text_file(),
+            CMD_BG_PROPERTIES => self.show_background_properties(),
             CMD_REFRESH => self.user_refresh_active(),
             CMD_SELECT_ALL => {
                 let tab = self.state.active_mut().active_mut();
@@ -12048,6 +12055,7 @@ impl App {
                     dirs: vec![crate::ops::undo::CreatedDir {
                         id: crate::ops::undo::capture_dir_id(&path),
                         path: path.clone(),
+                        is_file: false,
                     }],
                 });
                 self.scroll_to_paths = vec![path.clone()];
@@ -12064,6 +12072,76 @@ impl App {
                 );
             }
             Err(e) => self.set_status_job(self.trf("创建文件夹失败：{}", &[e.to_string()])),
+        }
+    }
+
+    /// 空白处「新建文本文档」：建一个 0 字节的 txt，然后直接进重命名。
+    ///
+    /// 与「新建文件夹」同一条路：记账 → 让新条目滚进可视区 → 起输入框。
+    fn create_text_file(&mut self) {
+        let Some(dir) = self.state.active().active().path.clone() else {
+            self.set_status_job(self.tr("请先进入一个文件夹"));
+            return;
+        };
+        // 用 create_new 而不是 File::create：后者会**截断**同名文件。
+        // exists() 查完到真正建之间有个窗口，这个窗口里冒出来的同名文件
+        // 必须换下一个名字，不能把别人的内容清成 0 字节。
+        let mut counter = 1u32;
+        let made = loop {
+            let name = if counter == 1 {
+                "新建文本文档.txt".to_string()
+            } else {
+                format!("新建文本文档 ({counter}).txt")
+            };
+            let candidate = dir.join(name);
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+            {
+                Ok(_) => break candidate,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    counter += 1;
+                    if counter > 9999 {
+                        self.set_status_job(self.trf("创建文件失败：{}", &[e.to_string()]));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    self.set_status_job(self.trf("创建文件失败：{}", &[e.to_string()]));
+                    return;
+                }
+            }
+        };
+        let path = made;
+        // 与新建文件夹一致：清拖拽上膛锁，作废 Shell 新建快照。
+        self.drag_pending = None;
+        self.ui.invoke_set_drag_armed(false);
+        self.shell_new_watch = None;
+        // 撤消这次新建 = 把这个**还是空**的文件删掉（见 ops::jobs 的
+        // Kind::Create：写了内容就不删）。
+        self.undo.record(crate::ops::undo::Kind::Create {
+            dirs: vec![crate::ops::undo::CreatedDir {
+                id: crate::ops::undo::capture_dir_id(&path),
+                path: path.clone(),
+                is_file: true,
+            }],
+        });
+        self.scroll_to_paths = vec![path.clone()];
+        self.scroll_select = false;
+        self.reveal_pane = Some(self.state.active().active_pane);
+        self.reload_active();
+        self.begin_rename(&path.clone());
+    }
+
+    /// 空白处「属性」：显示当前文件夹自己的属性页。
+    fn show_background_properties(&mut self) {
+        let Some(dir) = self.state.active().active().path.clone() else {
+            self.set_status_job(self.tr("请先进入一个文件夹"));
+            return;
+        };
+        if let Err(e) = crate::sys::shell::show_properties(&dir) {
+            self.set_status_job(self.trf("无法显示属性：{}", &[e.to_string()]));
         }
     }
 
