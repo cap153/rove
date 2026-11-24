@@ -527,8 +527,10 @@ fn filter_hidden(hmenu: HMENU, options: &Options) {
                 continue;
             }
         }
-        let label = super::normalize_label(&menu_label(hmenu, index));
-        if !label.is_empty() && super::keyword_hit(&label, &options.hide_keywords) {
+        // 原始标签直接交给 keyword_hit：精确匹配要靠结尾的省略号区分
+        // 「打开方式」的两种写法（带点 = 弹选择器，不带点 = 展开子菜单）。
+        let label = menu_label(hmenu, index);
+        if !label.trim().is_empty() && super::keyword_hit(&label, &options.hide_keywords) {
             let _ = unsafe { DeleteMenu(hmenu, index as u32, MF_BYPOSITION) };
             continue;
         }

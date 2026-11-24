@@ -129,7 +129,7 @@ impl Drop for DirWatcher {
     fn drop(&mut self) {
         let handle = self.handle as usize;
         // 核心修复：严禁在 UI 线程同步调用 CloseHandle！
-        // 阻塞中的 ReadDirectoryChangesW 在被 CloseHandle 取消时，内核需撤销挂起的 IRP，
+        // 阻塞中的 ReadDirectoryChangesW 在被 CloseHandle 取消时，内核需撤消挂起的 IRP，
         // 会阻塞调用线程 2~5 秒。移至后台线程异步销毁，UI 线程 0ms 瞬间返回。
         std::thread::spawn(move || unsafe {
             windows_sys::Win32::Foundation::CloseHandle(handle as _);

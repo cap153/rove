@@ -25,7 +25,7 @@ pub enum JobKind {
         paths: Vec<PathBuf>,
         to_trash: bool,
     },
-    /// 撤销 / 重做一条历史记录（`redo` = true 表示重做）。
+    /// 撤消 / 重做一条历史记录（`redo` = true 表示重做）。
     History {
         redo: bool,
         entry: crate::ops::undo::Kind,
@@ -63,14 +63,14 @@ pub struct JobSummary {
     pub affected_dirs: Vec<PathBuf>,
     pub failed: usize,
     pub outcome: JobOutcome,
-    /// 这次操作成功后要记进撤销栈的记录（撤销 / 重做任务本身为 None）。
+    /// 这次操作成功后要记进撤消栈的记录（撤消 / 重做任务本身为 None）。
     pub recorded: Option<crate::ops::undo::Kind>,
-    /// 撤销 / 重做任务自身的结果：(是否重做, 那条记录)。成功与否都由 UI
+    /// 撤消 / 重做任务自身的结果：(是否重做, 那条记录)。成功与否都由 UI
     /// 决定它在两个栈之间怎么搬。
     pub history: Option<(bool, crate::ops::undo::Kind)>,
-    /// 这次操作不可撤销（彻底删除），撤销历史必须跟着作废。
+    /// 这次操作不可撤消（彻底删除），撤消历史必须跟着作废。
     pub clear_undo: bool,
-    /// 撤销 / 重做任务是被**用户取消**的（不是失败）：记录要退回原栈，
+    /// 撤消 / 重做任务是被**用户取消**的（不是失败）：记录要退回原栈，
     /// 别的失败则把记录扔掉（见 `UndoStack::drop_undo`）。
     pub cancelled: bool,
 }
@@ -224,7 +224,7 @@ fn run_transfer(
     {
         // 传入 0 作无模态宿主 HWND，系统自行弹出居中对话框
         // （原生 Shell 操作自带官方传输进度条、同名覆盖确认、UAC 提权）。
-        // 撤销栈是 Rove 自己记的（见 ops::undo），不依赖 Shell 有没有记录。
+        // 撤消栈是 Rove 自己记的（见 ops::undo），不依赖 Shell 有没有记录。
         // 复制 / 移动前先记下目标目录里已有什么：事后差出来的才是这次新落的
         // 条目（同名冲突时系统会改名，只有差集能准确告诉我们是哪几条）。
         let before = name_set(dest_dir);
@@ -380,7 +380,7 @@ fn run_delete(
         let res = crate::sys::shell::shell_delete(paths, to_trash, 0);
         return match res {
             Ok(aborted) => JobSummary {
-                // 彻底删除不进撤销栈：它本来就没有反向动作。
+                // 彻底删除不进撤消栈：它本来就没有反向动作。
                 recorded: (to_trash && !aborted && !paths.is_empty()).then(|| {
                     crate::ops::undo::Kind::Trash {
                         paths: paths.to_vec(),
@@ -410,8 +410,8 @@ fn run_delete(
                 } else {
                     JobOutcome::Deleted
                 },
-                // 彻底删除没有反向动作：撤销历史必须一起作废，否则下一次
-                // Ctrl+Z 会往前跳过一条，去撤销更早的那次操作。
+                // 彻底删除没有反向动作：撤消历史必须一起作废，否则下一次
+                // Ctrl+Z 会往前跳过一条，去撤消更早的那次操作。
                 clear_undo: !to_trash && !aborted,
                 ..Default::default()
             },
@@ -507,7 +507,7 @@ fn run_delete(
 }
 
 // ---------------------------------------------------------------------------
-// 撤销 / 重做
+// 撤消 / 重做
 // ---------------------------------------------------------------------------
 
 /// 目录里现有条目的名字（只取名字：只是用来做前后差集）。
@@ -529,21 +529,21 @@ fn new_entries(dir: &Path, before: &std::collections::HashSet<std::ffi::OsString
 
 /// 一条历史记录的反向 / 正向动作。
 ///
-/// `redo = false` 是撤销（执行反向），`true` 是重做（再执行一次正向）。
+/// `redo = false` 是撤消（执行反向），`true` 是重做（再执行一次正向）。
 /// 允许就地更新记录：复制重做后新条目的名字可能变了（同名冲突被系统改名），
-/// 把最新的一份写回记录，下次撤销才不会去删一个不存在的路径。
+/// 把最新的一份写回记录，下次撤消才不会去删一个不存在的路径。
 fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize, String> {
     use crate::ops::undo::Kind;
     match entry {
         Kind::Trash { paths } => {
             if redo {
-                // 重做删除 = 再删一次。仍然进回收站，所以还能再撤销。
+                // 重做删除 = 再删一次。仍然进回收站，所以还能再撤消。
                 if crate::sys::shell::shell_delete(paths, true, 0)? {
                     return Err(CANCELLED.into());
                 }
                 Ok(paths.len())
             } else {
-                // 撤销删除 = 从回收站还原。按「删除前的原路径」匹配条目，
+                // 撤消删除 = 从回收站还原。按「删除前的原路径」匹配条目，
                 // 同名文件各有自己的 id，不会互相牵连。
                 let restored: usize = paths
                     .iter()
@@ -559,7 +559,7 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
             if redo {
                 for dir in dirs.iter_mut() {
                     // `create_dir_all` 对已存在的目录是「成功什么都不做」：
-                    // 直接放行会把用户后来自己建的目录认成我们建的，下一次撤销
+                    // 直接放行会把用户后来自己建的目录认成我们建的，下一次撤消
                     // 就把它删掉。这里必须先确认位置是空的。
                     if dir.path.exists() {
                         return Err(format!("「{}」已经存在了", dir.path.display()));
@@ -567,7 +567,7 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
                     std::fs::create_dir_all(&dir.path)
                         .map_err(|e| format!("{}：{e}", dir.path.display()))?;
                     // 重建出来的是**另一个**对象：身份要重新采一遍，否则下一次
-                    // 撤销会拿旧身份去核对，永远核对不上。
+                    // 撤消会拿旧身份去核对，永远核对不上。
                     dir.id = crate::ops::undo::capture_dir_id(&dir.path);
                 }
                 Ok(dirs.len())
@@ -624,7 +624,7 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
                 }
                 if removable.is_empty() {
                     if refused == 0 {
-                        // 已经被用户自己删掉了：撤销的目标已经达成。
+                        // 已经被用户自己删掉了：撤消的目标已经达成。
                         return Ok(0);
                     }
                     return Err(if refused_replaced == refused {
@@ -644,13 +644,13 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
             // 目标已存在会被**直接覆盖**，所以每一步都得先确认目标名空着。
             //
             // 但光靠「顺序 + 目标名空着」不够：批量重命名经常出现 a→b、b→c
-            // 这种链（编号顺移），撤销第一步「c→b」时 b 还在 —— 它自己也要
-            // 改回 a。照着判「名字被占用」会把整批撤销打死，所以分三段：
+            // 这种链（编号顺移），撤消第一步「c→b」时 b 还在 —— 它自己也要
+            // 改回 a。照着判「名字被占用」会把整批撤消打死，所以分三段：
             //   1. 源已经不在的跳过（上次撤到一半、或用户自己挪走了）；
             //   2. 目标名被**外部**文件占着（不是本批任何一步的源）→ 直接报错，
             //      一个都不改；
             //   3. 反复挑「目标名空闲」的改；整圈都互相占着就借临时名解环。
-            // 撤销的一步是「从新名字改回旧名字」，顺序仍按记录顺序：
+            // 撤消的一步是「从新名字改回旧名字」，顺序仍按记录顺序：
             // 链式改名 1→2、2→3 撤起来就是 2→1、3→2，前一步腾出的名字正好给
             // 后一步用。（把顺序也倒过来反而会先撞上还没腾出来的名字。）
             let mut steps: Vec<(PathBuf, PathBuf)> = if redo {
@@ -663,7 +663,7 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
             };
             steps.retain(|(from, _)| from.exists());
             if steps.is_empty() {
-                // 每一条都已经在目标位置上了：撤销的目的已经达成。
+                // 每一条都已经在目标位置上了：撤消的目的已经达成。
                 return Ok(pairs.len());
             }
             let sources: Vec<PathBuf> = steps.iter().map(|(from, _)| from.clone()).collect();
@@ -700,7 +700,7 @@ fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize
             Ok(done.max(1))
         }
         Kind::Move { pairs } => {
-            // 撤销：把条目从「现在的位置」搬回原目录；重做：再搬回去。
+            // 撤消：把条目从「现在的位置」搬回原目录；重做：再搬回去。
             let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
             for (original, current) in pairs.iter() {
                 let (from, dir) = if redo {
@@ -755,11 +755,11 @@ fn history_verb(redo: bool, en: bool) -> String {
     if redo {
         t(en, "重做", "Redo")
     } else {
-        t(en, "撤销", "Undo")
+        t(en, "撤消", "Undo")
     }
 }
 
-/// 撤销 / 重做在状态栏上的文案。
+/// 撤消 / 重做在状态栏上的文案。
 fn history_message(entry: &crate::ops::undo::Kind, redo: bool, count: usize, en: bool) -> String {
     use crate::ops::undo::Kind;
     let n = count.to_string();
@@ -771,20 +771,20 @@ fn history_message(entry: &crate::ops::undo::Kind, redo: bool, count: usize, en:
             "Deleted {} items to the Recycle Bin again",
             &[n],
         ),
-        (Kind::Create { .. }, false) => t(en, "已撤销新建", "Undid new folder").to_string(),
+        (Kind::Create { .. }, false) => t(en, "已撤消新建", "Undid new folder").to_string(),
         (Kind::Create { .. }, true) => t(en, "已重新新建", "Recreated folder").to_string(),
-        (Kind::Rename { .. }, false) => t(en, "已撤销重命名", "Undid rename").to_string(),
+        (Kind::Rename { .. }, false) => t(en, "已撤消重命名", "Undid rename").to_string(),
         (Kind::Rename { .. }, true) => t(en, "已重做重命名", "Redid rename").to_string(),
         (Kind::Move { .. }, false) => tf(
             en,
-            "已撤销移动：{} 项已移回原处",
+            "已撤消移动：{} 项已移回原处",
             "Undid move: {} items moved back",
             &[n],
         ),
         (Kind::Move { .. }, true) => tf(en, "已重做移动：{} 项", "Redid move: {} items", &[n]),
         (Kind::Copy { .. }, false) => tf(
             en,
-            "已撤销复制：删除了 {} 个副本",
+            "已撤消复制：删除了 {} 个副本",
             "Undid copy: removed {} copies",
             &[n],
         ),
@@ -792,7 +792,7 @@ fn history_message(entry: &crate::ops::undo::Kind, redo: bool, count: usize, en:
     }
 }
 
-/// 撤销 / 重做任务本体（跑在任务线程上，可以随便阻塞）。
+/// 撤消 / 重做任务本体（跑在任务线程上，可以随便阻塞）。
 fn run_history(entry: &crate::ops::undo::Kind, redo: bool, en: bool) -> JobSummary {
     let mut entry = entry.clone();
     let result = apply_history(&mut entry, redo);
@@ -924,8 +924,8 @@ mod tests {
         dir
     }
 
-    /// 批量重命名的链（1→2、2→3）撤销时必须按能走得通的顺序改名：
-    /// 倒着来第一步「3→2」会撞上还在原位的 2，按旧逻辑整批撤销永远失败。
+    /// 批量重命名的链（1→2、2→3）撤消时必须按能走得通的顺序改名：
+    /// 倒着来第一步「3→2」会撞上还在原位的 2，按旧逻辑整批撤消永远失败。
     #[test]
     fn rename_chain_undoes_in_a_workable_order() {
         let dir = scratch("undo-chain");
@@ -934,7 +934,7 @@ mod tests {
         let mut entry = crate::ops::undo::Kind::Rename {
             pairs: vec![(dir.join("1.txt"), dir.join("2.txt")), (dir.join("2.txt"), dir.join("3.txt"))],
         };
-        let done = apply_history(&mut entry, false).expect("链式改名必须能整体撤销");
+        let done = apply_history(&mut entry, false).expect("链式改名必须能整体撤消");
         assert_eq!(done, 2);
         assert_eq!(std::fs::read(dir.join("1.txt")).unwrap(), b"one");
         assert_eq!(std::fs::read(dir.join("2.txt")).unwrap(), b"two");
@@ -955,7 +955,7 @@ mod tests {
         let mut entry = crate::ops::undo::Kind::Rename {
             pairs: vec![(dir.join("a.txt"), dir.join("b.txt")), (dir.join("b.txt"), dir.join("a.txt"))],
         };
-        apply_history(&mut entry, false).expect("互换改名要能撤销");
+        apply_history(&mut entry, false).expect("互换改名要能撤消");
         // 换回来：a.txt 拿回原来属于 a 的内容，b.txt 拿回原来属于 b 的。
         assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"from-a");
         assert_eq!(std::fs::read(dir.join("b.txt")).unwrap(), b"from-b");

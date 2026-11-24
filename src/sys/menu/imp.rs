@@ -910,7 +910,7 @@ mod wire_tests {
                     }],
                 },
             ],
-            hide_keywords: vec!["!删除(D)".into(), "撤销".into()],
+            hide_keywords: vec!["!删除(D)".into(), "撤消".into()],
             extended: true,
             dark: true,
             owner: 0x1234,

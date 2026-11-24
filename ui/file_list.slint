@@ -1225,7 +1225,7 @@ export component FileList inherits Rectangle {
                                 root.background-pointer-event(event, self.mouse-x, self.mouse-y);
                             }
                         } else {
-                            // cancel：传零尺寸矩形，等价于撤销本轮框选。
+                            // cancel：传零尺寸矩形，等价于撤消本轮框选。
                             root.rubber-band-selected(root.sel-x1, root.sel-y1, root.sel-x1, root.sel-y1);
                         }
                         return EventResult.accept;

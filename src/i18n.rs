@@ -235,13 +235,13 @@ pub const ZH: &[&str] = &[
     "属性",
     "清空回收站",
     "新建文件夹",
-    "管理右键动作...",
+    "管理右键动作",
     "粘贴（移动）",
     "取消固定",
     "当前",
     "新建标签时编辑地址栏",
     "打开新标签后自动进入地址栏编辑态，可直接输入路径。",
-    "撤销",
+    "撤消",
     "重做",
     "盘符",
     "接管资源管理器",
@@ -311,19 +311,28 @@ pub const ZH: &[&str] = &[
     "前进",                    // 300
     "上一级",                  // 301
     "正在搜索…已扫 {} 项",     // 302
-    "没有可撤销的操作",         // 303
+    "没有可撤消的操作",         // 303
     "没有可重做的操作",         // 304
-    "撤销复制",                 // 305
-    "撤销移动",                 // 306
-    "撤销删除",                 // 307
-    "撤销新建",                 // 308
-    "撤销重命名",               // 309
+    "撤消复制",                 // 305
+    "撤消移动",                 // 306
+    "撤消删除",                 // 307
+    "撤消新建",                 // 308
+    "撤消重命名",               // 309
     "恢复复制",                 // 310
     "恢复移动",                 // 311
     "恢复删除",                 // 312
     "恢复新建",                 // 313
     "恢复重命名",               // 314
     "搜索中不能拖放到当前分屏，请拖到具体的文件夹上", // 315
+    // ---- 自建的「属性 / 重命名 / 快捷方式」（316 起，追加在末尾）----
+    "创建快捷方式",           // 316
+    "桌面快捷方式",           // 317
+    "快捷方式",               // 318 快捷方式文件名里的那半截
+    "已创建 {} 个快捷方式",   // 319
+    "创建快捷方式失败：{}",   // 320
+    // ---- 自建的「打开方式」（321 起）----
+    "打开方式",               // 321
+    "无法打开「打开方式」：{}", // 322
 ];
 
 pub const EN: &[&str] = &[
@@ -556,7 +565,7 @@ pub const EN: &[&str] = &[
     "Properties",
     "Empty Recycle Bin",
     "New folder",
-    "Manage context menu actions...",
+    "Manage context menu actions",
     "Paste (move)",
     "Unpin",
     "current",
@@ -643,6 +652,13 @@ pub const EN: &[&str] = &[
     "Redo new folder",
     "Redo rename",
     "Can't drop into this pane while searching; drop it on a folder instead",
+    "Create shortcut",
+    "Desktop shortcut",
+    "Shortcut",
+    "Created {} shortcut(s)",
+    "Couldn't create the shortcut: {}",
+    "Open with",
+    "Couldn't open the Open-with dialog: {}",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -730,20 +746,20 @@ mod tests {
         assert_eq!(ZH[302], "正在搜索…已扫 {} 项");
         assert_eq!(EN[302], "Searching… scanned {} items");
         // Ctrl+Z / Ctrl+Y 的空栈提示（追加在末尾，303 / 304）。
-        assert_eq!(ZH[303], "没有可撤销的操作");
+        assert_eq!(ZH[303], "没有可撤消的操作");
         assert_eq!(EN[303], "Nothing to undo");
         assert_eq!(ZH[304], "没有可重做的操作");
         assert_eq!(EN[304], "Nothing to redo");
-        // 空白处右键菜单里的撤销 / 重做项（追加在末尾，305–314）。
-        assert_eq!(ZH[305], "撤销复制");
+        // 空白处右键菜单里的撤消 / 重做项（追加在末尾，305–314）。
+        assert_eq!(ZH[305], "撤消复制");
         assert_eq!(EN[305], "Undo copy");
-        assert_eq!(ZH[306], "撤销移动");
+        assert_eq!(ZH[306], "撤消移动");
         assert_eq!(EN[306], "Undo move");
-        assert_eq!(ZH[307], "撤销删除");
+        assert_eq!(ZH[307], "撤消删除");
         assert_eq!(EN[307], "Undo delete");
-        assert_eq!(ZH[308], "撤销新建");
+        assert_eq!(ZH[308], "撤消新建");
         assert_eq!(EN[308], "Undo new folder");
-        assert_eq!(ZH[309], "撤销重命名");
+        assert_eq!(ZH[309], "撤消重命名");
         assert_eq!(EN[309], "Undo rename");
         assert_eq!(ZH[310], "恢复复制");
         assert_eq!(EN[310], "Redo copy");
@@ -757,11 +773,27 @@ mod tests {
         assert_eq!(EN[314], "Redo rename");
         // 搜索状态下拖回本栏的拒绝提示。
         assert_eq!(ZH[315], "搜索中不能拖放到当前分屏，请拖到具体的文件夹上");
+        // 自建的快捷方式动作（追加在末尾，316–320）。
+        assert_eq!(ZH[316], "创建快捷方式");
+        assert_eq!(EN[316], "Create shortcut");
+        assert_eq!(ZH[317], "桌面快捷方式");
+        assert_eq!(EN[317], "Desktop shortcut");
+        assert_eq!(ZH[318], "快捷方式");
+        assert_eq!(EN[318], "Shortcut");
+        assert_eq!(ZH[319], "已创建 {} 个快捷方式");
+        assert_eq!(EN[319], "Created {} shortcut(s)");
+        assert_eq!(ZH[320], "创建快捷方式失败：{}");
+        // 「打开方式」（追加在末尾，321–322）。
+        assert_eq!(ZH[321], "打开方式");
+        assert_eq!(EN[321], "Open with");
+        assert_eq!(ZH[322], "无法打开「打开方式」：{}");
+        assert_eq!(EN[322], "Couldn't open the Open-with dialog: {}");
         assert_eq!(
             EN[315],
             "Can't drop into this pane while searching; drop it on a folder instead"
         );
-        // 空白处右键菜单的撤销 / 重做文字是 Rust 侧按记录类型拼出来的，
+        assert_eq!(EN[320], "Couldn't create the shortcut: {}");
+        // 空白处右键菜单的撤消 / 重做文字是 Rust 侧按记录类型拼出来的，
         // 每种记录都得能在字典里查到，否则英文界面会冒出中文。
         let kinds = [
             crate::ops::undo::Kind::Trash { paths: vec![] },

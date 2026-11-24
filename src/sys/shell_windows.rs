@@ -382,9 +382,9 @@ mod imp {
         };
         for (path, alias, cookie) in expired {
             if let Err(err) = unsafe { windows.Revoke(cookie) } {
-                sw!("!! 撤销过期预定失败 cookie={cookie}: {err}");
+                sw!("!! 撤消过期预定失败 cookie={cookie}: {err}");
             }
-            swv!("预定过期撤销 path={path:?} alias={alias}");
+            swv!("预定过期撤消 path={path:?} alias={alias}");
         }
     }
 
@@ -500,7 +500,7 @@ mod imp {
                 // 关键动作是撤掉那条没用上的预定：否则 Shell 会一直以为「那个
                 // 目录的窗口马上就来」，白等到超时。
                 swv!(
-                    "预定未绑定，撤销 pending={pending} cookie={cookie} path={:?}",
+                    "预定未绑定，撤消 pending={pending} cookie={cookie} path={:?}",
                     pane.path
                 );
                 let _ = windows.Revoke(pending);

@@ -193,7 +193,7 @@ pub struct Config {
 }
 
 /// 当前默认隐藏项的补种代次（与 `Config::load` 里的补齐逻辑对应）。
-pub const CONTEXT_MENU_HIDE_GEN: u32 = 5;
+pub const CONTEXT_MENU_HIDE_GEN: u32 = 8;
 
 /// 侧边栏「网络位置」里的一条用户自定义项。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -266,10 +266,10 @@ pub fn default_sidebar_order() -> Vec<String> {
 /// 用 `!` 精确匹配，避免连带藏掉「复制到文件夹」这类变体。
 /// 中英两份都列：系统语言不同时靠另一份生效。
 ///
-/// 最后两条「撤销 / Undo」刻意**不带** `!`：Shell 那一项的文字跟着上一次
-/// 操作变（「撤销复制」「撤销移动」「撤销删除」/ "Undo Copy"…），精确匹配
-/// 一条都藏不掉。Rove 自己有撤销栈（Ctrl+Z），系统那项走的是 Explorer 的
-/// 历史，对不上，点下去只会让人以为撤销失灵。
+/// 最后两条「撤消 / Undo」刻意**不带** `!`：Shell 那一项的文字跟着上一次
+/// 操作变（「撤消复制」「撤消移动」「撤消删除」/ "Undo Copy"…），精确匹配
+/// 一条都藏不掉。Rove 自己有撤消栈（Ctrl+Z），系统那项走的是 Explorer 的
+/// 历史，对不上，点下去只会让人以为撤消失灵。
 pub fn default_context_menu_hide() -> Vec<String> {
     [
         "!Copy",
@@ -285,13 +285,33 @@ pub fn default_context_menu_hide() -> Vec<String> {
         "!Folder",
         "!文件夹(F)",
         // 系统菜单那两项「删除(D)」/ "Delete" 走 Explorer 的删除，Rove 记不了账
-        // （撤销栈里没有它），Rove 自己的删除项排在「剪切」下面，所以精确藏掉。
+        // （撤消栈里没有它），Rove 自己的删除项排在「剪切」下面，所以精确藏掉。
         "!删除(D)",
         "!Delete",
+        // 属性 / 重命名 / 创建快捷方式 / 桌面快捷方式：Rove 自己已有同名项
+        // （桌面快捷方式在主菜单里，系统的那个藏在「发送到」子菜单里），
+        // 系统那几项留着就是同一个功能出两份，全部精确藏掉。
+        "!属性(R)",
+        "!重命名(M)",
+        "!创建快捷方式(S)",
+        "!桌面快捷方式",
+        "!Properties",
+        "!Rename",
+        "!Create shortcut",
+        "!Desktop (create shortcut)",
+        // 「打开方式」有两种：带省略号的弹系统选择器（Rove 自己已经有同名项，
+        // 精确藏掉），不带省略号的会展开「程序」子菜单，那个保留不动。
+        // 省略号在精确匹配里是有意义的：`normalize_label` 会把结尾的点吃掉，
+        // 只靠文字分不出这两条（见 sys::menu::keyword_hit）。
+        "!打开方式(H)...",
+        "!Open with...",
+        // 兜底：万一某版系统给的带点项没有热键尾巴（`打开方式...`），
+        // 「不带点 = 展开子菜单」那条仍然匹配不上，不会被误伤。
+        "!打开方式...",
         "Undo",
-        "撤销",
+        "撤消",
         // 重做也按包含匹配：Shell 那项的文字同样会跟着操作变
-        // （「恢复复制」「恢复移动」/ "Redo Copy"…），跟撤销那两条一致。
+        // （「恢复复制」「恢复移动」/ "Redo Copy"…），跟撤消那两条一致。
         "Redo",
         "恢复",
     ]
@@ -707,10 +727,25 @@ impl Config {
             .get("context_menu_hide_gen")
             .and_then(|v| v.as_u64())
             .unwrap_or(0) as u32;
-        let seeds: [(u32, &[&str]); 3] = [
-            (3, &["Undo", "撤销"]),
+        let seeds: [(u32, &[&str]); 6] = [
+            (3, &["Undo", "撤消"]),
             (4, &["Redo", "恢复"]),
             (5, &["!删除(D)", "!Delete"]),
+            (
+                6,
+                &[
+                    "!属性(R)",
+                    "!重命名(M)",
+                    "!创建快捷方式(S)",
+                    "!桌面快捷方式",
+                    "!Properties",
+                    "!Rename",
+                    "!Create shortcut",
+                    "!Desktop (create shortcut)",
+                ],
+            ),
+            (7, &["!打开方式(H)...", "!Open with..."]),
+            (8, &["!打开方式..."]),
         ];
         if config.context_menu_hide_gen < CONTEXT_MENU_HIDE_GEN {
             for (gen, keywords) in seeds {

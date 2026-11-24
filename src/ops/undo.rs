@@ -1,21 +1,21 @@
-//! 撤销 / 重做栈。
+//! 撤消 / 重做栈。
 //!
-//! 为什么自己记账，而不是借 Windows Shell 的撤销栈：Shell 那份历史挂在
+//! 为什么自己记账，而不是借 Windows Shell 的撤消栈：Shell 那份历史挂在
 //! **资源管理器自己的视图实例**上（`FOFX_ADDUNDORECORD` 只是往当前视图的
-//! 撤销管理器里登记）。Rove 的列表不是 Shell 视图，操作又发生在后台线程，
-//! 进程里没有那个视图，所以「问 Shell 有没有可撤销项」永远问不到东西。
+//! 撤消管理器里登记）。Rove 的列表不是 Shell 视图，操作又发生在后台线程，
+//! 进程里没有那个视图，所以「问 Shell 有没有可撤消项」永远问不到东西。
 //!
 //! 记自己的账换来的是：复制 / 移动 / 重命名 / 新建 / 删除到回收站全都能撤，
 //! 而且不依赖 Shell 有没有记录（别的程序删的文件我们当然管不了）。
 //!
-//! 每条记录同时描述「正向」和「反向」两个动作，所以撤销与重做共用一份数据：
-//! - 撤销：把记录反向执行一遍，然后压进重做栈；
-//! - 重做：把记录正向再执行一遍，然后压回撤销栈。
+//! 每条记录同时描述「正向」和「反向」两个动作，所以撤消与重做共用一份数据：
+//! - 撤消：把记录反向执行一遍，然后压进重做栈；
+//! - 重做：把记录正向再执行一遍，然后压回撤消栈。
 
 use crate::logv;
 use std::path::{Path, PathBuf};
 
-/// 撤销栈最多保留多少步。每条记录只存路径，40 条撑死几百 KB。
+/// 撤消栈最多保留多少步。每条记录只存路径，40 条撑死几百 KB。
 pub const MAX_UNDO: usize = 40;
 
 /// 单条记录允许携带的路径条数上限。
@@ -27,7 +27,7 @@ pub const MAX_ENTRY_PATHS: usize = 2_000;
 /// 一个「新建出来的文件夹」的身份。
 ///
 /// 卷序列号 + 文件索引（NTFS 的 FileId）是对象本身的名字，不是路径的名字：
-/// 用户在我们撤销之前把那个文件夹删了、又新建了一个同名的，路径一模一样，
+/// 用户在我们撤消之前把那个文件夹删了、又新建了一个同名的，路径一模一样，
 /// 但 FileId 不同 —— 这时候绝不能拿它当「我新建的那个」删掉。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirId {
@@ -90,7 +90,7 @@ pub fn capture_dir_id(_path: &Path) -> Option<DirId> {
     None
 }
 
-/// 一次可撤销的文件操作。
+/// 一次可撤消的文件操作。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// 删除到回收站。
@@ -105,7 +105,7 @@ pub enum Kind {
     Move { pairs: Vec<(PathBuf, PathBuf)> },
     /// 重命名：`(旧路径, 新路径)`。
     Rename { pairs: Vec<(PathBuf, PathBuf)> },
-    /// 新建的文件夹（带身份，撤销前要核对）。
+    /// 新建的文件夹（带身份，撤消前要核对）。
     Create { dirs: Vec<CreatedDir> },
 }
 
@@ -163,17 +163,17 @@ impl Kind {
         dirs
     }
 
-    /// 空白处右键菜单的「撤销 X」文字（中文键，交给 `i18n::text` 翻译）。
+    /// 空白处右键菜单的「撤消 X」文字（中文键，交给 `i18n::text` 翻译）。
     ///
-    /// 用整串而不是「撤销」+动词拼：英文要的是 "Undo copy"，中文要的是
-    /// 「撤销复制」，拼起来得先知道当前语言，查表最省事。
+    /// 用整串而不是「撤消」+动词拼：英文要的是 "Undo copy"，中文要的是
+    /// 「撤消复制」，拼起来得先知道当前语言，查表最省事。
     pub fn undo_label(&self) -> &'static str {
         match self {
-            Kind::Trash { .. } => "撤销删除",
-            Kind::Copy { .. } => "撤销复制",
-            Kind::Move { .. } => "撤销移动",
-            Kind::Rename { .. } => "撤销重命名",
-            Kind::Create { .. } => "撤销新建",
+            Kind::Trash { .. } => "撤消删除",
+            Kind::Copy { .. } => "撤消复制",
+            Kind::Move { .. } => "撤消移动",
+            Kind::Rename { .. } => "撤消重命名",
+            Kind::Create { .. } => "撤消新建",
         }
     }
 
@@ -189,7 +189,7 @@ impl Kind {
     }
 }
 
-/// 撤销 / 重做两个栈。
+/// 撤消 / 重做两个栈。
 #[derive(Default)]
 pub struct UndoStack {
     undo: Vec<Kind>,
@@ -201,7 +201,7 @@ impl UndoStack {
         Self::default()
     }
 
-    /// 记下一次新操作：撤销栈增长，重做栈作废（标准的撤销语义）。
+    /// 记下一次新操作：撤消栈增长，重做栈作废（标准的撤消语义）。
     ///
     /// 路径太多的记录直接丢掉：记下来也回退不动，还白占内存。
     pub fn record(&mut self, kind: Kind) {
@@ -209,13 +209,13 @@ impl UndoStack {
         // 「重做」指向的那一步已经被它盖掉 —— 跟记不记得下来无关。
         self.redo.clear();
         // 空记录（一条路径都没有）记了也没用：它只会占着栈顶显示一个
-        // 什么都撤不掉的「撤销 X」。
+        // 什么都撤不掉的「撤消 X」。
         if kind.path_count() == 0 {
             return;
         }
         if kind.path_count() > MAX_ENTRY_PATHS {
             logv!(
-                "[undo] 记录过大（{} 条路径），不加入撤销栈",
+                "[undo] 记录过大（{} 条路径），不加入撤消栈",
                 kind.path_count()
             );
             return;
@@ -226,7 +226,7 @@ impl UndoStack {
         }
     }
 
-    /// 撤销栈顶的记录（不弹出，等任务真的提交成功再弹）。
+    /// 撤消栈顶的记录（不弹出，等任务真的提交成功再弹）。
     pub fn peek_undo(&self) -> Option<&Kind> {
         self.undo.last()
     }
@@ -236,14 +236,14 @@ impl UndoStack {
         self.redo.last()
     }
 
-    /// 撤销任务已经提交：从撤销栈挪到重做栈。
+    /// 撤消任务已经提交：从撤消栈挪到重做栈。
     pub fn take_undo(&mut self) -> Option<Kind> {
         let kind = self.undo.pop()?;
         self.redo.push(kind.clone());
         Some(kind)
     }
 
-    /// 重做任务已经提交：从重做栈挪回撤销栈。
+    /// 重做任务已经提交：从重做栈挪回撤消栈。
     pub fn take_redo(&mut self) -> Option<Kind> {
         let kind = self.redo.pop()?;
         self.undo.push(kind.clone());
@@ -264,7 +264,7 @@ impl UndoStack {
         }
     }
 
-    /// 撤销 / 重做**彻底失败**（不是用户取消）时用：把记录从另一侧扔掉。
+    /// 撤消 / 重做**彻底失败**（不是用户取消）时用：把记录从另一侧扔掉。
     ///
     /// 不扔的话它会一直顶在栈顶，每按一次 Ctrl+Z 都重试同一条、每次都失败，
     /// 更早的历史就永远撤不到了（「回收站里已经找不到」这种失败是永久的）。
@@ -285,8 +285,8 @@ impl UndoStack {
         !self.redo.is_empty()
     }
 
-    /// 清空两个栈。不可撤销的操作（彻底删除）之后必须调用：
-    /// 否则下一次 Ctrl+Z 会悄悄跳过它，去撤销更早的那次操作 ——
+    /// 清空两个栈。不可撤消的操作（彻底删除）之后必须调用：
+    /// 否则下一次 Ctrl+Z 会悄悄跳过它，去撤消更早的那次操作 ——
     /// 用户以为「删掉的那批又回来了」，其实动的是别的东西。
     pub fn clear(&mut self) {
         self.undo.clear();
@@ -298,7 +298,7 @@ impl UndoStack {
 ///
 /// 没有同名冲突时 `dest/源文件名` 就是答案；系统给冲突项改名成
 /// `名字 (2).后缀` 时按词干前缀再找一次。对不上的源直接跳过——
-/// 宁可少一条可撤销的项，也不能把 A 的位置记成 B 的。
+/// 宁可少一条可撤消的项，也不能把 A 的位置记成 B 的。
 pub fn pair_created(sources: &[PathBuf], created: &[PathBuf]) -> Vec<(PathBuf, PathBuf)> {
     let mut used = vec![false; created.len()];
     let mut pairs = Vec::new();
@@ -362,7 +362,7 @@ mod tests {
         }
     }
 
-    /// 新操作必须清空重做栈，否则「撤销 → 做点别的 → 重做」会把中间那次
+    /// 新操作必须清空重做栈，否则「撤消 → 做点别的 → 重做」会把中间那次
     /// 操作的结果覆盖掉。
     #[test]
     fn new_record_clears_redo() {
@@ -374,7 +374,7 @@ mod tests {
         assert!(!stack.can_redo());
     }
 
-    /// 撤销 / 重做必须在两个栈之间来回搬，不能丢也不能重复。
+    /// 撤消 / 重做必须在两个栈之间来回搬，不能丢也不能重复。
     #[test]
     fn undo_and_redo_move_between_stacks() {
         let mut stack = UndoStack::new();
@@ -479,7 +479,7 @@ mod tests {
     }
 
     /// 身份必须是「对象」的身份，不是「路径」的身份：同名文件夹删了重建，
-    /// 路径一样但身份必须不同 —— 撤销就靠这个区别决定能不能删。
+    /// 路径一样但身份必须不同 —— 撤消就靠这个区别决定能不能删。
     #[test]
     #[cfg(windows)]
     fn dir_identity_distinguishes_a_recreated_folder() {
@@ -489,7 +489,7 @@ mod tests {
         let target = root.join("新建文件夹");
         std::fs::create_dir(&target).unwrap();
         let first = capture_dir_id(&target).expect("新建的目录必须能采到身份");
-        // 同一个对象重复采集要稳定，否则撤销永远对不上。
+        // 同一个对象重复采集要稳定，否则撤消永远对不上。
         assert_eq!(Some(first), capture_dir_id(&target));
         std::fs::remove_dir(&target).unwrap();
         std::fs::create_dir(&target).unwrap();
@@ -498,7 +498,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// 撤销要刷新的目录：移动要同时刷源目录和目标目录。
+    /// 撤消要刷新的目录：移动要同时刷源目录和目标目录。
     #[test]
     fn affected_dirs_cover_both_sides() {
         let kind = Kind::Move {

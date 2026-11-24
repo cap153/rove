@@ -213,6 +213,24 @@ mod imp {
     /// `SEE_MASK_INVOKEIDLIST` 调用 `properties` 动词。这样由回收站自己的 Shell
     /// 扩展提供属性页（原位置 / 删除时间），而不是显示 `$R` 临时文件的属性。
     pub fn show_properties(parsing_name: &Path) -> Result<(), String> {
+        invoke_verb_on_idlist(parsing_name, "properties", "属性")
+    }
+
+    /// 弹系统「打开方式…」选择器。
+    ///
+    /// 走 Shell 的 `openas` 动词：跟资源管理器右键「打开方式…」拉起来的是同一个
+    /// 对话框（Win10/11 是 `OpenWith.exe`），能选已注册程序，也能「在电脑上查找
+    /// 其他应用」。**默认关联改不了**：Windows 禁止程序写 UserChoice，「始终使用」
+    /// 那个勾选只能由系统对话框自己落盘。
+    pub fn show_open_with(path: &Path) -> Result<(), String> {
+        invoke_verb_on_idlist(path, "openas", "「打开方式」")
+    }
+
+    /// 把路径解析成绝对 PIDL，再用 `SEE_MASK_INVOKEIDLIST` 调一个 Shell 动词。
+    ///
+    /// 走 IDList 而不是 `lpFile`：回收站的条目只有 parsing name（`$R` 临时文件
+    /// 的真实路径不存在），只有 PIDL 这条路能让回收站自己的 Shell 扩展接住。
+    fn invoke_verb_on_idlist(parsing_name: &Path, verb_name: &str, what: &str) -> Result<(), String> {
         use std::os::windows::ffi::OsStrExt;
         // COM 用项目已启用 feature 的 `windows` crate；Shell 结构体用 `windows-sys`
         // 的 POD 定义（windows-sys 未启用 Win32_System_Com）。
@@ -230,7 +248,7 @@ mod imp {
         }
         let mut name: Vec<u16> = parsing_name.as_os_str().encode_wide().collect();
         name.push(0);
-        let verb: Vec<u16> = "properties".encode_utf16().chain([0]).collect();
+        let verb: Vec<u16> = verb_name.encode_utf16().chain([0]).collect();
         let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
         let mut attrs: u32 = 0;
         unsafe {
@@ -254,10 +272,134 @@ mod imp {
             let ok = ShellExecuteExW(&mut info);
             CoTaskMemFree(Some(pidl as *const std::ffi::c_void));
             if ok == 0 {
-                return Err("Shell 未能打开属性对话框".to_string());
+                return Err(format!("Shell 未能打开{what}对话框"));
             }
         }
         Ok(())
+    }
+
+    /// 给一组目标建快捷方式（`.lnk`）。
+    ///
+    /// `to_desktop = true` → 全建到桌面；否则建在各自所在目录。
+    /// `suffix` 是文件名里的那半截（「<名字> - 快捷方式.lnk」），跟界面语言走。
+    /// 会碰磁盘 + COM，调用方必须放到后台线程上跑。
+    pub fn create_shortcuts(
+        paths: &[PathBuf],
+        to_desktop: bool,
+        suffix: &str,
+    ) -> Result<usize, String> {
+        use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+
+        if paths.is_empty() {
+            return Err("没有选中项".into());
+        }
+        let desktop = if to_desktop {
+            Some(desktop_dir()?)
+        } else {
+            None
+        };
+        // 线程上可能已经初始化过 COM（S_FALSE 也算成功，要配对 CoUninitialize）；
+        // 只有真的初始化成功才反初始化，否则会把别人的引用计数弄乱。
+        let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+        let mut made = 0usize;
+        let mut last_err = String::new();
+        for target in paths {
+            match unsafe { make_one_shortcut(target, desktop.as_deref(), suffix) } {
+                Ok(_) => made += 1,
+                Err(e) => last_err = e,
+            }
+        }
+        if initialized {
+            unsafe { CoUninitialize() };
+        }
+        if made == 0 {
+            return Err(if last_err.is_empty() {
+                "没有可创建的目标".to_string()
+            } else {
+                last_err
+            });
+        }
+        Ok(made)
+    }
+
+    /// 桌面目录的真实文件路径（不是虚拟命名空间）。
+    fn desktop_dir() -> Result<PathBuf, String> {
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{SHGetKnownFolderPath, FOLDERID_Desktop};
+
+        unsafe {
+            let raw = SHGetKnownFolderPath(&FOLDERID_Desktop, Default::default(), None)
+                .map_err(|e| format!("拿不到桌面路径（0x{:08X}）", e.code().0 as u32))?;
+            let text = raw.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(raw.0 as *const std::ffi::c_void));
+            if text.is_empty() {
+                return Err("拿不到桌面路径".to_string());
+            }
+            Ok(PathBuf::from(text))
+        }
+    }
+
+    /// 建一个 `.lnk`，返回落盘路径。
+    unsafe fn make_one_shortcut(
+        target: &Path,
+        desktop: Option<&Path>,
+        suffix: &str,
+    ) -> Result<PathBuf, String> {
+        use windows::core::{Interface, PCWSTR};
+        use windows::Win32::System::Com::{CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER};
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
+
+        fn wide(p: &Path) -> Vec<u16> {
+            use std::os::windows::ffi::OsStrExt as _;
+            p.as_os_str().encode_wide().chain([0]).collect()
+        }
+
+        let dir = desktop
+            .map(|d| d.to_path_buf())
+            .or_else(|| target.parent().map(|p| p.to_path_buf()))
+            .ok_or_else(|| "找不到目标所在文件夹".to_string())?;
+        let name = target
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| target.to_string_lossy().into_owned());
+        // 盘符根（`C:\`）没有 file_name，整串里有 `:` `\` 这些非法字符，
+        // 不换掉的话 IPersistFile::Save 会直接失败。换成 `_` 至少能建出来。
+        let name: String = name
+            .chars()
+            .map(|c| if "\\/:*?\"<>|".contains(c) { '_' } else { c })
+            .collect();
+        // 资源管理器的命名规则：「<原名> - 快捷方式.lnk」，重名就加「(2)」。
+        let stem = format!("{name} - {suffix}");
+        let mut link_path = dir.join(format!("{stem}.lnk"));
+        let mut n = 2u32;
+        while link_path.exists() {
+            if n > 999 {
+                return Err("同名快捷方式太多了".to_string());
+            }
+            link_path = dir.join(format!("{stem} ({n}).lnk"));
+            n += 1;
+        }
+
+        let link: IShellLinkW = CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)
+            .map_err(|e| format!("创建 Shell 链接失败（0x{:08X}）", e.code().0 as u32))?;
+        let target_w = wide(target);
+        link.SetPath(PCWSTR(target_w.as_ptr()))
+            .map_err(|e| format!("设置快捷方式目标失败（0x{:08X}）", e.code().0 as u32))?;
+        // 可执行文件双击时资源管理器会把工作目录设成它所在文件夹，这里跟着一致
+        // （否则程序会以 %SystemRoot%\System32 之类的目录为工作目录启动）。
+        if !target.is_dir() {
+            if let Some(parent) = target.parent() {
+                let parent_w = wide(parent);
+                let _ = link.SetWorkingDirectory(PCWSTR(parent_w.as_ptr()));
+            }
+        }
+        let file: IPersistFile = link
+            .cast()
+            .map_err(|_| "Shell 链接不支持 IPersistFile".to_string())?;
+        let link_w = wide(&link_path);
+        file.Save(PCWSTR(link_w.as_ptr()), true)
+            .map_err(|e| format!("写入快捷方式失败（0x{:08X}）", e.code().0 as u32))?;
+        Ok(link_path)
     }
 
     /// `ShellExecuteExW` 的错误码 → 人话。
@@ -352,6 +494,16 @@ mod imp {
     }
     pub fn show_properties(_parsing_name: &Path) -> Result<(), String> {
         Err("属性对话框仅在 Windows 支持".into())
+    }
+    pub fn show_open_with(_path: &Path) -> Result<(), String> {
+        Err("「打开方式」对话框仅在 Windows 支持".into())
+    }
+    pub fn create_shortcuts(
+        _paths: &[PathBuf],
+        _to_desktop: bool,
+        _suffix: &str,
+    ) -> Result<usize, String> {
+        Err("创建快捷方式仅在 Windows 支持".into())
     }
 }
 

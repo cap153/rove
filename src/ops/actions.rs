@@ -48,11 +48,8 @@ pub struct ActionEntry {
 /// 不再需要单独开关；启动时从 actions.toml 里清掉历史残留。
 pub const RETIRED_BUILTINS: &[&str] = &[
     "builtin.open",
-    "builtin.open_with",
     "builtin.sendto",
-    "builtin.rename",
     "builtin.delete",
-    "builtin.properties",
 ];
 
 /// 内置右键动作元数据（与 Rust 内建操作一一对应，由 actions.toml 开关控制显隐）。
@@ -89,7 +86,7 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
         },
         // 「删除」紧跟在「剪切」下面：它与复制/剪切同一类（作用于选中项），
         // 而且必须走 Rove 自己的任务队列 —— 系统菜单那一项调的是 Explorer 的
-        // 删除，Rove 记不了账（撤销栈里没有它），所以默认把它藏掉。
+        // 删除，Rove 记不了账（撤消栈里没有它），所以默认把它藏掉。
         ActionEntry {
             id: "builtin.trash".into(),
             label: "删除".into(),
@@ -98,6 +95,53 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             args: "".into(),
             working_dir: "".into(),
             target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        // 「属性」/「重命名」紧跟在「删除」下面：系统菜单也有这两项，但系统
+        // 项只是对话框，Rove 自己的重命名要接 F2 那套行内编辑，属性要在
+        // 系统菜单被藏掉时仍然可用。
+        ActionEntry {
+            id: "builtin.properties".into(),
+            label: "属性".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.rename".into(),
+            label: "重命名".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        // 「打开方式」：走 Shell 的 openas 动词，弹出跟资源管理器同一个原生选择器。
+        // 系统菜单里带省略号的那一项默认被关键词藏掉；不带省略号的（展开程序
+        // 子菜单的那种）保留原样。
+        ActionEntry {
+            id: "builtin.open_with".into(),
+            label: "打开方式".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            // 只对文件出现：Shell 的 openas 动词是给文件用的，文件夹右键系统
+            // 菜单里也没有「打开方式」这一项。
+            target: "file".into(),
             extensions: vec![],
             enabled: true,
             group: "".into(),
@@ -123,6 +167,34 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
         ActionEntry {
             id: "builtin.batch_rename".into(),
             label: "批量重命名".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        // 两个快捷方式动作紧跟在「批量重命名」下面：都是「对一个/一组文件产出一个
+        // 新东西」的操作，摆在一起更好认。
+        ActionEntry {
+            id: "builtin.create_shortcut".into(),
+            label: "创建快捷方式".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        ActionEntry {
+            id: "builtin.send_to_desktop".into(),
+            label: "桌面快捷方式".into(),
             tool: "".into(),
             program: "".into(),
             args: "".into(),
@@ -782,23 +854,53 @@ mod tests {
         assert!(!f.matches_selection(&[], |_| None));
     }
 
-    /// 一级菜单前四项的顺序：复制 / 剪切 / 删除 / 复制路径。
+    /// 一级菜单前六项的顺序：复制 / 剪切 / 删除 / 属性 / 重命名 / 复制路径。
     /// heal_full 会把内置动作按本函数顺序重排，所以只靠这里的顺序就成。
     #[test]
     fn copy_path_sits_right_below_cut() {
         let actions = builtin_actions();
         let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
         assert_eq!(
-            &ids[..5],
+            &ids[..7],
             &[
                 "builtin.copy",
                 "builtin.move",
                 // 「删除」插在剪切下面（系统那一项不记账，见 default_context_menu_hide）。
                 "builtin.trash",
+                // 「属性」/「重命名」紧跟删除，与系统菜单的习惯顺序一致。
+                "builtin.properties",
+                "builtin.rename",
+                // 「打开方式」跟在重命名后面。
+                "builtin.open_with",
                 "builtin.copy_path",
-                // 批量重命名紧跟「复制路径」：一级菜单里也在这个位置。
-                "builtin.batch_rename",
             ],
         );
+    }
+
+    /// 「打开方式」只对文件出现（文件夹没有这个概念）。
+    #[test]
+    fn open_with_is_file_only() {
+        let entry = builtin_actions()
+            .into_iter()
+            .find(|a| a.id == "builtin.open_with")
+            .unwrap();
+        assert_eq!(entry.target, "file");
+        let file = [PathBuf::from(r"C:.txt")];
+        let dir = [PathBuf::from(r"C:")];
+        assert!(entry.matches_selection(&file, |_| Some(false)));
+        assert!(!entry.matches_selection(&dir, |_| Some(true)));
+    }
+
+    /// 两个快捷方式动作必须紧跟在「批量重命名」下面。
+    #[test]
+    fn shortcuts_sit_right_below_batch_rename() {
+        let actions = builtin_actions();
+        let ids: Vec<&str> = actions.iter().map(|a| a.id.as_str()).collect();
+        let batch = ids
+            .iter()
+            .position(|id| *id == "builtin.batch_rename")
+            .expect("批量重命名项不见了");
+        assert_eq!(ids[batch + 1], "builtin.create_shortcut");
+        assert_eq!(ids[batch + 2], "builtin.send_to_desktop");
     }
 }

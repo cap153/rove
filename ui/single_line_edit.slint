@@ -139,11 +139,11 @@ export component SingleLineEdit inherits Rectangle {
 
     // 编辑框右键菜单：Slint 内置 ContextMenuArea（官方文档中 LineEdit 同款实现）。
     // 之前地址栏 / 搜索框 / 重命名框右键完全没有反应；这里统一补齐标准的
-    // 撤销 / 重做 / 剪切 / 复制 / 粘贴 / 全选，且只在可编辑时启用破坏性命令。
+    // 撤消 / 重做 / 剪切 / 复制 / 粘贴 / 全选，且只在可编辑时启用破坏性命令。
     ctx-area := ContextMenuArea {
         Menu {
             MenuItem {
-                title: I18n.strings[235]; // 撤销 / Undo
+                title: I18n.strings[235]; // 撤消 / Undo
                 activated => { input.undo(); }
             }
             MenuItem {

@@ -193,12 +193,25 @@ pub(crate) fn normalize_label(label: &str) -> String {
     s.trim().trim_end_matches('.').trim_end_matches('…').trim().to_string()
 }
 
-/// 关键词是否命中菜单项。`label` 必须已经过 [`normalize_label`]。
-/// 普通关键词 = **包含**即命中；`!` 开头 = **精确相等**（`!` 本身不参与比较）。
+/// 菜单标签结尾有没有省略号（`…` / `...`）。
+///
+/// 系统菜单里的「打开方式」有两种写法：带点的（弹系统选择器）和不带点的
+/// （展开「程序」子菜单）。[`normalize_label`] 会把结尾的点吃掉，两者归一化
+/// 之后一模一样，所以精确匹配还得回头看原始标签有没有点。
+pub(crate) fn has_trailing_dots(label: &str) -> bool {
+    let s = label.trim_end();
+    s.ends_with('…') || s.ends_with('.')
+}
+
+/// 关键词是否命中菜单项。`label` 传**原始标签**，内部自己归一化。
+/// 普通关键词 = **包含**即命中；`!` 开头 = **精确相等**（`!` 本身不参与比较），
+/// 且省略号也必须一致：`!Open with...` 只藏带点的那条，不带点的子菜单项留着。
 pub(crate) fn keyword_hit(label: &str, keywords: &[String]) -> bool {
-    if label.is_empty() {
+    let label_text = normalize_label(label);
+    if label_text.is_empty() {
         return false;
     }
+    let label_dots = has_trailing_dots(label);
     keywords.iter().any(|keyword| {
         let keyword = keyword.trim();
         if keyword.is_empty() {
@@ -206,8 +219,10 @@ pub(crate) fn keyword_hit(label: &str, keywords: &[String]) -> bool {
         }
         // 全角的「！」也当 `!` 用：中文输入法下很容易打出来。
         match keyword.strip_prefix('!').or_else(|| keyword.strip_prefix('！')) {
-            Some(exact) => normalize_label(exact) == label,
-            None => label.contains(&normalize_label(keyword)),
+            Some(exact) => {
+                normalize_label(exact) == label_text && has_trailing_dots(exact) == label_dots
+            }
+            None => label_text.contains(&normalize_label(keyword)),
         }
     })
 }
@@ -227,7 +242,7 @@ mod tests {
 
     fn hit(label: &str, keywords: &[&str]) -> bool {
         let keywords: Vec<String> = keywords.iter().map(|k| k.to_string()).collect();
-        keyword_hit(&normalize_label(label), &keywords)
+        keyword_hit(label, &keywords)
     }
 
     #[test]
@@ -276,6 +291,44 @@ mod tests {
         assert!(!hit("Open (new window)", &["!Open"]));
     }
 
+    /// 属性 / 重命名 / 创建快捷方式 / 桌面快捷方式的默认隐藏关键词
+    /// 必须能真的命中系统菜单的实际文字（带热键尾巴的按带尾巴写）。
+    #[test]
+    fn default_hide_keywords_hit_real_shell_labels() {
+        let hide = crate::config::default_context_menu_hide();
+        let hide: Vec<&str> = hide.iter().map(|s| s.as_str()).collect();
+        assert!(hit("属性(R)", &hide));
+        assert!(hit("重命名(M)", &hide));
+        assert!(hit("创建快捷方式(S)", &hide));
+        assert!(hit("桌面快捷方式", &hide));
+        assert!(hit("Properties", &hide));
+        assert!(hit("Rename", &hide));
+        assert!(hit("Create shortcut", &hide));
+        // 英文系统把「桌面快捷方式」写作带括号的长名。
+        assert!(hit("Desktop (create shortcut)", &hide));
+        // 不能误伤：Rove 自己那些项没有热键尾巴。
+        assert!(!hit("新建文件夹", &hide));
+    }
+
+    /// 「打开方式」在系统菜单里有两种写法：带省略号的弹原生选择器（Rove 自己
+    /// 已经有同名项，默认藏掉），不带省略号的会展开「程序」子菜单（保留）。
+    /// 两者归一化后文字一模一样，只能靠结尾的省略号区分。
+    #[test]
+    fn ellipsis_distinguishes_the_two_open_with_items() {
+        let hide = crate::config::default_context_menu_hide();
+        let hide: Vec<&str> = hide.iter().map(|s| s.as_str()).collect();
+        assert!(hit("打开方式(H)...", &hide));
+        assert!(hit("Open with...", &hide));
+        // 有的系统版本不带热键尾巴，带点的仍然要能命中。
+        assert!(hit("打开方式...", &hide));
+        // 不带点的那条：展开子菜单，必须留着。
+        assert!(!hit("打开方式(H)", &hide));
+        assert!(!hit("Open with", &hide));
+        assert!(!hit("打开方式", &hide));
+        // 精确匹配只认这几种写法，别的变体不受影响。
+        assert!(!hit("用其他应用打开", &hide));
+    }
+
     #[test]
     fn blank_keywords_are_ignored() {
         assert!(!hit("Open", &[""]));
@@ -283,8 +336,8 @@ mod tests {
         assert!(!hit("Open", &[]));
     }
 
-    /// Shell 的撤销项文字跟着上一次操作变，只能靠包含匹配全藏掉；
-    /// 同时不能误伤名字里带「撤销」字样的第三方项以外的东西 —— 这里只钉
+    /// Shell 的撤消项文字跟着上一次操作变，只能靠包含匹配全藏掉；
+    /// 同时不能误伤名字里带「撤消」字样的第三方项以外的东西 —— 这里只钉
     /// 「必须藏掉」的那几种写法。
     #[test]
     fn default_keywords_hide_every_shell_undo_variant() {
@@ -295,15 +348,15 @@ mod tests {
             "Undo Move",
             "Undo Delete",
             "Undo Rename",
-            "撤销",
-            "撤销复制",
-            "撤销移动",
-            "撤销删除",
-            "撤销重命名",
+            "撤消",
+            "撤消复制",
+            "撤消移动",
+            "撤消删除",
+            "撤消重命名",
         ] {
             assert!(
-                keyword_hit(&normalize_label(label), &kw),
-                "默认项应当藏掉撤销变体 {label}"
+                keyword_hit(label, &kw),
+                "默认项应当藏掉撤消变体 {label}"
             );
         }
     }
@@ -315,7 +368,7 @@ mod tests {
         let kw = crate::config::default_context_menu_hide();
         for label in ["删除(D)", "Delete"] {
             assert!(
-                keyword_hit(&normalize_label(label), &kw),
+                keyword_hit(label, &kw),
                 "默认项应当藏掉 {label}"
             );
         }
@@ -323,13 +376,13 @@ mod tests {
         assert!(!hit("删除到文件夹", &["!删除(D)"]));
     }
 
-    /// 重做项跟撤销项一样按包含匹配：Shell 的文字会跟着上一次操作变。
+    /// 重做项跟撤消项一样按包含匹配：Shell 的文字会跟着上一次操作变。
     #[test]
     fn default_keywords_hide_every_shell_redo_variant() {
         let kw = crate::config::default_context_menu_hide();
         for label in ["Redo", "Redo Copy", "Redo Move", "Redo Delete", "恢复", "恢复复制", "恢复移动"] {
             assert!(
-                keyword_hit(&normalize_label(label), &kw),
+                keyword_hit(label, &kw),
                 "默认项应当藏掉重做变体 {label}"
             );
         }
@@ -353,7 +406,7 @@ mod tests {
             "文件夹(F)",
         ] {
             assert!(
-                keyword_hit(&normalize_label(label), &kw),
+                keyword_hit(label, &kw),
                 "默认项应当藏掉 {label}"
             );
         }
@@ -367,7 +420,7 @@ mod tests {
             "取消固定到快速访问",
         ] {
             assert!(
-                !keyword_hit(&normalize_label(label), &kw),
+                !keyword_hit(label, &kw),
                 "默认项不能误伤 {label}"
             );
         }

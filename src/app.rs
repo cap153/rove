@@ -1193,7 +1193,7 @@ pub struct App {
     cur_col_widths: [[f32; 4]; 2],
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
-    /// 撤销 / 重做栈（见 `ops::undo`）。
+    /// 撤消 / 重做栈（见 `ops::undo`）。
     pub undo: crate::ops::undo::UndoStack,
     /// 用户最后一次自己滚动列表（滚轮 / 拖滚动条）的时刻。
     /// 「空闲时静默重排」靠它避开正在滚动的情形，否则滚到一半列表自己跳一下。
@@ -8899,6 +8899,9 @@ impl App {
 
                 for a in groups.remove("").unwrap_or_default() {
                     let mut label = self.tr(&a.label).to_string();
+                    // 「重命名」只对单个条目有意义（F2 那套行内编辑一次只改一个），
+                    // 多选时置灰，而不是弹出来再报错。
+                    let enabled = !(a.id == "builtin.rename" && paths.len() != 1);
                     // 终端：非目录时改标签。判断用已加载的条目表，
                     // 不在界面线程上 stat（网络路径的 is_dir() 会卡住）。
                     if a.id == "builtin.terminal" {
@@ -8916,7 +8919,7 @@ impl App {
                     nodes.push(MenuNode::Item {
                         key: format!("act:{}", a.id),
                         label,
-                        enabled: true,
+                        enabled,
                         checked: false,
                     });
                 }
@@ -8931,7 +8934,7 @@ impl App {
                             .map(|a| MenuNode::Item {
                                 key: format!("act:{}", a.id),
                                 label: self.tr(&a.label).to_string(),
-                                enabled: true,
+                                enabled: !(a.id == "builtin.rename" && paths.len() != 1),
                                 checked: false,
                             })
                             .collect(),
@@ -8946,7 +8949,7 @@ impl App {
                 // 「属性」不在这里：真实文件夹由系统菜单提供，
                 // 虚拟根（此电脑 / 回收站）本来也拿不到它。
                 let mut nodes: Vec<MenuNode> = Vec::new();
-                // 撤销 / 重做摆最顶上：栈里有东西才出现，撤销永远在恢复上面。
+                // 撤消 / 重做摆最顶上：栈里有东西才出现，撤消永远在恢复上面。
                 // 回收站走的是上面的专用菜单，拿不到这里。
                 if let Some(kind) = self.undo.peek_undo() {
                     nodes.push(item("undo", self.tr(kind.undo_label()).as_str(), true));
@@ -8971,11 +8974,11 @@ impl App {
                     },
                     item(CMD_NEW_FOLDER, self.tr("新建文件夹").as_str(), true),
                     MenuNode::Separator,
-                    item(CMD_TERMINAL, self.tr("在此处打开终端").as_str(), true),
                     item(CMD_REFRESH, self.tr("刷新").as_str(), true),
                     item(CMD_SELECT_ALL, self.tr("全选").as_str(), true),
                     item(CMD_INVERT_SELECTION, self.tr("反选").as_str(), true),
-                    item(CMD_MANAGE_ACTIONS, self.tr("管理右键动作...").as_str(), true),
+                    item(CMD_MANAGE_ACTIONS, self.tr("管理右键动作").as_str(), true),
+                    item(CMD_TERMINAL, self.tr("在此处打开终端").as_str(), true),
                     MenuNode::Submenu {
                         label: self.tr("视图").to_string(),
                         enabled: true,
@@ -10856,7 +10859,7 @@ impl App {
                 self.state.cut_paths.remove(path);
                 // 记账**不能**挂在下面「找到显示位置」那个 if 里：改名时条目
                 // 可能根本不在当前列表里（搜索 / 类型筛选过滤掉了，或者列举还
-                // 没到），那样这次改名就悄悄进不了撤销栈。
+                // 没到），那样这次改名就悄悄进不了撤消栈。
                 self.undo.record(crate::ops::undo::Kind::Rename {
                     pairs: vec![(path.to_path_buf(), new_path.clone())],
                 });
@@ -11361,7 +11364,7 @@ impl App {
             return;
         }
 
-        // 0.2 空白处右键菜单最顶上的撤销 / 重做（不依赖选中项和当前目录）。
+        // 0.2 空白处右键菜单最顶上的撤消 / 重做（不依赖选中项和当前目录）。
         if id == "undo" {
             self.history_action(false);
             return;
@@ -11450,9 +11453,109 @@ impl App {
                     return;
                 }
                 // 与 Del 键同一条路径（删除到回收站）。系统菜单那一项不记账，
-                // 所以默认藏掉它、改用这一条，撤销栈才能覆盖删除。
+                // 所以默认藏掉它、改用这一条，撤消栈才能覆盖删除。
                 "builtin.trash" => {
                     self.delete_selection(true);
+                    return;
+                }
+                // 属性 / 重命名：系统菜单也有这两项，但自己实现才能保证
+                // 系统菜单被关键词过滤掉以后功能还在（重命名还要接 F2 那条路）。
+                "builtin.properties" => {
+                    if let MenuScope::Selection(paths) = &target {
+                        // Shell 的 properties 动词一次只处理一个条目，多选时显示第一项。
+                        if let Some(p) = paths.first() {
+                            if let Err(e) = crate::sys::shell::show_properties(p) {
+                                self.set_status_job(self.trf("无法显示属性：{}", &[e.to_string()]));
+                            }
+                        }
+                    }
+                    return;
+                }
+                "builtin.rename" => {
+                    if let MenuScope::Selection(paths) = &target {
+                        if paths.len() == 1 {
+                            let path = paths[0].clone();
+                            // 与 F2 同一条路：先清拖拽上睾锁，否则输入框接管鼠标后
+                            // TouchArea 收不到 up 事件，滚轮/滚动会永久冻住。
+                            self.drag_pending = None;
+                            self.ui.invoke_set_drag_armed(false);
+                            self.begin_rename(&path);
+                        }
+                    }
+                    return;
+                }
+                "builtin.open_with" => {
+                    if let MenuScope::Selection(paths) = &target {
+                        // Shell 的选择器一次只处理一个文件（与「属性」同规矩）。
+                        if let Some(first) = paths.first().cloned() {
+                            // ShellExecuteEx 冷启动 OpenWith.exe 要几十毫秒到几百
+                            // 毫秒，不放 UI 线程上赌运气。
+                            std::thread::spawn(move || {
+                                if let Err(e) = crate::sys::shell::show_open_with(&first) {
+                                    crate::logal!("!! open_with {:?} failed: {}", first, e);
+                                    let msg = e.to_string();
+                                    let _ = slint::invoke_from_event_loop(move || {
+                                        let Some(app) =
+                                            SESSION.with(|slot| slot.borrow().clone())
+                                        else {
+                                            return;
+                                        };
+                                        let app = app.borrow();
+                                        let text = app.trf(
+                                            "无法打开「打开方式」：{}",
+                                            &[msg],
+                                        );
+                                        app.set_status_job(text);
+                                    });
+                                }
+                            });
+                        }
+                    }
+                    return;
+                }
+                "builtin.create_shortcut" | "builtin.send_to_desktop" => {
+                    let to_desktop = action_id == "builtin.send_to_desktop";
+                    if let MenuScope::Selection(paths) = &target {
+                        let paths = paths.clone();
+                        // 「- 快捷方式」这半截跟着界面语言走（资源管理器也是用系统语言）。
+                        let suffix = self.tr("快捷方式").to_string();
+                        // 回调回来时面板可能已经被切走（设置页 / 别的目录）：
+                        // 记住点击那一刻的目录，只有还停在那儿才重列举。
+                        let keep_path = self.state.active().active().path.clone();
+                        // 建 .lnk = 碰磁盘 + COM，绝不能跑在 UI 线程上。
+                        std::thread::spawn(move || {
+                            let result =
+                                crate::sys::shell::create_shortcuts(&paths, to_desktop, &suffix);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+                                    return;
+                                };
+                                let mut app = app.borrow_mut();
+                                match result {
+                                    Ok(n) => {
+                                        let msg = app
+                                            .trf("已创建 {} 个快捷方式", &[n.to_string()]);
+                                        app.set_status_job(msg);
+                                        // 「创建快捷方式」会往当前目录里放新条目，
+                                        // 重新列举才能看到它。设置页没有目录可刷，
+                                        // 切走的标签也不该被点亮“加载中”。
+                                        if app.state.active().kind
+                                            == crate::state::TabKind::Explorer
+                                            && app.state.active().active().path == keep_path
+                                        {
+                                            app.reload_active();
+                                        }
+                                    }
+                                    Err(e) => {
+                                        crate::logal!("!! shortcut failed: {e}");
+                                        let msg =
+                                            app.trf("创建快捷方式失败：{}", &[e.to_string()]);
+                                        app.set_status_job(msg);
+                                    }
+                                }
+                            });
+                        });
+                    }
                     return;
                 }
                 "builtin.stage" => {
@@ -11979,9 +12082,9 @@ impl App {
         ok
     }
 
-    /// Ctrl+Z / Ctrl+Y：撤销 / 重做最近一次文件操作。
+    /// Ctrl+Z / Ctrl+Y：撤消 / 重做最近一次文件操作。
     ///
-    /// 撤销本身也是一次文件任务（要动磁盘、可能弹 Shell 对话框），所以走同一条
+    /// 撤消本身也是一次文件任务（要动磁盘、可能弹 Shell 对话框），所以走同一条
     /// 任务队列，跟复制 / 删除互斥。栈顶那条记录要等任务**真的提交成功**才移动，
     /// 否则「有任务在跑」时按一下 Ctrl+Z 就把记录弄丢了。
     fn history_action(&mut self, redo: bool) {
@@ -11995,7 +12098,7 @@ impl App {
             self.set_status_job(self.tr(if redo {
                 "没有可重做的操作"
             } else {
-                "没有可撤销的操作"
+                "没有可撤消的操作"
             }));
             return;
         };
@@ -12027,7 +12130,7 @@ impl App {
     /// 任务完成后的处理：刷新受影响目录。
     fn on_job_finished(&mut self, mut summary: JobSummary) {
         self.shell_op_running = false;
-        // 撤销栈：普通操作成功就记一笔；撤销 / 重做任务只有失败时才把记录退回原处
+        // 撤消栈：普通操作成功就记一笔；撤消 / 重做任务只有失败时才把记录退回原处
         // （成功时提交那一步已经搬过了）。
         if let Some(kind) = summary.recorded.take() {
             self.undo.record(kind);
@@ -19601,7 +19704,7 @@ fn batch_sync_pane(done: &[crate::ops::batch_rename::PlanItem]) {
     let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
         return;
     };
-    // 批量改名也进撤销栈：一次 Ctrl+Z 把整批名字改回去。
+    // 批量改名也进撤消栈：一次 Ctrl+Z 把整批名字改回去。
     app.borrow_mut()
         .undo
         .record(crate::ops::undo::Kind::Rename {
