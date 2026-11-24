@@ -51,7 +51,7 @@ pub fn parse_args(args: &[String]) -> WakeRequest {
         let path = args.get(at + 1).filter(|p| !p.starts_with("--"));
         return match path {
             Some(path) => WakeRequest {
-                path: Some(PathBuf::from(path)),
+                path: Some(clean_shell_path(path)),
                 new_tab: true,
                 select: None,
             },
@@ -59,10 +59,25 @@ pub fn parse_args(args: &[String]) -> WakeRequest {
         };
     }
     WakeRequest {
-        path: args.iter().map(PathBuf::from).find(|p| p.is_dir()),
+        path: args
+            .iter()
+            .map(|a| clean_shell_path(a))
+            .find(|p| p.is_dir()),
         new_tab: false,
         select: None,
     }
+}
+
+/// 摘掉「磁盘根目录」被注册表模板传进来时多出来的那个引号。
+///
+/// 接管的命令行是 `"...\rove.exe" --shell-open "%1"`，双击 `C:` 时外壳把
+/// `%1` 换成 `C:\`，整行就成了 `--shell-open "C:\"`。Windows 的命令行解析
+/// 把结尾的 `\"` 当成**转义引号**，引号不再是分隔符，于是本进程拿到的参数
+/// 是 `C:\"` —— 路径末尾凭空多一个 `"`，后面按路径处理时就打不开。
+///
+/// 只处理末尾引号：Windows 文件名里不允许出现 `"`，摘掉不会误伤合法路径。
+fn clean_shell_path(raw: &str) -> PathBuf {
+    PathBuf::from(raw.trim_end_matches('"'))
 }
 
 /// 是否以「后台常驻」方式启动（登录自启动写进 Run 键的那个参数）。
@@ -354,6 +369,13 @@ mod tests {
         let req = parse_args(&args(&["--shell-open", "--some-flag"]));
         assert_eq!(req, WakeRequest::default());
         // `--this-pc` 优先（它自带语义），不会被 --shell-open 吞掉。
+        // 双击磁盘：外壳把 `"%1"` 展开成 `"C:\"`，命令行解析吃掉引号后
+        // 参数尾部会多一个 `"`，这里必须摘掉，否则打不开。
+        let req = parse_args(&args(&["--shell-open", r#"C:\""#]));
+        assert_eq!(req.path, Some(PathBuf::from(r"C:\")));
+        assert!(req.new_tab);
+        let req = parse_args(&args(&["--shell-open", r#"\\nas\share\""#]));
+        assert_eq!(req.path, Some(PathBuf::from(r#"\\nas\share\"#)));
         let req = parse_args(&args(&["--shell-open", "--this-pc"]));
         assert_eq!(
             req,
