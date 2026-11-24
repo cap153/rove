@@ -141,7 +141,7 @@ The result is a single `rove.exe` that runs from anywhere.
 - Only tested on Windows 10, 64-bit.
 - Global search matches **file and folder names** only, not file contents.
 - Dragging files to copy them onto the desktop blocks the UI; for large files use `Ctrl+C` / `Ctrl+V` instead.
-- The index covers local fixed drives by default; network and removable drives are read on demand and are not indexed (you can enable them on the settings page).
+- By default, indexing covers only local solid-state drives (HDDs can be included by enabling them in the settings); network drives and removable drives are not indexed.
 - Explorer takeover only changes the current user's settings, so it may fight with other tools of the same kind.
 
 ## License
