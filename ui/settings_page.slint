@@ -2,7 +2,7 @@ import { I18n } from "i18n.slint";
 // 设置页面（独立标签页）。
 // 目前实现：左侧子导航 + 右侧「本地右键菜单」分组管理。
 
-import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem, SettingsShortcutGroup, SettingsShortcutItem, SettingsDriveItem, IconRefresh, IconClose } from "common.slint";
+import { Theme, SettingsNavItem, SettingsActionGroup, SettingsActionItem, SettingsShortcutGroup, SettingsShortcutItem, SettingsDriveItem, IconRefresh, IconClose, MenuHideBlur } from "common.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
 
 component Toggle inherits Rectangle {
@@ -49,6 +49,7 @@ component SettingRow inherits Rectangle {
     callback toggled(id: string, enabled: bool);
     callback edit(id: string);
     callback delete(id: string);
+    callback rescan(id: string);
 
     height: 42px;
     background: row-ta.has-hover ? Theme.bg-hover : transparent;
@@ -98,63 +99,105 @@ component SettingRow inherits Rectangle {
             }
         }
 
-        // 编辑按钮（仅自定义；builtin 行隐藏）。
+        // 按钮区：编辑 / 删除 / 更新。用固定坐标摆，不靠布局 spacing ——
+        // 嵌套布局在这里会把两颗按钮推开，改为「编辑在 0、另一颗在 50」，
+        // 间距就是 6px（44 + 6）。
         // 用文字而非 ✎/✕ 字形：部分系统字体缺这两个符号，会渲染成空白。
         Rectangle {
-            visible: !root.item.builtin;
-            width: 44px;
-            height: 26px;
-            y: (parent.height - self.height) / 2;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: edit-ta.has-hover ? Theme.bg-hover : transparent;
+            width: (!root.item.builtin || root.item.special) ? 94px : 0px;
+            height: parent.height;
+            background: transparent;
 
-            Text {
-                text: I18n.strings[72];
-                color: Theme.text-secondary;
-                font-size: 11px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: 100%;
-                height: 100%;
-            }
+            // 编辑按钮（自定义 + 压缩关联项；其余 builtin 行隐藏）。
+            Rectangle {
+                visible: !root.item.builtin || root.item.special;
+                x: 0px;
+                width: 44px;
+                height: 26px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: edit-ta.has-hover ? Theme.bg-hover : transparent;
 
-            edit-ta := TouchArea {
-                width: 100%;
-                height: 100%;
-                clicked => {
-                    root.edit(root.item.id);
+                Text {
+                    text: I18n.strings[72];
+                    color: Theme.text-primary;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+
+                edit-ta := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => {
+                        root.edit(root.item.id);
+                    }
                 }
             }
-        }
 
-        // 删除按钮（仅自定义；builtin 行隐藏）。
-        Rectangle {
-            visible: !root.item.builtin;
-            width: 44px;
-            height: 26px;
-            y: (parent.height - self.height) / 2;
-            border-radius: 6px;
-            border-width: 1px;
-            border-color: Theme.border;
-            background: del-ta.has-hover ? Theme.bg-hover : transparent;
+            // 删除按钮（仅自定义；builtin 与压缩关联项都隐藏）。
+            Rectangle {
+                visible: !root.item.builtin && !root.item.special;
+                x: 50px;
+                width: 44px;
+                height: 26px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: del-ta.has-hover ? Theme.bg-hover : transparent;
 
-            Text {
-                text: I18n.strings[23];
-                color: Theme.danger;
-                font-size: 11px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-                width: 100%;
-                height: 100%;
+                Text {
+                    text: I18n.strings[23];
+                    color: Theme.danger;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+
+                del-ta := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => {
+                        root.delete(root.item.id);
+                    }
+                }
             }
 
-            del-ta := TouchArea {
-                width: 100%;
-                height: 100%;
-                clicked => {
-                    root.delete(root.item.id);
+            // 更新按钮（仅压缩关联项）：重新扫一遍压缩软件并刷新程序/参数。
+            Rectangle {
+                visible: root.item.special;
+                x: 50px;
+                width: 44px;
+                height: 26px;
+                y: (parent.height - self.height) / 2;
+                border-radius: 6px;
+                border-width: 1px;
+                border-color: Theme.border;
+                background: rescan-ta.has-hover ? Theme.bg-hover : transparent;
+
+                Text {
+                    text: I18n.strings[325]; // 更新
+                    color: Theme.text-primary;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    width: 100%;
+                    height: 100%;
+                }
+
+                rescan-ta := TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => {
+                        root.rescan(root.item.id);
+                    }
                 }
             }
         }
@@ -167,6 +210,8 @@ component GroupCard inherits Rectangle {
     callback group_toggled(name: string, expanded: bool);
     callback edit(id: string);
     callback delete(id: string);
+    callback rescan(id: string);
+    callback rescan_all();
 
     height: root.group.expanded ? 44px + root.group.items.length * 42px : 44px;
     background: Theme.bg-popup;
@@ -180,6 +225,16 @@ component GroupCard inherits Rectangle {
 
         Rectangle {
             height: 44px;
+
+            // 整行点击折叠放在布局「下面」先声明：Slint 里后声明的在上层，
+            // 把整行 TouchArea 放在按钮前面，按钮才抢得到点击。
+            TouchArea {
+                width: 100%;
+                height: 100%;
+                clicked => {
+                    root.group_toggled(root.group.name, !root.group.expanded);
+                }
+            }
 
             HorizontalLayout {
                 x: 16px;
@@ -206,13 +261,35 @@ component GroupCard inherits Rectangle {
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                 }
-            }
 
-            TouchArea {
-                width: 100%;
-                height: 100%;
-                clicked => {
-                    root.group_toggled(root.group.name, !root.group.expanded);
+                // 「更新全部」：重新扫一遍压缩软件，刷新该组所有项。
+                Rectangle {
+                    visible: root.group.rescan_all;
+                    width: 62px;
+                    height: 26px;
+                    y: (parent.height - self.height) / 2;
+                    border-radius: 6px;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    background: rescan-all-ta.has-hover ? Theme.bg-hover : transparent;
+
+                    Text {
+                        text: I18n.strings[326]; // 更新全部
+                        color: Theme.text-primary;
+                        font-size: 11px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        width: 100%;
+                        height: 100%;
+                    }
+
+                    rescan-all-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        clicked => {
+                            root.rescan_all();
+                        }
+                    }
                 }
             }
         }
@@ -236,6 +313,9 @@ component GroupCard inherits Rectangle {
                     }
                     delete(id) => {
                         root.delete(id);
+                    }
+                    rescan(id) => {
+                        root.rescan(id);
                     }
                 }
             }
@@ -486,6 +566,10 @@ export component SettingsPage inherits Rectangle {
     /// 「接管资源管理器」开关（来自 config.explorer_takeover，默认关闭）。
     in-out property <bool> explorer-takeover: false;
     callback explorer_takeover_toggled(bool);
+    /// 「系统菜单」开关（来自 config.system_menu，默认关闭）：关掉时右键只显示
+    /// Rove 内建项，「隐藏的系统菜单项」卡片随之隐藏。
+    in-out property <bool> system-menu: false;
+    callback system_menu_toggled(bool);
     /// 「开机自启动」开关（真源是注册表 Run 键，由 Rust 读实况下发）。
     in-out property <bool> autostart: false;
     callback autostart_toggled(bool);
@@ -533,16 +617,15 @@ export component SettingsPage inherits Rectangle {
     callback search_idle_toggled(bool);
     callback search_idle_minutes_changed(int);
     callback search_max_results_changed(int);
-    // 分组列表内容高度（Rust 按模型计算）。与 Slint 侧实测值取 max，
-    // 任一来源少报都不会导致内容被裁切后无法滚动到。
-    in property <length> content-height: 0px;
-
     callback nav_changed(id: string);
     callback action_toggled(id: string, enabled: bool);
     callback group_toggled(name: string, expanded: bool);
     callback action_add();
     callback action_edit(id: string);
     callback action_delete(id: string);
+    // 压缩关联项：单条「更新」/ 整组「更新全部」（重新探测压缩软件）。
+    callback action_rescan(id: string);
+    callback archive_rescan_all();
     // 诊断：滚动几何变化时回报（视口 / 内容 / 实测首选高度）。
     callback scroll_debug(viewport: length, content: length, preferred: length);
 
@@ -1705,16 +1788,18 @@ export component SettingsPage inherits Rectangle {
 
             // ---- 子页 2：本地右键菜单分组列表 ----
             if (root.page-title == I18n.strings[59]) : SettingsScrollContainer {
-                content-height: max(root.content-height, groups-layout.preferred-height) + 28px;
+                // 只按 Slint 实测高度滚动：本页内容随「系统菜单」开关增减，
+                // 再用 Rust 下发的旧高度取 max 会留下一片空白。
+                content-height: groups-layout.preferred-height + 28px;
 
-                // 点击本页空白处 → 释放关键词输入框焦点。
-                // 必须放在这个 if 块内：才能直接访问 hide-input-ta。
-                // 声明在内容之前（最底层）：内容区不消费指针事件，空白处点击会穿透到这里。
+                // 点击本页空白处 → 释放关键词输入框焦点。输入框在下面的 `if` 卡片里，
+                // 跨不过作用域，所以用计数器让卡片自己收：每点一次 +1，卡片监听到变化
+                // 就 blur。计数器只在可见时被监听，不可见时点了也无所谓。
                 TouchArea {
                     width: 100%;
                     height: 100%;
                     clicked => {
-                        hide-input-ta.blur-input();
+                        MenuHideBlur.tick += 1;
                     }
                 }
 
@@ -1724,10 +1809,73 @@ export component SettingsPage inherits Rectangle {
                     spacing: 12px;
                     alignment: start;
 
-                    // 隐藏的系统菜单项（关键词）：包含即隐藏，`!` 开头为精确匹配。
-                    // 只作用于系统 / 第三方项，Rove 自己的菜单项不受影响。
+                    // 系统菜单：关掉时右键只显示 Rove 内建项（默认关闭）。
                     Rectangle {
                         width: 100%;
+                        background: (!Theme.dark && sysmenu-ta.has-hover) ? Theme.bg-hover : Theme.bg-popup;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: (Theme.dark && sysmenu-ta.has-hover) ? Theme.accent.transparentize(0.45) : Theme.border;
+                        animate background, border-color { duration: 100ms; easing: ease-out; }
+                        height: 58px;
+
+                        sysmenu-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.system-menu = !root.system-menu;
+                                root.system_menu_toggled(root.system-menu);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: I18n.strings[338];
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: I18n.strings[339];
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.system-menu;
+                                toggled => {
+                                    root.system-menu = !root.system-menu;
+                                    root.system_menu_toggled(root.system-menu);
+                                }
+                            }
+                        }
+                    }
+
+                    // 隐藏的系统菜单项（关键词）：包含即隐藏，`!` 开头为精确匹配。
+                    // 只作用于系统 / 第三方项，Rove 自己的菜单项不受影响。
+                    // 系统菜单关着时这一整张卡片没有意义，跟着一起收起来。
+                    if (root.system-menu) : Rectangle {
+                        width: 100%;
+
+                        // 页面空白处点了一下（计数器变了）→ 收掉输入框焦点。
+                        property <int> blur-tick: MenuHideBlur.tick;
+                        changed blur-tick => {
+                            hide-input-ta.blur-input();
+                        }
+
                         background: Theme.bg-popup;
                         border-radius: 10px;
                         border-width: 1px;
@@ -1955,6 +2103,8 @@ export component SettingsPage inherits Rectangle {
                         group_toggled(name, expanded) => { root.group_toggled(name, expanded); }
                         edit(id) => { root.action_edit(id); }
                         delete(id) => { root.action_delete(id); }
+                        rescan(id) => { root.action_rescan(id); }
+                        rescan_all() => { root.archive_rescan_all(); }
                     }
                 }
             }

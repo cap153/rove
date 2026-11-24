@@ -149,6 +149,11 @@ export component ActionEditorDialog inherits Rectangle {
     in property <[string]> group-options: [I18n.strings[5]];
     in-out property <string> edit-id: "";
     in-out property <string> edit-label: "";
+    /// 压缩关联项：名称固定，只允许改程序/参数。
+    in property <bool> label-locked: false;
+    /// 压缩关联项：层级归属 / 作用对象 / 适用扩展名由 Rove 内部判定，
+    /// 页面上不展示（填了也不参与判断，只会误导）。
+    in property <bool> managed: false;
     in-out property <string> edit-group: "";
     in-out property <string> edit-target: "any";
     in-out property <string> edit-extensions: "";
@@ -244,6 +249,14 @@ export component ActionEditorDialog inherits Rectangle {
                 }
             }
 
+            // 压缩关联项说明：只有程序和参数真正起作用。
+            if (root.managed) : Text {
+                text: I18n.strings[337];
+                color: Theme.text-secondary;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
             // 字段 1：显示名称
             VerticalLayout {
                 spacing: 4px;
@@ -252,6 +265,7 @@ export component ActionEditorDialog inherits Rectangle {
                     mouse-pressed: root.mouse-pressed;
                     text <=> root.edit-label;
                     placeholder: I18n.strings[15];
+                    enabled: !root.label-locked;
                 }
             }
 
@@ -328,7 +342,7 @@ export component ActionEditorDialog inherits Rectangle {
             }
 
             // 字段 4：作用对象（单选）
-            VerticalLayout {
+            if (!root.managed) : VerticalLayout {
                 spacing: 4px;
                 Text { text: I18n.strings[10]; color: Theme.text-secondary; font-size: 12px; }
 
@@ -355,7 +369,7 @@ export component ActionEditorDialog inherits Rectangle {
             }
 
             // 字段 5：层级归属（可输入新名称新建二级菜单；右侧箭头列出已有分组）
-            VerticalLayout {
+            if (!root.managed) : VerticalLayout {
                 spacing: 4px;
                 Text { text: I18n.strings[39]; color: Theme.text-secondary; font-size: 12px; }
 
@@ -473,7 +487,7 @@ export component ActionEditorDialog inherits Rectangle {
             }
 
             // 字段 6：适用扩展名
-            VerticalLayout {
+            if (!root.managed) : VerticalLayout {
                 spacing: 4px;
                 Text { text: I18n.strings[77]; color: Theme.text-secondary; font-size: 12px; }
                 StyledInput {

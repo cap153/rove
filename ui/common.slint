@@ -78,12 +78,22 @@ export struct SettingsActionItem {
     program: string,
     enabled: bool,
     builtin: bool,
+    // 压缩软件关联项：显示「编辑 / 更新」，名称不可改。
+    special: bool,
+}
+
+// 关键词输入框的失焦请求：设置页空白处点击时 +1，输入框所在的卡片监听变化。
+// 用 global 是因为输入框在 `if` 卡片里，页面级元素拿不到它的 id。
+export global MenuHideBlur {
+    in-out property <int> tick: 0;
 }
 
 // 设置页二级分组卡片。
 export struct SettingsActionGroup {
     name: string,
     expanded: bool,
+    // 组头右上角带「更新全部」（压缩关联组）。
+    rescan_all: bool,
     items: [SettingsActionItem],
 }
 

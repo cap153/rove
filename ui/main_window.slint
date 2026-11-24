@@ -113,7 +113,6 @@ export component MainWindow inherits Window {
     in-out property <string> settings-page-title: I18n.strings[59];
     in-out property <string> settings-page-desc: "";
     in-out property <bool> settings-show-add: true;
-    in-out property <length> settings-content-height: 0px;
     // 是否显示隐藏文件（来自 config.show_hidden，驱动设置页「通用」开关）。
     in-out property <bool> show-hidden: false;
     callback show_hidden_toggled(bool);
@@ -123,6 +122,10 @@ export component MainWindow inherits Window {
     /// 「接管资源管理器」开关（来自 config.explorer_takeover，默认关闭）。
     in-out property <bool> explorer-takeover: false;
     callback explorer_takeover_toggled(bool);
+    /// 「系统菜单」开关（来自 config.system_menu，默认关闭）：关掉时右键只显示
+    /// Rove 自己的内建项，不去请求系统 / 第三方菜单项。
+    in-out property <bool> system-menu: false;
+    callback system_menu_toggled(bool);
     /// 「开机自启动」开关（真源是注册表 Run 键，由 Rust 读实况下发）。
     in-out property <bool> autostart: false;
     callback autostart_toggled(bool);
@@ -165,6 +168,8 @@ export component MainWindow inherits Window {
     // 动作编辑器弹窗状态。
     in-out property <string> settings-editor-title: "";
     in-out property <bool> settings-editor-open: false;
+    in-out property <bool> settings-editor-label-locked: false;
+    in-out property <bool> settings-editor-managed: false;
     in-out property <string> settings-editor-id: "";
     in-out property <string> settings-editor-label: "";
     in-out property <string> settings-editor-group: "";
@@ -531,6 +536,8 @@ out property <length> row-height-out: file-list.row-height-out;
     callback settings_action_add();
     callback settings_action_edit(id: string);
     callback settings_action_delete(id: string);
+    callback settings_action_rescan(id: string);
+    callback settings_archive_rescan_all();
     callback settings_editor_save(
         id: string,
         label: string,
@@ -1622,7 +1629,6 @@ out property <length> row-height-out: file-list.row-height-out;
                     page-title: root.settings-page-title;
                     page-desc: root.settings-page-desc;
                     show-add: root.settings-show-add;
-                    content-height: root.settings-content-height;
                     show-hidden: root.show-hidden;
                     show_hidden_toggled(v) => { root.show_hidden_toggled(v); }
                     mouse-pressed: root.mouse-left-pressed;
@@ -1630,6 +1636,8 @@ out property <length> row-height-out: file-list.row-height-out;
                     auto_edit_path_on_new_tab_toggled(v) => { root.auto_edit_path_on_new_tab_toggled(v); }
                     explorer-takeover: root.explorer-takeover;
                     explorer_takeover_toggled(v) => { root.explorer_takeover_toggled(v); }
+                    system-menu: root.system-menu;
+                    system_menu_toggled(v) => { root.system_menu_toggled(v); }
                     autostart: root.autostart;
                     autostart_toggled(v) => { root.autostart_toggled(v); }
                     language-index: root.language-index;
@@ -1680,6 +1688,12 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                     action_add() => {
                         root.settings_action_add();
+                    }
+                    action_rescan(id) => {
+                        root.settings_action_rescan(id);
+                    }
+                    archive_rescan_all() => {
+                        root.settings_archive_rescan_all();
                     }
                     action_edit(id) => {
                         root.settings_action_edit(id);
@@ -1782,6 +1796,8 @@ out property <length> row-height-out: file-list.row-height-out;
 
     // 动作编辑器弹窗（新增 / 编辑自定义右键菜单）。
     action-editor := ActionEditorDialog {
+        label-locked: root.settings-editor-label-locked;
+        managed: root.settings-editor-managed;
         mouse-pressed: root.mouse-left-pressed;
         visible: root.settings-editor-open;
         title: root.settings-editor-title;

@@ -190,6 +190,12 @@ pub struct Config {
     /// 启动时按代次补齐缺少的那几条 —— 用单个整数而不是一串 bool，加一条
     /// 就多一个字段的写法撑不了多久。
     pub context_menu_hide_gen: u32,
+
+    /// 右键菜单是否读取系统和第三方菜单项。
+    ///
+    /// 关掉时完全不请求 Shell 菜单（也就不给外壳扩展执行的机会），右键只显示
+    /// Rove 自己的内建项。首次启动默认关闭。
+    pub system_menu: bool,
 }
 
 /// 当前默认隐藏项的补种代次（与 `Config::load` 里的补齐逻辑对应）。
@@ -366,6 +372,7 @@ impl Default for Config {
             quick_items: default_quick_items(),
             context_menu_hide_seeded: true,
             context_menu_hide_gen: CONTEXT_MENU_HIDE_GEN,
+            system_menu: false,
         }
     }
 }
@@ -605,6 +612,11 @@ impl Config {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect();
         }
+        config.system_menu = json
+            .get("system_menu")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
         if let Some(arr) = json.get("context_menu_hide").and_then(|v| v.as_array()) {
             config.context_menu_hide = arr
                 .iter()
@@ -747,6 +759,22 @@ impl Config {
             (7, &["!打开方式(H)...", "!Open with..."]),
             (8, &["!打开方式..."]),
         ];
+        // 9 这一代是发错的一版（把压缩软件自己的菜单项藏了），跑过那一版的
+        // 配置里已经写进去 5 条关键词，这里原地撤掉并退回当前代。
+        if config.context_menu_hide_gen == 9 {
+            const BOGUS: [&str; 5] = [
+                "!添加到压缩文件...",
+                "!添加到压缩包...",
+                "!Add to archive...",
+                "解压到 \"",
+                "Extract to \"",
+            ];
+            config
+                .context_menu_hide
+                .retain(|k| !BOGUS.contains(&k.as_str()));
+            config.context_menu_hide_gen = CONTEXT_MENU_HIDE_GEN;
+            config.save();
+        }
         if config.context_menu_hide_gen < CONTEXT_MENU_HIDE_GEN {
             for (gen, keywords) in seeds {
                 if config.context_menu_hide_gen >= gen {
@@ -768,14 +796,9 @@ impl Config {
         config
     }
 
-    pub fn save(&self) {
-        let Some(path) = Self::config_path() else {
-            return;
-        };
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let json = serde_json::json!({
+    /// 配置的 JSON 表示（`save` 与测试共用）。
+    pub fn save_json(&self) -> serde_json::Value {
+        serde_json::json!({
             "theme-mode": match self.theme {
                 ThemeChoice::System => "system",
                 ThemeChoice::Light => "light",
@@ -846,8 +869,18 @@ impl Config {
                 .collect::<Vec<_>>(),
             "context_menu_hide_seeded": self.context_menu_hide_seeded,
             "context_menu_hide_gen": self.context_menu_hide_gen,
-        });
-        let text = serde_json::to_string_pretty(&json).unwrap_or_default();
+            "system_menu": self.system_menu,
+        })
+    }
+
+    pub fn save(&self) {
+        let Some(path) = Self::config_path() else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let text = serde_json::to_string_pretty(&self.save_json()).unwrap_or_default();
         let _ = std::fs::write(&path, text);
     }
 }
@@ -870,6 +903,22 @@ mod tests {
         // 只有主机名（没有共享名）也合法：资源管理器能直接列出该主机的共享。
         assert_eq!(normalize_network_path("\\\\nas").as_deref(), Some("\\\\nas"));
         assert_eq!(normalize_network_path("\\\\").as_deref(), None);
+    }
+
+    /// 「系统菜单」默认关闭：首次启动就只显示 Rove 内建项。
+    #[test]
+    fn system_menu_defaults_off() {
+        assert!(!Config::default().system_menu);
+        // 保存时一定写出这个键，否则用户开了之后重启就丢。
+        let json = serde_json::to_string(&Config::default().save_json()).unwrap();
+        assert!(json.contains("\"system_menu\":false"), "{json}");
+        // 老配置里没有这个键 → 保持关闭，不能被读成开。
+        let mut config = Config::default();
+        let old = serde_json::json!({ "language": "zh" });
+        if let Some(v) = old.get("system_menu").and_then(|v| v.as_bool()) {
+            config.system_menu = v;
+        }
+        assert!(!config.system_menu);
     }
 
     #[test]

@@ -336,6 +336,22 @@ pub const ZH: &[&str] = &[
     // ---- 空白处右键：新建文本文档（323 起）----
     "新建文本文档",           // 323
     "创建文件失败：{}",       // 324
+    // ---- 压缩软件关联（325 起）----
+    "更新",                   // 325
+    "更新全部",               // 326
+    "一级菜单(压缩)",         // 327
+    "添加到压缩文件",         // 328
+    "解压文件",               // 329
+    "解压到当前文件夹",       // 330
+    "解压到\"{name}\"\\",    // 331
+    "已更新压缩软件关联：{}", // 332
+    "未检测到压缩软件（WinRAR / 7-Zip / Bandizip）", // 333
+    "正在查找压缩软件…",      // 334
+    "选中的分卷缺少第一卷，没法解压", // 335
+    "已跳过 {} 个后续分卷",   // 336
+    "点「更新」会重新扫描 WinRAR / 7-Zip / Bandizip 并填写动作。", // 337
+    "系统菜单",               // 338
+    "关闭后不再读取系统和第三方菜单项，右键只显示 Rove 内建项", // 339
 ];
 
 pub const EN: &[&str] = &[
@@ -664,6 +680,21 @@ pub const EN: &[&str] = &[
     "Couldn't open the Open-with dialog: {}",
     "New text document",
     "Couldn't create the file: {}",
+    "Update",
+    "Update all",
+    "Top-level (archives)",
+    "Add to archive",
+    "Extract files",
+    "Extract here",
+    "Extract to \"{name}\"\\",
+    "Archive tool updated: {}",
+    "No archive tool found (WinRAR / 7-Zip / Bandizip)",
+    "Looking for an archive tool…",
+    "The first volume of the selected split archive is missing",
+    "Skipped {} follow-up volumes",
+    "Update rescans WinRAR / 7-Zip / Bandizip and fills in the archive actions.",
+    "System menu",
+    "When off, system and third-party items are not loaded; the menu shows only Rove's own items",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -798,6 +829,33 @@ mod tests {
         assert_eq!(EN[323], "New text document");
         assert_eq!(ZH[324], "创建文件失败：{}");
         assert_eq!(EN[324], "Couldn't create the file: {}");
+        // 压缩软件关联（325 起）。
+        assert_eq!(ZH[325], "更新");
+        assert_eq!(EN[325], "Update");
+        assert_eq!(ZH[326], "更新全部");
+        assert_eq!(EN[326], "Update all");
+        assert_eq!(ZH[327], "一级菜单(压缩)");
+        assert_eq!(EN[327], "Top-level (archives)");
+        assert_eq!(ZH[328], "添加到压缩文件");
+        assert_eq!(EN[328], "Add to archive");
+        assert_eq!(ZH[329], "解压文件");
+        assert_eq!(EN[329], "Extract files");
+        assert_eq!(ZH[330], "解压到当前文件夹");
+        assert_eq!(EN[330], "Extract here");
+        assert_eq!(ZH[331], "解压到\"{name}\"\\");
+        assert_eq!(EN[331], "Extract to \"{name}\"\\");
+        assert_eq!(ZH[332], "已更新压缩软件关联：{}");
+        assert_eq!(EN[332], "Archive tool updated: {}");
+        assert_eq!(ZH[334], "正在查找压缩软件…");
+        assert_eq!(ZH[335], "选中的分卷缺少第一卷，没法解压");
+        assert_eq!(EN[335], "The first volume of the selected split archive is missing");
+        assert_eq!(ZH[336], "已跳过 {} 个后续分卷");
+        assert_eq!(EN[336], "Skipped {} follow-up volumes");
+        assert!(ZH[337].contains("WinRAR / 7-Zip / Bandizip"));
+        assert_eq!(ZH[338], "系统菜单");
+        assert_eq!(EN[338], "System menu");
+        assert!(ZH[339].contains("只显示 Rove 内建项"));
+        assert!(EN[339].contains("only Rove's own items"));
         assert_eq!(
             EN[315],
             "Can't drop into this pane while searching; drop it on a folder instead"

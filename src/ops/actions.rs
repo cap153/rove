@@ -42,6 +42,267 @@ pub struct ActionEntry {
     pub builtin: bool,
 }
 
+/// 「添加到压缩文件」的动作 id（压缩软件关联项）。
+pub const ARCHIVE_ADD_ID: &str = "builtin.archive_add";
+/// 「解压文件」的动作 id（弹工具自己的「解压路径和选项」对话框）。
+pub const ARCHIVE_EXTRACT_FILES_ID: &str = "builtin.archive_extract_files";
+/// 「解压到当前文件夹」的动作 id。
+pub const ARCHIVE_EXTRACT_HERE_ID: &str = "builtin.archive_extract_here";
+/// 「解压到"{name}"\」的动作 id。
+pub const ARCHIVE_EXTRACT_ID: &str = "builtin.archive_extract";
+/// 设置页里这几条单独成一组用的组名（菜单里它们仍是一级项）。
+pub const ARCHIVE_GROUP: &str = "一级菜单(压缩)";
+
+/// 压缩关联项的动作 id，按菜单里的固定顺序排列。
+pub const ARCHIVE_IDS: [&str; 4] = [
+    ARCHIVE_ADD_ID,
+    ARCHIVE_EXTRACT_FILES_ID,
+    ARCHIVE_EXTRACT_HERE_ID,
+    ARCHIVE_EXTRACT_ID,
+];
+
+/// 压缩关联项布局的代数：改了条数/默认参数就 +1，老配置会按新模板补齐。
+pub const ARCHIVE_GEN: i64 = 7;
+
+fn ext_lower(p: &Path) -> String {
+    p.extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+}
+
+/// 这个路径是不是压缩包（含分卷的各卷）。
+pub fn is_archive_file(p: &Path) -> bool {
+    let ext = ext_lower(p);
+    if ARCHIVE_EXTS.iter().any(|x| *x == ext) {
+        return true;
+    }
+    // 分卷：`x.7z.001` / `x.zip.001` / `x.rar.001` / 旧式 `x.r00`、`x.z01`。
+    let three: Vec<char> = ext.chars().collect();
+    if three.len() == 3 && three[1..].iter().all(|c| c.is_ascii_digit()) {
+        return match three[0] {
+            'r' | 'z' => true,
+            c if c.is_ascii_digit() => true,
+            _ => false,
+        };
+    }
+    false
+}
+
+/// 是不是“后续卷”（`part2.rar`、`x.7z.002`、`x.r00`、`x.z01`）。
+///
+/// 只有第一卷能交给压缩软件：把整组卷一起递过去，WinRAR 会卡在
+/// 「找不到下一卷」的对话框上（实测），7-Zip 直接失败。
+fn is_later_volume(p: &Path) -> bool {
+    let ext = ext_lower(p);
+    let three: Vec<char> = ext.chars().collect();
+    if three.len() == 3 && three[1..].iter().all(|c| c.is_ascii_digit()) {
+        if three[0].is_ascii_digit() {
+            return ext != "001";
+        }
+        // r00/z01 起头的旧式分卷：永远不是“第一卷”。
+        return true;
+    }
+    // `name.part12.rar` / `name.part02.rar`
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if let Some(idx) = name.rfind(".part") {
+        let tail = &name[idx + 5..];
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            return digits.trim_start_matches('0') != "1";
+        }
+    }
+    false
+}
+
+/// 后续卷对应的「第一卷」候选（按优先级，纯字符串推导，不碰磁盘）。
+fn first_volume_candidates(p: &Path) -> Option<Vec<PathBuf>> {
+    if !is_later_volume(p) {
+        return None;
+    }
+    // 全程用 lower 切片：大小写转换可能改变字节长度，拿 lower 的下标去切原始
+    // 文件名会越界 panic。Windows 文件名不分大小写，候选用小写照样能找到。
+    let name = p.file_name()?.to_string_lossy().to_lowercase();
+    let dir = p.parent()?.to_path_buf();
+    // `name.part12.rar` → `name.part1.rar` / `name.part01.rar`
+    if let Some(idx) = name.rfind(".part") {
+        let tail = &name[idx + 5..];
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !digits.is_empty() {
+            let rest = &name[idx + 5 + digits.len()..];
+            let stem = &name[..idx];
+            let mut padded = String::from("1");
+            while padded.len() < digits.len() {
+                padded.insert(0, '0');
+            }
+            let mut out = vec![dir.join(format!("{stem}.part{padded}{rest}"))];
+            let plain = dir.join(format!("{stem}.part1{rest}"));
+            if plain != out[0] {
+                out.push(plain);
+            }
+            return Some(out);
+        }
+    }
+    let ext = ext_lower(p);
+    let three: Vec<char> = ext.chars().collect();
+    // `x.7z.002` → `x.7z.001`
+    if three.len() == 3 && three.iter().all(|c| c.is_ascii_digit()) {
+        return Some(vec![p.with_extension("001")]);
+    }
+    // 旧式 `x.r00` → `x.rar`；`x.z01` → `x.zip`
+    if three.len() == 3 && three[0].is_ascii_alphabetic() {
+        let base = p.with_extension("");
+        return Some(vec![
+            base.with_extension("rar"),
+            base.with_extension("zip"),
+            base.with_extension("7z"),
+        ]);
+    }
+    None
+}
+
+/// 把选中的某一卷解析成「该交给工具的那一个」：后续卷会自己去找第一卷。
+fn resolve_first_volume(p: &Path) -> Option<PathBuf> {
+    if !is_later_volume(p) {
+        return Some(p.to_path_buf());
+    }
+    first_volume_candidates(p)?
+        .into_iter()
+        .find(|c| c.is_file())
+}
+
+/// 选中项里真正该交给压缩软件的那些：每组分卷只留第一卷（选中 part2
+/// 也会自己去找 part1）。找不到第一卷的那些组不交出去 —— 缺第一卷本来
+/// 也解不开，交出去只会弹错误框。
+pub fn extractable_archives(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in paths.iter().filter(|p| is_archive_file(p)) {
+        if let Some(first) = resolve_first_volume(p) {
+            if !out.contains(&first) {
+                out.push(first);
+            }
+        }
+    }
+    out
+}
+
+/// 找不到第一卷、被跳过的分卷数量（状态栏提示用，免得用户以为点了没反应）。
+pub fn skipped_volumes(paths: &[PathBuf]) -> usize {
+    paths
+        .iter()
+        .filter(|p| is_archive_file(p) && is_later_volume(p) && resolve_first_volume(p).is_none())
+        .count()
+}
+
+/// 是不是压缩关联项。
+pub fn is_archive_action(id: &str) -> bool {
+    ARCHIVE_IDS.contains(&id)
+}
+
+/// 当成压缩包的扩展名（「添加到压缩文件」要避开它们，解压类只认它们）。
+pub const ARCHIVE_EXTS: &[&str] = &[
+    "rar", "zip", "zipx", "7z", "tar", "gz", "tgz", "bz2", "tbz", "tbz2", "xz", "txz", "lzma",
+    "zst", "iso", "cab", "lzh", "arj", "z", "jar", "wim", "esd", "rev",
+];
+
+/// 生成压缩软件关联的动作（按 [`ARCHIVE_IDS`] 的顺序）。
+///
+/// `tool = None`（没装）时程序与参数留空、`enabled = false` —— 设置页里仍然
+/// 有这几行，用户装了软件之后点「更新」就能接上。
+pub fn archive_actions(tool: Option<&crate::sys::archive::Tool>) -> Vec<ActionEntry> {
+    use crate::sys::archive::ToolKind;
+
+    let (add_program, extract_program, templates) = match tool {
+        Some(t) => {
+            let add_program = t.add_program().to_string_lossy().into_owned();
+            let extract_program = t.extract_program().to_string_lossy().into_owned();
+            // 参数模板约定：模板自带引号，占位符替换成裸路径。
+            // 「解压到当前文件夹」这类要显式给目标目录时，WinRAR 的目录参数
+            // 必须以 `\` 收尾，否则它报「诊断信息」并且什么都不解。
+            // `{dest}` 只出现在「解压文件」里，运行前换成用户挑的目录。
+            let templates: [String; 4] = match t.kind {
+                // 三款都没有「命令行弹对话框」的开关（WinRAR 试了空档案名 / `?` /
+                // `--` / `-ieml`，7zG 试了 `a` 不给档案名 / `-o?`，Bandizip 试了
+                // `x` 不给 `-o:`，全都不弹，只报错或直接按默认干）：
+                // 所以「添加到压缩文件」直接用默认配置建 `名字.<ext>`，
+                // 「解压文件」由 Rove 自己问一个目标目录（模板里的 `{dest}`）。
+                ToolKind::WinRar => [
+                    // -ep1：不把选中项的路径一起存进包里，否则包里会多出
+                    // 一层层目录（用户说的「像洋葱」）。包里只留文件名。
+                    r#"a -ep1 "{target_dir}\{archive_name}.rar" {target_paths}"#.to_string(),
+                    // 解压类每次只处理一个包（多选由调用方逐个跑）：三款工具都
+                    // 不接受「一次给多个包」，多出来的参数会被当成包内文件名。
+                    r#"x {target_paths} "{dest}\""#.to_string(),
+                    r#"x {target_paths} "{target_dir}\""#.to_string(),
+                    r#"x -ad {target_paths} "{target_dir}\""#.to_string(),
+                ],
+                // 7zG：`a` 直接建包，`x` 靠 `-o` 指定落点。
+                ToolKind::SevenZip => [
+                    r#"a "{target_dir}\{archive_name}.7z" {target_paths}"#.to_string(),
+                    r#"x {target_paths} -o"{dest}""#.to_string(),
+                    r#"x {target_paths} -o"{target_dir}""#.to_string(),
+                    r#"x {target_paths} -o"{target_dir}\{stem}""#.to_string(),
+                ],
+                // Bandizip：开关必须写在压缩包**前面**，否则 `-o:` 被忽略、
+                // 直接解到当前目录（实测）。
+                ToolKind::Bandizip => [
+                    r#"c "{target_dir}\{archive_name}.zip" {target_paths}"#.to_string(),
+                    r#"x -o:"{dest}" {target_paths}"#.to_string(),
+                    r#"x -o:"{target_dir}" {target_paths}"#.to_string(),
+                    r#"x -o:"{target_dir}\{stem}" {target_paths}"#.to_string(),
+                ],
+            };
+            (add_program, extract_program, templates)
+        }
+        None => (
+            String::new(),
+            String::new(),
+            std::array::from_fn(|_| String::new()),
+        ),
+    };
+
+    let make = |id: &str, label: &str, program: &str, args: &str| ActionEntry {
+        id: id.to_string(),
+        label: label.to_string(),
+        tool: tool.map(|t| t.kind.id().to_string()).unwrap_or_default(),
+        program: program.to_string(),
+        args: args.to_string(),
+        working_dir: "{target_dir}".into(),
+        target: "file".into(),
+        extensions: vec![],
+        enabled: tool.is_some(),
+        group: "".into(),
+        builtin: true,
+    };
+
+    let [add_args, files_args, here_args, extract_args] = templates;
+    vec![
+        // 压缩：文件和文件夹都收，压缩包本身不收。包名走 `{archive_name}`
+        // （单选 = 那一项的主名；多选 = 当前文件夹名，盘根用盘符）。
+        make(ARCHIVE_ADD_ID, "添加到压缩文件", &add_program, &add_args),
+        make(
+            ARCHIVE_EXTRACT_FILES_ID,
+            "解压文件",
+            &extract_program,
+            &files_args,
+        ),
+        make(
+            ARCHIVE_EXTRACT_HERE_ID,
+            "解压到当前文件夹",
+            &extract_program,
+            &here_args,
+        ),
+        make(
+            ARCHIVE_EXTRACT_ID,
+            r#"解压到"{name}\""#,
+            &extract_program,
+            &extract_args,
+        ),
+    ]
+}
+
 /// 已废弃的内置动作 id。
 ///
 /// 这些项全部由系统菜单提供，隐藏它们改用设置页的关键词过滤，
@@ -129,6 +390,21 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             group: "".into(),
             builtin: true,
         },
+        // 「复制路径」放在「剪切」下面：菜单按本函数顺序输出一级项，
+        // 复制 / 剪切 / 复制路径 三个密切相关，摆在一起更好认。
+        ActionEntry {
+            id: "builtin.copy_path".into(),
+            label: "复制路径".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "any".into(),
+            extensions: vec![],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
         // 「打开方式」：走 Shell 的 openas 动词，弹出跟资源管理器同一个原生选择器。
         // 系统菜单里带省略号的那一项默认被关键词藏掉；不带省略号的（展开程序
         // 子菜单的那种）保留原样。
@@ -142,21 +418,6 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             // 只对文件出现：Shell 的 openas 动词是给文件用的，文件夹右键系统
             // 菜单里也没有「打开方式」这一项。
             target: "file".into(),
-            extensions: vec![],
-            enabled: true,
-            group: "".into(),
-            builtin: true,
-        },
-        // 「复制路径」放在「剪切」下面：菜单按本函数顺序输出一级项，
-        // 复制 / 剪切 / 复制路径 三个密切相关，摆在一起更好认。
-        ActionEntry {
-            id: "builtin.copy_path".into(),
-            label: "复制路径".into(),
-            tool: "".into(),
-            program: "".into(),
-            args: "".into(),
-            working_dir: "".into(),
-            target: "any".into(),
             extensions: vec![],
             enabled: true,
             group: "".into(),
@@ -279,6 +540,48 @@ impl ActionEntry {
         let Some(first) = paths.first() else {
             return false;
         };
+        // 压缩软件关联项：没探测到程序就不进菜单（设置页里仍可编辑/更新）。
+        if is_archive_action(&self.id) && self.program.is_empty() {
+            return false;
+        }
+        if is_archive_action(&self.id) {
+            let ext_of = |p: &Path| {
+                p.extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default()
+            };
+            let listed = |ext: &str, exts: &[String]| {
+                exts.iter().any(|e| e.eq_ignore_ascii_case(ext))
+            };
+            let packed = |ext: &str| ARCHIVE_EXTS.iter().any(|e| *e == ext);
+            // 扩展名留空 = 用内置默认；用户在设置页填了扩展名就按他填的来。
+            if self.id == ARCHIVE_ADD_ID {
+                // 压缩：文件和文件夹都收（文件夹本身没有扩展名，永远算「不是压缩包」），
+                // 只要选中项里还有能压的东西就露出来。
+                return paths.iter().any(|p| {
+                    if is_dir_of(p).unwrap_or_else(|| p.is_dir()) {
+                        return true;
+                    }
+                    let ext = ext_of(p);
+                    if self.extensions.is_empty() {
+                        !packed(&ext)
+                    } else {
+                        listed(&ext, &self.extensions)
+                    }
+                });
+            }
+            // 解压类只认压缩包文件（分卷的各卷也算，挑卷交给 extractable_archives）。
+            let is_dir = is_dir_of(first).unwrap_or_else(|| first.is_dir());
+            if is_dir {
+                return false;
+            }
+            if !self.extensions.is_empty() {
+                return listed(&ext_of(first), &self.extensions);
+            }
+            return paths
+                .iter()
+                .any(|p| !is_dir_of(p).unwrap_or_else(|| p.is_dir()) && is_archive_file(p));
+        }
         let want_dir = match self.target.as_str() {
             "file" => false,
             "dir" => true,
@@ -388,18 +691,144 @@ pub fn load_or_create() -> Vec<ActionEntry> {
         }
         logln!("actions.toml created");
     }
-    heal_and_load(&path)
+    let (mut entries, needs_archive_seed) = heal_and_load(&path);
+    if needs_archive_seed {
+        // 首次启动只扫一次：装了压缩软件就默认开启（挑优先级最高的那款），
+        // 没装就生成两行关闭状态的条目，用户点「更新」随时能接上。
+        let began = std::time::Instant::now();
+        let tool = crate::sys::archive::seed_on_first_run();
+        logln!(
+            "[archive] 首次探测 {}（{}ms）",
+            tool.as_ref()
+                .map(|t| format!("{} → {}", t.kind.id(), t.program.display()))
+                .unwrap_or_else(|| "未找到压缩软件".into()),
+            began.elapsed().as_millis()
+        );
+        let fresh = archive_actions(tool.as_ref());
+        for entry in fresh {
+            entries.retain(|a| a.id != entry.id);
+            entries.push(entry);
+        }
+        if let Err(e) = save(&entries) {
+            logln!("actions.toml seed write failed: {e}");
+        }
+    }
+    entries
+}
+
+/// 把一次探测结果并回动作表。
+///
+/// `only = Some(id)` 时只动那一项（设置页单条「更新」），别的项原样保留；
+/// `None` 时是「更新全部」。
+pub fn merge_archive_entries(
+    actions: &mut Vec<ActionEntry>,
+    fresh: Vec<ActionEntry>,
+    only: Option<&str>,
+) {
+    for entry in fresh {
+        if let Some(want) = only {
+            if entry.id != want {
+                continue;
+            }
+        }
+        let mut entry = entry;
+        match actions.iter().position(|a| a.id == entry.id) {
+            Some(idx) => {
+                // 找到程序就沿用用户原来的开关，找不到一律关掉。
+                entry.enabled = !entry.program.is_empty() && actions[idx].enabled;
+                actions[idx] = entry;
+            }
+            None => {
+                entry.enabled = !entry.program.is_empty();
+                actions.push(entry);
+            }
+        }
+    }
+}
+
+/// 扫描不到任何压缩软件时，把所有压缩项关掉。
+///
+/// 留着开着的项只会指向已被卸载的 exe，点下去什么都不发生（连错误都没有）。
+pub fn disable_all_archive_entries(actions: &mut [ActionEntry]) {
+    for a in actions.iter_mut().filter(|a| is_archive_action(&a.id)) {
+        a.enabled = false;
+    }
+}
+
+/// 压缩关联项改版时的补齐：按当前模板重建，保留用户改过的开关与参数。
+fn upgrade_archive_entries(entries: &mut Vec<ActionEntry>) {
+    let old: Vec<ActionEntry> = entries
+        .iter()
+        .filter(|a| is_archive_action(&a.id))
+        .cloned()
+        .collect();
+    if old.is_empty() {
+        return;
+    }
+    let kind = old
+        .iter()
+        .find_map(|a| crate::sys::archive::ToolKind::from_id(&a.tool));
+    let program = old
+        .iter()
+        .find(|a| a.id == ARCHIVE_ADD_ID && !a.program.is_empty())
+        .or_else(|| old.iter().find(|a| !a.program.is_empty()))
+        .map(|a| PathBuf::from(&a.program));
+    let tool = match (kind, program) {
+        (Some(kind), Some(program)) => Some(crate::sys::archive::Tool { kind, program }),
+        _ => None,
+    };
+    for mut entry in archive_actions(tool.as_ref()) {
+        if let Some(o) = old.iter().find(|o| o.id == entry.id) {
+            entry.enabled = o.enabled;
+            if !o.program.is_empty() {
+                entry.program = o.program.clone();
+            }
+            // 参数一律换成新模板：老版本的 WinRAR 模板缺尾反斜杠，留着等于留个坏命令。
+        }
+        entries.retain(|a| a.id != entry.id);
+        entries.push(entry);
+    }
+}
+
+/// 把「压缩关联已初始化」标记写进配置（只在首扫后调用一次）。
+fn mark_archive_seeded_text(doc: &mut toml_edit::DocumentMut) {
+    doc["rove_archive_seeded"] = toml_edit::value(true);
+}
+
+/// `rove_archive_seeded` 是否已写过（没写过 = 首次启动，需要扫压缩软件）。
+fn archive_seeded(doc: &toml_edit::DocumentMut) -> bool {
+    doc.get("rove_archive_seeded")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 /// 用 toml_edit 无损校验并加载。
-fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
+fn heal_and_load(path: &Path) -> (Vec<ActionEntry>, bool) {
+    let (entries, needs_archive_seed, upgraded) = heal_and_load_ex(path);
+    // 压缩项按新模板重建过：必须写回文件，否则下次启动读到的还是旧参数，
+    // 而代数已经补齐，就再也不会重建了（旧模板永远留在盘上）。
+    if upgraded {
+        if let Err(e) = save_to(path, &entries) {
+            logln!("actions.toml upgrade write failed: {e}");
+        }
+    }
+    (entries, needs_archive_seed)
+}
+
+fn heal_and_load_ex(path: &Path) -> (Vec<ActionEntry>, bool, bool) {
     let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
+        return (Vec::new(), false, false);
     };
     let Ok(mut doc) = text.parse::<toml_edit::DocumentMut>() else {
         logln!("actions.toml parse failed");
-        return Vec::new();
+        return (Vec::new(), false, false);
     };
+    // 必须先读：后面 `get_mut` 会可变借用 doc。
+    let needs_archive_seed = !archive_seeded(&doc);
+    let archive_gen = doc
+        .get("rove_archive_gen")
+        .and_then(|v| v.as_integer())
+        .unwrap_or(0);
 
     // 一次性迁移：「在资源管理器中显示」改为首次启动默认关闭。
     // 老配置里这一项由旧默认值写成 enabled=true，仅改 builtin_actions 的默认值
@@ -412,7 +841,7 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
         .unwrap_or(false);
 
     let Some(items) = doc.get_mut("action").and_then(|i| i.as_array_of_tables_mut()) else {
-        return Vec::new();
+        return (Vec::new(), needs_archive_seed, false);
     };
 
     if !reveal_default_fixed {
@@ -498,8 +927,21 @@ fn heal_and_load(path: &Path) -> Vec<ActionEntry> {
     if !reveal_default_fixed {
         doc["rove_reveal_default_fixed"] = toml_edit::value(true);
     }
+    // 条数/默认参数改过的版本：按新模板重建，旧的那几条里用户改过的开关和
+    // 参数原样搬过去，多出来的补上。没种过（needs_archive_seed）就不动，
+    // 交给首扫去生成。
+    let mut upgraded = false;
+    if !needs_archive_seed && archive_gen < ARCHIVE_GEN {
+        upgrade_archive_entries(&mut entries);
+        upgraded = true;
+    }
+    // 首扫之后才写标记：写早了就等于「以后再也不扫」，
+    // 用户装好压缩软件重启也不会有菜单。
+    if !needs_archive_seed {
+        mark_archive_seeded_text(&mut doc);
+    }
     let _ = std::fs::write(path, doc.to_string());
-    entries
+    (entries, needs_archive_seed, upgraded)
 }
 
 /// 无损写回全部动作配置（设置页开关 / 新建 / 编辑 / 删除后保存）。
@@ -508,11 +950,18 @@ pub fn save(entries: &[ActionEntry]) -> Result<(), String> {
     let Some(path) = config_path() else {
         return Err("无法定位配置目录".into());
     };
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    save_to(&path, entries)
+}
+
+/// 写到指定路径（`save` 与升级回写共用，测试也能给临时文件）。
+fn save_to(path: &Path, entries: &[ActionEntry]) -> Result<(), String> {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .unwrap_or_else(|_| toml_edit::DocumentMut::new());
 
+    mark_archive_seeded_text(&mut doc);
+    doc["rove_archive_gen"] = toml_edit::value(ARCHIVE_GEN);
     let arr = doc["action"].or_insert(toml_edit::Item::ArrayOfTables(Default::default()));
     let arr = arr
         .as_array_of_tables_mut()
@@ -574,9 +1023,15 @@ pub fn heal_full(entries: &[ActionEntry]) -> Vec<ActionEntry> {
         out.push(e);
     }
 
-    // 2) 剩余条目：用户自定义动作，保留原顺序。
+    // 2) 剩余条目：用户自定义动作 + 压缩软件关联项（这两条由探测生成，
+    //    但程序/参数/开关用户可以自己改，不能被丢弃或重置）。
     for e in entries {
-        if !e.builtin && e.tool.is_empty() && by_id.contains_key(&e.id) {
+        if !by_id.contains_key(&e.id) {
+            continue;
+        }
+        let custom = !e.builtin && e.tool.is_empty();
+        let archive = is_archive_action(&e.id);
+        if custom || archive {
             out.push(e.clone());
         }
     }
@@ -598,6 +1053,23 @@ fn str_field(table: &toml_edit::Table, key: &str) -> Option<String> {
 /// 放在界面线程上就是整窗未响应（和终端那条路径同一个坑）。启动失败由后台
 /// 线程塞进 `ops::report_launch_error`，状态栏轮询显示。
 pub fn run_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String> {
+    run_action_with(entry, targets, None)
+}
+
+/// 「解压文件」：解到用户在选择框里挑的目录（模板里的 `{dest}`）。
+pub fn run_action_into_dir(
+    entry: &ActionEntry,
+    targets: &[PathBuf],
+    dest: &str,
+) -> Result<(), String> {
+    run_action_with(entry, targets, Some(dest))
+}
+
+fn run_action_with(
+    entry: &ActionEntry,
+    targets: &[PathBuf],
+    dest: Option<&str>,
+) -> Result<(), String> {
     if targets.is_empty() {
         return Err("没有选中项".into());
     }
@@ -606,10 +1078,11 @@ pub fn run_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String
     }
     let entry = entry.clone();
     let targets = targets.to_vec();
+    let dest = dest.map(str::to_string);
     std::thread::Builder::new()
         .name("rove-action".into())
         .spawn(move || {
-            if let Err(e) = launch_action(&entry, &targets) {
+            if let Err(e) = launch_action_with(&entry, &targets, dest.as_deref()) {
                 crate::ops::report_launch_error(format!("执行失败：{e}"));
             }
         })
@@ -618,12 +1091,19 @@ pub fn run_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String
 }
 
 /// 真正的启动动作（只在后台线程里跑，允许阻塞在慢速磁盘/网络上）。
-fn launch_action(entry: &ActionEntry, targets: &[PathBuf]) -> Result<(), String> {
+fn launch_action_with(
+    entry: &ActionEntry,
+    targets: &[PathBuf],
+    dest: Option<&str>,
+) -> Result<(), String> {
     let target_dir = targets[0]
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
-    let args = build_substituted(&entry.args, targets);
+    let mut args = build_substituted(&entry.args, targets);
+    if let Some(dest) = dest {
+        args = args.replace("{dest}", dest);
+    }
     let working_dir = if entry.working_dir.is_empty() {
         target_dir.clone()
     } else {
@@ -685,12 +1165,45 @@ pub fn build_substituted(template: &str, targets: &[PathBuf]) -> String {
         .map(|p| format!("\"{}\"", p.display()))
         .collect::<Vec<_>>()
         .join(" ");
+    let archive_name = if targets.len() > 1 {
+        folder_archive_name(&target_dir)
+    } else {
+        stem.clone()
+    };
     template
+        .replace("{archive_name}", &archive_name)
         .replace("{target_paths}", &all)
         .replace("{target_path}", &targets[0].to_string_lossy().into_owned())
         .replace("{target_dir}", &target_dir.to_string_lossy().into_owned())
         .replace("{name}", &name)
         .replace("{stem}", &stem)
+}
+
+/// 多选时给压缩包取的名字：当前文件夹名；盘根（`D:\`）没有文件夹名，
+/// 退成盘符（`D`）。
+fn folder_archive_name(dir: &Path) -> String {
+    if let Some(name) = dir.file_name() {
+        let name = name.to_string_lossy();
+        // 盘根在某些写法下会带出 `D:`（冒号进文件名是非法的），只取盘符。
+        let trimmed = name.trim_end_matches(':');
+        if !trimmed.is_empty() && !trimmed.contains(':') {
+            return trimmed.to_string();
+        }
+        if let Some(letter) = trimmed.chars().find(|c| c.is_alphanumeric()) {
+            return letter.to_string();
+        }
+    }
+    let letter: String = dir
+        .to_string_lossy()
+        .chars()
+        .find(|c| c.is_alphanumeric())
+        .map(|c| c.to_string())
+        .unwrap_or_default();
+    if letter.is_empty() {
+        "归档".to_string()
+    } else {
+        letter
+    }
 }
 
 /// 引号感知的参数切分（剥离成对引号，Command 会重新转义）。
@@ -718,6 +1231,373 @@ fn split_args(s: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file(name: &str) -> PathBuf {
+        PathBuf::from(name)
+    }
+
+    fn winrar() -> crate::sys::archive::Tool {
+        crate::sys::archive::Tool {
+            kind: crate::sys::archive::ToolKind::WinRar,
+            program: PathBuf::from("D:/winrar/WinRAR.exe"),
+        }
+    }
+
+    /// 压缩项升级必须写回磁盘：只补代数不写参数的话，下次启动会读到旧参数，
+    /// 而代数已经补齐 —— 旧模板就永远留在盘上了。
+    #[test]
+    fn archive_upgrade_is_persisted() {
+        let dir = std::env::temp_dir().join(format!("rove-actions-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("actions.toml");
+        std::fs::write(
+            &path,
+            r#"rove_archive_seeded = true
+rove_archive_gen = 1
+
+[[action]]
+id = "builtin.archive_extract_here"
+label = '解压到当前文件夹'
+program = 'D:/winrar/WinRAR.exe'
+args = 'x {target_paths} {target_dir}'
+enabled = true
+builtin = true
+tool = "winrar"
+"#,
+        )
+        .unwrap();
+
+        let (entries, seeded) = heal_and_load(&path);
+        assert!(!seeded);
+        let here = entries
+            .iter()
+            .find(|a| a.id == ARCHIVE_EXTRACT_HERE_ID)
+            .unwrap();
+        assert!(here.args.ends_with(r#"\""#), "{}", here.args);
+
+        // 落盘了才会在下次启动生效：重读一次仍是新模板。
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#"x {target_paths} "{target_dir}\""#), "{text}");
+        assert!(text.contains(&format!("rove_archive_gen = {ARCHIVE_GEN}")), "{text}");
+
+        let (again, _) = heal_and_load(&path);
+        let here = again
+            .iter()
+            .find(|a| a.id == ARCHIVE_EXTRACT_HERE_ID)
+            .unwrap();
+        assert!(here.args.ends_with(r#"\""#), "{}", here.args);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 没装压缩软件时也要生成这四条（关闭状态），否则设置页里没有入口可更新。
+    #[test]
+    fn archive_actions_exist_even_without_tool() {
+        let entries = archive_actions(None);
+        let ids: Vec<&str> = entries.iter().map(|a| a.id.as_str()).collect();
+        assert_eq!(ids, ARCHIVE_IDS.to_vec());
+        for e in &entries {
+            assert!(e.program.is_empty());
+            assert!(e.args.is_empty());
+            assert!(!e.enabled);
+            assert!(e.builtin);
+            assert!(e.tool.is_empty());
+        }
+    }
+
+    /// 探测到工具后：程序/参数就位、默认开启、解压标签带 `{name}` 占位符。
+    #[test]
+    fn archive_actions_fill_templates_for_tool() {
+        let entries = archive_actions(Some(&winrar()));
+        for e in &entries {
+            assert!(e.enabled);
+            assert_eq!(e.tool, "winrar");
+            assert!(e.program.ends_with("WinRAR.exe"));
+            assert!(!e.args.is_empty());
+        }
+        let add = &entries[0];
+        assert!(add.args.contains("{target_paths}"));
+        let whole = &entries[3];
+        assert!(whole.label.contains("{name}"));
+        assert!(whole.args.contains("{target_paths}"));
+        // WinRAR 的目标目录必须带尾反斜杠，否则它只报「诊断信息」。
+        assert!(entries[2].args.ends_with(r#"\""#), "{}", entries[2].args);
+    }
+
+    /// 压缩包名走 `{archive_name}`，不能带扩展名：`{name}` 是含扩展名的
+    /// 全名，会压出 `a.txt.rar` 这种东西。
+    #[test]
+    fn add_archive_name_placeholder() {
+        let entries = archive_actions(Some(&winrar()));
+        let add = &entries[0];
+        assert!(add.args.contains("{archive_name}"), "{}", add.args);
+        assert!(!add.args.contains("{name}"), "{}", add.args);
+    }
+
+    /// 单选 = 那一项的主名；多选 = 当前文件夹名；盘根 = 盘符。
+    #[test]
+    fn archive_name_single_multi_and_drive_root() {
+        let one = build_substituted("{archive_name}", &[file("/work/report.txt")]);
+        assert_eq!(one, "report");
+        let one_dir = build_substituted("{archive_name}", &[file("/work/photos")]);
+        assert_eq!(one_dir, "photos");
+        let many = build_substituted(
+            "{archive_name}",
+            &[file("/work/a.txt"), file("/work/b.txt")],
+        );
+        assert_eq!(many, "work");
+        let root = build_substituted("{archive_name}", &[file("/D:/a.txt"), file("/D:/b.txt")]);
+        assert_eq!(root, "D");
+    }
+
+    /// 三款压缩软件全没了：所有压缩项一起关掉（含「更新」只刷一项的情况）。
+    #[test]
+    fn missing_tools_turn_off_every_archive_entry() {
+        let mut actions = archive_actions(Some(&winrar()));
+        assert!(actions.iter().all(|a| a.enabled));
+        disable_all_archive_entries(&mut actions);
+        assert!(actions.iter().all(|a| !a.enabled));
+
+        // 只剩一项被「更新」刷新时，其它项也必须一起关。
+        let mut actions = archive_actions(Some(&winrar()));
+        let fresh = archive_actions(None);
+        disable_all_archive_entries(&mut actions);
+        merge_archive_entries(&mut actions, fresh, Some(ARCHIVE_EXTRACT_ID));
+        assert!(actions.iter().all(|a| !a.enabled));
+        // 被刷新的那一项程序被清空；其它项只是开关关掉，下次「更新全部」才清。
+    }
+
+    /// 后续卷要能自己推出第一卷（纯推导，不看磁盘）。
+    #[test]
+    fn later_volume_finds_first_volume_candidates() {
+        assert_eq!(
+            first_volume_candidates(&file("/d/multi.part2.rar")).unwrap(),
+            vec![file("/d/multi.part1.rar")]
+        );
+        assert_eq!(
+            first_volume_candidates(&file("/d/multi.part02.rar")).unwrap(),
+            vec![file("/d/multi.part01.rar"), file("/d/multi.part1.rar")]
+        );
+        assert_eq!(
+            first_volume_candidates(&file("/d/x.7z.003")).unwrap(),
+            vec![file("/d/x.7z.001")]
+        );
+        assert_eq!(
+            first_volume_candidates(&file("/d/x.r01")).unwrap(),
+            vec![file("/d/x.rar"), file("/d/x.zip"), file("/d/x.7z")]
+        );
+        assert!(first_volume_candidates(&file("/d/x.7z.001")).is_none());
+        assert!(first_volume_candidates(&file("/d/a.zip")).is_none());
+    }
+
+    /// 真建几卷，验证单选 part2 / 混选整组都会自己找第一卷并去重。
+    #[test]
+    fn selection_resolves_to_first_volume_on_disk() {
+        let dir = std::env::temp_dir().join(format!("rove-vol-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["multi.part1.rar", "multi.part2.rar", "multi.part3.rar"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        for n in ["x.7z.001", "x.7z.002"] {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        std::fs::write(dir.join("a.zip"), b"x").unwrap();
+
+        assert_eq!(
+            extractable_archives(&[dir.join("multi.part2.rar")]),
+            vec![dir.join("multi.part1.rar")]
+        );
+        assert_eq!(
+            extractable_archives(&[
+                dir.join("multi.part2.rar"),
+                dir.join("multi.part3.rar"),
+                dir.join("multi.part1.rar"),
+                dir.join("x.7z.002"),
+                dir.join("a.zip"),
+            ]),
+            vec![
+                dir.join("multi.part1.rar"),
+                dir.join("x.7z.001"),
+                dir.join("a.zip")
+            ]
+        );
+        assert_eq!(
+            skipped_volumes(&[
+                dir.join("multi.part2.rar"),
+                dir.join("multi.part3.rar"),
+                dir.join("multi.part1.rar"),
+                dir.join("a.zip"),
+            ]),
+            0
+        );
+
+        std::fs::remove_file(dir.join("multi.part1.rar")).unwrap();
+        assert!(extractable_archives(&[dir.join("multi.part2.rar")]).is_empty());
+        assert_eq!(skipped_volumes(&[dir.join("multi.part2.rar")]), 1);
+        // 残缺分卷 + 正常包：只解正常包。
+        assert_eq!(
+            extractable_archives(&[dir.join("multi.part2.rar"), dir.join("a.zip")]),
+            vec![dir.join("a.zip")]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分卷的各卷都要能让「解压」在菜单里出现。
+    #[test]
+    fn split_volumes_count_as_archives() {
+        for name in [
+            "/d/multi.part1.rar",
+            "/d/multi.part2.rar",
+            "/d/x.7z.001",
+            "/d/x.zip.001",
+            "/d/x.r00",
+            "/d/x.z01",
+        ] {
+            assert!(is_archive_file(&file(name)), "{name}");
+        }
+        assert!(!is_archive_file(&file("/d/note.txt")));
+    }
+
+    /// 「解压文件」三款都用 `{dest}` 占位（Rove 自己问目录），别的项不许有。
+    #[test]
+    fn extract_files_uses_dest_placeholder() {
+        for kind in [
+            crate::sys::archive::ToolKind::WinRar,
+            crate::sys::archive::ToolKind::SevenZip,
+            crate::sys::archive::ToolKind::Bandizip,
+        ] {
+            let tool = crate::sys::archive::Tool {
+                kind,
+                program: PathBuf::from("C:/tool/t.exe"),
+            };
+            let entries = archive_actions(Some(&tool));
+            let files = entries
+                .iter()
+                .find(|a| a.id == ARCHIVE_EXTRACT_FILES_ID)
+                .unwrap();
+            assert!(files.args.contains("{dest}"), "{kind:?} 少 {{dest}}");
+            for a in &entries {
+                if a.id != ARCHIVE_EXTRACT_FILES_ID {
+                    assert!(!a.args.contains("{dest}"), "{:?} 多 {{dest}}", a.id);
+                }
+            }
+        }
+    }
+
+    /// 加压缩包文件、文件夹都收（压缩包本身除外）；解压类只认压缩包。
+    #[test]
+    fn archive_actions_split_by_archive_extension() {
+        let entries = archive_actions(Some(&winrar()));
+        let add = &entries[0];
+        let not_dir = |_: &Path| Some(false);
+        let dir = |_: &Path| Some(true);
+
+        assert!(add.matches_selection(&[file("a.txt")], not_dir));
+        assert!(!add.matches_selection(&[file("a.rar")], not_dir));
+        // 文件夹也能压。
+        assert!(add.matches_selection(&[file("folder")], dir));
+        // 混合选择里只要还有能压的文件就露出来。
+        assert!(add.matches_selection(&[file("a.rar"), file("b.txt")], not_dir));
+
+        for e in &entries[1..] {
+            assert!(e.matches_selection(&[file("a.rar")], not_dir));
+            assert!(e.matches_selection(&[file("a.ZIP")], not_dir));
+            assert!(!e.matches_selection(&[file("a.txt")], not_dir));
+            assert!(!e.matches_selection(&[file("a.rar")], dir));
+        }
+    }
+
+    /// 程序缺失（没探测到）时这几条不进菜单，但设置页里仍在。
+    #[test]
+    fn archive_actions_hidden_without_program() {
+        let entries = archive_actions(None);
+        let not_dir = |_: &Path| Some(false);
+        for e in &entries {
+            assert!(!e.matches_selection(&[file("a.txt")], not_dir));
+            assert!(!e.matches_selection(&[file("a.rar")], not_dir));
+        }
+    }
+
+    /// 自愈不能把压缩关联项丢掉或重置成默认（用户的程序/参数/开关要留住）。
+    #[test]
+    fn heal_full_keeps_archive_entries() {
+        let mut raw = archive_actions(Some(&winrar()));
+        raw[0].enabled = false;
+        raw[0].program = "E:/elsewhere/WinRAR.exe".into();
+        let healed = heal_full(&raw);
+        let add = healed.iter().find(|a| a.id == ARCHIVE_ADD_ID).unwrap();
+        assert_eq!(add.program, "E:/elsewhere/WinRAR.exe");
+        assert!(!add.enabled);
+        assert_eq!(add.tool, "winrar");
+        for id in ARCHIVE_IDS {
+            assert!(healed.iter().any(|a| a.id == id), "缺了 {id}");
+        }
+    }
+
+    /// 单条「更新」只能动那一项，别的项一个字节都不许变。
+    #[test]
+    fn merge_updates_only_the_requested_entry() {
+        let mut actions = archive_actions(Some(&winrar()));
+        // 用户手工把「解压到当前文件夹」改成别的程序与参数。
+        let here = actions
+            .iter_mut()
+            .find(|a| a.id == ARCHIVE_EXTRACT_HERE_ID)
+            .unwrap();
+        here.program = "E:/mine/other.exe".into();
+        here.args = "--mine".into();
+        here.enabled = true;
+
+        let fresh = archive_actions(Some(&winrar()));
+        merge_archive_entries(&mut actions, fresh, Some(ARCHIVE_ADD_ID));
+
+        let here = actions
+            .iter()
+            .find(|a| a.id == ARCHIVE_EXTRACT_HERE_ID)
+            .unwrap();
+        assert_eq!(here.program, "E:/mine/other.exe");
+        assert_eq!(here.args, "--mine");
+        let add = actions.iter().find(|a| a.id == ARCHIVE_ADD_ID).unwrap();
+        assert_eq!(add.program, "D:/winrar/WinRAR.exe");
+    }
+
+    /// 「更新全部」才把每一项都刷成新值。
+    #[test]
+    fn merge_updates_every_entry_for_rescan_all() {
+        let mut actions = archive_actions(Some(&winrar()));
+        for a in actions.iter_mut() {
+            a.program = "E:/old/x.exe".into();
+        }
+        let fresh = archive_actions(Some(&winrar()));
+        merge_archive_entries(&mut actions, fresh, None);
+        for id in ARCHIVE_IDS {
+            let a = actions.iter().find(|a| a.id == id).unwrap();
+            assert_eq!(a.program, "D:/winrar/WinRAR.exe", "{id} 没刷到");
+        }
+    }
+
+    /// 老配置只有两条时，升级要补齐四条，并留住用户改过的开关（参数换成新模板）。
+    #[test]
+    fn upgrade_fills_missing_archive_entries() {
+        let mut entries = archive_actions(Some(&winrar()));
+        entries.retain(|a| a.id == ARCHIVE_ADD_ID || a.id == ARCHIVE_EXTRACT_ID);
+        entries[0].enabled = false;
+        upgrade_archive_entries(&mut entries);
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter(|a| is_archive_action(&a.id))
+            .map(|a| a.id.as_str())
+            .collect();
+        assert_eq!(ids.len(), ARCHIVE_IDS.len());
+        for id in ARCHIVE_IDS {
+            assert!(ids.contains(&id), "缺了 {id}");
+        }
+        let add = entries.iter().find(|a| a.id == ARCHIVE_ADD_ID).unwrap();
+        assert!(!add.enabled, "用户关掉的不能被升级打开");
+        let whole = entries.iter().find(|a| a.id == ARCHIVE_EXTRACT_ID).unwrap();
+        assert!(whole.args.ends_with(r#"\""#), "参数要换成新模板");
+        assert_eq!(whole.program, "D:/winrar/WinRAR.exe");
+    }
 
     /// 「删除」必须紧跟在「剪切」下面，而且必须存在：系统菜单那一项不记账，
     /// 删掉这一条等价于把右键菜单里的删除功能弄丢。
@@ -870,9 +1750,9 @@ mod tests {
                 // 「属性」/「重命名」紧跟删除，与系统菜单的习惯顺序一致。
                 "builtin.properties",
                 "builtin.rename",
-                // 「打开方式」跟在重命名后面。
-                "builtin.open_with",
+                // 「复制路径」跟在重命名后面，「打开方式」再跟在它后面。
                 "builtin.copy_path",
+                "builtin.open_with",
             ],
         );
     }

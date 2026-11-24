@@ -1236,6 +1236,10 @@ pub struct App {
     /// 是否有原生 Shell 文件操作正在进行（复制/移动/删除）。
     /// 这类操作会弹 Shell 自己的确认/进度对话框，期间必须拒绝文件类按键。
     shell_op_running: bool,
+    /// 设置页点过压缩关联的「更新」：后台扫描线程跑着，结果由主循环收。
+    archive_scan_pending: bool,
+    /// 上面那次扫描只刷新的那一项 id；`None` = 「更新全部」。
+    archive_rescan_id: Option<String>,
     /// 设置页点过「重新扫描驱动器」：状态栏已挂上「正在重新扫描…」，
     /// 等索引线程回报就绪后补发一条完成信息，避免那句话永久留在右下角。
     index_rescan_status: bool,
@@ -1434,6 +1438,8 @@ impl App {
             menu_anchor_path: None,
             last_left_press_row: None,
             pending_single_click: None,
+            archive_scan_pending: false,
+            archive_rescan_id: None,
             shell_new_watch: None,
             shell_new_reload_at: None,
             reveal_grace_until: None,
@@ -8805,6 +8811,21 @@ impl App {
             checked: false,
         };
         let dup = |id: &str| shell_present && Self::is_shell_duplicate(id);
+        // 压缩关联项的标签里带 `{name}`（如 `解压到"{name}"\`）：随选中项实时替换。
+        let action_label = |a: &crate::ops::actions::ActionEntry,
+                            paths: &[std::path::PathBuf]| {
+            let stem = paths
+                .first()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let text = self.tr(&a.label).to_string();
+            if text.contains("{name}") || text.contains("{stem}") {
+                text.replace("{name}", &stem).replace("{stem}", &stem)
+            } else {
+                text
+            }
+        };
 
         // 回收站视图：专用菜单（还原 / 剪切 / 彻底删除 / 属性 / 清空 / 视图 / 排序）。
         if self.state.active().active().path.as_deref()
@@ -8883,14 +8904,21 @@ impl App {
                     .actions
                     .iter()
                     // reveal_explorer 由上面的 CMD_REVEAL_EXPLORER 单独渲染，
-                    // 这里排除掉，避免一级菜单里出现两个同名项。
-                    .filter(|a| a.id != "builtin.reveal_explorer")
+                    // 压缩关联两条由末尾那段单独渲染（要带分隔线压在最底下），
+                    // 这里都排除掉，否则菜单里会出现两份。
+                    .filter(|a| {
+                        a.id != "builtin.reveal_explorer"
+                            && !crate::ops::actions::is_archive_action(&a.id)
+                    })
                     // 「是不是文件夹」用已加载的条目快照回答：右键时再去
                     // stat 网络路径会卡住界面线程（整个窗口未响应）。
                     .filter(|a| {
                         a.enabled
                             && a.matches_selection(paths, |p| self.loaded_is_dir(p))
                             && !dup(&a.id)
+                            // 重命名一次只改一个条目（行内编辑）：多选时直接不出现，
+                            // 比留一个点不动的灰项干净。
+                            && !(a.id == "builtin.rename" && paths.len() != 1)
                     })
                 {
                     if !groups.contains_key(&a.group) {
@@ -8900,10 +8928,8 @@ impl App {
                 }
 
                 for a in groups.remove("").unwrap_or_default() {
-                    let mut label = self.tr(&a.label).to_string();
-                    // 「重命名」只对单个条目有意义（F2 那套行内编辑一次只改一个），
-                    // 多选时置灰，而不是弹出来再报错。
-                    let enabled = !(a.id == "builtin.rename" && paths.len() != 1);
+                    let mut label = action_label(a, paths);
+                    let enabled = true;
                     // 终端：非目录时改标签。判断用已加载的条目表，
                     // 不在界面线程上 stat（网络路径的 is_dir() 会卡住）。
                     if a.id == "builtin.terminal" {
@@ -8935,12 +8961,36 @@ impl App {
                             .into_iter()
                             .map(|a| MenuNode::Item {
                                 key: format!("act:{}", a.id),
-                                label: self.tr(&a.label).to_string(),
-                                enabled: !(a.id == "builtin.rename" && paths.len() != 1),
+                                label: action_label(a, paths),
+                                enabled: true,
                                 checked: false,
                             })
                             .collect(),
                     });
+                }
+
+                // 压缩软件关联项：永远带一条分隔线压在最底下。
+                // 顺序按 ARCHIVE_IDS 固定（加压缩包 → 解压文件 → 解压到当前文件夹
+                // → 解压到"{name}"\），与探测到的是哪一款无关；某一项不适用时
+                // 由 matches_selection 挡掉。
+                let mut packed: Vec<MenuNode> = Vec::new();
+                for id in crate::ops::actions::ARCHIVE_IDS {
+                    let Some(a) = self.actions.iter().find(|a| a.id == id) else {
+                        continue;
+                    };
+                    if !a.enabled || !a.matches_selection(paths, |p| self.loaded_is_dir(p)) {
+                        continue;
+                    }
+                    packed.push(MenuNode::Item {
+                        key: format!("act:{}", a.id),
+                        label: action_label(a, paths),
+                        enabled: true,
+                        checked: false,
+                    });
+                }
+                if !packed.is_empty() {
+                    nodes.push(MenuNode::Separator);
+                    nodes.extend(packed);
                 }
                 nodes
             }
@@ -9073,7 +9123,13 @@ impl App {
                     self.state.active().active().path
                 ),
             }
-            let mut native_target = self.shell_menu_target(&target);
+            // 「系统菜单」关着：一次都不去请求 Shell 菜单（也就不给外壳扩展
+            // 执行的机会），右键只显示 Rove 自己的内建项。
+            let mut native_target = if self.config.system_menu {
+                self.shell_menu_target(&target)
+            } else {
+                crate::sys::menu::Target::AppOnly
+            };
             // 系统菜单刚把菜单线程拖死过：这次只弹 Rove 自己的项。
             // 卡死的源头是第三方外壳扩展（一直在 `QueryContextMenu` 里不出来），
             // 不请它上场就不会再卡，代价是暂时没有「打开方式 / 发送到」这些系统项。
@@ -9171,25 +9227,6 @@ impl App {
 
 }
 
-/// 累加各分组卡片高度，得到内容总高（与 `GroupCard` 的 Slint 侧公式一致：
-/// 44px 头 + 42px/行，收起仅留头部，外加 12px 卡片间距）。
-///
-/// 与 Slint 的 `groups-layout.preferred-height` 取 max 使用：两路独立计算，
-/// 任一少报都不会让底部内容被裁在视口外又滚不到。
-fn sum_group_heights<M: Model<Data = SettingsActionGroup>>(model: &M) -> f32 {
-    let mut h = 0.0f32;
-    for i in 0..model.row_count() {
-        if let Some(g) = model.row_data(i) {
-            h += if g.expanded {
-                44.0 + g.items.row_count() as f32 * 42.0
-            } else {
-                44.0
-            } + 12.0;
-        }
-    }
-    h
-}
-
 impl App {
     /// 打开或切换到设置页标签。
     fn open_settings_tab(&mut self, subpage: crate::state::SettingsSubpage, force_subpage: bool) {
@@ -9217,6 +9254,52 @@ impl App {
         let raw = crate::ops::actions::load_or_create();
         self.actions = crate::ops::actions::heal_full(&raw);
     }
+    /// 重新探测压缩软件（设置页「更新全部」= 整组，`None` 表示全部项）。
+    fn rescan_archive(&mut self) {
+        self.rescan_archive_for(None);
+    }
+
+    /// 重新探测压缩软件。`only = Some(id)` 时扫完只更新那一项（单条「更新」）。
+    fn rescan_archive_for(&mut self, only: Option<String>) {
+        if self.archive_scan_pending {
+            return;
+        }
+        self.set_status_job(self.tr("正在查找压缩软件…"));
+        self.archive_rescan_id = only;
+        self.archive_scan_pending = crate::sys::archive::scan_async();
+        if !self.archive_scan_pending {
+            self.archive_rescan_id = None;
+            self.set_status_job(
+                self.tr("未检测到压缩软件（WinRAR / 7-Zip / Bandizip）")
+                    .to_string(),
+            );
+        }
+    }
+
+    /// 把扫描结果并回配置：刷新程序/参数，并同步开关。
+    ///
+    /// 找到了 → 保留用户原来的开关（他关掉的不要擅自打开）；
+    /// 没找到 → 一律关掉，因为程序路径已经不可用了。
+    fn apply_archive_tool(&mut self, tool: Option<crate::sys::archive::Tool>) {
+        // 单条「更新」只并回那一项；「更新全部」才整组覆盖。
+        let only = self.archive_rescan_id.take();
+        let fresh = crate::ops::actions::archive_actions(tool.as_ref());
+        if tool.is_none() {
+            // 三款软件都被卸载了：所有压缩项一起关掉，别留指向已删除 exe 的开关。
+            crate::ops::actions::disable_all_archive_entries(&mut self.actions);
+        }
+        crate::ops::actions::merge_archive_entries(&mut self.actions, fresh, only.as_deref());
+        self.save_actions_and_reload();
+        self.sync_settings();
+        let text = match tool {
+            Some(t) => self.trf("已更新压缩软件关联：{}", &[t.kind.name().to_string()]),
+            None => self
+                .tr("未检测到压缩软件（WinRAR / 7-Zip / Bandizip）")
+                .to_string(),
+        };
+        self.set_status_job(text);
+    }
+
     /// 菜单健康检查：看门狗。
     ///
     /// 必须在 UI 线程的周期回调里（40ms 心跳）。菜单跑在子进程里，所以这里
@@ -9478,6 +9561,7 @@ impl App {
         self.ui.set_show_hidden(self.config.show_hidden);
         self.ui.set_auto_edit_path_on_new_tab(self.config.auto_edit_path_on_new_tab);
         self.ui.set_explorer_takeover(self.config.explorer_takeover);
+        self.ui.set_system_menu(self.config.system_menu);
         // 开机自启动没有配置项：注册表 Run 键就是唯一真源，进设置页按实况显示，
         // 这样用户在任务管理器里停用/删掉之后，开关不会骗人。
         self.ui.set_autostart(crate::sys::autostart::enabled());
@@ -9562,14 +9646,17 @@ impl App {
 
         if current != SettingsSubpage::ContextMenu {
             self.ui.set_settings_action_groups(ModelRc::new(VecModel::from(Vec::<SettingsActionGroup>::new())));
-            self.ui.set_settings_content_height(0.0);
             return;
         }
 
         let mut groups_map: std::collections::BTreeMap<String, Vec<SettingsActionItem>> =
             std::collections::BTreeMap::new();
         let mut order: Vec<String> = Vec::new();
+        let mut packed: Vec<SettingsActionItem> = Vec::new();
         for a in &self.actions {
+            if crate::ops::actions::is_archive_action(&a.id) {
+                continue;
+            }
             let g = a.group.clone();
             if !groups_map.contains_key(&g) {
                 order.push(g.clone());
@@ -9582,8 +9669,27 @@ impl App {
                 program: a.program.clone().into(),
                 enabled: a.enabled,
                 builtin: a.builtin,
+                special: false,
             };
             groups_map.entry(g).or_default().push(item);
+        }
+        // 压缩关联项在菜单里是一级项，但设置页单独成一组（组头有「更新全部」，
+        // 每行的删除按钮换成「更新」）。顺序固定，与文件里的先后无关。
+        for id in crate::ops::actions::ARCHIVE_IDS {
+            let Some(a) = self.actions.iter().find(|a| a.id == id) else {
+                continue;
+            };
+            packed.push(SettingsActionItem {
+                id: a.id.clone().into(),
+                // 显示当前语言的模板（`{name}` 原样留着，用户改的就是这段）。
+                label: self.tr(&a.label).into(),
+                target: a.target.clone().into(),
+                extensions: a.extensions.join(", ").into(),
+                program: a.program.clone().into(),
+                enabled: a.enabled,
+                builtin: a.builtin,
+                special: true,
+            });
         }
         let groups: Vec<SettingsActionGroup> = order
             .into_iter()
@@ -9596,12 +9702,22 @@ impl App {
                 SettingsActionGroup {
                     name,
                     expanded: true,
+                    rescan_all: false,
                     items: ModelRc::new(VecModel::from(groups_map.remove(&g).unwrap_or_default())),
                 }
             })
             .collect();
+        let mut groups = groups;
+        if !packed.is_empty() {
+            // 压缩关联组压在最底下，组头带「更新全部」。
+            groups.push(SettingsActionGroup {
+                name: self.tr(crate::ops::actions::ARCHIVE_GROUP).into(),
+                expanded: true,
+                rescan_all: true,
+                items: ModelRc::new(VecModel::from(packed)),
+            });
+        }
         let groups_model = VecModel::from(groups);
-        self.ui.set_settings_content_height(sum_group_heights(&groups_model));
         self.ui.set_settings_action_groups(ModelRc::new(groups_model));
     }
 
@@ -11597,6 +11713,72 @@ impl App {
                     } else {
                         self.tr("文件夹已在快速访问中").to_string()
                     });
+                    return;
+                }
+                // 三个解压项：多选时逐个包跑一遍（WinRAR / 7-Zip / Bandizip
+                // 都不接受「一次给多个包」——多出来的参数会被当成包内文件名，
+                // 实测 WinRAR 直接卡在对话框上不出结果）。
+                // 分卷只交第一卷：整组递过去同样会卡住。
+                "builtin.archive_extract_files"
+                | "builtin.archive_extract_here"
+                | "builtin.archive_extract" => {
+                    let MenuScope::Selection(paths) = &target else {
+                        return;
+                    };
+                    let archives = crate::ops::actions::extractable_archives(paths);
+                    let skipped = crate::ops::actions::skipped_volumes(paths);
+                    if archives.is_empty() {
+                        // 只有后续卷 / 只选了 part2 这类：缺第一卷本来解不开。
+                        if skipped > 0 {
+                            self.set_status_job(
+                                self.tr("选中的分卷缺少第一卷，没法解压").to_string(),
+                            );
+                        }
+                        return;
+                    }
+                    let entry = self.actions.iter().find(|a| a.id == action_id).cloned();
+                    let Some(entry) = entry else { return };
+                    // 「解压文件」先问一次目录，全部包都解到那儿。
+                    let dest = if action_id == "builtin.archive_extract_files" {
+                        match crate::sys::pick::pick_folder_path() {
+                            Some(d) => Some(d),
+                            None => return,
+                        }
+                    } else {
+                        None
+                    };
+                    let mut result = Ok(());
+                    for one in &archives {
+                        let one = std::slice::from_ref(one);
+                        result = match &dest {
+                            Some(d) => crate::ops::actions::run_action_into_dir(&entry, one, d),
+                            None => crate::ops::actions::run_action(&entry, one),
+                        };
+                        if result.is_err() {
+                            break;
+                        }
+                    }
+                    match result {
+                        Ok(()) => {
+                            // 跳过后续分卷时说一句，别让用户以为少解了东西。
+                            if skipped > 0 {
+                                self.set_status_job(self.trf(
+                                    "已跳过 {} 个后续分卷",
+                                    &[skipped.to_string()],
+                                ));
+                            } else {
+                                self.set_status_job(format!(
+                                    "{}：{}",
+                                    self.tr("已执行"),
+                                    self.tr(&entry.label)
+                                ));
+                            }
+                            self.reload_active();
+                        }
+                        Err(e) => {
+                            self.set_status_job(self.trf("执行失败：{}", &[e.to_string()]))
+                        }
+                    }
                     return;
                 }
                 _ => {
@@ -13753,6 +13935,16 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     // 扩展拖坏进程后能在一秒内自我修复，而不是等 15 秒那条周期定时器。
     app.borrow_mut().check_menu_health();
 
+    // 压缩软件「更新」：后台线程扫完就把结果并回配置。搭这趟 40ms 轮询，
+    // 不额外起定时器，也不让界面线程去碰开始菜单。
+    if app.borrow().archive_scan_pending {
+        if let Some(found) = crate::sys::archive::take_result() {
+            let mut app = app.borrow_mut();
+            app.archive_scan_pending = false;
+            app.apply_archive_tool(found);
+        }
+    }
+
     // 搜索框防抖：攒够 150ms 再跑一次全目录匹配。
     // 用 40ms 轮询判到期，省一个单独的定时器；到期前用户又敲了字会重新计时。
     let pending_search = app.borrow().pending_search.clone();
@@ -15815,6 +16007,17 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
         // 接管资源管理器：改开关立刻写/还原注册表，失败只回退开关并记日志。
         let takeover_app = app.clone();
+        // 「系统菜单」开关：只影响下一次右键（不重建菜单线程、不用重启）。
+        let sysmenu_app = app.clone();
+        upgrade().on_system_menu_toggled(move |enabled| {
+            let Some(app) = sysmenu_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.system_menu = enabled;
+            app.config.save();
+            app.ui.set_system_menu(enabled);
+            // 关掉时「隐藏的系统菜单项」卡片随之隐藏，顺带重算页面内容高度。
+            app.sync_settings();
+        });
         upgrade().on_explorer_takeover_toggled(move |enabled| {
             let Some(app) = takeover_app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -15949,8 +16152,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                     }
                 }
             }
-            // 同步内容高度（与 Slint 实测值取 max，见 settings_page.slint）。
-            app.ui.set_settings_content_height(sum_group_heights(&model));
+            // 内容高度由 Slint 侧 `preferred-height` 实测，这里只换模型。
         });
     }
     {
@@ -15988,6 +16190,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.ui.set_settings_editor_program("".into());
             // 参数模板默认给 "{target_path}"（带双引号），符合任务书约定。
             app.ui.set_settings_editor_args("\"{target_path}\"".into());
+            app.ui.set_settings_editor_label_locked(false);
+            // 弹窗是同一个实例：上一条是压缩项时留下的「受管」标记必须清掉，
+            // 否则新增动作也只剩 名称 / 执行路径 / 参数模板。
+            app.ui.set_settings_editor_managed(false);
         });
     }
     {
@@ -15998,6 +16204,10 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let id = id.to_string();
             if let Some(a) = app.actions.iter().find(|a| a.id == id) {
                 app.ui.set_settings_editor_title(app.tr("编辑动作"));
+                // 压缩关联项的名称是固定语义（`解压到"{name}"\`），不许改。
+                let locked = crate::ops::actions::is_archive_action(&a.id);
+                app.ui.set_settings_editor_label_locked(locked);
+                app.ui.set_settings_editor_managed(locked);
                 // 层级归属候选：已有二级分组 + 内置「一级菜单」（当前语言文案）。
                 app.ui.set_settings_editor_group_options(ModelRc::new(VecModel::from(
                     group_options(&app.actions, &app.tr("一级菜单")),
@@ -16025,6 +16235,21 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
         });
     }
     {
+        // 压缩关联项：单条「更新」只刷这一项；组头「更新全部」才刷整组。
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_action_rescan(move |id| {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().rescan_archive_for(Some(id.to_string()));
+        });
+    }
+    {
+        let app = Rc::downgrade(app);
+        upgrade().on_settings_archive_rescan_all(move || {
+            let Some(app) = app.upgrade() else { return };
+            app.borrow_mut().rescan_archive();
+        });
+    }
+    {
         let app = Rc::downgrade(app);
         upgrade().on_settings_editor_save(move |id, label, group, target, extensions, program, args| {
             let Some(app) = app.upgrade() else { return };
@@ -16043,18 +16268,26 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             } else {
                 group
             };
+            // 压缩关联项：名称与 tool/builtin 标记沿用原值，只让用户改程序/参数。
+            let existing = app.actions.iter().find(|a| a.id == id).cloned();
+            let is_archive = crate::ops::actions::is_archive_action(&id);
+            let (label, tool, builtin) = match (&existing, is_archive) {
+                (Some(old), true) => (old.label.clone(), old.tool.clone(), old.builtin),
+                _ => (label.to_string(), String::new(), false),
+            };
             let action = crate::ops::actions::ActionEntry {
                 id: id.clone(),
-                label: label.to_string(),
-                tool: "".into(),
+                label,
                 program: program.to_string(),
                 args: args.to_string(),
                 working_dir: "{target_dir}".into(),
                 target: target.to_string(),
                 extensions,
-                enabled: true,
+                // 压缩关联项跟着原开关走，别因为「编辑」就被强行打开。
+                enabled: existing.as_ref().map(|a| a.enabled).unwrap_or(true),
                 group: group.to_string(),
-                builtin: false,
+                tool,
+                builtin,
             };
             if let Some(idx) = app.actions.iter().position(|a| a.id == id) {
                 app.actions[idx] = action;

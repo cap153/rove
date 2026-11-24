@@ -20,3 +20,5 @@ pub mod autostart;
 pub mod theme;
 // 把窗格登记成 Shell 窗口：浏览器/下载器的「打开文件所在位置」会直接选中条目。
 pub mod shell_windows;
+// 压缩软件探测（WinRAR / 7-Zip / Bandizip），给「添加到压缩文件 / 解压到」用。
+pub mod archive;
