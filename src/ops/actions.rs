@@ -676,7 +676,8 @@ fn action_to_toml(a: &ActionEntry) -> String {
     lines.join("\n")
 }
 /// 加载（必要时生成）并自愈配置，返回全部动作（含禁用）。
-pub fn load_or_create() -> Vec<ActionEntry> {
+/// 加载动作配置（没有就建）。`prefer` = 默认压缩软件，首扫时优先用它。
+pub fn load_or_create(prefer: Option<crate::sys::archive::ToolKind>) -> Vec<ActionEntry> {
     let Some(path) = config_path() else {
         return Vec::new();
     };
@@ -696,7 +697,7 @@ pub fn load_or_create() -> Vec<ActionEntry> {
         // 首次启动只扫一次：装了压缩软件就默认开启（挑优先级最高的那款），
         // 没装就生成两行关闭状态的条目，用户点「更新」随时能接上。
         let began = std::time::Instant::now();
-        let tool = crate::sys::archive::seed_on_first_run();
+        let tool = crate::sys::archive::seed_on_first_run(prefer);
         logln!(
             "[archive] 首次探测 {}（{}ms）",
             tool.as_ref()

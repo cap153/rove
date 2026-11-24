@@ -133,6 +133,9 @@ export component MainWindow inherits Window {
     in-out property <int> language-index: 0;
     in-out property <int> theme-index: 0;
     in-out property <int> startup-index: 0;
+    /// 默认压缩软件：0 WinRAR / 1 7-Zip / 2 Bandizip。
+    in-out property <int> archive-tool-index: 0;
+    callback archive_tool_changed(int);
     callback language_changed(int);
     callback theme_changed(int);
     callback startup_changed(int);
@@ -1643,6 +1646,8 @@ out property <length> row-height-out: file-list.row-height-out;
                     language-index: root.language-index;
                     theme-index: root.theme-index;
                     startup-index: root.startup-index;
+                    archive-tool-index: root.archive-tool-index;
+                    archive_tool_changed(i) => { root.archive_tool_changed(i); }
                     language_changed(i) => { root.language_changed(i); }
                     theme_changed(i) => { root.theme_changed(i); }
                     startup_changed(i) => { root.startup_changed(i); }

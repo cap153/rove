@@ -576,6 +576,9 @@ export component SettingsPage inherits Rectangle {
     /// 显示语言：0 跟随系统 / 1 简体中文 / 2 English。
     in-out property <int> language-index: 0;
     callback language_changed(int);
+    /// 默认压缩软件：0 WinRAR / 1 7-Zip / 2 Bandizip（缺省 0）。
+    in-out property <int> archive-tool-index: 0;
+    callback archive_tool_changed(int);
     /// 主题色：0 跟随系统 / 1 亮 / 2 暗。
     in-out property <int> theme-index: 0;
     callback theme_changed(int);
@@ -1088,6 +1091,20 @@ export component SettingsPage inherits Rectangle {
                         selection_changed(i) => {
                             root.startup-index = i;
                             root.startup_changed(i);
+                        }
+                    }
+
+                    // 默认压缩软件：装了多款时决定右键里用哪一款（选完立刻整组重扫）。
+                    combo-archive-tool := ComboRow {
+                        z: self.open ? 10 : 0;
+                        label: I18n.strings[340];
+                        options: ["WinRAR", "7-Zip", "Bandizip"];
+                        selected: root.archive-tool-index;
+                        viewport-top: gen-scroll.absolute-position.y;
+                        viewport-bottom: gen-scroll.absolute-position.y + gen-scroll.height;
+                        selection_changed(i) => {
+                            root.archive-tool-index = i;
+                            root.archive_tool_changed(i);
                         }
                     }
                 }

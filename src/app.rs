@@ -1240,6 +1240,10 @@ pub struct App {
     archive_scan_pending: bool,
     /// 上面那次扫描只刷新的那一项 id；`None` = 「更新全部」。
     archive_rescan_id: Option<String>,
+    /// 正在等的那一轮扫描的序号（连续「更新」时旧结果会被丢弃）。
+    archive_scan_gen: u64,
+    /// 「解压文件」的目录选择框正在弹（防止再弹第二个）。
+    archive_extract_picking: bool,
     /// 设置页点过「重新扫描驱动器」：状态栏已挂上「正在重新扫描…」，
     /// 等索引线程回报就绪后补发一条完成信息，避免那句话永久留在右下角。
     index_rescan_status: bool,
@@ -1439,7 +1443,9 @@ impl App {
             last_left_press_row: None,
             pending_single_click: None,
             archive_scan_pending: false,
+            archive_extract_picking: false,
             archive_rescan_id: None,
+            archive_scan_gen: 0,
             shell_new_watch: None,
             shell_new_reload_at: None,
             reveal_grace_until: None,
@@ -9245,14 +9251,68 @@ impl App {
             .invoke_scroll_tabs_to_index(self.state.active_tab as i32);
     }
 
+    /// 逐个包解压（每个包一个子进程：坏包弹自己的错，不影响别的包）。
+    fn run_archive_extract(
+        &mut self,
+        archives: Vec<std::path::PathBuf>,
+        dest: Option<String>,
+        entry: &crate::ops::actions::ActionEntry,
+        skipped: usize,
+    ) {
+        let mut result = Ok(());
+        for one in &archives {
+            let one = std::slice::from_ref(one);
+            result = match &dest {
+                Some(d) => crate::ops::actions::run_action_into_dir(entry, one, d),
+                None => crate::ops::actions::run_action(entry, one),
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+        match result {
+            Ok(()) => {
+                // 跳过后续分卷时说一句，别让用户以为少解了东西。
+                if skipped > 0 {
+                    self.set_status_job(
+                        self.trf("已跳过 {} 个后续分卷", &[skipped.to_string()]),
+                    );
+                } else {
+                    self.set_status_job(format!(
+                        "{}：{}",
+                        self.tr("已执行"),
+                        self.tr(&entry.label)
+                    ));
+                }
+                self.reload_active();
+            }
+            Err(e) => self.set_status_job(self.trf("执行失败：{}", &[e.to_string()])),
+        }
+    }
+
     /// 保存当前 actions 并重新加载（合并内置动作、校验自定义命令）。
     fn save_actions_and_reload(&mut self) {
         if let Err(e) = crate::ops::actions::save(&self.actions) {
             self.set_status_job(e);
             return;
         }
-        let raw = crate::ops::actions::load_or_create();
+        let raw = crate::ops::actions::load_or_create(Some(self.preferred_archive_tool()));
         self.actions = crate::ops::actions::heal_full(&raw);
+    }
+
+    /// 设置页选的默认压缩软件（缺省 WinRAR）。
+    fn preferred_archive_tool(&self) -> crate::sys::archive::ToolKind {
+        crate::sys::archive::ToolKind::from_id(&self.config.archive_tool)
+            .unwrap_or(crate::sys::archive::ToolKind::WinRar)
+    }
+
+    /// 默认压缩软件在设置页下拉框里的下标（0 WinRAR / 1 7-Zip / 2 Bandizip）。
+    fn archive_tool_index(&self) -> i32 {
+        match self.config.archive_tool.as_str() {
+            "7zip" => 1,
+            "bandizip" => 2,
+            _ => 0,
+        }
     }
     /// 重新探测压缩软件（设置页「更新全部」= 整组，`None` 表示全部项）。
     fn rescan_archive(&mut self) {
@@ -9261,18 +9321,20 @@ impl App {
 
     /// 重新探测压缩软件。`only = Some(id)` 时扫完只更新那一项（单条「更新」）。
     fn rescan_archive_for(&mut self, only: Option<String>) {
-        if self.archive_scan_pending {
-            return;
-        }
         self.set_status_job(self.tr("正在查找压缩软件…"));
         self.archive_rescan_id = only;
-        self.archive_scan_pending = crate::sys::archive::scan_async();
-        if !self.archive_scan_pending {
-            self.archive_rescan_id = None;
-            self.set_status_job(
-                self.tr("未检测到压缩软件（WinRAR / 7-Zip / Bandizip）")
-                    .to_string(),
-            );
+        match crate::sys::archive::scan_async(Some(self.preferred_archive_tool())) {
+            Some(gen) => {
+                self.archive_scan_gen = gen;
+                self.archive_scan_pending = true;
+            }
+            None => {
+                self.archive_scan_pending = false;
+                self.archive_rescan_id = None;
+                self.set_status_job(
+                    self.tr("未检测到压缩软件（WinRAR / 7-Zip / Bandizip）").to_string(),
+                );
+            }
         }
     }
 
@@ -9562,6 +9624,7 @@ impl App {
         self.ui.set_auto_edit_path_on_new_tab(self.config.auto_edit_path_on_new_tab);
         self.ui.set_explorer_takeover(self.config.explorer_takeover);
         self.ui.set_system_menu(self.config.system_menu);
+        self.ui.set_archive_tool_index(self.archive_tool_index());
         // 开机自启动没有配置项：注册表 Run 键就是唯一真源，进设置页按实况显示，
         // 这样用户在任务管理器里停用/删掉之后，开关不会骗人。
         self.ui.set_autostart(crate::sys::autostart::enabled());
@@ -11739,46 +11802,43 @@ impl App {
                     let entry = self.actions.iter().find(|a| a.id == action_id).cloned();
                     let Some(entry) = entry else { return };
                     // 「解压文件」先问一次目录，全部包都解到那儿。
-                    let dest = if action_id == "builtin.archive_extract_files" {
-                        match crate::sys::pick::pick_folder_path() {
-                            Some(d) => Some(d),
-                            None => return,
+                    // 选择框必须放后台线程弹：同步 Show 会开嵌套消息循环堵死
+                    // Slint 的定时器，吸附窗就渲染不出来（搜索排除目录那边同理）。
+                    if action_id == "builtin.archive_extract_files" {
+                        if self.archive_extract_picking {
+                            return;
                         }
-                    } else {
-                        None
-                    };
-                    let mut result = Ok(());
-                    for one in &archives {
-                        let one = std::slice::from_ref(one);
-                        result = match &dest {
-                            Some(d) => crate::ops::actions::run_action_into_dir(&entry, one, d),
-                            None => crate::ops::actions::run_action(&entry, one),
-                        };
-                        if result.is_err() {
-                            break;
-                        }
+                        self.archive_extract_picking = true;
+                        let title = self.tr("选择解压目标文件夹").to_string();
+                        std::thread::spawn(move || {
+                            let dest = crate::sys::pick::pick_folder_titled(&title);
+                            let _ = slint::invoke_from_event_loop(move || {
+                                let Some(app) =
+                                    SESSION.with(|slot| slot.borrow().clone())
+                                else {
+                                    return;
+                                };
+                                let mut app = app.borrow_mut();
+                                app.archive_extract_picking = false;
+                                let Some(dest) = dest else { return };
+                                let entry = app
+                                    .actions
+                                    .iter()
+                                    .find(|a| a.id == "builtin.archive_extract_files")
+                                    .cloned();
+                                if let Some(entry) = entry {
+                                    app.run_archive_extract(
+                                        archives,
+                                        Some(dest),
+                                        &entry,
+                                        skipped,
+                                    );
+                                }
+                            });
+                        });
+                        return;
                     }
-                    match result {
-                        Ok(()) => {
-                            // 跳过后续分卷时说一句，别让用户以为少解了东西。
-                            if skipped > 0 {
-                                self.set_status_job(self.trf(
-                                    "已跳过 {} 个后续分卷",
-                                    &[skipped.to_string()],
-                                ));
-                            } else {
-                                self.set_status_job(format!(
-                                    "{}：{}",
-                                    self.tr("已执行"),
-                                    self.tr(&entry.label)
-                                ));
-                            }
-                            self.reload_active();
-                        }
-                        Err(e) => {
-                            self.set_status_job(self.trf("执行失败：{}", &[e.to_string()]))
-                        }
-                    }
+                    self.run_archive_extract(archives, None, &entry, skipped);
                     return;
                 }
                 _ => {
@@ -13938,7 +13998,7 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
     // 压缩软件「更新」：后台线程扫完就把结果并回配置。搭这趟 40ms 轮询，
     // 不额外起定时器，也不让界面线程去碰开始菜单。
     if app.borrow().archive_scan_pending {
-        if let Some(found) = crate::sys::archive::take_result() {
+        if let Some(found) = crate::sys::archive::take_result(app.borrow().archive_scan_gen) {
             let mut app = app.borrow_mut();
             app.archive_scan_pending = false;
             app.apply_archive_tool(found);
@@ -16017,6 +16077,26 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.ui.set_system_menu(enabled);
             // 关掉时「隐藏的系统菜单项」卡片随之隐藏，顺带重算页面内容高度。
             app.sync_settings();
+        });
+        // 默认压缩软件：存配置后整组重扫，四条压缩项按新的那一款重填程序/参数。
+        let archtool_app = app.clone();
+        upgrade().on_archive_tool_changed(move |index| {
+            let Some(app) = archtool_app.upgrade() else { return };
+            let id = match index {
+                1 => "7zip",
+                2 => "bandizip",
+                _ => "winrar",
+            };
+            {
+                let mut app = app.borrow_mut();
+                if app.config.archive_tool == id {
+                    return;
+                }
+                app.config.archive_tool = id.to_string();
+                app.config.save();
+                app.ui.set_archive_tool_index(index);
+            }
+            app.borrow_mut().rescan_archive();
         });
         upgrade().on_explorer_takeover_toggled(move |enabled| {
             let Some(app) = takeover_app.upgrade() else { return };
@@ -18402,7 +18482,8 @@ fn create_session(
     // 供延迟重命名等定时器在回调里升级回 App。
     app.borrow_mut().self_weak = Some(Rc::downgrade(&app));
     {
-        let raw = crate::ops::actions::load_or_create();
+        let prefer = app.borrow().preferred_archive_tool();
+        let raw = crate::ops::actions::load_or_create(Some(prefer));
         app.borrow_mut().actions = crate::ops::actions::heal_full(&raw);
     }
 

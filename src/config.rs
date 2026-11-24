@@ -191,6 +191,11 @@ pub struct Config {
     /// 就多一个字段的写法撑不了多久。
     pub context_menu_hide_gen: u32,
 
+    /// 默认压缩软件（`winrar` / `7zip` / `bandizip`）：装了多款时优先用这一款。
+    ///
+    /// 空串按 `winrar` 处理；用户选的那一款没装时退回默认优先级。
+    pub archive_tool: String,
+
     /// 右键菜单是否读取系统和第三方菜单项。
     ///
     /// 关掉时完全不请求 Shell 菜单（也就不给外壳扩展执行的机会），右键只显示
@@ -372,6 +377,7 @@ impl Default for Config {
             quick_items: default_quick_items(),
             context_menu_hide_seeded: true,
             context_menu_hide_gen: CONTEXT_MENU_HIDE_GEN,
+            archive_tool: "winrar".into(),
             system_menu: false,
         }
     }
@@ -616,6 +622,11 @@ impl Config {
             .get("system_menu")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        if let Some(t) = json.get("archive_tool").and_then(|v| v.as_str()) {
+            if matches!(t, "winrar" | "7zip" | "bandizip") {
+                config.archive_tool = t.to_string();
+            }
+        }
 
         if let Some(arr) = json.get("context_menu_hide").and_then(|v| v.as_array()) {
             config.context_menu_hide = arr
@@ -870,6 +881,7 @@ impl Config {
             "context_menu_hide_seeded": self.context_menu_hide_seeded,
             "context_menu_hide_gen": self.context_menu_hide_gen,
             "system_menu": self.system_menu,
+            "archive_tool": self.archive_tool,
         })
     }
 
@@ -919,6 +931,14 @@ mod tests {
             config.system_menu = v;
         }
         assert!(!config.system_menu);
+    }
+
+    /// 默认压缩软件：缺省 WinRAR，只认这三款，写进 config 才能持久。
+    #[test]
+    fn archive_tool_defaults_to_winrar() {
+        assert_eq!(Config::default().archive_tool, "winrar");
+        let json = Config::default().save_json();
+        assert_eq!(json["archive_tool"], "winrar");
     }
 
     #[test]

@@ -53,13 +53,33 @@ unsafe fn run_dialog() -> Option<String> {
 /// 弹出原生目录选择对话框，返回选中文件夹的绝对路径；用户取消或失败时为 None。
 ///
 /// 与 [`pick_program_path`] 一样会开启嵌套消息循环，仅适合用户点击时调用。
+/// 标题是「选择要排除索引的文件夹」；别的用途请用 [`pick_folder_titled`]。
 #[cfg(windows)]
 pub fn pick_folder_path() -> Option<String> {
     use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 
     unsafe {
         let uninit = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
-        let out = run_folder_dialog();
+        let out = run_folder_dialog("选择要排除索引的文件夹");
+        if uninit {
+            CoUninitialize();
+        }
+        out
+    }
+}
+
+/// 弹目录选择框并指定标题（同步，**调用方自己负责放到后台线程**）。
+///
+/// 为什么必须放后台线程：`IFileDialog::Show` 会开一个嵌套消息循环，把 Slint
+/// 的定时器堵死，吸附窗（`dialog_jump`）就渲染不出来。搜索排除目录那边早就
+/// 是这么做的，这里同样走后台线程 + `invoke_from_event_loop` 回主线程。
+#[cfg(windows)]
+pub fn pick_folder_titled(title: &str) -> Option<String> {
+    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+
+    unsafe {
+        let uninit = CoInitializeEx(None, COINIT_APARTMENTTHREADED).is_ok();
+        let out = run_folder_dialog(title);
         if uninit {
             CoUninitialize();
         }
@@ -68,7 +88,7 @@ pub fn pick_folder_path() -> Option<String> {
 }
 
 #[cfg(windows)]
-unsafe fn run_folder_dialog() -> Option<String> {
+unsafe fn run_folder_dialog(title_text: &str) -> Option<String> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
     use windows::Win32::UI::Shell::{
@@ -78,7 +98,7 @@ unsafe fn run_folder_dialog() -> Option<String> {
 
     let dialog: IFileDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_ALL).ok()?;
 
-    let title: Vec<u16> = "选择要排除索引的文件夹\0".encode_utf16().collect();
+    let title: Vec<u16> = format!("{title_text}\0").encode_utf16().collect();
     let _ = dialog.SetTitle(PCWSTR(title.as_ptr()));
     let _ = dialog.SetOptions(FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
 
@@ -95,6 +115,12 @@ unsafe fn run_folder_dialog() -> Option<String> {
 /// 非 Windows 平台（交叉编译期）的空实现。
 #[cfg(not(windows))]
 pub fn pick_folder_path() -> Option<String> {
+    None
+}
+
+/// 非 Windows 平台（交叉编译期）的空实现。
+#[cfg(not(windows))]
+pub fn pick_folder_titled(_title: &str) -> Option<String> {
     None
 }
 

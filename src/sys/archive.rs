@@ -100,7 +100,12 @@ impl Tool {
 // 异步扫描（「更新」按钮 / 首次启动）
 // ---------------------------------------------------------------------------
 
-type ScanResult = Option<Tool>;
+/// 一次扫描的结果。带序号是为了让「先发起的扫描」不能覆盖「后发起的」：
+/// 连着点两次「更新」、或者扫描途中切换默认压缩软件时，旧结果直接丢弃。
+struct ScanResult {
+    gen: u64,
+    tool: Option<Tool>,
+}
 
 #[cfg(windows)]
 fn slot() -> &'static std::sync::Mutex<Option<ScanResult>> {
@@ -111,14 +116,19 @@ fn slot() -> &'static std::sync::Mutex<Option<ScanResult>> {
 
 /// 后台线程扫一遍；结果留在槽里，由主循环 `take_result` 取走。
 ///
-/// 返回 false 表示线程没起来（此时不会有结果回来，调用方别干等）。
-pub fn scan_async() -> bool {
+/// `prefer` = 设置页选的「默认压缩软件」；装了多款时优先用它。
+/// 返回 `None` 表示线程没起来（此时不会有结果回来，调用方别干等）；
+/// 否则返回这次扫描的序号，取结果时要比对，防止旧结果被当成新的。
+pub fn scan_async(prefer: Option<ToolKind>) -> Option<u64> {
     #[cfg(windows)]
     {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static GEN: AtomicU64 = AtomicU64::new(0);
+        let gen = GEN.fetch_add(1, Ordering::SeqCst) + 1;
         std::thread::Builder::new()
             .name("rove-archive-scan".into())
-            .spawn(|| {
-                let found = detect();
+            .spawn(move || {
+                let found = detect(prefer);
                 crate::logln!(
                     "[archive] 扫描完成：{}",
                     found
@@ -127,32 +137,52 @@ pub fn scan_async() -> bool {
                         .unwrap_or_else(|| "未找到".into())
                 );
                 if let Ok(mut slot) = slot().lock() {
-                    *slot = Some(found);
+                    // 慢的那一轮后到也不能盖掉新一轮的结果。
+                    let newer = slot.as_ref().map(|r| r.gen).unwrap_or(0);
+                    if newer <= gen {
+                        *slot = Some(ScanResult { gen, tool: found });
+                    }
                 }
             })
-            .is_ok()
+            .ok()
+            .map(|_| gen)
     }
     #[cfg(not(windows))]
     {
-        false
+        let _ = prefer;
+        None
     }
 }
 
 /// 取一次扫描结果（主循环里轮询，没有结果返回 None）。
-pub fn take_result() -> Option<Option<Tool>> {
+///
+/// `min_gen` = 调用方等的那一轮序号；只接受不早于它的结果，早的先扔着
+/// （那种结果对应的是已经作废的扫描）。
+pub fn take_result(min_gen: u64) -> Option<Option<Tool>> {
     #[cfg(windows)]
     {
-        slot().lock().ok().and_then(|mut g| g.take())
+        let mut g = slot().lock().ok()?;
+        let result = g.as_ref()?;
+        if result.gen < min_gen {
+            return None;
+        }
+        let tool = result.tool.clone();
+        *g = None;
+        Some(tool)
     }
     #[cfg(not(windows))]
     {
+        let _ = min_gen;
         None
     }
 }
 
 /// 同步探测（**只在后台线程 / 启动首扫时调用**）。
+///
+/// `prefer` 优先：用户选了 7-Zip 就先用 7-Zip，哪怕 WinRAR 也装了；选的那款
+/// 没装（或没解析出来）时退回默认优先级 WinRAR > 7-Zip > Bandizip。
 #[cfg(windows)]
-pub fn detect() -> Option<Tool> {
+pub fn detect(prefer: Option<ToolKind>) -> Option<Tool> {
     use std::os::windows::ffi::OsStrExt;
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Com::{
@@ -227,36 +257,48 @@ pub fn detect() -> Option<Tool> {
     }
 
     let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
-    let mut best: Option<Tool> = None;
+    // 每款只留第一个解析成功的（同款装多处时按开始菜单里的顺序）。
+    let mut found: Vec<Tool> = Vec::new();
     for lnk in &lnks {
         let Some(target) = (unsafe { resolve(lnk) }) else {
             continue;
         };
         let Some(kind) = kind_of(&target) else { continue };
-        let tool = Tool {
+        if found.iter().any(|t| t.kind == kind) {
+            continue;
+        }
+        found.push(Tool {
             kind,
             program: target,
+        });
+        // 已经拿到想要的那一款就收工：优先项拿到了，或者没指定优先项时
+        // 最高优先级（WinRAR）拿到了。
+        let done = match prefer {
+            Some(p) => found.iter().any(|t| t.kind == p),
+            None => found.iter().any(|t| t.kind.priority() == 0),
         };
-        if best.as_ref().map(|b| kind.priority() < b.kind.priority()).unwrap_or(true) {
-            best = Some(tool);
-        }
-        // 已经拿到最高优先级（WinRAR）就不必再解析剩下的。
-        if best.as_ref().map(|b| b.kind.priority()) == Some(0) {
+        if done {
             break;
         }
     }
     if initialized {
         unsafe { CoUninitialize() };
     }
-    best
+    if let Some(p) = prefer {
+        if let Some(t) = found.iter().find(|t| t.kind == p) {
+            return Some(t.clone());
+        }
+    }
+    found.sort_by_key(|t| t.kind.priority());
+    found.into_iter().next()
 }
 
 #[cfg(not(windows))]
-pub fn detect() -> Option<Tool> {
+pub fn detect(_prefer: Option<ToolKind>) -> Option<Tool> {
     None
 }
 
 /// 启动首扫（同步，调用方负责放到后台线程上）。
-pub fn seed_on_first_run() -> Option<Tool> {
-    detect()
+pub fn seed_on_first_run(prefer: Option<ToolKind>) -> Option<Tool> {
+    detect(prefer)
 }

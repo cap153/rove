@@ -352,6 +352,8 @@ pub const ZH: &[&str] = &[
     "点「更新」会重新扫描 WinRAR / 7-Zip / Bandizip 并填写动作。", // 337
     "系统菜单",               // 338
     "关闭后不再读取系统和第三方菜单项，右键只显示 Rove 内建项", // 339
+    "默认压缩软件",           // 340
+    "选择解压目标文件夹",     // 341
 ];
 
 pub const EN: &[&str] = &[
@@ -695,6 +697,8 @@ pub const EN: &[&str] = &[
     "Update rescans WinRAR / 7-Zip / Bandizip and fills in the archive actions.",
     "System menu",
     "When off, system and third-party items are not loaded; the menu shows only Rove's own items",
+    "Default archive tool",
+    "Extract to folder",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -856,6 +860,9 @@ mod tests {
         assert_eq!(EN[338], "System menu");
         assert!(ZH[339].contains("只显示 Rove 内建项"));
         assert!(EN[339].contains("only Rove's own items"));
+        assert_eq!(ZH[340], "默认压缩软件");
+        assert_eq!(EN[340], "Default archive tool");
+        assert_eq!(ZH[341], "选择解压目标文件夹");
         assert_eq!(
             EN[315],
             "Can't drop into this pane while searching; drop it on a folder instead"
