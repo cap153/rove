@@ -5,16 +5,20 @@
 //! 显示它自己的菜单：`打开方式` `发送到` `新建` `属性` 以及所有第三方扩展项
 //! （7-Zip / 网盘 / BitLocker …）全部由 Shell 提供，行为与资源管理器一致。
 //!
-//! 线程模型（关键）：
+//! 进程模型（关键）：
 //!   * `TrackPopupMenuEx` 是阻塞式 API，内部会跑**嵌套消息循环**。如果放在
 //!     Slint 的 UI 线程上，嵌套循环里派发出来的消息会重入 Slint 回调，
-//!     而回调里再 `borrow_mut()` App 就会 panic。所以菜单跑在**专用 STA 线程**。
-//!   * 该线程自己创建一个隐藏的宿主窗口，`TrackPopupMenuEx` 的 hWnd 必须是
+//!     而回调里再 `borrow_mut()` App 就会 panic。
+//!   * 更重要的是第三方外壳扩展会在 `QueryContextMenu` 里**永远不返回**。
+//!     线程杀不掉（只能丢弃，丢几次进程就废了），进程能 `TerminateProcess`。
+//!     所以菜单在**子进程**（`rove.exe --menu-host`）里构建并显示：卡住就杀，
+//!     主程序一行扩展代码都没跑过，永远不受牵连。
+//!   * 子进程自己创建一个隐藏的宿主窗口，`TrackPopupMenuEx` 的 hWnd 必须是
 //!     调用线程的窗口。菜单的四条消息（`WM_INITMENUPOPUP` / `WM_DRAWITEM` /
-//!     `WM_MEASUREITEM` / `WM_MENUCHAR`）也必须由这个线程的窗口过程转发给
+//!     `WM_MEASUREITEM` / `WM_MENUCHAR`）也必须由这个窗口过程转发给
 //!     `IContextMenu2/3`，否则「新建 / 发送到 / 打开方式」这些懒加载子菜单
 //!     是**空的**。
-//!   * UI 线程只投递请求、接收结果，全程不阻塞。
+//!   * UI 线程只派子进程、收事件，全程不阻塞。
 //!
 //! id 约定（与 Shell 一致）：`1..=0x6FFF` 归 Shell 命令，`0x7000+` 归应用命令。
 
@@ -22,7 +26,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 /// 菜单里的一项（应用自己追加的命令）。
-#[derive(Clone, Debug)]
+///
+/// 菜单在子进程里构建，所以这些内容要序列化过去。
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum MenuNode {
     Separator,
     Item {
@@ -40,7 +46,7 @@ pub enum MenuNode {
 }
 
 /// 菜单目标：选中项 / 当前目录空白处 / 纯应用菜单（不挂 Shell 项）。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Target {
     Items(Vec<PathBuf>),
     Background(PathBuf),
@@ -62,6 +68,8 @@ pub enum MenuAction {
     ShellOpEnd,
     /// Shell 操作可能改了磁盘：让 UI 刷新当前目录。
     Refresh,
+    /// 菜单已经关掉了（子进程画的那张可能把前台权带走过）：把焦点收回主窗口。
+    Closed,
 }
 
 pub type Sink = Arc<dyn Fn(MenuAction) + Send + Sync>;
@@ -105,25 +113,30 @@ pub struct Options {
     pub extended: bool,
 }
 
-/// 弹出原生菜单。`owner` 是主窗口 HWND（用于菜单关闭后归还前台权）；
-/// 菜单本身由内部专用线程的零面积窗口持有。
-/// 返回 false 表示菜单线程不可用（调用方记日志并放弃本次菜单）。
+/// 弹原生菜单。`nodes` = 带系统项时该显示的应用项，`fallback` = 一旦系统菜单
+/// 卡死要立刻退成的「只含 Rove 自己项」的那一套（由 UI 线程一并算好，
+/// 退的时候不用再回头问它）。`owner` 是主窗口 HWND，用于菜单关掉后归还前台权。
+/// 返回 false 表示菜单子进程根本没起来。
 #[cfg(windows)]
 pub(crate) use imp::{
-    apply_tray_theme, busy_for_ms, exhausted, open, poisoned, prewarm, purge_recycle_items,
-    set_dark, shell_unhealthy, tick,
+    apply_tray_theme, busy_for_ms, open, purge_recycle_items, recently_active, set_dark,
+    shell_unhealthy, shutdown, tick,
 };
+
+/// `--menu-host` 子进程入口：构建并显示菜单，然后退出进程。
+#[cfg(windows)]
+pub(crate) use child::run as run_host_child;
+
+/// 非 Windows：从来就没有原生菜单，谈不上「刚动过」。
+#[cfg(not(windows))]
+pub(crate) fn recently_active(_ms: u64) -> bool {
+    false
+}
 
 /// 非 Windows：没有菜单线程，永远不忙。
 #[cfg(not(windows))]
 pub(crate) fn busy_for_ms() -> Option<u64> {
     None
-}
-
-/// 非 Windows：没有菜单线程，永远不需要换进程。
-#[cfg(not(windows))]
-pub(crate) fn exhausted() -> bool {
-    false
 }
 
 /// 非 Windows：没有系统菜单，也就谈不上「刚卡过」。
@@ -132,20 +145,21 @@ pub(crate) fn shell_unhealthy() -> bool {
     false
 }
 
-/// 非 Windows：没有菜单宿主线程。
-#[cfg(not(windows))]
-pub(crate) fn prewarm() {}
-
-#[cfg(not(windows))]
-pub(crate) fn poisoned() -> bool {
-    false
-}
-
 #[cfg(not(windows))]
 pub(crate) fn tick() {}
 
 #[cfg(not(windows))]
-pub fn open(_: Target, _: Vec<MenuNode>, _: Options, _: isize, _: Sink) -> bool {
+pub(crate) fn shutdown() {}
+
+#[cfg(not(windows))]
+pub fn open(
+    _: Target,
+    _: Vec<MenuNode>,
+    _: Vec<MenuNode>,
+    _: Options,
+    _: isize,
+    _: Sink,
+) -> bool {
     false
 }
 
@@ -199,7 +213,13 @@ pub(crate) fn keyword_hit(label: &str, keywords: &[String]) -> bool {
 }
 
 #[cfg(windows)]
+mod child;
+#[cfg(windows)]
+mod dark;
+#[cfg(windows)]
 mod imp;
+#[cfg(windows)]
+mod wire;
 
 #[cfg(test)]
 mod tests {

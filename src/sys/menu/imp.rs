@@ -1,193 +1,133 @@
-//! Windows 实现：`IContextMenu` 构建 + 专用 STA 菜单线程。
+//! Windows 实现：**父进程侧**的原生菜单调度。
 //!
-//! 对外类型与入口见父模块 `super`。
+//! 菜单本身在子进程里构建和显示（见 `child.rs`），这里只管四件事：
+//!   1. 把「要弹什么」送过去（`--menu-host` 子进程 + stdin 里的 bincode 请求）；
+//!   2. 把「用户点了哪一项」收回来（子进程 stdout 上一行一条事件）；
+//!   3. 看门狗：门槛（2.5 秒起，按实测耗时自动放宽）还没弹出来就**杀掉子进程**、
+//!      改弹只含 Rove 自己项的菜单；
+//!   4. 连着卡两次才记住「本次运行不要再请系统菜单了」（一次卡只降级这一下）。
+//!
+//! 为什么非要子进程：第三方外壳扩展（网盘 / 同步 / 杀毒）会在
+//! `QueryContextMenu` 或子菜单展开里永远不返回。线程杀不掉，只能丢弃，丢着
+//! 丢着进程就废了（新线程一行代码都跑不到，右键彻底没反应）。进程能杀干净，
+//! 主程序也不会被扩展代码污染。
+//!
+//! id 约定（与 Shell 一致）：`1..=0x6FFF` 归 Shell 命令，`0x7000+` 归应用命令。
 
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::mem::ManuallyDrop;
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use super::{MenuAction, MenuNode, Options, Sink, Target};
+use super::wire;
+use super::{dark, MenuAction, MenuNode, Options, Sink, Target};
 
-use windows::core::{Interface, PCSTR, PCWSTR, PSTR, Result as WinResult};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
-use windows::Win32::System::Com::CoTaskMemFree;
-use windows::Win32::System::Ole::OleInitialize;
-use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-use windows::Win32::UI::Shell::{
-    IContextMenu, IContextMenu2, IContextMenu3, IShellFolder, IShellView, SHBindToParent,
-    SHCreateDefaultContextMenu, SHGetDesktopFolder, SHParseDisplayName, CMF_CANRENAME, CMF_EXPLORE,
-    CMF_EXTENDEDVERBS, CMF_NORMAL, CMIC_MASK_CONTROL_DOWN, CMIC_MASK_PTINVOKE,
-    CMIC_MASK_SHIFT_DOWN, CMINVOKECOMMANDINFO, CMINVOKECOMMANDINFOEX, DEFCONTEXTMENU, GCS_VERBW,
-    SVGIO_BACKGROUND,
-};
-use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, AllowSetForegroundWindow, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-    DeleteMenu, DestroyMenu, DestroyWindow, DispatchMessageW, GetCursorPos, GetForegroundWindow,
-    GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW, GetMessageW, GetSubMenu,
-    IsWindow, PostMessageW, RegisterClassW, SendMessageTimeoutW, SetForegroundWindow,
-    SetWindowPos, ShowWindow,
-    TranslateMessage, TrackPopupMenuEx, HMENU, MSG, MF_BYPOSITION, MF_CHECKED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, SWP_NOACTIVATE, SWP_NOZORDER, SW_SHOWNOACTIVATE, TPM_RETURNCMD,
-    GetClassNameW, SMTO_ABORTIFHUNG, SMTO_BLOCK, TPM_RIGHTBUTTON, WM_APP, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM, WM_MENUCHAR, WNDCLASSW,
-    WS_EX_TOOLWINDOW, WS_POPUP,
-};
-use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, SetActiveWindow, SetFocus, VK_CONTROL, VK_SHIFT,
-};
-
-/// Shell 命令 id 区间（与 `QueryContextMenu` 的入参一致）。
-const SHELL_FIRST: u32 = 1;
-const SHELL_LAST: u32 = 0x6FFF;
-/// 应用命令 id 起点。
-const APP_FIRST: u32 = 0x7000;
 /// `CMINVOKECOMMANDINFOEX` 的 `fMask` 位：`lpVerbW` 才是宽字符动词。
 const CMIC_MASK_UNICODE: u32 = 0x4000;
 
-/// 菜单线程的宿主窗口消息：有新的菜单请求。
-const WM_APP_OPEN_MENU: u32 = WM_APP + 0x51;
-/// 宿主窗口消息：存活探测。宿主窗口过程直接回 1，用来区分「忙」和「死了」。
-const WM_APP_PING: u32 = WM_APP + 0x52;
-/// 宿主窗口消息：切换菜单深浅色（wparam 1 = 深色 / 0 = 浅色）。
-const WM_APP_SET_DARK: u32 = WM_APP + 0x53;
-/// 菜单是否要跟随深色（由 UI 线程按当前主题写入）。
+use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+
+/// 菜单要跟随深色（由 UI 线程按当前主题写入）。
 static DARK: AtomicBool = AtomicBool::new(false);
-/// 宿主窗口是否已经挂上深色主题（避免每次弹菜单都重复调用）。
-static HOST_DARK: AtomicBool = AtomicBool::new(false);
-/// 进程级偏好当前是深还是浅（与 [`DARK`] 比对，避免重复调 `SetPreferredAppMode`）。
-static MODE_DARK: AtomicBool = AtomicBool::new(false);
-
-/// 进程级偏好是否**已经显式设过**。`SetPreferredAppMode` 的默认值是
-/// 「跟随系统」——只要没设过，Shell 弹的任何菜单都按系统走，而不是按 Rove 的主题。
-static MODE_SET: AtomicBool = AtomicBool::new(false);
-
 /// `tray-icon` 那个隐藏窗口的句柄（类名固定 `tray_icon_app`）。托盘菜单的配色
 /// 只认它自己的窗口，缓存下来免得每次 `FindWindowW`。
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
-/// 菜单**已经弹在屏幕上**却挂着：超过它才值得探测一次（正常操作不会超过）。
-const MENU_STALL_MS: u64 = 1_500;
-/// 构建阶段（菜单还没弹出来）的忍耐时限。
+/// 是否已经有一张菜单在等（用户正开着，或者子进程卡在构建里）。
 ///
-/// 正常建菜单几十毫秒。用户右键一次没反应，本能就是「再点一下」——那一下
-/// 就是「卡住了」的信号，必须立刻换线程给他弹出来，而不是让他干等。
-/// 以前这里写 20 秒：第一条右键被第三方扩展卡住后，之后二十秒里每次右键都
-/// 被静默忽略，用户只会以为右键坏了，转头去任务管理器杀进程。
-const MENU_BUILD_GRACE_MS: u64 = 800;
-/// 构建阶段的硬上限：就算线程还能回 ping（有的扩展自己泵消息），
-/// 5 秒还弹不出来的菜单用户早就不想要了，放弃它换新的。
-const MENU_BUILD_MAX_MS: u64 = 5_000;
-/// 探测超时：正常线程几毫秒就回，等 400ms 还没回就是真卡死了。
-const PING_TIMEOUT_MS: u32 = 400;
+/// 第二轮右键不能排队：否则用户点外面关掉菜单后，排着的那份会迟一步跳出来。
+static BUSY: AtomicBool = AtomicBool::new(false);
+/// 这一轮是从什么时候开始的（毫秒，进程启动起算）。看门狗用它算门槛。
+static BUSY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
+/// 子进程是否已经回报「菜单弹到屏幕上了」。
+///
+/// 只有**弹出之前**才计时：门槛内没弹出来就是第三方扩展卡住了，杀掉换精简菜单；
+/// 已经弹出来的菜单只等用户（但卡死不动时另有 `IsHungAppWindow` 兜着）。
+static SHOWN: AtomicBool = AtomicBool::new(false);
+/// 本次运行系统菜单已经拖死够多次：从此只弹 Rove 自己的项。
+///
+/// 进程级、只在内存里，Rove 退出即清零 —— 下次启动重新试一次系统菜单。
+/// 不做任何跨启动的记忆（那是自锁，用户明确否决过）。
+static SHELL_DEAD: AtomicBool = AtomicBool::new(false);
+/// 连着卡了几次（成功弹出来一次就清零）。
+///
+/// 一次卡就判死太狠了：真机日志里 `O:\Video` 两分钟前还好好的，转头就超过
+/// 1 秒 —— 网盘/网络盘的扩展在 `QueryContextMenu` 里做网络 I/O，本来就时快
+/// 时慢。所以给两次机会。
+static SHELL_STRIKES: AtomicU32 = AtomicU32::new(0);
+/// 连续卡这么多次，本次运行就不再请系统菜单了。
+const MAX_SHELL_STRIKES: u32 = 2;
+/// 菜单弹出耗时的平滑值（毫秒；0 = 还没有样本）。
+///
+/// 光给固定门槛不够：慢机器 / 慢扩展本来就要更久。这里按实测的正常弹出耗时
+/// 放宽门槛（3 倍余量），快机器上永远不会被放宽。
+static BUILD_EMA_MS: AtomicU64 = AtomicU64::new(0);
+/// 最近一次「菜单有动静」的时刻（毫秒）。给外部的抖动取证用：原生菜单本来
+/// 就要把前台交给菜单进程、关掉再还回来，这段窗口里的失焦/获焦不是窗口在抖。
+static LAST_ACTIVE_MS: AtomicU64 = AtomicU64::new(0);
+/// 菜单请求的代数：老的读线程回来时不许动新请求的状态。
+static MENU_GEN: AtomicU64 = AtomicU64::new(1);
+/// 菜单要多久还没弹出来就算卡住（下限）。
+///
+/// 真机日志：`O:` 盘上的系统菜单同一目标一会儿能用一会儿超过 1 秒，属于
+/// 网盘扩展在 `QueryContextMenu` 里做网络 I/O。1 秒太紧，2.5 秒才够它读完。
+const MENU_SHOW_TIMEOUT_MS: u64 = 2_500;
+/// 自动放宽的上限：再慢也不让用户干等超过这个数。
+const MENU_SHOW_MAX_MS: u64 = 6_000;
+/// 子进程连「我起来了」都没报的硬上限：正常几十毫秒，超过这就是它自己
+/// 起不来（被拦截 / 磁盘卡死），跟外壳扩展无关。
+const MENU_START_TIMEOUT_MS: u64 = 5_000;
 
-// ---------------------------------------------------------------------------
-// 菜单请求
-// ---------------------------------------------------------------------------
-struct Job {
-    /// 投递这次请求时 BUSY 的代数。宿主线程被放弃重建后，老线程恢复也不许
-    /// 复位新线程的 BUSY。
+/// 正在跑的那张菜单。
+struct Active {
     gen: u64,
-    target: Target,
-    nodes: Vec<MenuNode>,
-    options: Options,
-    owner: isize,
+    child: Child,
+    /// 子进程报 `ready` 的时刻（`MENU_SHOW_TIMEOUT_MS` 从这里算）。
+    started_ms: u64,
+    /// 派出去的时刻：子进程一直不报 `ready` 时用这条硬上限。
+    spawned_ms: u64,
+    shown: bool,
+    /// 这次请求本来就是「只含 Rove 自己项」（没有系统项可退）。
+    app_only: bool,
+    /// 已经为这张菜单退过一次精简版：不许再退第二次。
+    retried: bool,
     sink: Sink,
+    /// 精简版要用的菜单项（由 UI 线程一并算好，退的时候不用再回头问它）。
+    fallback: Vec<MenuNode>,
+    hide_keywords: Vec<String>,
+    extended: bool,
+    owner: isize,
 }
 
-// ---------------------------------------------------------------------------
-// 线程间状态
-// ---------------------------------------------------------------------------
+static ACTIVE: Mutex<Option<Active>> = Mutex::new(None);
 
-static JOBS: Mutex<Vec<Job>> = Mutex::new(Vec::new());
-static HOST: AtomicIsize = AtomicIsize::new(0);
-static START_LOCK: Mutex<()> = Mutex::new(());
-/// 是否已经有菜单在 Track 中。第二轮右键不能排队——否则用户点外面关掉菜单后，
-/// 排着的那份会迟一步跳出来。
-static BUSY: AtomicBool = AtomicBool::new(false);
-/// 本轮 BUSY 是哪一代菜单线程持有的。被放弃的那条老线程恢复后不许再改 BUSY，
-/// 否则它会把新线程正在用的标记清掉（右键就会叠出第二个菜单）。
-static BUSY_GEN: AtomicU64 = AtomicU64::new(0);
-/// BUSY 是什么时候置上的（毫秒，进程启动起算）。用来判断「忙」还是「死了」。
-static BUSY_SINCE_MS: AtomicU64 = AtomicU64::new(0);
-/// 菜单线程代数：老线程恢复时不许覆盖 `HOST`。
-static HOST_GEN: AtomicU64 = AtomicU64::new(0);
-/// 有一条宿主线程正在起来的路上（还没把窗口建出来）。
+/// 菜单已经关掉、但子进程还在跑的子进程。
 ///
-/// 建窗口可能要等好几秒 —— 卡死的老线程握着进程级的锁（loader lock 等），
-/// 新的 `CreateWindowExW` 得排队。这期间**不能让 UI 线程干等**（真机日志：
-/// 每次右键卡 5 秒，用户看到的是一整窗没反应），也不能每点一次就再开一条线程。
-static HOST_STARTING: AtomicBool = AtomicBool::new(false);
-/// 这条「正在起来」的线程是什么时候派出去的（毫秒）。
-static HOST_START_MS: AtomicU64 = AtomicU64::new(0);
-/// 建宿主窗口最多给多久。超了就当它卡死，允许另开一条。
+/// 「发送到 / 复制到 / 删除到回收站」这些是 Shell 在**菜单进程里**起的后台
+/// 任务：菜单一关就把进程杀掉，等于把用户的复制砍断。所以关掉之后不杀，
+/// 交给它自己收工（见 `child.rs` 的 `linger_for_shell_work`）。
+static LINGER: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+/// 同时最多留几个干活的子进程（正常只有一个；留点余量防手贱连点）。
+const MAX_LINGER: usize = 4;
+
+/// 记一次「菜单有动静」（派出去 / 起来了 / 弹出来 / 关掉了）。
+fn touch() {
+    LAST_ACTIVE_MS.store(now_ms(), Ordering::Release);
+}
+
+/// 最近 `ms` 毫秒内菜单有没有动静。
 ///
-/// 这台机器建窗口本来就要好几秒（全局钩子拖的），所以不能给太紧：判错成
-/// 「进程被拖坏」会白白换掉一个好好的进程。
-const HOST_START_TIMEOUT_MS: u64 = 10_000;
-/// 本进程**曾经**有过一条能用的宿主窗口。
-///
-/// 判毒只在「从来没有过」时成立：进程级锁被卡死的扩展攥着时，新线程一行代码
-/// 都跑不到，宿主窗口永远建不出来。反过来，如果已经有过宿主（右键能用），
-/// 只是后来补的备用窗口慢了几秒，那跟「进程被拖坏」毫无关系，绝不能触发
-/// 静默换进程。
-static HAD_HOST: AtomicBool = AtomicBool::new(false);
-/// 备用宿主窗口：已建好、空闲，随时可以顶上去。
-///
-/// 真机日志里恢复慢的根因就是「放弃一条线程 → 新线程建窗口要好几秒 → 这
-/// 几秒里每次右键都被忽略」。有了备用窗口，放弃的瞬间就能顶上一个现成的，
-/// 下一次右键立刻有菜单。
-static SPARE: AtomicIsize = AtomicIsize::new(0);
-/// 已经放弃过多少条卡死的宿主线程。
-///
-/// 卡在第三方扩展里的线程**无法回收**（没有 API 能安全杀掉一个卡在原生调用里
-/// 的线程），它会一直挂着：一根栈（保留 2MB 虚拟空间）+ 一个隐藏窗口 + 扩展
-/// 自己持有的对象。CPU 占用为 0（它在等待），所以代价是内存不是速度。
-/// 但也不能无限重建，否则反复右键会把它们攒起来 —— 超过上限就彻底停手，
-/// 让用户重启 Rove。
-static ABANDONED: AtomicU32 = AtomicU32::new(0);
-/// 最多放弃几条卡死的宿主线程。
-///
-/// 现在判死很激进（0.8 秒），网络盘上「慢」会被当成「死」多放弃几条，
-/// 所以留 6 条余量；每条只占 2MB 虚拟空间，用户重启一次就清零。
-const MAX_ABANDONED: u32 = 6;
-/// 菜单是否已经**弹到屏幕上**（`TrackPopupMenuEx` 已进入）。
-///
-/// 用来区分两种「没回应」：构建阶段被第三方扩展拖住（还没弹出来，稍后可能自己好）
-/// 和菜单真的在屏幕上（这时线程在跑消息循环，探测一定能回）。判活/放弃前者要看
-/// 更长的时限，否则会把「慢」当成「死」，然后把一个稍后自己弹出来的菜单丢掉。
-static SHOWN: AtomicBool = AtomicBool::new(false);
-/// 已经彻底停手（右键菜单不再可用）。UI 侧据此决定要不要找个时机静默重启进程。
-static GAVE_UP: AtomicBool = AtomicBool::new(false);
-/// 最近一次「系统菜单建不完、线程被判死」的时刻（0 = 从没发生过）。
-static LAST_ABANDON_MS: AtomicU64 = AtomicU64::new(0);
-/// 最近一次**带系统菜单**的弹出正常走完的时刻。
-static LAST_OK_MS: AtomicU64 = AtomicU64::new(0);
-/// 判死之后这段时间内不再邀请系统菜单上场。
-const SHELL_COOLDOWN_MS: u64 = 120_000;
-/// 系统菜单把线程拖死过几次；够两次就本次运行不再请它上场。
-///
-/// 每拖死一次就漏一条线程（回收不了），而 `MAX_ABANDONED` 到顶后右键会**永久**
-/// 不可用。两次之后彻底不用系统菜单，等于拿「打开方式 / 发送到」换「右键永远能用」。
-static SHELL_FAILS: AtomicU32 = AtomicU32::new(0);
-const MAX_SHELL_FAILS: u32 = 2;
-/// 进程被拖坏：派出去的宿主线程根本起不来。
-///
-/// 卡死的扩展握着进程级的锁（loader lock）时，`std::thread::spawn` 能成功但
-/// 新线程永远拿不到锁、一行代码都跑不到 —— 之后网络枚举、索引、右键全部哑掉。
-/// 这种进程没救了，只能换一个新的（见 app.rs 的自我修复）。
-static POISONED: AtomicBool = AtomicBool::new(false);
-/// 被放弃的那一代菜单任务。卡在第三方扩展里的线程**迟早会返回**，然后照样
-/// 把菜单弹出来 —— 那会是一个没人要的幽灵菜单（用户点它还有效，更糟）。
-/// 判死时把代数记在这儿，`run_menu` 弹出前对一下，被放弃的一律不弹。
-static ABORTED_GEN: AtomicU64 = AtomicU64::new(0);
+/// 焦点抖动取证用：`WindowEvent::Focused` 在菜单抢前台 / 还前台的瞬间必然
+/// 成对出现，那是用户在右键，不是窗口在抖。
+pub(crate) fn recently_active(ms: u64) -> bool {
+    let last = LAST_ACTIVE_MS.load(Ordering::Acquire);
+    last != 0 && now_ms().saturating_sub(last) <= ms
+}
 
 /// 进程启动起的毫秒数。
 fn now_ms() -> u64 {
-    static START: OnceLock<Instant> = OnceLock::new();
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     START
         .get_or_init(Instant::now)
         .elapsed()
@@ -195,557 +135,505 @@ fn now_ms() -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
-/// 菜单线程当前是否还活着（挡住第三方菜单扩展把宿主线程拖死的情况）。
-fn host_responsive(host: isize) -> bool {
-    if host == 0 {
-        return false;
+/// 弹出原生菜单。
+///
+/// `nodes` 是带系统项时该显示的应用项，`fallback` 是「只含 Rove 自己项」时
+/// 该显示的应用项 —— 一旦卡死要立刻退到后者，不能再回头问 UI 线程。
+///
+/// 返回 false 表示子进程根本没起来（真正的「菜单不可用」）。
+pub(crate) fn open(
+    target: Target,
+    nodes: Vec<MenuNode>,
+    fallback: Vec<MenuNode>,
+    options: Options,
+    owner: isize,
+    sink: Sink,
+) -> bool {
+    if BUSY.swap(true, Ordering::AcqRel) {
+        // 上一张还在：要么用户正开着，要么子进程卡在构建里（那由 `tick()` 收拾）。
+        crate::logv!("[menu] 上一张菜单还没结束，忽略这次右键");
+        return true;
     }
-    let mut result = 0usize;
-    let ok = unsafe {
-        SendMessageTimeoutW(
-            HWND(host as *mut _),
-            WM_APP_PING,
-            WPARAM(0),
-            LPARAM(0),
-            SMTO_ABORTIFHUNG | SMTO_BLOCK,
-            PING_TIMEOUT_MS,
-            Some(&mut result),
-        )
+    BUSY_SINCE_MS.store(now_ms(), Ordering::Release);
+    touch();
+    SHOWN.store(false, Ordering::Release);
+    // 系统菜单已经拖死过：本次运行只弹 Rove 自己的项。
+    let (target, nodes) = if SHELL_DEAD.load(Ordering::Acquire)
+        && !matches!(target, Target::AppOnly)
+    {
+        crate::logv!("[menu] 本次运行已判死系统菜单，直接弹 Rove 自己的项");
+        (Target::AppOnly, fallback.clone())
+    } else {
+        (target, nodes)
     };
-    ok.0 != 0
+    let app_only = matches!(target, Target::AppOnly);
+    if start(target, nodes, &options, owner, sink, fallback, app_only, false) {
+        return true;
+    }
+    BUSY.store(false, Ordering::Release);
+    false
 }
 
-/// 只复位自己那一代：被放弃的老线程恢复后不许动新线程的标记。
-fn end_busy(gen: u64) {
-    if BUSY_GEN.load(Ordering::Acquire) == gen {
+/// 派一个菜单子进程（请求由读线程去写，见 `reader`）。
+///
+/// 写请求**不能**放在 UI 线程：选中的文件多到几万个时，请求会有几百 KB，
+/// 超过管道缓冲区，`write_all` 就要等子进程消费 —— 那是个能卡住 UI 线程的
+/// 阻塞点。交给 `rove-menu-ipc` 线程去做，UI 线程只负责 `CreateProcess`。
+fn launch() -> std::io::Result<(Child, ChildStdin, ChildStdout)> {
+    let exe = std::env::current_exe()?;
+    let mut child = std::process::Command::new(exe)
+        .arg("--menu-host")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    match (stdin, stdout) {
+        (Some(stdin), Some(stdout)) => Ok((child, stdin, stdout)),
+        _ => {
+            let _ = child.kill();
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "菜单子进程的管道没建起来",
+            ))
+        }
+    }
+}
+
+/// 启动一次菜单请求并接管它的输出。返回 false = 子进程没起来。
+#[allow(clippy::too_many_arguments)]
+fn start(
+    target: Target,
+    nodes: Vec<MenuNode>,
+    options: &Options,
+    owner: isize,
+    sink: Sink,
+    fallback: Vec<MenuNode>,
+    app_only: bool,
+    retried: bool,
+) -> bool {
+    let request = wire::Request {
+        target,
+        nodes,
+        hide_keywords: options.hide_keywords.clone(),
+        extended: options.extended,
+        dark: DARK.load(Ordering::Acquire),
+        owner,
+    };
+    let payload = bincode::serialize(&request).unwrap_or_default();
+    let gen = MENU_GEN.fetch_add(1, Ordering::AcqRel) + 1;
+    let (child, stdin, stdout) = match launch() {
+        Ok(parts) => parts,
+        Err(e) => {
+            crate::logal!("!! [menu] 菜单子进程启动失败: {e}");
+            return false;
+        }
+    };
+    // 前台锁只认「父进程放行」：不放行的话子进程抢不到前台，菜单就收不到键盘。
+    let child_pid = child.id();
+    if let Err(e) = unsafe { AllowSetForegroundWindow(child_pid) } {
+        crate::logv!("[menu] AllowSetForegroundWindow({child_pid}) 失败 {:?}", e.code());
+    }
+    let now = now_ms();
+    *ACTIVE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Active {
+        gen,
+        started_ms: now,
+        spawned_ms: now,
+        child,
+        shown: false,
+        app_only,
+        retried,
+        sink: sink.clone(),
+        fallback,
+        hide_keywords: request.hide_keywords,
+        extended: request.extended,
+        owner,
+    });
+    let spawned = std::thread::Builder::new()
+        .name("rove-menu-ipc".into())
+        .spawn(move || {
+            // 请求写给子进程，写完就关（drop）：它读到 EOF 才知道请求结束了。
+            {
+                use std::io::Write;
+                let mut stdin = stdin;
+                let _ = stdin.write_all(&payload);
+            }
+            reader(stdout, gen, sink);
+        });
+    if spawned.is_err() {
+        crate::logal!("!! [menu] 菜单读线程创建失败");
+        let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mut active) = active {
+            let _ = active.child.kill();
+        }
+        return false;
+    }
+    true
+}
+
+/// 读子进程的事件行，翻译成 UI 线程认识的动作。
+fn reader(stdout: ChildStdout, gen: u64, sink: Sink) {
+    use std::io::BufRead;
+    let mut shown = false;
+    let mut chosen = false;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        if line == wire::EV_READY {
+            mark_ready(gen);
+            continue;
+        }
+        if line == wire::EV_SHOWN {
+            shown = true;
+            SHOWN.store(true, Ordering::Release);
+            mark_shown(gen);
+            continue;
+        }
+        let ends = ends_menu(&line);
+        chosen |= ends;
+        if ends {
+            // 菜单已经有结果：立刻放行，下一次右键马上能用。
+            finish_menu(gen);
+        }
+        if let Some(action) = parse_event(&line) {
+            sink(action);
+        }
+        // 这里**不**补发 `Closed`：子进程关菜单时自己会把前台还给 Rove
+        // （只在它确实还持有时才还），足够让键盘回到主窗口。反过来由父进程
+        // 无条件抢前台，会把「用某某打开 / 在终端中打开」刚拉起来的窗口按下去。
+        // 只有「菜单被我们杀掉、没机会还前台」那几条路径才补 `Closed`。
+    }
+    // 子进程结束了。被看门狗接管的（代数对不上）这里一律不碰。
+    let pending = {
+        let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(active) if active.gen == gen => guard.take(),
+            _ => None,
+        }
+    };
+    let Some(mut active) = pending else {
+        // 菜单早就结束了（子进程在跑 Shell 的后台任务）：这里只是等它收工。
+        crate::logv!("[menu] 子进程结束");
+        return;
+    };
+    let _ = active.child.wait();
+    if !shown {
+        // 还没弹出来就没了：构建阶段崩了（扩展写坏了内存之类）。
+        crate::logal!("!! [menu] 菜单子进程没弹出来就退出了，这次改用 Rove 自己的菜单项");
+        note_shell_stall();
+        retry_app_only(active);
+        return;
+    }
+    crate::logv!("[menu] 菜单结束 chosen={chosen}");
+    SHOWN.store(false, Ordering::Release);
+    BUSY.store(false, Ordering::Release);
+    sink(MenuAction::Closed);
+}
+
+/// 子进程的一行事件 → 要回投给 UI 线程的动作。
+fn parse_event(line: &str) -> Option<MenuAction> {
+    if let Some(key) = line.strip_prefix(wire::EV_APP) {
+        return Some(MenuAction::App(key.to_string()));
+    }
+    if let Some(path) = line.strip_prefix(wire::EV_NAVIGATE) {
+        return Some(MenuAction::Navigate(wire::unescape_path(path)));
+    }
+    if line == wire::EV_RENAME {
+        return Some(MenuAction::Rename);
+    }
+    if line == wire::EV_BEGIN {
+        return Some(MenuAction::ShellOpBegin);
+    }
+    if line == wire::EV_END {
+        return Some(MenuAction::ShellOpEnd);
+    }
+    if line == wire::EV_REFRESH {
+        return Some(MenuAction::Refresh);
+    }
+    None
+}
+
+/// 这一行是不是「菜单已经关掉了」（之后只剩 Shell 任务的收尾事件）。
+fn ends_menu(line: &str) -> bool {
+    line == wire::EV_DISMISSED
+        || line == wire::EV_RENAME
+        || line == wire::EV_BEGIN
+        || line.starts_with(wire::EV_APP)
+        || line.starts_with(wire::EV_NAVIGATE)
+}
+
+/// 菜单有结果了：立刻放行（下一次右键马上能用），子进程转去「可能还在干活」的名单。
+fn finish_menu(gen: u64) {
+    let taken = {
+        let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(active) if active.gen == gen => guard.take(),
+            _ => None,
+        }
+    };
+    let Some(active) = taken else { return };
+    touch();
+    SHOWN.store(false, Ordering::Release);
+    BUSY.store(false, Ordering::Release);
+    let mut linger = LINGER.lock().unwrap_or_else(|e| e.into_inner());
+    linger.push(active.child);
+    while linger.len() > MAX_LINGER {
+        if let Some(oldest) = linger.first_mut() {
+            let _ = oldest.kill();
+        }
+        linger.remove(0);
+    }
+}
+
+/// 这一轮实际允许等多久：固定下限 + 本机实测放宽。
+fn show_timeout_ms() -> u64 {
+    let ema = BUILD_EMA_MS.load(Ordering::Acquire);
+    // 实测平均的 3 倍留余量；没样本时就是下限本身。
+    let relaxed = ema.saturating_mul(3);
+    MENU_SHOW_TIMEOUT_MS.max(relaxed).min(MENU_SHOW_MAX_MS)
+}
+
+/// 记一次「菜单弹出耗时」样本（滑动平均，不需要精确）。
+fn record_build(ms: u64) {
+    let mut cur = BUILD_EMA_MS.load(Ordering::Acquire);
+    loop {
+        let next = if cur == 0 { ms } else { (cur * 3 + ms) / 4 };
+        match BUILD_EMA_MS.compare_exchange_weak(cur, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// 系统菜单又卡了一次。返回 true = 本次运行不再请系统菜单。
+fn note_shell_stall() -> bool {
+    let n = SHELL_STRIKES.fetch_add(1, Ordering::AcqRel) + 1;
+    if n >= MAX_SHELL_STRIKES {
+        SHELL_DEAD.store(true, Ordering::Release);
+        true
+    } else {
+        crate::logv!("[menu] 系统菜单第 {n} 次卡住（连着卡 {MAX_SHELL_STRIKES} 次才判死）");
+        false
+    }
+}
+
+/// 子进程报「我起来了」：弹出门槛从这一刻开始算。
+fn mark_ready(gen: u64) {
+    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = guard.as_mut() {
+        if active.gen == gen {
+            active.started_ms = now_ms();
+            touch();
+        }
+    }
+}
+
+fn mark_shown(gen: u64) {
+    let now = now_ms();
+    let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(active) = guard.as_mut() {
+        if active.gen == gen {
+            active.shown = true;
+            touch();
+            let built = now.saturating_sub(active.started_ms);
+            let app_only = active.app_only;
+            drop(guard);
+            record_build(built);
+            crate::logv!("[menu] {built}ms 弹出（现门槛 {}ms）", show_timeout_ms());
+            if !app_only {
+                // 系统菜单弹出来了：连击清零，下次照样请它。
+                SHELL_STRIKES.store(0, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// 判死之后改弹只含 Rove 自己项的菜单（这张右键立刻就有反应）。
+fn retry_app_only(active: Active) {
+    let mut active = active;
+    let _ = active.child.kill();
+    let _ = active.child.wait();
+    SHOWN.store(false, Ordering::Release);
+    if active.app_only || active.retried {
+        // 精简菜单也弹不出来：这次右键只能放弃，别再无限重试。
+        crate::logal!("!! [menu] 精简菜单也没弹出来，本次右键放弃");
+        BUSY.store(false, Ordering::Release);
+        (active.sink)(MenuAction::Closed);
+        return;
+    }
+    let options = Options {
+        hide_keywords: active.hide_keywords.clone(),
+        extended: active.extended,
+    };
+    crate::logv!("[menu] 改弹 Rove 自己的菜单项");
+    if !start(
+        Target::AppOnly,
+        active.fallback.clone(),
+        &options,
+        active.owner,
+        active.sink.clone(),
+        active.fallback.clone(),
+        true,
+        true,
+    ) {
         BUSY.store(false, Ordering::Release);
     }
 }
 
-/// 系统菜单刚刚卡死过？（两分钟内没再成功出过一次带系统项的菜单就算）
-///
-/// 这台机器的实际情形：某个第三方外壳扩展在 `QueryContextMenu` 里永远不返回，
-/// 每次都把菜单线程拖死。判死之后如果还继续请系统菜单，用户右键一次死一次。
-/// 所以冷却期内只弹 Rove 自己的菜单项 —— 少了「打开方式 / 发送到」这些，
-/// 但至少右键立刻有反应，别的功能都还能用。
-pub(crate) fn shell_unhealthy() -> bool {
-    if SHELL_FAILS.load(Ordering::Acquire) >= MAX_SHELL_FAILS {
-        return true;
-    }
-    let abandoned = LAST_ABANDON_MS.load(Ordering::Acquire);
-    if abandoned == 0 {
-        return false;
-    }
-    if LAST_OK_MS.load(Ordering::Acquire) > abandoned {
-        return false;
-    }
-    now_ms().saturating_sub(abandoned) < SHELL_COOLDOWN_MS
-}
-
-/// UI 线程周期调用：不点右键也能发现「进程被拖坏」。
-///
-/// 判据和 `ensure_host` 里那条一样 —— 派出去建窗口的线程过了时限还没露头，
-/// 说明新线程根本跑不起来（进程级的锁被卡死的扩展攥着）。
+/// UI 线程周期调用（40ms）：不点右键也能发现「菜单卡住没弹出来」。
 pub(crate) fn tick() {
-    if POISONED.load(Ordering::Acquire)
-        || !HOST_STARTING.load(Ordering::Acquire)
-        || HAD_HOST.load(Ordering::Acquire)
-    {
+    reap_linger();
+    if !BUSY.load(Ordering::Acquire) {
         return;
     }
-    let age = now_ms().saturating_sub(HOST_START_MS.load(Ordering::Acquire));
-    if age >= HOST_START_TIMEOUT_MS {
-        POISONED.store(true, Ordering::Release);
+    // 菜单已经弹出来了，但子进程的线程被扩展堵在不返回的调用里：菜单留在
+    // 屏幕上、点它也点不掉，整台机器上这块区域就废了。Windows 自己会判定
+    // 「5 秒没泵消息」的窗口无响应 —— 借这个判断把它收掉。
+    //
+    // 必须放在「已弹出就返回」**之前**：这一段只在菜单已经弹出来时才有意义。
+    kill_if_hung();
+    if SHOWN.load(Ordering::Acquire) {
+        return;
+    }
+
+    let now = now_ms();
+    let pending = {
+        let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(active) if !active.shown => {
+                let built = now.saturating_sub(active.started_ms);
+                let alive = now.saturating_sub(active.spawned_ms);
+                if built >= show_timeout_ms() || alive >= MENU_START_TIMEOUT_MS {
+                    guard.take()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+    let Some(mut active) = pending else { return };
+    let age = now.saturating_sub(active.started_ms);
+    // 卡住的扩展在子进程里：直接杀掉（进程能杀，线程杀不掉）。
+    let _ = active.child.kill();
+    if active.app_only {
+        crate::logal!("!! [menu] 精简菜单 {age}ms 也没弹出来（门槛 {}ms）", show_timeout_ms());
+    } else if note_shell_stall() {
         crate::logal!(
-            "[menu] !! 宿主线程 {}ms 都没起来，进程多半已被卡死的扩展拖坏",
-            age
+            "[menu] 系统菜单 {age}ms 没弹出来（门槛 {}ms，多半是第三方外壳扩展卡死），\
+             杀掉子进程；连着卡 {MAX_SHELL_STRIKES} 次，本次运行改用 Rove 自己的菜单项",
+            show_timeout_ms()
+        );
+    } else {
+        crate::logal!(
+            "[menu] 系统菜单 {age}ms 没弹出来（门槛 {}ms），杀掉子进程；\
+             这次只降级这一下，下次右键还试系统菜单",
+            show_timeout_ms()
         );
     }
+    retry_app_only(active);
 }
 
-/// 进程是不是已经被卡死的扩展拖坏了（新线程都起不来）。
-pub(crate) fn poisoned() -> bool {
-    POISONED.load(Ordering::Acquire)
+/// 菜单弹出来之后卡死：杀掉子进程，别让一张点不动的菜单糊在屏幕上。
+fn kill_if_hung() {
+    let pid = {
+        let guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(active) if active.shown => active.child.id(),
+            _ => return,
+        }
+    };
+    if !process_is_hung(pid) {
+        return;
+    }
+    let taken = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(mut active) = taken else { return };
+    crate::logal!("!! [menu] 菜单弹出来后卡死（第三方扩展不返回），杀掉菜单子进程");
+    note_shell_stall();
+    let _ = active.child.kill();
+    let _ = active.child.wait();
+    SHOWN.store(false, Ordering::Release);
+    BUSY.store(false, Ordering::Release);
+    // 前台权跟着那个进程一起没了：让主窗口把焦点收回，不然键盘没人接。
+    (active.sink)(MenuAction::Closed);
 }
 
-/// 开机就把菜单宿主线程叫起来。
-///
-/// 真机日志：第一条右键时宿主线程要花 4 秒多才建出窗口（那台机器的窗口创建
-/// 被各种全局钩子拖得很慢），于是第一次右键白点了。提前建好就没这个问题。
-pub(crate) fn prewarm() {
-    let _ = ensure_host();
+/// 这个进程里有没有「无响应」的窗口（Windows 的判定：5 秒没泵消息）。
+fn process_is_hung(pid: u32) -> bool {
+    use windows::Win32::Foundation::BOOL;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowThreadProcessId, IsHungAppWindow,
+    };
+
+    struct Scan {
+        pid: u32,
+        hung: bool,
+    }
+    unsafe extern "system" fn each_window(hwnd: HWND, lp: LPARAM) -> BOOL {
+        let scan = unsafe { &mut *(lp.0 as *mut Scan) };
+        let mut owner_pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut owner_pid)) };
+        if owner_pid == scan.pid && unsafe { IsHungAppWindow(hwnd).as_bool() } {
+            scan.hung = true;
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+
+    let mut scan = Scan { pid, hung: false };
+    unsafe { EnumWindows(Some(each_window), LPARAM(&mut scan as *mut Scan as isize)) }.ok();
+    scan.hung
 }
 
-/// 右键菜单是不是已经彻底放弃了（卡死线程到上限）。只有这时才值得换个进程。
-pub(crate) fn exhausted() -> bool {
-    GAVE_UP.load(Ordering::Acquire)
+/// 收掉已经退出的「还在干活」的子进程。
+fn reap_linger() {
+    let mut linger = LINGER.lock().unwrap_or_else(|e| e.into_inner());
+    linger.retain_mut(|child| match child.try_wait() {
+        Ok(Some(_)) => false,
+        _ => true,
+    });
 }
 
-/// UI 线程侧只读诊断：菜单挂着多久了（毫秒）。给看门狗用。
+/// 关窗时收摊：菜单子进程不能留着（它可能正卡在扩展里）。
+pub(crate) fn shutdown() {
+    let active = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(mut active) = active {
+        let _ = active.child.kill();
+        let _ = active.child.wait();
+    }
+    // 注意：`LINGER` 里的**不杀** —— 那里面可能有正在跑的复制 / 移动，
+    // 杀掉等于把用户的操作砍断。它们收工后自己退出。
+    SHOWN.store(false, Ordering::Release);
+    BUSY.store(false, Ordering::Release);
+}
+
+/// 菜单挂着多久了（毫秒）。给看门狗 / 关闭流程留证据用。
 pub(crate) fn busy_for_ms() -> Option<u64> {
     BUSY.load(Ordering::Acquire)
         .then(|| now_ms().saturating_sub(BUSY_SINCE_MS.load(Ordering::Acquire)))
 }
 
-thread_local! {
-    /// 当前这个线程上正在 Track 的菜单：四条菜单消息要转发给它。
-    static ACTIVE: RefCell<Option<IContextMenu>> = const { RefCell::new(None) };
-    /// 当前菜单的裁剪选项。子菜单是**展开那一刻**才被 Shell 填内容的，
-    /// 所以 `WM_INITMENUPOPUP` 里必须再裁一次。
-    static ACTIVE_OPTS: RefCell<Option<Options>> = const { RefCell::new(None) };
-    /// 背景菜单取自视图时，视图对象必须活到菜单关掉为止。
-    static ACTIVE_VIEW: RefCell<Option<IShellView>> = const { RefCell::new(None) };
-    /// 根弹出菜单的句柄。它也会收到 `WM_INITMENUPOPUP`，但那个时刻 Rove
-    /// 自己的菜单项已经追加进去了；根菜单在构建阶段（那时还只有系统项）
-    /// 已经裁过一遍，所以补过滤要跳过它。
-    static ACTIVE_ROOT: RefCell<isize> = const { RefCell::new(0) };
-    /// Rove 自己建的子菜单句柄。关键词过滤只针对系统菜单项，
-    /// 这些子菜单连同里面的内容一律不碰。
-    static APP_POPUPS: RefCell<Vec<isize>> = const { RefCell::new(Vec::new()) };
-    /// 本线程是第几代菜单宿主（BUSY 记账用）。
-    static SELF_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// 本线程自己的窗口。卡死被放弃的老线程若干分钟后会自己「活过来」，
-    /// 那时它手里的窗口已经没人认了：不许它取走新线程的请求，也不许它动 BUSY。
-    static SELF_HWND: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+/// 系统菜单这次运行还值不值得请？（拖死过一次就再也不请）
+pub(crate) fn shell_unhealthy() -> bool {
+    SHELL_DEAD.load(Ordering::Acquire)
 }
 
-/// 弹出原生菜单。`owner` 是主窗口 HWND（用于菜单关闭后归还前台权）；
-/// 菜单本身由内部专用线程的零面积窗口持有。返回 false 表示菜单线程没起来。
-pub(crate) fn open(
-    target: Target,
-    nodes: Vec<MenuNode>,
-    options: Options,
-    owner: isize,
-    sink: Sink,
-) -> bool {
-    // 上一份菜单还在 Track 中？正常情况直接忽略这次右键（连点两下不能叠出两个菜单）。
-    // 但第三方菜单扩展（网盘 / 同步 / 杀毒）有时会在 `QueryContextMenu` 或子菜单
-    // 展开里卡死，把整个宿主线程拖住——那时 BUSY 永远不会复位，右键从此打不开。
-    // 所以挂得太久的要探测一次：没回应就放弃这条线程，换一条新的。
-    if BUSY.load(Ordering::Acquire) {
-        let age = now_ms().saturating_sub(BUSY_SINCE_MS.load(Ordering::Acquire));
-        let shown = SHOWN.load(Ordering::Acquire);
-        let limit = if shown { MENU_STALL_MS } else { MENU_BUILD_GRACE_MS };
-        // 还在等宿主窗口建出来的阶段：请求已经排队，等它起来自己会取走，
-        // 不算「卡死」（否则慢一点的宿主启动会把放弃名额白白烧光，
-        // 6 条烧完右键就彻底不再恢复）。
-        if HOST.load(Ordering::Acquire) == 0 && HOST_STARTING.load(Ordering::Acquire) {
-            return true;
-        }
-        // 判死规则：
-        //  · 菜单已经在屏幕上 → 线程在跑消息循环，ping 不该超时；
-        //  · 构建阶段 → 先探活。能回 ping 的是「慢」（有的第三方扩展自己泵消息），
-        //    别换线程；但超过硬上限照样放弃。
-        let alive = host_responsive(HOST.load(Ordering::Acquire));
-        let dead = if shown {
-            !alive
-        } else {
-            !alive || age > MENU_BUILD_MAX_MS
-        };
-        if age > limit && dead {
-            let abandoned = ABANDONED.fetch_add(1, Ordering::AcqRel) + 1;
-            LAST_ABANDON_MS.store(now_ms().max(1), Ordering::Release);
-            let fails = SHELL_FAILS.fetch_add(1, Ordering::AcqRel) + 1;
-            if fails >= MAX_SHELL_FAILS {
-                crate::logal!(
-                    "[menu] 系统菜单已经拖死线程 {fails} 次，本次运行不再请它上场（只弹 Rove 自己的项）"
-                );
-            }
-            ABORTED_GEN.store(BUSY_GEN.load(Ordering::Acquire), Ordering::Release);
-            // `SHOWN` 是进程级的：卡死在 `TrackPopupMenuEx` 里的线程永远不会复位
-            // 它，留着 true 就会让后面每次右键都按「菜单已在屏幕上」的时限判活。
-            SHOWN.store(false, Ordering::Release);
-            HOST.store(0, Ordering::Release);
-            // 挂着的那条请求属于已经判死的线程，跑起来只会是幽灵菜单。
-            JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            // 现成的备用窗口立刻顶上：这条右键马上就能弹出来，
-            // 不用再等一个新线程慢慢建窗口。
-            let spare = SPARE.swap(0, Ordering::AcqRel);
-            if spare != 0 {
-                HOST.store(spare, Ordering::Release);
-                // 备用窗口建出来之后主题可能已经切过：让它下次弹出前重新上色。
-                HOST_DARK.store(!DARK.load(Ordering::Acquire), Ordering::Release);
-                crate::logv!("[menu] 备用宿主窗口顶上 {:#x}", spare);
-                ensure_spare();
-            }
-            BUSY.store(false, Ordering::Release);
-            if abandoned > MAX_ABANDONED {
-                // 卡死的线程回收不了，攒多了只会白占内存：彻底停手，别再造新的。
-                GAVE_UP.store(true, Ordering::Release);
-                crate::logal!(
-                    "[menu] 已放弃 {abandoned} 条卡死的菜单线程，不再重建（右键菜单暂停，关窗时自动重启可恢复）"
-                );
-                return false;
-            }
-            crate::logal!(
-                "[menu] 菜单线程无响应 {age}ms（多半是第三方菜单扩展卡死），重建线程（第 {abandoned} 条）"
-            );
-            // 这次右键别排给这条刚判死的线程：调用方会用「只含 Rove 自己项」
-            // 的菜单立刻重试一次（备用窗口已经在顶上，是瞬时的）。
-            return false;
-        } else {
-            return true;
-        }
-    }
-    // 必须在 UI 线程就把 BUSY 置上：否则连点两次右键会在菜单线程开工前
-    // 排进去两个请求，关掉第一个后第二个又自己跳出来。
-    if BUSY.swap(true, Ordering::AcqRel) {
-        return true;
-    }
-    let gen = BUSY_GEN.fetch_add(1, Ordering::AcqRel) + 1;
-    BUSY_SINCE_MS.store(now_ms(), Ordering::Release);
-    // 拿到的是「已经建好的宿主」（可能为 0 = 还在起来），建好与否不重要：
-    // 下面入队后会再读一次。
-    let _ = ensure_host();
-    JOBS.lock().unwrap_or_else(|e| e.into_inner()).push(Job {
-        gen,
-        target,
-        nodes,
-        options,
-        owner,
-        sink,
-    });
-    // 入队后再取一次句柄：宿主线程可能刚好在这一瞬间上岗，而它上岗时发的
-    // `WM_APP_OPEN_MENU` 早于我们入队 —— 那条消息会白跑一趟（队列还是空的），
-    // 之后没人再来取，这次右键就永远不弹。补发一条覆盖这个窗口。
-    let host = HOST.load(Ordering::Acquire);
-    if host == 0 {
-        // 宿主线程还在起来的路上。请求已经入队，它把窗口建好之后会自己来取
-        // （见 `host_thread`）。UI 线程在这里**一秒都不等**。
-        crate::logv!("[menu] host not ready yet, request queued");
-        return true;
-    }
-    let ok = unsafe {
-        PostMessageW(
-            Some(HWND(host as *mut _)),
-            WM_APP_OPEN_MENU,
-            WPARAM(0),
-            LPARAM(0),
-        )
-    };
-    if ok.is_err() {
-        // 宿主窗口已经不在了（线程退出 / 窗口被销毁）：把句柄清掉，
-        // 否则之后每次右键都往一个死窗口投递，永远没人再来建。
-        let _ = HOST.compare_exchange(host, 0, Ordering::AcqRel, Ordering::Acquire);
-        JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        end_busy(gen);
-        crate::logal!("[menu] 宿主窗口已失效，下次右键重建");
-        return false;
-    }
-    true
-}
-
-/// `WM_INITMENUPOPUP` / `WM_DRAWITEM` / `WM_MEASUREITEM` / `WM_MENUCHAR` 的转发。
-fn forward_menu_message(msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
-    if !matches!(
-        msg,
-        WM_INITMENUPOPUP | WM_DRAWITEM | WM_MEASUREITEM | WM_MENUCHAR
-    ) {
-        return None;
-    }
-    let menu = ACTIVE.with(|active| active.borrow().clone())?;
-    let mut result = LRESULT(0);
-    let mut handled = false;
-    if let Ok(menu3) = menu.cast::<IContextMenu3>() {
-        if unsafe { menu3.HandleMenuMsg2(msg, wp, lp, Some(&mut result)) }.is_ok() {
-            handled = true;
-        }
-    }
-    if !handled {
-        if let Ok(menu2) = menu.cast::<IContextMenu2>() {
-            if unsafe { menu2.HandleMenuMsg(msg, wp, lp) }.is_ok() {
-                handled = true;
-                result = LRESULT(0);
-            }
-        }
-    }
-    // 子菜单是**展开那一刻**才被 Shell 填内容的，所以这里必须再裁一次。
-    // 只处理子菜单：根弹出菜单在构建阶段已经裁过，那时里面还只有系统项。
-    if msg == WM_INITMENUPOPUP {
-        let popup = HMENU(wp.0 as *mut _);
-        let root = ACTIVE_ROOT.with(|value| *value.borrow());
-        if root != 0 && wp.0 as isize == root {
-            return if handled { Some(result) } else { None };
-        }
-        // IContextMenu3 的聚合会跳过「只实现了 IContextMenu2」的子处理器
-        // （典型：授予访问权限 / 共享、部分网盘与同步类扩展）。
-        // 结果就是子菜单一直空着，但 `HandleMenuMsg2` 照样返回 S_OK。
-        // 发现还是空的就补一次 2 版本的调用。
-        if unsafe { GetMenuItemCount(Some(popup)) } <= 0 {
-            if let Ok(menu2) = menu.cast::<IContextMenu2>() {
-                let _ = unsafe { menu2.HandleMenuMsg(msg, wp, lp) };
-            }
-        }
-        if let Some(options) = ACTIVE_OPTS.with(|opts| opts.borrow().clone()) {
-            let filled = unsafe { GetMenuItemCount(Some(popup)) }.max(0);
-            filter_hidden(popup, &options);
-            let kept = unsafe { GetMenuItemCount(Some(popup)) }.max(0);
-            crate::logv!(
-                "[menu] popup handled={} filled={} kept={}",
-                handled,
-                filled,
-                kept
-            );
-        }
-    }
-    if handled {
-        Some(result)
-    } else {
-        None
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 菜单站点
-// ---------------------------------------------------------------------------
-
-/// 「授予访问权限」这类扩展不是从 `IShellExtInit` 的 pidl / 数据对象里拿目标的，
-/// 而是向菜单的 **site**（`IObjectWithSite`）要一个 `IFolderView`，
-/// 再调 `IFolderView::Items(SVGIO_SELECTION, IID_IShellItemArray)` 取当前目标。
-/// 不给 site 时它们不报错、也不填子菜单——就是我们现在遇到的现象。
+/// 让原生菜单跟随主题（UI 线程调用）。
 ///
-/// 这里给一个只实现必要几项的最小 site：
-/// `IOleWindow::GetWindow` 给宿主窗口，`IFolderView::Items` 给文件夹自身的
-/// `IShellItemArray`，其余全部 `E_NOTIMPL`。
-#[cfg(windows)]
-mod site {
-    use std::cell::RefCell;
-    use std::ffi::c_void;
-    use std::path::Path;
-
-    use windows::core::{implement, GUID, IUnknown, Interface, Result as WinResult};
-    use windows::Win32::Foundation::{BOOL, E_NOTIMPL, E_NOINTERFACE, HWND, POINT};
-    use windows::Win32::System::Com::{IServiceProvider, IServiceProvider_Impl};
-    use windows::Win32::System::Ole::{IObjectWithSite, IOleWindow, IOleWindow_Impl};
-    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-    use windows::Win32::UI::Shell::{
-        IFolderView, IFolderView_Impl, IShellItem, IShellItemArray, SHCreateItemFromIDList,
-        SHCreateShellItemArrayFromShellItem, _SVGIO,
-    };
-
-    thread_local! {
-        /// `QueryService` 要把自己 QI 成 `IFolderView`，但 `_Impl` 方法里
-        /// 只有 `&self`，拿不到外层 COM 指针，所以存一份自己。
-        static SELF_UNK: RefCell<Option<IUnknown>> = const { RefCell::new(None) };
+/// 应急退路：设置环境变量 `ROVE_NO_DARK_MENU=1` 后一律浅色菜单。
+pub fn set_dark(dark: bool) {
+    let dark = dark && std::env::var_os("ROVE_NO_DARK_MENU").is_none();
+    // 第一次即使值等于默认的 `false` 也不能提前返回：进程默认是「跟随系统」，
+    // 用户「Rove 亮色 + Windows 深色」时不设就一直是深色菜单。
+    let first = !dark::mode_set();
+    if DARK.swap(dark, Ordering::AcqRel) == dark && !first {
+        return;
     }
-
-    #[implement(IServiceProvider, IOleWindow, IFolderView)]
-    struct MenuSite {
-        hwnd: HWND,
-        item: IShellItem,
-    }
-
-    impl IServiceProvider_Impl for MenuSite_Impl {
-        fn QueryService(
-            &self,
-            _guidservice: *const GUID,
-            riid: *const GUID,
-            ppvobject: *mut *mut c_void,
-        ) -> WinResult<()> {
-            let unknown = SELF_UNK.with(|slot| slot.borrow().clone());
-            let Some(unknown) = unknown else {
-                return Err(windows::core::Error::from_hresult(E_NOINTERFACE));
-            };
-            unsafe { unknown.query(riid, ppvobject) }.ok()
-        }
-    }
-
-    impl IOleWindow_Impl for MenuSite_Impl {
-        fn GetWindow(&self) -> WinResult<HWND> {
-            Ok(self.hwnd)
-        }
-        fn ContextSensitiveHelp(&self, _entermode: BOOL) -> WinResult<()> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-    }
-
-    impl IFolderView_Impl for MenuSite_Impl {
-        fn GetCurrentViewMode(&self) -> WinResult<u32> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn SetCurrentViewMode(&self, _viewmode: u32) -> WinResult<()> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn GetFolder(
-            &self,
-            _riid: *const GUID,
-            _ppv: *mut *mut c_void,
-        ) -> WinResult<()> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn Item(&self, _itemindex: i32) -> WinResult<*mut ITEMIDLIST> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn ItemCount(&self, _flags: &_SVGIO) -> WinResult<i32> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn Items(
-            &self,
-            _flags: &_SVGIO,
-            riid: *const GUID,
-            ppv: *mut *mut c_void,
-        ) -> WinResult<()> {
-            let array: IShellItemArray =
-                unsafe { SHCreateShellItemArrayFromShellItem(&self.item) }?;
-            unsafe { array.query(riid, ppv) }.ok()
-        }
-        fn GetSelectionMarkedItem(&self) -> WinResult<i32> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn GetFocusedItem(&self) -> WinResult<i32> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn GetItemPosition(&self, _pidl: *const ITEMIDLIST) -> WinResult<POINT> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn GetSpacing(&self, _ppt: *mut POINT) -> WinResult<()> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn GetDefaultSpacing(&self) -> WinResult<POINT> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn GetAutoArrange(&self) -> WinResult<()> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn SelectItem(&self, _item: i32, _flags: u32) -> WinResult<()> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-        fn SelectAndPositionItems(
-            &self,
-            _cidl: u32,
-            _apidl: *const *const ITEMIDLIST,
-            _apt: *const POINT,
-            _flags: u32,
-        ) -> WinResult<()> {
-            Err(windows::core::Error::from_hresult(E_NOTIMPL))
-        }
-    }
-
-    /// 挂上 site；菜单关掉后 `Drop` 会自动摘下来。
-    pub(super) struct SiteGuard {
-        shell_hook: IObjectWithSite,
-        _provider: IServiceProvider,
-    }
-
-    impl Drop for SiteGuard {
-        fn drop(&mut self) {
-            let _ = unsafe { self.shell_hook.SetSite(None) };
-            SELF_UNK.with(|slot| *slot.borrow_mut() = None);
-        }
-    }
-
-    pub(super) fn attach(menu: &windows::Win32::UI::Shell::IContextMenu, hwnd: HWND, dir: &Path) -> Option<SiteGuard> {
-        let pidl = super::path_pidl(dir).ok()?;
-        let guard = super::Pidls(vec![pidl]);
-        let item: IShellItem = unsafe { SHCreateItemFromIDList(guard.0[0]) }.ok()?;
-        let unknown: IUnknown = MenuSite {
-            hwnd,
-            item,
-        }
-        .into();
-        SELF_UNK.with(|slot| *slot.borrow_mut() = Some(unknown.clone()));
-        let provider: IServiceProvider = match unknown.cast() {
-            Ok(provider) => provider,
-            Err(_) => {
-                SELF_UNK.with(|slot| *slot.borrow_mut() = None);
-                return None;
-            }
-        };
-        let shell_hook: IObjectWithSite = match menu.cast() {
-            Ok(hook) => hook,
-            Err(_) => {
-                SELF_UNK.with(|slot| *slot.borrow_mut() = None);
-                return None;
-            }
-        };
-        if unsafe { shell_hook.SetSite(Some(&unknown)) }.is_err() {
-            SELF_UNK.with(|slot| *slot.borrow_mut() = None);
-            return None;
-        }
-        crate::logv!("[menu] site attached");
-        Some(SiteGuard {
-            shell_hook,
-            _provider: provider,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 菜单线程
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// 深色菜单（uxtheme 的未公开序号；任何一步拿不到就整体退回浅色）
-// ---------------------------------------------------------------------------
-
-/// 取 `uxtheme.dll` 里的未公开导出（按序号）。
-///
-/// 序号：133 `AllowDarkModeForWindow` / 135 `SetPreferredAppMode` /
-/// 136 `FlushMenuThemes`。这几个接口微软从 Win10 1809 起就一直有，但从未
-/// 公开——所以全程尽力而为：取不到就是浅色，绝不让菜单因此弹不出来。
-fn uxtheme_export(ordinal: usize) -> Option<unsafe extern "system" fn() -> isize> {
-    use windows::core::{w, PCSTR};
-    use windows::Win32::System::LibraryLoader::{
-        GetModuleHandleW, GetProcAddress, LoadLibraryW,
-    };
-    unsafe {
-        // 先找已加载的模块；没有就主动加载（uxtheme 通常早就被通用控件带进来了）。
-        let module = match GetModuleHandleW(w!("uxtheme.dll")) {
-            Ok(module) => module,
-            Err(_) => LoadLibraryW(w!("uxtheme.dll")).ok()?,
-        };
-        GetProcAddress(module, PCSTR(ordinal as *const u8))
-    }
-}
-
-/// 进程级深浅偏好（`SetPreferredAppMode`，0=Default 1=AllowDark 2=ForceDark 3=ForceLight）。
-fn set_preferred_mode(dark: bool) -> bool {
-    let Some(export) = uxtheme_export(135) else {
-        return false;
-    };
-    let set_mode: unsafe extern "system" fn(i32) -> i32 = unsafe { std::mem::transmute(export) };
-    unsafe { set_mode(if dark { 2 } else { 3 }) };
-    MODE_DARK.store(dark, Ordering::Release);
-    MODE_SET.store(true, Ordering::Release);
-    flush_menu_themes();
-    true
-}
-
-/// 让菜单主题缓存失效，下一次弹出才吃新设置。
-fn flush_menu_themes() {
-    if let Some(export) = uxtheme_export(136) {
-        let flush: unsafe extern "system" fn() = unsafe { std::mem::transmute(export) };
-        unsafe { flush() };
-    }
-}
-
-/// 给任意窗口挂上（或摘掉）深色主题（不改 Rove 自己的宿主状态）。
-fn apply_dark_flag(hwnd: HWND, dark: bool) {
-    unsafe {
-        if let Some(export) = uxtheme_export(133) {
-            let allow: unsafe extern "system" fn(HWND, i32) -> i32 =
-                std::mem::transmute(export);
-            allow(hwnd, dark as i32);
-        }
-        // Win10 认 "DarkMode_Explorer"；空串 = 恢复系统默认主题。
-        let theme = if dark {
-            windows::core::w!("DarkMode_Explorer")
-        } else {
-            windows::core::PCWSTR::null()
-        };
-        let _ = windows::Win32::UI::Controls::SetWindowTheme(
-            hwnd,
-            theme,
-            windows::core::PCWSTR::null(),
-        );
-        flush_menu_themes();
-    }
-}
-
-/// 给 Rove 自己的菜单宿主窗口挂主题，并记下状态。
-fn theme_host(hwnd: HWND, dark: bool) {
-    apply_dark_flag(hwnd, dark);
-    HOST_DARK.store(dark, Ordering::Release);
+    crate::logv!("[menu] set_dark dark={} first={}", dark, first);
+    // 托盘菜单是父进程自己弹的，进程级偏好在这里设；菜单子进程每次启动
+    // 都会按请求里的 `dark` 自己再设一遍（偏好不跨进程）。
+    let _ = dark::set_preferred_mode(dark);
+    apply_tray_theme();
 }
 
 /// 让托盘右键菜单跟随 Rove 的主题。
@@ -767,7 +655,7 @@ pub fn apply_tray_theme() {
             None => return,
         }
     }
-    apply_dark_flag(HWND(hwnd as _), dark);
+    dark::apply_dark_flag(HWND(hwnd as _), dark);
 }
 
 /// 找 `tray-icon` 的隐藏窗口，**必须是本进程的**。
@@ -780,7 +668,7 @@ fn find_own_tray_window() -> Option<isize> {
     use windows::Win32::Foundation::BOOL;
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowThreadProcessId, IsWindowVisible,
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
     };
 
     struct Ctx {
@@ -817,340 +705,6 @@ fn find_own_tray_window() -> Option<isize> {
     (ctx.found != 0).then_some(ctx.found)
 }
 
-/// 让原生菜单跟随主题（UI 线程调用；真正的绘制在菜单线程上）。
-///
-/// 应急退路：设置环境变量 `ROVE_NO_DARK_MENU=1` 后一律浅色菜单。
-pub fn set_dark(dark: bool) {
-    let dark = dark && std::env::var_os("ROVE_NO_DARK_MENU").is_none();
-    // 第一次即使值等于默认的 `false` 也不能提前返回：进程默认是「跟随系统」，
-    // 用户「Rove 亮色 + Windows 深色」时不设就一直是深色菜单。
-    let first = !MODE_SET.swap(true, Ordering::AcqRel);
-    crate::logv!("[menu] set_dark dark={} first={}", dark, first);
-    if DARK.swap(dark, Ordering::AcqRel) == dark && !first {
-        return;
-    }
-    if first {
-        let _ = set_preferred_mode(dark);
-        apply_tray_theme();
-        return;
-    }
-    // 还没弹过菜单：宿主窗口建起来时会自己按 DARK 决定，不必在这里做什么。
-    let hwnd = HOST.load(Ordering::Acquire);
-    if hwnd != 0 {
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(hwnd as _)),
-                WM_APP_SET_DARK,
-                WPARAM(dark as usize),
-                LPARAM(0),
-            );
-        }
-    }
-    apply_tray_theme();
-}
-
-/// 取（必要时派出）菜单宿主线程。返回**当前已经建好的**宿主窗口句柄，
-/// 0 表示「还没有，线程正在起来」。
-///
-/// 以前这里会阻塞等最多 5 秒等线程回报句柄。真机日志里那是一条死路：
-/// 卡死的第三方菜单扩展握着进程级的锁，新线程建窗口要排队好几秒，
-/// 于是每次右键 UI 线程被冻 5 秒，连关闭按钮和托盘都没反应。
-/// 现在一律不等：请求留在 `JOBS` 里，宿主建好窗口后自己来取。
-fn ensure_host() -> isize {
-    let existing = HOST.load(Ordering::Acquire);
-    if existing != 0 {
-        return existing;
-    }
-    let spare = SPARE.swap(0, Ordering::AcqRel);
-    if spare != 0 {
-        HOST.store(spare, Ordering::Release);
-        HOST_DARK.store(!DARK.load(Ordering::Acquire), Ordering::Release);
-        crate::logv!("[menu] 备用宿主窗口顶上 {:#x}", spare);
-        ensure_spare();
-        return spare;
-    }
-    let _guard = START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let existing = HOST.load(Ordering::Acquire);
-    if existing != 0 {
-        return existing;
-    }
-    if HOST_STARTING.load(Ordering::Acquire) {
-        let age = now_ms().saturating_sub(HOST_START_MS.load(Ordering::Acquire));
-        if age < HOST_START_TIMEOUT_MS {
-            // 已经有一条在路上，给它时间。
-            return 0;
-        }
-        // 派出去太久还没建出窗口：新线程根本没跑起来 —— 进程级的锁被卡死的
-        // 扩展攥着（真机：之后网络枚举 / 索引 / 右键全哑）。标死，交给自我修复。
-        // 只在「本进程从来没有过宿主窗口」时才这么判：有过就说明线程能起来，
-        // 这条只是慢（备用窗口也会走这条路），换进程没有意义。
-        if !HAD_HOST.load(Ordering::Acquire) {
-            POISONED.store(true, Ordering::Release);
-            crate::logal!(
-                "[menu] !! 宿主线程 {}ms 都没起来，进程多半已被卡死的扩展拖坏",
-                age
-            );
-        } else {
-            crate::logv!("[menu] 备用宿主线程 {}ms 还没建出窗口（不判毒）", age);
-        }
-    }
-    spawn_host_thread();
-    0
-}
-
-/// 派一条宿主线程出去。它建好窗口后优先当宿主，宿主义务已满就当备用。
-fn spawn_host_thread() -> bool {
-    let gen = HOST_GEN.fetch_add(1, Ordering::AcqRel) + 1;
-    HOST_STARTING.store(true, Ordering::Release);
-    HOST_START_MS.store(now_ms(), Ordering::Release);
-    let spawned = std::thread::Builder::new()
-        .name("rove-menu".into())
-        .spawn(move || host_thread(gen));
-    if spawned.is_err() {
-        HOST_STARTING.store(false, Ordering::Release);
-        crate::logal!("[menu] 菜单宿主线程创建失败");
-        return false;
-    }
-    true
-}
-
-/// 保证有一条**现成的备用窗口**等着接手。
-///
-/// 卡死一次就要换一条线程，而那台机器上新线程建窗口要好几秒。提前备一个，
-/// 换的时候就是瞬时的 —— 用户右键不会再「这几秒没反应」。
-fn ensure_spare() {
-    if SPARE.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    let _guard = START_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if SPARE.load(Ordering::Acquire) != 0 {
-        return;
-    }
-    if HOST_STARTING.load(Ordering::Acquire) {
-        // 已经有一条在路上：它要是抢不到宿主义务，会自己当备用。
-        return;
-    }
-    spawn_host_thread();
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(Some(0)).collect()
-}
-
-fn host_thread(gen: u64) {
-    unsafe {
-        crate::logv!("[menu] host thread gen={} start", gen);
-        // OleInitialize = STA COM + OLE（剪贴板延迟渲染靠它）。
-        let hr = OleInitialize(None);
-        crate::logv!("[menu] host gen={} ole hr={:?}", gen, hr);
-        let class_name = windows::core::w!("Rove.NativeMenuHost");
-        let wc = WNDCLASSW {
-            lpfnWndProc: Some(host_proc),
-            lpszClassName: class_name,
-            ..Default::default()
-        };
-        // 重建线程的情况：类名已被（卡死的那条）老线程注册过，注册会失败，
-        // 但类是全进程有效的，照样能 CreateWindowExW。
-        let atom = RegisterClassW(&wc);
-        let class_ok = atom != 0
-            || windows::Win32::Foundation::GetLastError()
-                == windows::Win32::Foundation::ERROR_CLASS_ALREADY_EXISTS;
-        // 必须在**这条线程的第一个窗口建出来之前**设：`SetPreferredAppMode`
-        // 对已经创建过的窗口不追溯，晚一步菜单就还是浅色。
-        //
-        // 注意浅色时也要显式设成 ForceLight：进程默认值是「跟随系统」，
-        // 用户把 Rove 钉成亮色而 Windows 是深色时，不设就还是深色菜单。
-        let want_dark = DARK.load(Ordering::Acquire);
-        let _ = set_preferred_mode(want_dark);
-        let hwnd = if class_ok {
-            CreateWindowExW(
-                // 注意：不能加 WS_EX_NOACTIVATE —— 激活不了就拿不到键盘焦点，
-                // 菜单的方向键 / 回车 / Esc 全会失效。零面积弹出窗 + 菜单
-                // 关闭后归还前台权（见 run_menu）。
-                WS_EX_TOOLWINDOW,
-                class_name,
-                PCWSTR::null(),
-                WS_POPUP,
-                0,
-                0,
-                1,
-                1,
-                None,
-                None,
-                None,
-                None,
-            )
-            .ok()
-        } else {
-            None
-        };
-        let Some(hwnd) = hwnd else {
-            // 建不出窗口：排着的请求等不到人处理，直接作废，别让 BUSY 悬着。
-            crate::logal!("[menu] 菜单宿主窗口创建失败");
-            HOST_STARTING.store(false, Ordering::Release);
-            JOBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-            BUSY.store(false, Ordering::Release);
-            return;
-        };
-        let self_hwnd = hwnd.0 as isize;
-        SELF_GEN.with(|g| g.set(gen));
-        SELF_HWND.with(|h| h.set(self_hwnd));
-        theme_host(hwnd, want_dark);
-        // 谁先建好窗口谁上岗：宿主义务空着就当宿主，否则当备用，
-        // 都满了就销毁自己退出（不白占一个窗口）。
-        let role_host = HOST
-            .compare_exchange(0, self_hwnd, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        let role_spare = !role_host
-            && SPARE
-                .compare_exchange(0, self_hwnd, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok();
-        HOST_STARTING.store(false, Ordering::Release);
-        if !role_host && !role_spare {
-            crate::logv!("[menu] 多余的宿主窗口，销毁 {:#x}", self_hwnd);
-            let _ = DestroyWindow(hwnd);
-            return;
-        }
-        if role_host {
-            HAD_HOST.store(true, Ordering::Release);
-        }
-        crate::logln!(
-            "[menu] 宿主窗口就绪 {:#x} 角色={}",
-            self_hwnd,
-            if role_host { "host" } else { "spare" }
-        );
-        if role_host {
-            // 建窗口期间 UI 线程照常接右键，请求都在 `JOBS` 里躺着：这里催一下，
-            // 让它们立刻被取走（没有请求时这条消息只是顺手复位 BUSY）。
-            let _ = PostMessageW(Some(hwnd), WM_APP_OPEN_MENU, WPARAM(0), LPARAM(0));
-        }
-        // 无论当宿主还是备用都补一条备用窗口：有备无患，换线程才是瞬时的。
-        ensure_spare();
-
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-}
-
-unsafe extern "system" fn host_proc(
-    hwnd: HWND,
-    msg: u32,
-    wp: WPARAM,
-    lp: LPARAM,
-) -> LRESULT {
-    if let Some(result) = forward_menu_message(msg, wp, lp) {
-        return result;
-    }
-    if msg == WM_APP_PING {
-        // 回非 0：`SendMessageTimeoutW` 靠这个区分「活着但忙」和「超时没回」。
-        return LRESULT(1);
-    }
-    if msg == WM_APP_SET_DARK {
-        let dark = wp.0 != 0;
-        let _ = set_preferred_mode(dark);
-        theme_host(hwnd, dark);
-        return LRESULT(0);
-    }
-    if msg == WM_APP_OPEN_MENU {
-        let self_gen = SELF_GEN.with(|g| g.get());
-        // 按**窗口**认身份：被换下去的老线程（哪怕它自己活过来了）和备用窗口
-        // 都不许接活，否则会出现幽灵菜单或者把 BUSY 记到别人头上。
-        let self_hwnd = SELF_HWND.with(|h| h.get());
-        if self_hwnd == 0 || self_hwnd != HOST.load(Ordering::Acquire) {
-            // 被换掉的老线程：请求留给新线程，BUSY 也只在还是自己那一代时才清。
-            end_busy(self_gen);
-            return LRESULT(0);
-        }
-        // 一次性取走全部入队请求，只执行最新那一条（旧的在 BUSY 竞态下
-        // 可能残留，不能让它延迟弹出来）。
-        let job = JOBS.lock().unwrap_or_else(|e| e.into_inner()).drain(..).last();
-        if let Some(job) = job {
-            // 现在开始 Track：先补一条备用窗口，万一这次卡死也有人接手。
-            ensure_spare();
-            run_menu(hwnd, job);
-        } else {
-            end_busy(self_gen);
-        }
-        return LRESULT(0);
-    }
-    unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
-}
-
-/// 取路径的绝对 PIDL（调用方负责 `CoTaskMemFree`）。
-fn path_pidl(path: &Path) -> WinResult<*mut ITEMIDLIST> {
-    let mut name: Vec<u16> = path.as_os_str().encode_wide().collect();
-    name.push(0);
-    let mut pidl = std::ptr::null_mut();
-    unsafe { SHParseDisplayName(PCWSTR(name.as_ptr()), None, &mut pidl, 0, None)? };
-    if pidl.is_null() {
-        return Err(windows::core::Error::from_win32());
-    }
-    Ok(pidl)
-}
-
-struct Pidls(Vec<*mut ITEMIDLIST>);
-impl Drop for Pidls {
-    fn drop(&mut self) {
-        for pidl in self.0.drain(..) {
-            unsafe { CoTaskMemFree(Some(pidl.cast())) };
-        }
-    }
-}
-
-/// 绝对 PIDL 里最后一个 `SHITEMID` 的字节偏移。
-/// 从该偏移开始就是「相对父文件夹的子项 PIDL」。
-unsafe fn last_item_offset(pidl: *const ITEMIDLIST) -> Option<usize> {
-    let mut at = pidl as *const u8;
-    let mut offset = 0usize;
-    let mut last = 0usize;
-    loop {
-        let cb = std::ptr::read_unaligned(at as *const u16) as usize;
-        if cb == 0 {
-            break;
-        }
-        last = offset;
-        offset += cb;
-        at = at.add(cb);
-        if offset > 0x10000 {
-            return None;
-        }
-    }
-    Some(last)
-}
-
-/// 选中项 → `IContextMenu`。
-/// 同一父文件夹时走 `SHBindToParent` + `IShellFolder::GetUIObjectOf`（与资源管理器一致）；
-/// 横跨多个文件夹时返回 None，由调用方回退到 `SHCreateDefaultContextMenu`。
-fn items_context_menu(host: HWND, pidls: &[*mut ITEMIDLIST]) -> Option<IContextMenu> {
-    let first = *pidls.first()?;
-    let offsets: Vec<usize> = pidls
-        .iter()
-        .map(|p| unsafe { last_item_offset(*p) })
-        .collect::<Option<Vec<_>>>()?;
-    // 父文件夹相同 = 绝对 PIDL 的父前缀字节完全一致。
-    let prefix_len = offsets[0];
-    let prefix = unsafe { std::slice::from_raw_parts(first as *const u8, prefix_len) };
-    for (pidl, offset) in pidls.iter().zip(&offsets) {
-        if *offset != prefix_len {
-            return None;
-        }
-        let other = unsafe { std::slice::from_raw_parts(*pidl as *const u8, *offset) };
-        if other != prefix {
-            return None;
-        }
-    }
-    let children: Vec<*const ITEMIDLIST> = pidls
-        .iter()
-        .zip(&offsets)
-        .map(|(pidl, offset)| unsafe { (*pidl as *const u8).add(*offset) as *const ITEMIDLIST })
-        .collect();
-    let parent: IShellFolder = unsafe { SHBindToParent(first, None) }.ok()?;
-    unsafe { parent.GetUIObjectOf(host, &children, None) }.ok()
-}
-
 /// 回收站里的「彻底删除」：在**回收站命名空间**上执行 Shell 的 `delete` 动词。
 ///
 /// 为什么不能在 `C:\$Recycle.Bin\...` 的物理路径上调 `SHFileOperationW` /
@@ -1165,10 +719,13 @@ fn items_context_menu(host: HWND, pidls: &[*mut ITEMIDLIST]) -> Option<IContextM
 /// 返回投递给 Shell 的条目数；用户点「否」时命令返回失败，所以结果仍以
 /// 「条目还在不在」为准。
 pub(crate) fn purge_recycle_items(paths: &[PathBuf], owner: isize) -> usize {
+    use windows::core::{PCSTR, PCWSTR};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        IShellItem, IShellFolder, IEnumIDList, SHCreateItemWithParent, SHGetKnownFolderItem,
-        BHID_SFObject, FOLDERID_RecycleBinFolder, KF_FLAG_DEFAULT, SHCONTF_FOLDERS,
-        SHCONTF_NONFOLDERS, SIGDN_DESKTOPABSOLUTEPARSING, SIGDN_NORMALDISPLAY,
+        IContextMenu, IEnumIDList, IShellFolder, IShellItem, SHCreateItemWithParent,
+        SHGetKnownFolderItem, BHID_SFObject, FOLDERID_RecycleBinFolder,
+        KF_FLAG_DEFAULT, SHCONTF_FOLDERS, SHCONTF_NONFOLDERS, SIGDN_DESKTOPABSOLUTEPARSING,
+        SIGDN_NORMALDISPLAY,
     };
     if paths.is_empty() {
         return 0;
@@ -1190,7 +747,8 @@ pub(crate) fn purge_recycle_items(paths: &[PathBuf], owner: isize) -> usize {
     };
     let host = HWND(owner as *mut core::ffi::c_void);
     let mut list: Option<IEnumIDList> = None;
-    if unsafe { folder.EnumObjects(host, (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32, &mut list) }.is_err()
+    if unsafe { folder.EnumObjects(host, (SHCONTF_FOLDERS.0 | SHCONTF_NONFOLDERS.0) as u32, &mut list) }
+        .is_err()
     {
         return 0;
     }
@@ -1265,8 +823,8 @@ pub(crate) fn purge_recycle_items(paths: &[PathBuf], owner: isize) -> usize {
     let verb = "delete";
     let ansi: Vec<u8> = verb.bytes().chain(Some(0)).collect();
     let wide: Vec<u16> = verb.encode_utf16().chain(Some(0)).collect();
-    let info = CMINVOKECOMMANDINFOEX {
-        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
+    let info = windows::Win32::UI::Shell::CMINVOKECOMMANDINFOEX {
+        cbSize: std::mem::size_of::<windows::Win32::UI::Shell::CMINVOKECOMMANDINFOEX>() as u32,
         fMask: CMIC_MASK_UNICODE,
         hwnd: host,
         lpVerb: PCSTR(ansi.as_ptr()),
@@ -1275,7 +833,10 @@ pub(crate) fn purge_recycle_items(paths: &[PathBuf], owner: isize) -> usize {
         ..Default::default()
     };
     let result = unsafe {
-        menu.InvokeCommand((&info as *const CMINVOKECOMMANDINFOEX).cast::<CMINVOKECOMMANDINFO>())
+        menu.InvokeCommand(
+            (&info as *const windows::Win32::UI::Shell::CMINVOKECOMMANDINFOEX)
+                .cast::<windows::Win32::UI::Shell::CMINVOKECOMMANDINFO>(),
+        )
     };
     crate::logv!(
         "[menu] purge_recycle n={} hr={:?}",
@@ -1286,484 +847,192 @@ pub(crate) fn purge_recycle_items(paths: &[PathBuf], owner: isize) -> usize {
 }
 
 /// 一批由 Shell 分配的子项 PIDL，析构时统一还给 `CoTaskMemFree`。
-struct ChildPidls(Vec<*mut ITEMIDLIST>);
+struct ChildPidls(Vec<*mut windows::Win32::UI::Shell::Common::ITEMIDLIST>);
 
 impl Drop for ChildPidls {
     fn drop(&mut self) {
         for pidl in self.0.drain(..) {
             if !pidl.is_null() {
-                unsafe { CoTaskMemFree(Some(pidl as *const core::ffi::c_void)) };
+                unsafe {
+                    windows::Win32::System::Com::CoTaskMemFree(Some(
+                        pidl as *const core::ffi::c_void,
+                    ))
+                };
             }
         }
     }
 }
 
 /// `IShellItem` 显示名（调用方负责释放 `CoTaskMem` 那块内存）。
-fn shell_item_name(item: &windows::Win32::UI::Shell::IShellItem, kind: windows::Win32::UI::Shell::SIGDN) -> Option<String> {
+fn shell_item_name(
+    item: &windows::Win32::UI::Shell::IShellItem,
+    kind: windows::Win32::UI::Shell::SIGDN,
+) -> Option<String> {
+    use windows::Win32::System::Com::CoTaskMemFree;
     let raw = unsafe { item.GetDisplayName(kind) }.ok()?;
     let text = unsafe { raw.to_string() }.ok();
     unsafe { CoTaskMemFree(Some(raw.0 as *const core::ffi::c_void)) };
     text
 }
 
-/// 目录空白处 → `IContextMenu`。
-/// 必须绑定到该目录**本身**（`BindToObject`）再 `CreateViewObject`。
-/// 用 `SHBindToParent` 会拿到它的父目录，结果是上一层的空白菜单（「新建」会建到上一级）。
-fn folder_context_menu(host: HWND, dir: &Path) -> Option<IContextMenu> {
-    let pidl = path_pidl(dir).ok()?;
-    let pidls = Pidls(vec![pidl]);
-    let desktop = unsafe { SHGetDesktopFolder() }.ok()?;
-    let folder: IShellFolder = unsafe { desktop.BindToObject(pidls.0[0], None) }.ok()?;
-    // 「授予访问权限」这类子菜单是靠 Shell 扩展在展开那一刻填的。
-    // 文件夹自己的菜单对象（`CreateViewObject(IID_IContextMenu)`）虽然也会
-    // 画出那一条，但它转发不到扩展里，子菜单永远是空的。
-    // 视图的背景菜单对象才会转发，所以优先走视图（不需要真建窗口，
-    // 跟 zsdesk 借背景菜单的做法一致）。
-    if let Ok(view) = unsafe { folder.CreateViewObject::<IShellView>(host) } {
-        if let Ok(menu) = unsafe { view.GetItemObject::<IContextMenu>(SVGIO_BACKGROUND) } {
-            crate::logv!("[menu] background source=view");
-            ACTIVE_VIEW.with(|slot| *slot.borrow_mut() = Some(view));
-            return Some(menu);
-        }
-    }
-    crate::logv!("[menu] background source=folder-object");
-    unsafe { folder.CreateViewObject::<IContextMenu>(host) }.ok()
-}
+/// 未使用，但保留类型引用以免 `Arc` 导入被判为多余。
+#[allow(dead_code)]
+type SharedSink = Arc<dyn Fn(MenuAction) + Send + Sync>;
 
-/// 按用户关键词删除 Shell 菜单项（`!` 开头 = 精确匹配，否则包含即隐藏）。
-///
-/// 只看菜单文字：不再为每一项发 `GetCommandString` 跨进程询问，
-/// 系统自带的复制/剪切/粘贴/刷新也靠默认关键词藏掉。
-/// 应用项（`0x7000+`）不动。
-fn filter_hidden(hmenu: HMENU, options: &Options) {
-    if options.hide_keywords.is_empty() {
-        return;
-    }
-    if APP_POPUPS.with(|list| list.borrow().iter().any(|h| *h == hmenu.0 as isize)) {
-        return;
-    }
-    let count = unsafe { GetMenuItemCount(Some(hmenu)) }.max(0);
-    for index in (0..count).rev() {
-        let id = unsafe { GetMenuItemID(hmenu, index) };
-        if id >= APP_FIRST && id != u32::MAX {
-            continue;
+#[cfg(test)]
+mod wire_tests {
+    use super::wire::Request;
+    use super::{ends_menu, parse_event, wire, MenuAction, MenuNode, Target};
+    use std::path::PathBuf;
+
+    fn sample_request() -> Request {
+        Request {
+            target: Target::Items(vec![
+                PathBuf::from(r"O:\评测素材\甲.txt"),
+                PathBuf::from(r"O:\评测素材\乙 空格.txt"),
+            ]),
+            nodes: vec![
+                MenuNode::Separator,
+                MenuNode::Item {
+                    key: "builtin.trash".into(),
+                    label: "删除".into(),
+                    enabled: true,
+                    checked: false,
+                },
+                MenuNode::Submenu {
+                    label: "排序方式".into(),
+                    enabled: false,
+                    children: vec![MenuNode::Item {
+                        key: "sort.name".into(),
+                        label: "名称".into(),
+                        enabled: true,
+                        checked: true,
+                    }],
+                },
+            ],
+            hide_keywords: vec!["!删除(D)".into(), "撤销".into()],
+            extended: true,
+            dark: true,
+            owner: 0x1234,
         }
-        // 子菜单项没有 id，只能看句柄归属。
-        if id == u32::MAX {
-            let sub = unsafe { GetSubMenu(hmenu, index) };
-            if !sub.is_invalid()
-                && APP_POPUPS.with(|list| list.borrow().iter().any(|h| *h == sub.0 as isize))
-            {
-                continue;
+    }
+
+    /// 请求要跨进程过一遍 bincode：中文 / 空格 / 嵌套子菜单都不能变形。
+    #[test]
+    fn request_survives_bincode() {
+        let request = sample_request();
+        let bytes = bincode::serialize(&request).expect("serialize");
+        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+
+        match &back.target {
+            Target::Items(paths) => {
+                assert_eq!(paths.len(), 2);
+                assert_eq!(paths[0], PathBuf::from(r"O:\评测素材\甲.txt"));
+                assert_eq!(paths[1], PathBuf::from(r"O:\评测素材\乙 空格.txt"));
             }
+            other => panic!("目标变形了: {other:?}"),
         }
-        let label = super::normalize_label(&menu_label(hmenu, index));
-        if !label.is_empty() && super::keyword_hit(&label, &options.hide_keywords) {
-            let _ = unsafe { DeleteMenu(hmenu, index as u32, MF_BYPOSITION) };
-            continue;
-        }
-        let sub = unsafe { GetSubMenu(hmenu, index) };
-        if !sub.is_invalid() {
-            filter_hidden(sub, options);
-        }
-    }
-    trim_separators(hmenu);
-}
-
-fn menu_label(hmenu: HMENU, index: i32) -> String {
-    let mut buffer = [0u16; 512];
-    let length = unsafe { GetMenuStringW(hmenu, index as u32, Some(&mut buffer), MF_BYPOSITION) };
-    let length = length.max(0) as usize;
-    String::from_utf16_lossy(&buffer[..length.min(buffer.len())])
-}
-
-/// 菜单线程的 OLE 剪贴板延迟渲染落盘（仅当剪贴板属主是本线程）。
-fn flush_ole_clipboard() {
-    use windows_sys::Win32::System::DataExchange::GetClipboardOwner;
-    use windows_sys::Win32::System::Ole::OleFlushClipboard;
-    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
-    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
-    unsafe {
-        let owner = GetClipboardOwner();
-        if owner.is_null() {
-            return;
-        }
-        if GetWindowThreadProcessId(owner, std::ptr::null_mut()) != GetCurrentThreadId() {
-            return;
-        }
-        let _ = OleFlushClipboard();
-    }
-}
-
-fn append_nodes(
-    hmenu: windows::Win32::UI::WindowsAndMessaging::HMENU,
-    nodes: &[MenuNode],
-    next_id: &mut u32,
-    map: &mut HashMap<u32, String>,
-) -> WinResult<()> {
-    for node in nodes {
-        match node {
-            MenuNode::Separator => unsafe {
-                AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null())?;
-            },
-            MenuNode::Item {
-                key,
-                label,
-                enabled,
-                checked,
-            } => {
-                let id = *next_id;
-                *next_id = next_id.wrapping_add(1);
-                map.insert(id, key.clone());
-                let mut flags = MF_STRING;
-                if !enabled {
-                    flags |= MF_GRAYED;
-                }
-                if *checked {
-                    flags |= MF_CHECKED;
-                }
-                let text = wide(label);
-                unsafe { AppendMenuW(hmenu, flags, id as usize, PCWSTR(text.as_ptr()))? };
-            }
+        assert!(back.extended && back.dark);
+        assert_eq!(back.owner, 0x1234);
+        assert_eq!(back.hide_keywords, request.hide_keywords);
+        assert_eq!(back.nodes.len(), 3);
+        match &back.nodes[2] {
             MenuNode::Submenu {
                 label,
                 enabled,
                 children,
             } => {
-                let sub = unsafe { CreatePopupMenu()? };
-                APP_POPUPS.with(|list| list.borrow_mut().push(sub.0 as isize));
-                append_nodes(sub, children, next_id, map)?;
-                let mut flags = MF_POPUP | MF_STRING;
-                if !enabled {
-                    flags |= MF_GRAYED;
-                }
-                let text = wide(label);
-                unsafe {
-                    AppendMenuW(hmenu, flags, sub.0 as usize, PCWSTR(text.as_ptr()))?;
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 去掉连续 / 首尾分隔线：Shell 菜单按条件吞掉项后经常留下空档。
-fn trim_separators(hmenu: windows::Win32::UI::WindowsAndMessaging::HMENU) {
-    let mut index = 0u32;
-    let mut previous_separator = true;
-    loop {
-        let count = unsafe { GetMenuItemCount(Some(hmenu)) }.max(0) as u32;
-        if index >= count {
-            break;
-        }
-        let flags = unsafe { GetMenuState(hmenu, index, MF_BYPOSITION) };
-        let separator = flags != u32::MAX && flags & MF_SEPARATOR.0 != 0;
-        if separator && (previous_separator || index + 1 == count) {
-            let _ = unsafe { DeleteMenu(hmenu, index, MF_BYPOSITION) };
-        } else {
-            previous_separator = separator;
-            index += 1;
-        }
-    }
-}
-
-/// Shell 命令的规范动词（"open" / "rename" / "delete" …），失败返回 None。
-fn canonical_verb(menu: &IContextMenu, id: u32) -> Option<String> {
-    if !(SHELL_FIRST..=SHELL_LAST).contains(&id) {
-        return None;
-    }
-    let mut buffer = [0u16; 128];
-    unsafe {
-        menu.GetCommandString(
-            (id - SHELL_FIRST) as usize,
-            GCS_VERBW,
-            None,
-            PSTR(buffer.as_mut_ptr().cast()),
-            buffer.len() as u32,
-        )
-    }
-    .ok()?;
-    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
-    Some(String::from_utf16_lossy(&buffer[..end]))
-}
-
-fn invoke_shell(
-    menu: &IContextMenu,
-    owner: HWND,
-    id: u32,
-    point: POINT,
-    dir: Option<&Path>,
-) -> WinResult<()> {
-    if !(SHELL_FIRST..=SHELL_LAST).contains(&id) {
-        return Ok(());
-    }
-    let offset = (id - SHELL_FIRST) as usize;
-    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
-    let control = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
-    let mut mask = CMIC_MASK_UNICODE | CMIC_MASK_PTINVOKE;
-    if shift {
-        mask |= CMIC_MASK_SHIFT_DOWN;
-    }
-    if control {
-        mask |= CMIC_MASK_CONTROL_DOWN;
-    }
-    // 资源管理器会把“当前文件夹”一起传给处理程序（lpDirectoryW）。
-    // 有些扩展靠它拼相对路径 / 定位工作目录，缺了就会自己再猜一个（往往猜错）。
-    let dir_wide: Vec<u16> = dir
-        .map(|d| d.as_os_str().encode_wide().chain(Some(0)).collect())
-        .unwrap_or_default();
-    let info = CMINVOKECOMMANDINFOEX {
-        cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-        fMask: mask,
-        hwnd: owner,
-        lpVerb: PCSTR(offset as *const u8),
-        nShow: 1, // SW_SHOWNORMAL
-        lpVerbW: PCWSTR(offset as *const u16),
-        lpDirectoryW: if dir_wide.is_empty() {
-            PCWSTR::null()
-        } else {
-            PCWSTR(dir_wide.as_ptr())
-        },
-        ptInvoke: point,
-        ..Default::default()
-    };
-    let result = unsafe {
-        menu.InvokeCommand((&info as *const CMINVOKECOMMANDINFOEX).cast::<CMINVOKECOMMANDINFO>())
-    };
-    crate::logv!(
-        "[menu] invoke id={} offset={} verb={:?} dir={:?} hr={:?}",
-        id,
-        offset,
-        canonical_verb(menu, id),
-        dir.map(|d| d.display().to_string()),
-        result.as_ref().err().map(|e| e.code().0)
-    );
-    result
-}
-
-fn run_menu(host: HWND, job: Job) {
-    let _busy = BusyGuard(job.gen);
-    if ABORTED_GEN.load(Ordering::Acquire) == job.gen {
-        // 这条已经被判死、宿主线程也被换掉了：别再弹（幽灵菜单）。
-        crate::logv!("[menu] gen={} 已放弃，跳过弹出", job.gen);
-        return;
-    }
-    // 深浅色兜底对齐：UI 线程切主题的那一刻宿主窗口可能还没建好（`HOST` 还是 0），
-    // 那条切换消息就丢了。每次弹菜单前对一次，代价只是一次原子比较。
-    let want_dark = DARK.load(Ordering::Acquire);
-    if MODE_DARK.load(Ordering::Acquire) != want_dark {
-        let _ = set_preferred_mode(want_dark);
-    }
-    if HOST_DARK.load(Ordering::Acquire) != want_dark {
-        theme_host(host, want_dark);
-    }
-    // `owner`（Rove 主窗口）只用来在菜单关闭后归还前台权。
-    // Shell 菜单本身的 hwnd 一律用宿主窗口：Shell 弹的属性/确认框都归属于它，
-    // 而宿主窗口被摆到鼠标位置，对话框就落在鼠标附近而不是屏幕左上角。
-    let owner = if job.owner != 0 {
-        HWND(job.owner as *mut _)
-    } else {
-        host
-    };
-    let mut point = POINT::default();
-    if unsafe { GetCursorPos(&mut point) }.is_err() {
-        point = POINT { x: 0, y: 0 };
-    }
-
-    let hmenu = match unsafe { CreatePopupMenu() } {
-        Ok(menu) => menu,
-        Err(_) => return,
-    };
-
-    // 1. Shell 部分
-    let mut menu: Option<IContextMenu> = None;
-    let mut site_guard: Option<site::SiteGuard> = None;
-    match &job.target {
-        Target::Items(paths) if !paths.is_empty() => {
-            let mut pidls = Pidls(Vec::with_capacity(paths.len()));
-            for path in paths {
-                match path_pidl(path) {
-                    Ok(pidl) => pidls.0.push(pidl),
-                    Err(_) => continue,
-                }
-            }
-            // 首选：真实父文件夹的 GetUIObjectOf（资源管理器走的就是这条）。
-            // 这样「打开方式 / 发送到 / 属性 / 扫描 / 共享 / 网盘同步」这些由父文件夹
-            // 聚合出来的项才会出现，且不会把文件误当成命名空间项（那样会冒出「管理」）。
-            menu = items_context_menu(host, &pidls.0);
-            // 退路：选中项横跨多个文件夹时，交给默认实现拼一个。
-            if menu.is_none() {
-                if let Ok(desktop) = unsafe { SHGetDesktopFolder() } {
-                    let mut list: Vec<*mut ITEMIDLIST> = pidls.0.clone();
-                    let mut dcm = DEFCONTEXTMENU {
-                        hwnd: host,
-                        psf: ManuallyDrop::new(Some(desktop)),
-                        cidl: list.len() as u32,
-                        apidl: list.as_mut_ptr(),
-                        ..Default::default()
-                    };
-                    menu = unsafe { SHCreateDefaultContextMenu::<IContextMenu>(&dcm) }.ok();
-                    unsafe { ManuallyDrop::drop(&mut dcm.psf) };
-                }
-            }
-        }
-        Target::Background(dir) => {
-            menu = folder_context_menu(host, dir);
-            // 背景菜单要挂 site，「授予访问权限」子菜单才会被填内容。
-            if let Some(active) = &menu {
-                site_guard = site::attach(active, host, dir);
-            }
-        }
-        _ => {}
-    }
-
-    // 2. 填充 Shell 命令 + 按用户开关裁掉对应项
-    if let Some(active) = &menu {
-        let mut flags = CMF_NORMAL | CMF_EXPLORE;
-        if matches!(&job.target, Target::Items(p) if p.len() == 1) {
-            flags |= CMF_CANRENAME;
-        }
-        if job.options.extended {
-            flags |= CMF_EXTENDEDVERBS;
-        }
-        let _ = unsafe { active.QueryContextMenu(hmenu, 0, SHELL_FIRST, SHELL_LAST, flags) };
-        filter_hidden(hmenu, &job.options);
-    }
-
-    // 3. 追加应用命令
-    let mut map: HashMap<u32, String> = HashMap::new();
-    let mut next_id = APP_FIRST;
-    if !job.nodes.is_empty() {
-        // 应用项与系统项之间补一条分隔线，区分归属。
-        if unsafe { GetMenuItemCount(Some(hmenu)) } > 0 {
-            let _ = unsafe { AppendMenuW(hmenu, MF_SEPARATOR, 0, PCWSTR::null()) };
-        }
-    }
-    let _ = append_nodes(hmenu, &job.nodes, &mut next_id, &mut map);
-    trim_separators(hmenu);
-
-    // 判死只要 0.8 秒，而慢扩展往往就慢在 `QueryContextMenu` 之后 —— 弹之前
-    // 确认一次：这中间用户又右键了、这条已经被放弃，就别把它弹出来（幽灵菜单）。
-    // 必须放在「挂 ACTIVE / 显示宿主窗口」之前：提前 return 会漏掉 `DestroyMenu`
-    // 和 ACTIVE 复位（弹出菜单句柄泄漏，宿主窗口还会被摆到鼠标位置）。
-    if ABORTED_GEN.load(Ordering::Acquire) == job.gen {
-        crate::logv!("[menu] gen={} 建好时已被放弃，不弹", job.gen);
-        let _ = unsafe { DestroyMenu(hmenu) };
-        return;
-    }
-
-    // 4. 显示（阻塞；嵌套消息循环中 host_proc 会转发菜单消息）
-    //
-    // 菜单的键盘导航（方向键 / 回车 / Esc / 热键）依赖「菜单所属线程的窗口
-    // 是前台窗口」。宿主窗口是零面积弹出窗：先摆到菜单锚点、不激活地显示，
-    // 再把前台权交给它；菜单关后把前台权还给 Rove。
-    unsafe {
-        let _ = SetWindowPos(host, None, point.x, point.y, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE);
-        let _ = ShowWindow(host, SW_SHOWNOACTIVATE);
-        let _ = SetForegroundWindow(host);
-        let _ = SetActiveWindow(host);
-        let _ = SetFocus(Some(host));
-    }
-    ACTIVE.with(|active| *active.borrow_mut() = menu.clone());
-    ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = Some(job.options.clone()));
-    ACTIVE_ROOT.with(|root| *root.borrow_mut() = hmenu.0 as isize);
-    let flags = TPM_RETURNCMD.0 | TPM_RIGHTBUTTON.0;
-    SHOWN.store(true, Ordering::Release);
-    let chosen = unsafe { TrackPopupMenuEx(hmenu, flags, point.x, point.y, host, None) }.0 as u32;
-    SHOWN.store(false, Ordering::Release);
-    if menu.is_some() {
-        // 带系统项的菜单走完了：说明外壳扩展这次没卡，冷却解除。
-        LAST_OK_MS.store(now_ms().max(1), Ordering::Release);
-    }
-    ACTIVE_OPTS.with(|opts| *opts.borrow_mut() = None);
-    ACTIVE.with(|active| *active.borrow_mut() = None);
-    ACTIVE_VIEW.with(|slot| *slot.borrow_mut() = None);
-    ACTIVE_ROOT.with(|root| *root.borrow_mut() = 0);
-    APP_POPUPS.with(|list| list.borrow_mut().clear());
-    drop(site_guard.take());
-    crate::logv!(
-        "[menu] shell={} count={} app={} keywords={} chosen={}",
-        menu.is_some(),
-        unsafe { GetMenuItemCount(Some(hmenu)) },
-        map.len(),
-        job.options.hide_keywords.len(),
-        chosen
-    );
-
-
-    // 5. 分发结果
-    if chosen != 0 {
-        // Shell 在自己的进程里弹确认/进度框；不先放行的话它们拿不到前台权（会藏在后面）。
-        let _ = unsafe { AllowSetForegroundWindow(0xFFFF_FFFF) };
-        if let Some(key) = map.get(&chosen) {
-            (job.sink)(MenuAction::App(key.clone()));
-        } else if let Some(active) = &menu {
-            let verb = canonical_verb(active, chosen);
-            let single_dir = match &job.target {
-                Target::Items(paths) if paths.len() == 1 => {
-                    paths.first().filter(|p| p.is_dir()).cloned()
-                }
-                _ => None,
-            };
-            // 交给 Shell 处理时的“当前文件夹”：背景菜单就是该目录，
-            // 选中项就是它所在的目录（与资源管理器一致）。
-            let shell_dir = match &job.target {
-                Target::Background(dir) => Some(dir.clone()),
-                Target::Items(paths) => paths.first().map(|p| {
-                    if p.is_dir() {
-                        p.clone()
-                    } else {
-                        p.parent().map(|d| d.to_path_buf()).unwrap_or_else(|| p.clone())
+                assert_eq!(label, "排序方式");
+                assert!(!enabled, "禁用的子菜单不能变成可用的");
+                assert_eq!(children.len(), 1);
+                match &children[0] {
+                    MenuNode::Item { key, checked, .. } => {
+                        assert_eq!(key, "sort.name");
+                        assert!(*checked);
                     }
-                }),
-                _ => None,
-            };
-            match verb.as_deref() {
-                Some(v) if v.eq_ignore_ascii_case("rename") => (job.sink)(MenuAction::Rename),
-                Some(v)
-                    if v.eq_ignore_ascii_case("open") || v.eq_ignore_ascii_case("explore") =>
-                {
-                    match &single_dir {
-                        // 文件夹的默认动作交回 Rove 自己导航（否则会开资源管理器）。
-                        Some(dir) => (job.sink)(MenuAction::Navigate(dir.clone())),
-                        None => {
-                            (job.sink)(MenuAction::ShellOpBegin);
-                            let _ = invoke_shell(active, host, chosen, point, shell_dir.as_deref());
-                            (job.sink)(MenuAction::ShellOpEnd);
-                            (job.sink)(MenuAction::Refresh);
-                        }
-                    }
+                    other => panic!("子项变形了: {other:?}"),
                 }
-                _ => {
-                    (job.sink)(MenuAction::ShellOpBegin);
-                    let _ = invoke_shell(active, host, chosen, point, shell_dir.as_deref());
-                    (job.sink)(MenuAction::ShellOpEnd);
-                    (job.sink)(MenuAction::Refresh);
-                }
+            }
+            other => panic!("子菜单变形了: {other:?}"),
+        }
+    }
+
+    /// 空菜单项（纯应用菜单）也要能过一遍。
+    #[test]
+    fn app_only_request_survives_bincode() {
+        let request = Request {
+            target: Target::AppOnly,
+            nodes: Vec::new(),
+            hide_keywords: Vec::new(),
+            extended: false,
+            dark: false,
+            owner: 0,
+        };
+        let bytes = bincode::serialize(&request).expect("serialize");
+        let back: Request = bincode::deserialize(&bytes).expect("deserialize");
+        assert!(matches!(back.target, Target::AppOnly));
+        assert!(back.nodes.is_empty());
+    }
+
+    /// 文件名里带换行 / 百分号时，`nav` 这一行不能被拆断。
+    #[test]
+    fn nav_path_survives_line_protocol() {
+        for raw in [
+            r"O:\评测素材",
+            r"O:\a%0Ab",
+            "O:\\带\n换行\\的目录",
+            "O:\\带\r回车",
+        ] {
+            let path = std::path::PathBuf::from(raw);
+            let line = format!("{}{}", wire::EV_NAVIGATE, wire::escape_path(&path));
+            assert!(!line.contains('\n') && !line.contains('\r'), "{line}");
+            assert!(ends_menu(&line));
+            match parse_event(&line) {
+                Some(MenuAction::Navigate(back)) => assert_eq!(back, path, "原样还原 {raw:?}"),
+                other => panic!("不是导航动作: {other:?}"),
             }
         }
     }
 
-    let _ = unsafe { DestroyMenu(hmenu) };
-    drop(menu);
-
-    // 剪切/复制是 OLE 延迟渲染：数据只活在本线程的 STA 里，必须 flush 一次，
-    // 别的进程（包括 Rove 自己的粘贴）才读得到 CF_HDROP。
-    flush_ole_clipboard();
-
-    // 前台权还给 Rove，否则关菜单后键盘事件无人接收。
-    // （必须在 invoke 之后：Shell 的确认/进度框要靠我们当前持有前台权才能弹到前面。）
-    unsafe {
-        if GetForegroundWindow() == host && IsWindow(Some(owner)).as_bool() {
-            let _ = SetForegroundWindow(owner);
-        }
+    #[test]
+    fn events_map_to_actions() {
+        assert!(matches!(
+            parse_event("app\tbuiltin.trash"),
+            Some(MenuAction::App(key)) if key == "builtin.trash"
+        ));
+        assert!(matches!(
+            parse_event("nav\tO:\\评测"),
+            Some(MenuAction::Navigate(path)) if path == PathBuf::from(r"O:\评测")
+        ));
+        assert!(matches!(parse_event("rename"), Some(MenuAction::Rename)));
+        assert!(matches!(
+            parse_event("begin"),
+            Some(MenuAction::ShellOpBegin)
+        ));
+        assert!(matches!(parse_event("end"), Some(MenuAction::ShellOpEnd)));
+        assert!(matches!(parse_event("refresh"), Some(MenuAction::Refresh)));
+        // 这两种只是状态标记，不是用户动作。
+        assert!(parse_event("ready").is_none());
+        assert!(parse_event("shown").is_none());
+        assert!(parse_event("dismissed").is_none());
     }
-}
 
-/// `BUSY` 标记的守卫：任何返回路径都会复位。
-struct BusyGuard(u64);
-impl Drop for BusyGuard {
-    fn drop(&mut self) {
-        end_busy(self.0);
+    /// 「菜单已经关掉了」要覆盖用户可能做过的每一种选择，否则 BUSY 会漏清。
+    #[test]
+    fn every_outcome_ends_the_menu() {
+        for line in [
+            "dismissed".to_string(),
+            "rename".to_string(),
+            format!("{}builtin.copy", wire::EV_APP),
+            format!("{}O:\\x", wire::EV_NAVIGATE),
+            // 点了 Shell 项：菜单当场就关了，之后只剩「开始 / 结束」的收尾。
+            "begin".to_string(),
+        ] {
+            assert!(ends_menu(&line), "{line} 必须算菜单结束");
+        }
+        // Shell 任务的收尾事件不算：那时菜单早就关掉了。
+        assert!(!ends_menu("end"));
+        assert!(!ends_menu("refresh"));
+        assert!(!ends_menu("shown"));
     }
 }

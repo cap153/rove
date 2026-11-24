@@ -9075,21 +9075,18 @@ impl App {
             }
             let shell_present = !matches!(native_target, crate::sys::menu::Target::AppOnly);
             let nodes = self.build_app_nodes(&target, shell_present);
+            // 系统菜单卡死时要立刻退成「只含 Rove 自己项」的那一套。两套都在
+            // UI 线程一次算好交过去 —— 退回是菜单模块自己做的（1 秒看门狗），
+            // 那时再来问 UI 线程就太晚了。
+            let fallback = if shell_present {
+                self.build_app_nodes(&target, false)
+            } else {
+                Vec::new()
+            };
             // Shift + 右键 = 扩展动词（「以管理员身份运行」这类）。
             let extended = key_down(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT as i32);
-            if !self.open_native_menu(native_target.clone(), nodes, extended) {
-                if crate::sys::menu::shell_unhealthy() {
-                    // 上一次右键刚把系统菜单判死（某个外壳扩展卡在
-                    // `QueryContextMenu` 里）。立刻改用只含 Rove 自己项的菜单重试：
-                    // 备用宿主窗口已经在顶上，这一步是瞬时的。
-                    logln!("[menu] 刚判死系统菜单，改弹 Rove 自己的菜单项");
-                    let nodes = self.build_app_nodes(&target, false);
-                    if !self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, extended) {
-                        logln!("[menu] 原生菜单不可用，本次右键被忽略");
-                    }
-                } else {
-                    logln!("[menu] 原生菜单不可用，本次右键被忽略");
-                }
+            if !self.open_native_menu(native_target.clone(), nodes, fallback, extended) {
+                logln!("[menu] 原生菜单不可用，本次右键被忽略");
             }
         }
         #[cfg(not(windows))]
@@ -9142,6 +9139,7 @@ impl App {
         &self,
         target: crate::sys::menu::Target,
         nodes: Vec<crate::sys::menu::MenuNode>,
+        fallback: Vec<crate::sys::menu::MenuNode>,
         extended: bool,
     ) -> bool {
         let owner = get_window_hwnd(&self.ui).unwrap_or(0);
@@ -9160,7 +9158,7 @@ impl App {
         let sink: crate::sys::menu::Sink = std::sync::Arc::new(|action| {
             let _ = slint::invoke_from_event_loop(move || handle_native_menu_action(action));
         });
-        crate::sys::menu::open(target, nodes, options, owner, sink)
+        crate::sys::menu::open(target, nodes, fallback, options, owner, sink)
     }
 
 }
@@ -9211,24 +9209,14 @@ impl App {
         let raw = crate::ops::actions::load_or_create();
         self.actions = crate::ops::actions::heal_full(&raw);
     }
-    /// 菜单健康检查：进程被卡死的扩展拖坏时自我修复（静默换一个新进程）。
+    /// 菜单健康检查：看门狗。
     ///
-    /// 必须放在 UI 线程的周期回调里：要看 `jobs` 有没有任务在跑，交班也只能
-    /// 在本线程做（被拖坏的进程根本开不出能跑起来的新线程）。
+    /// 必须在 UI 线程的周期回调里（40ms 心跳）。菜单跑在子进程里，所以这里
+    /// 不用再操心「进程被扩展拖坏」—— 扩展代码从来没在主进程里跑过。
+    /// 唯一要管的是「1 秒还没弹出来」：杀掉那个子进程，改弹只含 Rove 自己
+    /// 项的菜单（见 `sys::menu::tick`）。
     fn check_menu_health(&mut self) {
         crate::sys::menu::tick();
-        if !crate::sys::menu::poisoned() || self.jobs.is_running() {
-            return;
-        }
-        if QUITTING.load(std::sync::atomic::Ordering::Acquire)
-            || HANDOFF_DONE.swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        crate::logal!("[menu] !! 进程已被卡死的扩展拖坏（新线程都起不来），静默换一个新进程");
-        // 这里**不能再开线程**：被抓住的正是「新线程起不来」这把锁。
-        // 交班本身只用 CreateProcess + 等标记文件，直接在本线程做完更稳。
-        restart_handoff_show();
     }
 
     /// `ROVE_LOG=2` 内存明细（节流 2 秒）。
@@ -9617,7 +9605,7 @@ impl App {
         #[cfg(windows)]
         {
             let nodes = self.view_menu_nodes();
-            if !self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false) {
+            if !self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, Vec::new(), false) {
                 logln!("[menu] 原生菜单不可用，视图下拉被忽略");
             }
         }
@@ -10051,7 +10039,7 @@ impl App {
             item(format!("netloc:edit:{}", entry.path), self.tr("编辑").as_str()),
             item(format!("netloc:unpin:{}", entry.path), self.tr("取消固定").as_str()),
         ];
-        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false);
+        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, Vec::new(), false);
     }
 
     #[cfg(not(windows))]
@@ -10075,7 +10063,7 @@ impl App {
             enabled: !entry.is_special(),
             checked: false,
         }];
-        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false);
+        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, Vec::new(), false);
     }
 
     #[cfg(not(windows))]
@@ -10119,7 +10107,7 @@ impl App {
                 index + 1 < total,
             ),
         ];
-        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, false);
+        self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, Vec::new(), false);
     }
 
     #[cfg(not(windows))]
@@ -14006,7 +13994,12 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             {
                 use std::sync::atomic::Ordering;
                 let now = now_ms();
-                if now.saturating_sub(FOCUS_WINDOW_MS.load(Ordering::Relaxed)) > 3000 {
+                if crate::sys::menu::recently_active(1_500) {
+                    // 原生菜单刚抢过 / 还过前台：这时的失焦/获焦是用户右键了，
+                    // 不是窗口在抖，重新起窗别算进来。
+                    FOCUS_WINDOW_MS.store(now, Ordering::Relaxed);
+                    FOCUS_COUNT.store(0, Ordering::Relaxed);
+                } else if now.saturating_sub(FOCUS_WINDOW_MS.load(Ordering::Relaxed)) > 3000 {
                     FOCUS_WINDOW_MS.store(now, Ordering::Relaxed);
                     FOCUS_COUNT.store(0, Ordering::Relaxed);
                 } else {
@@ -16516,38 +16509,6 @@ fn spawn_handoff_child() -> Option<std::process::Child> {
     Some(child)
 }
 
-/// 自我修复用：接班进程要**把窗口显示出来**（用户还在用着，不能变成只剩托盘）。
-fn restart_handoff_show() {
-    let Ok(exe) = std::env::current_exe() else {
-        logal!("[restart] 拿不到自身路径，放弃重启");
-        return;
-    };
-    let marker = restart_marker_path();
-    let _ = std::fs::remove_file(&marker);
-    let child = std::process::Command::new(&exe)
-        .arg("--await-pipe")
-        .arg("--await-pid")
-        .arg(std::process::id().to_string())
-        .spawn();
-    let Ok(mut child) = child else {
-        logal!("[restart] 子进程启动失败，继续用旧进程");
-        return;
-    };
-    for _ in 0..80 {
-        std::thread::sleep(Duration::from_millis(100));
-        if marker.exists() {
-            logal!("[restart] 新进程已就位（带窗口），退出这个被拖坏的进程");
-            hard_exit();
-        }
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            break;
-        }
-    }
-    let _ = child.kill();
-    let _ = std::fs::remove_file(&marker);
-    logal!("[restart] 新进程没能接管 IPC，继续用旧进程");
-}
-
 fn restart_handoff() {
     let marker = restart_marker_path();
     let Some(mut child) = spawn_handoff_child() else {
@@ -16570,10 +16531,6 @@ fn restart_handoff() {
     let _ = std::fs::remove_file(&marker);
     logal!("[restart] 新进程没能接管 IPC，继续用旧进程");
 }
-
-/// 关窗时会话销毁的忍耐上限：原生菜单已经被占住这么久，几乎可以肯定
-/// `drop(session)` 会卡死（真机日志实证），这时直接换进程更划算。
-const MENU_CLOSE_STUCK_MS: u64 = 3_000;
 
 /// 用户主动「退出」时置上：这条路径绝不能再拉起接班进程，否则退出会把应用又拖回来。
 static QUITTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -16657,8 +16614,8 @@ pub fn start_ui_watchdog() {
                 // 停了 —— 这不是卡死。以前这里照样每 30 秒记一条「UI 线程无响应
                 // session=false」，把真正的问题埋在了噪音里。
                 if !SESSION_ALIVE.load(std::sync::atomic::Ordering::Acquire) {
-                    // 销毁会话卡住了（真机：右键菜单的第三方扩展把菜单线程占死，
-                    // 销毁停在 `drop(session)` 里再没回来）。这时窗口没了、事件
+                    // 销毁会话卡住了（真机：一个第三方组件把销毁路径堵住，
+                    // 停在 `drop(session)` 里再没回来）。这时窗口没了、事件
                     // 循环不转、托盘点了没反应，除任务管理器没有出路 —— 自己换一个
                     // 新进程，用户至少还能继续用。
                     let since = CLOSING_AT.load(std::sync::atomic::Ordering::Acquire);
@@ -16754,6 +16711,19 @@ pub(crate) fn handle_native_menu_action(action: crate::sys::menu::MenuAction) {
             app.shell_op_running = false;
         }
         MenuAction::Refresh => app.user_refresh_active(),
+        // 菜单子进程会把前台权带走：收回主窗口的焦点，否则键盘事件没人接。
+        // Shell 任务正在跑时不抢（会把它的确认框/进度框压下去），并且延到
+        // 本次借用释放之后再动 Slint —— 回调里再 borrow_mut 会直接 panic。
+        MenuAction::Closed => {
+            if !app.shell_op_running {
+                let ui = app.ui.as_weak();
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(ui) = ui.upgrade() {
+                        focus_window(&ui);
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -17271,6 +17241,15 @@ pub fn run() {
         log_write(&format!("!! [panic] {location}: {payload}"));
     }));
 
+    // 菜单子进程：只构建并显示一张原生菜单，然后退出。
+    //
+    // 必须在**任何**初始化之前分叉出去：单实例管道、托盘、Slint 事件循环
+    // 统统不要碰（碰了就会跟已经在跑的主进程抢东西）。
+    #[cfg(windows)]
+    if std::env::args().any(|a| a == "--menu-host") {
+        crate::sys::menu::run_host_child();
+    }
+
     // 守护模式启动：拉起 Windows 文件对话框监听器（非 Windows 平台为空实现）。
     crate::sys::dialog_jump::start_daemon();
 
@@ -17430,11 +17409,6 @@ pub fn run() {
     // UI 卡死留证据：心跳 + 看门狗（先装定时器再装看门狗）。
     install_ui_heartbeat();
     start_ui_watchdog();
-
-    // 菜单宿主线程开机就建好：这台机器上它建窗口要好几秒（全局钩子拖的），
-    // 等到第一次右键才建就会白点一次。
-    #[cfg(windows)]
-    crate::sys::menu::prewarm();
 
     // 事件循环常驻：窗口全部销毁后保持空闲（0% CPU），
     // 等待管道唤醒/托盘点击重建 UI；退出由托盘菜单触发。
@@ -18570,36 +18544,22 @@ pub fn destroy_session() {
     // 时，销毁会话会撞上它：真机日志停在「dirsize SAVE」之后、`session
     // destroyed` 之前，UI 线程再没回来，托盘也就永远唤不醒窗口。留一条证据。
     if let Some(ms) = crate::sys::menu::busy_for_ms() {
-        logal!("!! [close] 有原生菜单挂着 {ms}ms，销毁会话可能被它拖住");
+        logal!("!! [close] 有原生菜单挂着 {ms}ms，直接杀掉菜单子进程");
     }
+    // 菜单在建在子进程里：关窗时把这个子进程杀掉就干净了，销毁会话不会被它拖住。
+    crate::sys::menu::shutdown();
     // 会话销毁时，将累计的目录容量缓存刷写到系统 Temp 目录（重启不丢）。
     if let Ok(mut store) = global_dir_sizes().lock() {
         store.save_to_temp();
     }
     logv!("[close] step 1/4 dirsize saved");
-    // 菜单线程卡到上限（右键已经不可用）时，趁这个安全时刻换一个新进程。
-    // 有任务在跑就不动：重启会杀掉进行中的复制 / 移动。
-    // `ROVE_FORCE_RESTART=1` 只为验证交接流程用（正常人碰不到「卡满 4 次」）。
+    // 有任务在跑就不换进程：重启会杀掉进行中的复制 / 移动。
+    // `ROVE_FORCE_RESTART=1` 只为验证交接流程用。
     let jobs_running = app.borrow().jobs.is_running();
-    let menu_stuck_ms = crate::sys::menu::busy_for_ms().unwrap_or(0);
     let restart_wanted = !QUITTING.load(std::sync::atomic::Ordering::Acquire)
-        && (crate::sys::menu::exhausted() || std::env::var_os("ROVE_FORCE_RESTART").is_some())
+        && std::env::var_os("ROVE_FORCE_RESTART").is_some()
         && !jobs_running;
     logv!("[close] step 2/4 restart_wanted={} -> dropping session", restart_wanted);
-    // 菜单线程被第三方扩展占死时，销毁会话会**停在 `drop` 里再也不回来**
-    // （真机日志：这一行之后一个字都没有，窗口关不掉、托盘也唤不醒）。
-    // 存档已经全部落盘，这时不再尝试销毁，直接交给接班进程。
-    if !QUITTING.load(std::sync::atomic::Ordering::Acquire)
-        && !jobs_running
-        && menu_stuck_ms > MENU_CLOSE_STUCK_MS
-    {
-        logal!(
-            "[close] 菜单线程被占死 {}ms，跳过会话销毁，直接换进程",
-            menu_stuck_ms
-        );
-        restart_handoff();
-        logal!("[close] 接班进程没起来，仍尝试销毁会话");
-    }
     // 会话销毁本身也可能卡死（真机：卡在 `drop(session)` 里再也不回来，
     // 于是本进程赖着不放 IPC 和托盘图标，新进程只能转发给这个僵尸）。
     // 交给一个后台线程盯着：真的卡住就硬终止，绝不留下第二个僵尸。
