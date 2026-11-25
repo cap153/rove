@@ -14,6 +14,8 @@ pub mod dialog_jump;
 pub mod integration;
 // Win+E 接管：低级键盘钩子（注册表那一层在 integration 里）。
 pub mod win_e;
+// 鼠标侧键（XButton1/XButton2）→ 后退/前进：低级鼠标钩子。
+pub mod mouse_nav;
 // 开机自启动（登录时后台常驻，写 HKCU 的 Run 键）。
 pub mod autostart;
 // 系统应用深浅色（「跟随系统」主题与原生右键菜单共用）。

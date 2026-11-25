@@ -18415,6 +18415,8 @@ fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
     if !drag_hittest::is_installed(hwnd) {
         crate::sys::shell::set_owner_hwnd(hwnd);
         drag_hittest::install(hwnd);
+        // 鼠标侧键 → 后退/前进：同样要真实 HWND（钩子里要拿它比对光标下的窗口）。
+        crate::sys::mouse_nav::init(hwnd);
         // 这一帧是「窗口真正 realize」的时刻。登记给 Shell 依赖真实 HWND，
         // 之前每一次 publish 都可能因为拿不到句柄而空转，这里补一次保证
         // 冷启动时尽快出现在 IShellWindows 里。
@@ -19018,6 +19020,26 @@ fn create_session(
     // 启动就采一条：哪怕只开几秒也能看到「地板」是多少。
     app.borrow_mut().log_memory_snapshot();
     SESSION_ALIVE.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// 鼠标侧键快退/快进（由 `sys::mouse_nav` 的低级鼠标钩子调用）。
+///
+/// 只在事件循环线程上真正执行：钩子线程不能碰 App（低级钩子有 300ms 超时，
+/// 超了会被系统摘掉）。
+#[cfg(windows)]
+pub fn mouse_side_nav(forward: bool) {
+    let _ = slint::invoke_from_event_loop(move || {
+        let Some(app) = SESSION.with(|slot| slot.borrow().clone()) else {
+            return;
+        };
+        let mut app = app.borrow_mut();
+        logv!("[mouse-nav] 侧键 {}", if forward { "前进" } else { "后退" });
+        if forward {
+            app.nav_forward();
+        } else {
+            app.nav_back();
+        }
+    });
 }
 
 /// Shell 通过 `IShellView::SelectItem` 发来的「选中这个条目」请求。
