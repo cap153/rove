@@ -1511,10 +1511,17 @@ mod tests {
             format!("zz-beam-{i}.mp4")
         });
         let mut scan = DeepScan::new(&root, "beam");
-        let (total, batches) = drain(&mut scan);
+        let (total, _) = drain(&mut scan);
         assert_eq!(total, DEEP_MAX_RESULTS, "低档命中必须正好停在配额上");
         assert!(scan.hit_cap(), "被上限掐停的要能问出来（状态栏要说话）");
-        assert!(batches <= DEEP_MAX_RESULTS / DEEP_BATCH + 1);
+        // 掐停之后不能再吐命中。**不要**按「批次数 ≤ 配额 / 批大小」来断言：
+        // 一批何时结束有两把尺子 —— 攒满 `want` 条，或者一片 `DEEP_SLICE`（60ms）
+        // 时间用完。机器忙的时候（跑全量测试、机械盘）时间先到，一批就不满，
+        // 批次数自然多于「理想值」，按批次数断言等于在赌测试机的负载。
+        assert!(
+            scan.next_batch(DEEP_BATCH).is_empty(),
+            "到了配额就不该再有命中"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
