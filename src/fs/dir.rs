@@ -319,7 +319,14 @@ pub fn entry_cmp(a: &FileEntry, b: &FileEntry, sort: SortState) -> std::cmp::Ord
         }
         SortKey::Modified => a.modified.cmp(&b.modified),
         SortKey::Type => a.type_text.cmp(&b.type_text),
-        SortKey::Path => a.path.cmp(&b.path),
+        // 路径：回收站条目的 `path` 是 Shell 内部 id（排序毫无意义），
+        // 有「删除前原始路径」时按它排；普通目录两者相同。
+        SortKey::Path => match (&a.original_path, &b.original_path) {
+            (Some(x), Some(y)) => x.cmp(y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.path.cmp(&b.path),
+        },
         // 盘符：驱动器路径形如 `C:\`，按路径字典序即 C、D、E…
         SortKey::Drive => a.path.cmp(&b.path),
     };
@@ -580,6 +587,25 @@ mod tests {
             },
         );
         assert_eq!(entries[0].name, "b");
+    }
+
+    #[test]
+    fn path_sort_prefers_recycle_original_path() {
+        // 回收站条目的 path 是 Shell 内部 id，按它排毫无意义；有删除前原始路径
+        // 时必须按原始路径排，否则「路径」列的顺序和显示的文字对不上。
+        let mut a = test_entry("a.txt", false, 1);
+        a.original_path = Some(std::path::PathBuf::from(r"D:\zoo\a.txt"));
+        let mut b = test_entry("b.txt", false, 1);
+        b.original_path = Some(std::path::PathBuf::from(r"C:\cat\b.txt"));
+        let mut entries = vec![a, b];
+        sort_entries(
+            &mut entries,
+            SortState {
+                key: SortKey::Path,
+                ascending: true,
+            },
+        );
+        assert_eq!(entries[0].name, "b.txt");
     }
 
     #[test]

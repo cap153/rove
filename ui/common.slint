@@ -22,6 +22,9 @@ export struct FileRow {
     // —— 文件名里的 ❀ 等装饰符号会触发字体回退，elide 会整行丢掉首行。
     grid-lines: [GridLine],
     path: string,
+    /// 所在目录（完整路径去掉文件名）。图标视图搜索态的路径浮层只用这一半 ——
+    /// 名字本来就在格子上，浮层再拼一遍就是重复信息。
+    dir-path: string,
     is-dir: bool,
     is-hidden: bool,
     size-text: string,

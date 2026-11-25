@@ -838,7 +838,7 @@ fn global_dir_sizes() -> &'static Mutex<DirSizeStore> {
 type ExpandSig = (i32, u32, u64, u64, i32, u32, u64);
 
 /// 面板所在的「视图种类」：决定它用哪一套排序状态。
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ViewSort {
     /// 「此电脑」（路径为 None）：主键是盘符，没有修改时间列。
     ThisPc,
@@ -866,6 +866,17 @@ impl ViewSort {
             (_, SortKey::Drive) => false,
             _ => true,
         }
+    }
+
+    /// 面板级判定：**搜索态与回收站共用同一份排序状态**。
+    ///
+    /// 两者都是「跨目录的结果列表」，用户在这里按路径排序的意图是一样的；
+    /// 各记一套只会让人怀疑「刚才排好的顺序怎么没了」。
+    fn of_pane(path: Option<&std::path::Path>, searching: bool) -> Self {
+        if searching {
+            return Self::Recycle;
+        }
+        Self::of(path)
     }
 
     /// 排序键在不可用时退回的兼底值。
@@ -1192,7 +1203,7 @@ pub struct App {
     autofit_key: [Option<String>; 2],
     /// 界面上当前实际生效的四列宽度（名称/修改时间/类型/大小），按栏一份。
     /// 拖动某列时以它为基准，避免把没动过的列弹回默认值。
-    cur_col_widths: [[f32; 4]; 2],
+    cur_col_widths: [[f32; 5]; 2],
     /// 后台大小变化时置位，等待主线程空闲时静默重排。
     pub size_sort_pending: bool,
     /// 撤消 / 重做栈（见 `ops::undo`）。
@@ -1491,18 +1502,8 @@ impl App {
             pending_global_search: None,
             autofit_key: [None, None],
             cur_col_widths: [
-                [
-                    crate::config::DEFAULT_COLUMN_WIDTHS[0],
-                    crate::config::DEFAULT_COLUMN_WIDTHS[1],
-                    crate::config::DEFAULT_COLUMN_WIDTHS[2],
-                    crate::config::DEFAULT_COLUMN_WIDTHS[3],
-                ],
-                [
-                    crate::config::DEFAULT_COLUMN_WIDTHS[0],
-                    crate::config::DEFAULT_COLUMN_WIDTHS[1],
-                    crate::config::DEFAULT_COLUMN_WIDTHS[2],
-                    crate::config::DEFAULT_COLUMN_WIDTHS[3],
-                ],
+                crate::config::DEFAULT_COLUMN_WIDTHS,
+                crate::config::DEFAULT_COLUMN_WIDTHS,
             ],
             size_sort_pending: false,
             undo: crate::ops::undo::UndoStack::new(),
@@ -2330,6 +2331,8 @@ impl App {
             .active_mut()
             .set_filter_from_search(text);
         let clearing = text.trim().is_empty();
+        // 排序状态跟着视图走：搜索态与回收站共用一套，清空搜索回到该视图自己那套。
+        self.sync_view_sort();
         // 「此电脑」视图：搜索框 = 全局拼音秒搜（Phase 5 索引）。
         if is_root {
             let query = text.trim().to_string();
@@ -3746,6 +3749,20 @@ mod tests {
         }
     }
 
+    /// 图标视图搜索态的路径浮层只显示目录：盘根、盘根下一层、深层、UNC 都要对。
+    #[test]
+    fn dir_path_text_strips_file_name() {
+        assert_eq!(dir_path_text(r"C:\Users\a\b.txt"), r"C:\Users\a");
+        assert_eq!(dir_path_text(r"C:\b.txt"), r"C:\");
+        assert_eq!(dir_path_text(r"C:\"), r"C:\");
+        assert_eq!(dir_path_text(r"\\nas\share\f.txt"), r"\\nas\share");
+        // 共享根里的条目：再往上只有服务器名，那不是可用目录，原样返回。
+        assert_eq!(dir_path_text(r"\\nas\share"), r"\\nas\share");
+        assert_eq!(dir_path_text(r"\\nas"), r"\\nas");
+        // 目录自己作为条目出现时，浮层显示它的上一级（名字在格子上）。
+        assert_eq!(dir_path_text(r"D:\work\proj"), r"D:\work");
+    }
+
     /// 真机 bug：连打 `ziya` → `ziyan` 时，界面丢掉一条过期结果会顺手发取消，
     /// 取消排在新查询后面，以前两者共用一个槽 → 新查询被顶掉，界面就这样
     /// 挂着「已扫 0 项」不动了。取消必须单独处理，且不能顶掉新查询。
@@ -4113,6 +4130,22 @@ mod tests {
     }
 
     /// 排序字段的字符串标识必须能双向转换：落盘后再读回来不能变成别的字段。
+    /// 搜索态与回收站共用同一份排序状态；普通目录仍然归自己。
+    #[test]
+    fn search_sort_shares_with_recycle() {
+        let dir = std::path::Path::new(r"D:\work");
+        let recycle = crate::fs::drives::recycle_virtual_path();
+        assert_eq!(
+            ViewSort::of_pane(Some(dir), true),
+            ViewSort::of_pane(Some(recycle.as_path()), false)
+        );
+        assert_eq!(ViewSort::of_pane(Some(dir), false), ViewSort::Normal);
+        assert_eq!(ViewSort::of_pane(None, false), ViewSort::ThisPc);
+        // 「此电脑」的全局搜索也归到同一套：那里要能按名称/路径排序，
+        // 而 ThisPc 视图本身不允许「名称」键。
+        assert_eq!(ViewSort::of_pane(None, true), ViewSort::Recycle);
+    }
+
     #[test]
     fn sort_key_ids_roundtrip() {
         for key in [
@@ -4790,6 +4823,9 @@ impl App {
         // 表头只在详细信息视图存在：切走就没人能再操作这个下拉了。
         self.close_type_filter_menu();
         self.ui.set_view_mode(mode.into());
+        // 切视图后格子布局全变，旧的悬停浮层不能再指下去。
+        self.ui.invoke_clear_path_tip(0);
+        self.ui.invoke_clear_path_tip(1);
         self.visible_cache = None;
         self.visible_cache_right = None;
         self.sync_file_list();
@@ -4801,7 +4837,8 @@ impl App {
     fn apply_sort(&mut self, key: SortKey, ascending: bool) {
         // 显式重排优先：丢掉重命名后临时钉住的位置。
         self.rename_pin = None;
-        let view = ViewSort::of(self.state.active().active().path.as_deref());
+        let active = self.state.active().active();
+        let view = ViewSort::of_pane(active.path.as_deref(), !active.filter.is_empty());
         // 此电脑没有「修改时间」列：要是这个键还落进去，状态就变成了
         // 「按一列不显示的东西排」，用户看不出发生了什么，也改不回来。
         if !view.allows(key) {
@@ -4827,7 +4864,7 @@ impl App {
             if tab.kind == crate::state::TabKind::Settings { continue; }
             for pane in &mut tab.panes {
                 // 别的视图的面板保持自己的排序，不被本次操作带走。
-                if ViewSort::of(pane.path.as_deref()) != view {
+                if ViewSort::of_pane(pane.path.as_deref(), !pane.filter.is_empty()) != view {
                     continue;
                 }
                 pane.sort.key = key;
@@ -4866,7 +4903,7 @@ impl App {
                 ascending: self.config.sort_ascending,
             },
         );
-        let want = |path: Option<&std::path::Path>| match ViewSort::of(path) {
+        let want = |path: Option<&std::path::Path>, searching: bool| match ViewSort::of_pane(path, searching) {
             ViewSort::ThisPc => this_pc,
             ViewSort::Recycle => recycle,
             ViewSort::Normal => global,
@@ -4875,7 +4912,7 @@ impl App {
         for tab in &mut self.state.tabs {
             if tab.kind == crate::state::TabKind::Settings { continue; }
             for pane in &mut tab.panes {
-                let s = want(pane.path.as_deref());
+                let s = want(pane.path.as_deref(), !pane.filter.is_empty());
                 if pane.sort.key == s.key && pane.sort.ascending == s.ascending {
                     continue;
                 }
@@ -5601,6 +5638,29 @@ impl App {
         // 多选时不弹名称浮层（左右栏各自判定）。
         self.ui.set_file_single_selection(single0);
         self.ui.set_file_single_selection_right(single1);
+        // 「所在目录」两套呈现，条件相同（搜索态或回收站 —— 两者条目来源各异，
+        // 路径是唯一的来源线索），具体用哪套由视图决定：
+        //  · 图标视图：悬停在格子上弹浮层；
+        //  · 详细信息：`路径` 列（名称与修改时间之间）；
+        //  · 列表：每行下面挂一行路径（列表没有列）。
+        let (path_tip0, path_tip1, path_row0, path_row1) = {
+            let panes = &self.state.active().panes;
+            let search0 = !panes[0].filter.is_empty();
+            let search1 = panes.get(1).is_some_and(|p| !p.filter.is_empty());
+            (
+                is_recycle0 || search0,
+                is_recycle1 || search1,
+                is_recycle0 || search0,
+                is_recycle1 || search1,
+            )
+        };
+        let (search_col0, search_col1) = (path_row0, path_row1);
+        self.ui.set_file_path_tip(path_tip0);
+        self.ui.set_file_path_tip_right(path_tip1);
+        self.ui.set_file_path_row(path_row0);
+        self.ui.set_file_path_row_right(path_row1);
+        self.ui.set_file_search_active(search_col0);
+        self.ui.set_file_search_active_right(search_col1);
         self.ui.set_type_filter_active(type_active0);
         self.ui.set_type_filter_active_right(type_active1);
         self.ui.set_sort_key(sort_key.into());
@@ -5614,8 +5674,11 @@ impl App {
         if let Some((searching, scanned)) = empty1 {
             self.ui.set_file_empty_text_right(searching.then(|| self.trf("正在搜索…已扫 {} 项", &[fmt_scan_count(scanned)])).unwrap_or_else(|| self.tr("此文件夹为空").to_string()).into());
         }
-        self.ui.set_show_path_column(is_recycle0);
-        self.ui.set_show_path_column_right(is_recycle1);
+        // 「路径」列：回收站一直有，搜索结果同样有（只在详细信息视图显示，
+        // 见 Slint）。「此电脑」的全局搜索结果也是普通文件，照样加这一列。
+        self.ui.set_show_path_column(search_col0 || is_recycle0);
+        self.ui
+            .set_show_path_column_right(search_col1 || is_recycle1);
         // 视图形态（此电脑无修改时间列、大小列表头叫剩余）也按栏判定，
         // 否则分屏时「此电脑 + 普通目录」会把普通目录的修改时间列一起藏掉。
         self.ui.set_file_is_computer_view(is_computer0);
@@ -6886,6 +6949,9 @@ impl App {
                 } else {
                     self.ui.set_file_rows_right(model_rc);
                 }
+                // 整表换模型：悬停路径浮层记的是旧内容里的行号与路径，先清掉，
+                // 否则鼠标不动时会继续显示上一批结果的路径。
+                self.ui.invoke_clear_path_tip(pane as i32);
             }
         }
         // 诊断（ROVE_LOG=1）：一行一行补更新时打一行，便于确认「缩略图到达只动
@@ -7301,6 +7367,7 @@ impl App {
                                 .collect::<Vec<_>>(),
                         ))
                     },
+                    dir_path: dir_path_text(&p.path_text).into(),
                     path: p.path_text,
                     is_dir: p.is_dir,
                     is_hidden: p.is_hidden,
@@ -7901,6 +7968,35 @@ struct PreRow {
     name_line_ws: Vec<f32>,
 }
 
+/// 完整路径去掉文件名后剩下的目录部分（图标视图路径浮层、详细视图行内路径行、
+/// 回收站「路径」列都用它）。
+///
+/// 它不带文件名 —— 名字已经显示在格子/行上了，重复一遍没有意义。
+fn dir_path_text(full: &str) -> String {
+    let trimmed = full.trim_end_matches(['\\', '/']);
+    if trimmed.len() <= 2 {
+        // "C:" / "C:\" 这类没有父级，原样返回。
+        return full.to_string();
+    }
+    match trimmed.rfind(['\\', '/']) {
+        // 盘根下的条目："C:\b" 的目录是 "C:\"（只留到反斜杠）。
+        Some(2) if trimmed.as_bytes().get(1) == Some(&b':') => trimmed[..3].to_string(),
+        Some(i) if i >= 2 => {
+            let dir = &trimmed[..i];
+            // UNC 的共享根本身（\\服务器\共享）再往上只剩服务器名，那不是
+            // 可用目录（"\\nas" 少一层）；这种情况原样返回，别造一个假路径。
+            let unc_root = (dir.starts_with("\\\\") || dir.starts_with("//"))
+                && !dir[2..].contains(['\\', '/']);
+            if unc_root {
+                full.to_string()
+            } else {
+                dir.to_string()
+            }
+        }
+        _ => full.to_string(),
+    }
+}
+
 /// 状态栏里的扫描量：一万以上换「万」，免得一串数字挤掉别的信息。
 fn fmt_scan_count(n: usize) -> String {
     if n < 10_000 {
@@ -8416,8 +8512,8 @@ fn autofit_widths_for_pane(app: &App, pane_index: usize) -> [f32; 5] {
         (max[1] + 24.0).clamp(110.0, 320.0),
         (max[2] + 24.0).clamp(70.0, 260.0),
         (max[3] + 24.0).clamp(70.0, 200.0),
-        // 第 5 项对应「路径」列：它是固定 240px，不参与自适应下发，
-        // 保留占位只为与 Config 的 [f32; 5] 结构对齐。
+        // 第 5 项对应「路径」列（仅回收站显示）。双击它的分隔符就是「恢复默认宽」：
+        // 站内每行来源目录各不相同，逐条算「最长路径」既贵又没有代表值。
         crate::config::DEFAULT_COLUMN_WIDTHS[4],
     ]
 }
@@ -8429,9 +8525,9 @@ fn autofit_widths_for_pane(app: &App, pane_index: usize) -> [f32; 5] {
 #[cfg(windows)]
 fn push_col_widths(app: &mut App, pane: usize, w: [f32; 5]) {
     let pane = pane.min(1);
-    app.cur_col_widths[pane] = [w[0], w[1], w[2], w[3]];
+    app.cur_col_widths[pane] = [w[0], w[1], w[2], w[3], w[4]];
     app.ui
-        .invoke_apply_col_widths(pane as i32, w[0], w[1], w[2], w[3]);
+        .invoke_apply_col_widths(pane as i32, w[0], w[1], w[2], w[3], w[4]);
 }
 
 /// 切目录时重新开启「名称列窗口自适应」。
@@ -8511,7 +8607,7 @@ fn record_col_width(app: &mut App, pane: usize, index: i32, width: f32, name_w_h
         cur[1],
         cur[2],
         cur[3],
-        crate::config::DEFAULT_COLUMN_WIDTHS[4],
+        cur[4],
     ];
     if width < 0.0 {
         // 双击列边界（-1）：按这一栏当前目录的内容现算「刚好放下最长内容」的宽度。
@@ -9087,6 +9183,11 @@ impl App {
     fn sort_menu_nodes(&self) -> Vec<crate::sys::menu::MenuNode> {
         let sort = self.state.active().active().sort;
         let is_computer = self.state.active().active().path.is_none();
+        // 搜索结果与回收站一样有「路径」这一列（只在详细信息视图里显示），
+        // 所以排序菜单里也要能选它。
+        let is_recycle = self.state.active().active().path.as_deref()
+            == Some(crate::fs::drives::recycle_virtual_path().as_path());
+        let searching = !self.state.active().active().filter.is_empty();
         use crate::sys::menu::MenuNode;
         let item = |key: &str, label: &str, checked: bool| MenuNode::Item {
             key: format!("sort:{key}"),
@@ -9094,18 +9195,30 @@ impl App {
             enabled: true,
             checked,
         };
-        let mut nodes = vec![if is_computer {
-            // 此电脑：首项是「盘符」（与表头一致）。
+        // 首项跟表头一致：「此电脑」平时是「盘符」，进入搜索后变成「名称」。
+        let mut nodes = vec![if is_computer && !searching {
             item("drive", "盘符", sort.key == SortKey::Drive)
         } else {
             item("name", "名称", sort.key == SortKey::Name)
         }];
-        // 只列该视图真实存在的列（此电脑没有名称/修改时间列）。
+        // 「路径」列：回收站与搜索结果都有，紧跟在名称后面（与表头列顺序一致）。
+        if is_recycle || searching {
+            nodes.push(item("path", "路径", sort.key == SortKey::Path));
+        }
+        // 其他列只列该视图真实存在的（此电脑没有修改时间列）。
         if !is_computer {
             nodes.push(item("modified", "修改日期", sort.key == SortKey::Modified));
         }
         nodes.push(item("type", "类型", sort.key == SortKey::Type));
-        nodes.push(item("size", "大小", sort.key == SortKey::Size));
+        // 「此电脑」那一列叫「剩余」（磁盘容量），文案跟表头保持一致；
+        // 搜索结果里没有这一列，菜单也就不列它。
+        if !(is_computer && searching) {
+            nodes.push(item(
+                "size",
+                if is_computer { "剩余" } else { "大小" },
+                sort.key == SortKey::Size,
+            ));
+        }
         nodes.push(MenuNode::Separator);
         nodes.push(item("asc", "递增", sort.ascending));
         nodes.push(item("desc", "递减", !sort.ascending));
@@ -11171,6 +11284,11 @@ impl App {
     /// 除了设置目标路径，还要把当前文件名填进 `rename-text`，
     /// 因为图标视图的重命名输入框是列表最上层的浮层，不在行内，拿不到 `row.name`。
     fn begin_rename(&mut self, path: &Path) {
+        // 回收站条目没有「可改的名字」：站内路径是内部 Shell id，显示的原始
+        // 路径只是线索。F2、单击文件名、右键重命名都收口在这里，一律拦掉。
+        if self.pane_is_recycle() {
+            return;
+        }
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -11196,6 +11314,12 @@ impl App {
         self.ui.set_rename_select_end(stem_end);
         self.arm_rename_scroll_guard();
         self.sync_expand_targets();
+    }
+
+    /// 当前聚焦的那一栏是不是回收站。
+    fn pane_is_recycle(&self) -> bool {
+        self.state.active().active().path.as_deref()
+            == Some(crate::fs::drives::recycle_virtual_path().as_path())
     }
 
     fn start_rename(&mut self) {
@@ -11572,6 +11696,8 @@ impl App {
             match sort_mode {
                 "name" => { key = SortKey::Name; asc = true; }
                 "drive" => { key = SortKey::Drive; asc = true; }
+                // 路径（仅回收站有这一列）：从根往后读，默认升序。
+                "path" => { key = SortKey::Path; asc = true; }
                 "modified" => { key = SortKey::Modified; asc = false; } // 修改时间默认最新在前
                 "type" => { key = SortKey::Type; asc = true; }
                 "size" => { key = SortKey::Size; asc = false; } // 大小默认最大在前
@@ -19287,7 +19413,7 @@ fn batch_lookup(id: u64) -> Option<(BatchRenameWindow, Rc<RefCell<BatchSession>>
 /// 打开一次批量重命名窗口。
 impl App {
     fn open_batch_rename(&mut self, paths: Vec<PathBuf>) {
-        if paths.is_empty() {
+        if paths.is_empty() || self.pane_is_recycle() {
             return;
         }
         let pane = self.state.active().active();

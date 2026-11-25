@@ -138,6 +138,28 @@ export component FileList inherits Rectangle {
     /// 本栏是否恰好单选一个文件。多选时一律不显示名称浮层（避免多选时
     /// 满屏浮层互相遮挡）。由 Rust 按当前 pane 的 selection.len() 下发。
     in-out property <bool> single-selection: false;
+    /// 显示「所在目录」：详细/列表视图在每行下面多一行文字，图标视图在悬停
+    /// 格子上弹浮层（不重复显示文件名 —— 名字已经在格子/行上）。
+    ///
+    /// 条件由 Rust 判定：搜索态（搜索框非空）或回收站（站内条目来源各异，
+    /// 路径是唯一的来源线索，所以不管搜不搜都显示）。
+    in property <bool> show-path-tip: false;
+    /// 搜索态或回收站：列表视图在每行下面多一行「所在目录」（列表没有列
+    /// 可放路径）。详细信息视图不用它 —— 那里用 `路径` 列。
+    in property <bool> show-path-row: false;
+    /// 这一栏正在显示搜索结果（搜索框非空）。「此电脑」全局搜索时表头/排序
+    /// 从「盘符」切成「名称」，并显示「路径」列。
+    in property <bool> search-active: false;
+    /// 悬停格子（内容坐标下的绝对行号，-1 = 无）与它所在的目录。
+    private property <int> path-tip-row: -1;
+    private property <string> path-tip-text: "";
+
+    /// 内容或形态换了之后清掉悬停路径浮层。浮层文字只在鼠标进出格子时更新，
+    /// 不清就会停在旧路径上（内容已经换了一批，浮层还挂着上一批的路径）。
+    public function clear-path-tip() {
+        root.path-tip-row = -1;
+        root.path-tip-text = "";
+    }
 
     callback row-pointer-event(index: int, event: PointerEvent, x: length, y: length, on-name: bool);
     /// 单选后再次点击文件名才进入重命名：判断点击是否落在「名称」列。
@@ -296,9 +318,17 @@ export component FileList inherits Rectangle {
         : root.view-mode == "icons-large" ? 88px
         : root.view-mode == "icons-medium" ? 60px
         : 44px;
-    /// 行高：details 30 / list 24 / icons = cell-h。
-    private property <length> view-row-h: root.view-mode == "details" ? 30px
-        : root.view-mode == "list" ? 24px
+    /// 行内路径行的高度。只有**列表视图**需要它（列表没有列可放路径）；
+    /// 详细信息视图用 `路径` 列（含此电脑的搜索结果），所以行高不加。
+    private property <length> path-line-h: (root.show-path-row
+        && root.view-mode == "list") ? 16px : 0px;
+    /// 挂路径行的列表视图里，「名称 + 路径」这两行作为一个整体在行内垂直居中：
+    /// 名称行 18px、路径行 14px，合计 32px，上下各留 (row-h - 32) / 2。
+    /// 这样文字块的中心正好落在行中心，图标（整行居中）也在同一条线上。
+    private property <length> path-block-top: max(0px, (root.row-h - 32px) / 2);
+    /// 行高：details 30 / list 24 / icons = cell-h（详细/列表要再加一行路径）。
+    private property <length> view-row-h: root.view-mode == "details" ? 30px + root.path-line-h
+        : root.view-mode == "list" ? 24px + root.path-line-h
         : root.cell-h;
     /// 格子 AABB 宽度（可点击 / 高亮区），与下方 Repeater 的 width 一致。
     private property <length> item-w: root.cell-w - 8px;
@@ -592,6 +622,10 @@ export component FileList inherits Rectangle {
     /// 「修改时间」列的实际占宽：此电脑视图整列不存在，按 0 参与后面的列排布，
     /// 这样类型/大小/路径列会自动左移，不留空洞。
     private property <length> eff-modified-w: root.is-computer-view ? 0px : root.w-modified;
+    /// 「剩余」列的有效宽度：此电脑的**搜索结果**是普通文件，那一列没有意义，
+    /// 整列收成 0（表头、行、列宽预算一起消失）。
+    private property <length> eff-size-w: (root.is-computer-view && root.search-active)
+        ? 0px : root.w-size;
     /// 此电脑视图：整个「修改时间」列不显示，首列表头是「盘符」，
     /// 大小列表头改成「剩余」，单元格只显示剩余容量。
     in-out property <bool> is-computer-view: false;
@@ -635,6 +669,13 @@ export component FileList inherits Rectangle {
     private property <length> rs-name-lock: -1px;
     /// 最右侧留白：方便在空白处拖拽框选文件（减为原来一半，少占名称列空间）。
     private property <length> right-pad: 48px;
+    /// 名称浮层可用的右边界（内容坐标）：出现垂直滚动条时让开它的**轨道**
+    /// （宽 8px + edge-inset 边距）。轨道里滑块只有 4px 且贴轨道右半边，所以
+    /// 这样算出来浮层右边缘到可见滑块正好 4px，与左边的 4px 对称；没有滚动条
+    /// 时等同原来的「列表宽 − 4px」。
+    /// 只给「单选/悬停的名称浮层」用 —— 重命名浮层压条不影响使用，不在此列。
+    private property <length> overlay-right-x: flick.width - flick.content-x
+        - (scrollbar.visible ? (8px + root.edge-inset) : 4px);
     /// 滚动条轨道宽（含内边距）。
     /// 滚动条按下时记录的滑块 y，用于计算拖拽增量。
     private property <length> sb-drag-grab-y: 0px;
@@ -676,8 +717,12 @@ export component FileList inherits Rectangle {
     /// 名称框按输入文本实测伸展（与行内版本一致：最小宽度 + 左右内边距）。
     private property <length> rf-want-w: max(root.rf-small ? 60px : 80px,
         rename-measure-fixed.preferred-width + 18px);
+    // 小图标视图允许占满整个视口宽度：右侧不够时由 rf-x 向左侧借空间，
+    // 不再被「起点 → 视口右边缘」这段卡死（长名字右侧一满就停止变宽）。
     private property <length> rf-w: min(root.rf-want-w,
-        max(80px, flick.width - 8px - root.rf-cell-x));
+        root.rf-small
+            ? max(80px, flick.width - 8px)
+            : max(80px, flick.width - 8px - root.rf-cell-x));
     /// 小图标是多列网格：行号 = 条目索引 / 每行格子数（详细/列表每行 1 个，除下来就是它自己）。
     /// 直接用条目索引当行号会把浮层推到列表末尾之外（表现为跑到左下角）。
     private property <int> rf-row-index: floor(max(0, root.rename-row) / max(1, root.cells-per-row));
@@ -687,6 +732,8 @@ export component FileList inherits Rectangle {
     private property <length> rf-want-x: root.rf-small
         ? root.rf-cell-x + 50px
         : root.col-name-x + flick.content-x;
+    /// 横向：起点往右放得下就贴着起点；放不下整体左移（小图标可越过自己的
+    /// 图标甚至左边格子），左边到 4px 为止，两头都满才封顶成视口宽度。
     private property <length> rf-x: (root.rf-want-x + root.rf-w + 4px <= flick.width)
         ? max(4px, root.rf-want-x)
         : max(4px, flick.width - 4px - root.rf-w);
@@ -705,8 +752,10 @@ export component FileList inherits Rectangle {
         : root.col-end + 8px;
     private property <length> min-content-x: min(0px, flick.width - flick.content-width);
     private property <length> max-content-x: 0px;
+    /// 路径列宽度（可拖拽，会话内有效，不落盘 —— 与其他列一致）。
+    private property <length> w-path: 240px;
     // 「路径」列基宽：隐藏时为 0。
-    private property <length> path-w-base: root.show-path-column ? 240px : 0px;
+    private property <length> path-w-base: root.show-path-column ? root.w-path : 0px;
     // 列几何（表头与行共用，保证像素级对齐）。
     private property <length> col-icon-x: 8px;
     private property <length> col-name-x: 8px + root.w-icon;
@@ -717,7 +766,7 @@ export component FileList inherits Rectangle {
     /// 自适应预算：视口宽扣掉图标列、其余固定列、路径列、以及「大小」列右侧
     /// 预留的框选留白，剩下的全给名称列。只在该目录没有手动列宽记录时生效。
     private property <length> auto-name-w: max(160px,
-        flick.width - root.col-name-x - root.eff-modified-w - root.w-type - root.w-size
+        flick.width - root.col-name-x - root.eff-modified-w - root.w-type - root.eff-size-w
         - root.col-path-w - root.right-pad - 8px);
     private property <length> col-name-w: root.view-mode == "list"
         // 列表视图也要在右侧留一条空白（right-pad）：否则行铺满整个视口宽度，
@@ -735,27 +784,30 @@ export component FileList inherits Rectangle {
                     : root.w-name))
             : root.w-name);
     private property <length> col-path-w: root.path-w-base;
-    /// 最后一列的右边界（= 「大小」列右边那条分隔符的位置，显示路径列时顺延）。
+    /// 最后一列的右边界（= 「大小」列右边那条分隔符的位置）。
     /// 三个用途：行点击区的右界、表头最后一条分隔线、横向滚动条的判定基准。
-    private property <length> col-end: root.col-path-x + root.col-path-w;
+    /// 「路径」列显示时插在名称与修改时间之间，不再占结尾位置。
+    private property <length> col-end: root.col-size-x + root.eff-size-w;
     /// 行（含点击区）的右边界。
     /// 列表视图不画修改时间/类型/大小列，`col-end` 会落到视口之外，
     /// 所以按「名称列右边界 + 8px」算，右侧留下可框选的空白。
     private property <length> row-end: root.view-mode == "list"
         ? root.col-name-x + root.col-name-w + 8px
         : root.col-end;
-    private property <length> col-modified-x: root.col-name-x + root.col-name-w;
+    /// 路径列紧跟名称列；隐藏时 `col-path-w` 为 0，修改时间自然接上来。
+    private property <length> col-path-x: root.col-name-x + root.col-name-w;
+    private property <length> col-modified-x: root.col-path-x + root.col-path-w;
     private property <length> col-type-x: root.col-modified-x + root.eff-modified-w;
     private property <length> col-size-x: root.col-type-x + root.w-type;
-    private property <length> col-path-x: root.col-size-x + root.w-size;
 
     /// 外部（Rust）按目录下发列宽。不用双向绑定：两个分屏各持一套宽度，
     /// 绑定会互相覆盖，函数式下发更直接。
-    public function set-col-widths(n: length, m: length, t: length, s: length) {
+    public function set-col-widths(n: length, m: length, t: length, s: length, p: length) {
         root.w-name = n;
         root.w-modified = m;
         root.w-type = t;
         root.w-size = s;
+        root.w-path = p;
     }
     // 在 Slint 侧切换「名称列窗口自适应」开关。必须走 Slint 侧（而非 Rust 的
     // set_col_auto_widths），否则 Rust 直接 set 的值不会可靠传播到 col-name-w 的求值，
@@ -828,8 +880,10 @@ export component FileList inherits Rectangle {
                 SortCell {
                     x: root.col-name-x;
                     width: root.col-name-w;
-                    key: root.is-computer-view ? "drive" : "name";
-                    label: root.is-computer-view ? I18n.strings[237] : I18n.strings[30];
+                    // 搜索结果不是磁盘：首列按普通文件的「名称」显示与排序。
+                    key: (root.is-computer-view && !root.search-active) ? "drive" : "name";
+                    label: (root.is-computer-view && !root.search-active)
+                        ? I18n.strings[237] : I18n.strings[30];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
                     clicked(k) => {
@@ -866,8 +920,9 @@ export component FileList inherits Rectangle {
                     }
                 }
                 SortCell {
+                    visible: root.eff-size-w > 0px;
                     x: root.col-size-x;
-                    width: root.w-size;
+                    width: root.eff-size-w;
                     key: "size";
                     label: root.is-computer-view ? I18n.strings[25] : I18n.strings[38];
                     active-key: root.sort-key;
@@ -896,7 +951,8 @@ export component FileList inherits Rectangle {
             // 这些手柄与分隔符必须同步补偿，否则出现横向滚动条后手柄停在原位，
             // 与列边界错位、点不中（用户反馈「排序分隔符不跟着滚」）。
             h-name := TouchArea {
-                x: root.col-modified-x - 3px + flick.content-x;
+                // 名称列右边界 = 路径列左边界（路径列隐藏时等于修改时间列左边界）。
+                x: root.col-path-x - 3px + flick.content-x;
                 width: 6px;
                 height: parent.height - 1px;
                 mouse-cursor: col-resize;
@@ -1010,6 +1066,53 @@ export component FileList inherits Rectangle {
                     }
                 }
             }
+            // 「路径」列（仅回收站显示）右边界：拖动改路径列宽。
+            if (root.show-path-column && root.view-mode == "details") : h-path := TouchArea {
+                x: root.col-modified-x - 3px + flick.content-x;
+                width: 6px;
+                height: parent.height - 1px;
+                mouse-cursor: col-resize;
+                Rectangle {
+                    x: 2.5px;
+                    y: (parent.height - 16px) / 2;
+                    width: 1px;
+                    height: 16px;
+                    background: root.rs-col == 4 || h-path.has-hover ? Theme.accent : Theme.border;
+                }
+                moved => {
+                    if (self.pressed) {
+                        let d = self.absolute-position.x + self.mouse-x - root.rs-start-px;
+                        if (abs(d) > 4px) {
+                            if (!root.rs-dragged) {
+                                root.rs-dragged = true;
+                            }
+                            root.w-path = max(80px, root.rs-start-w + d);
+                        }
+                    }
+                }
+                pointer-event(e) => {
+                    if (e.kind == PointerEventKind.down) {
+                        root.rs-col = 4;
+                        root.rs-dragged = false;
+                        root.rs-start-px = self.absolute-position.x + self.mouse-x;
+                        root.rs-start-w = root.w-path;
+                        root.rs-start-name-w = root.col-name-w;
+                        root.rs-name-lock = root.rs-start-name-w;
+                    }
+                    if (e.kind == PointerEventKind.up) {
+                        root.rs-col = -1;
+                        root.rs-name-lock = -1px;
+                        if (root.rs-dragged) {
+                            root.col_resized(4, root.w-path, root.rs-start-name-w);
+                        }
+                    }
+                }
+                double-clicked => {
+                    if (!root.rs-dragged) {
+                        root.col_resized(4, -1px, root.rs-start-name-w);
+                    }
+                }
+            }
             h-type := TouchArea {
                 x: root.col-size-x - 3px + flick.content-x;
                 width: 6px;
@@ -1057,7 +1160,11 @@ export component FileList inherits Rectangle {
                 }
             }
             h-size := TouchArea {
-                x: root.col-path-x - 3px + flick.content-x;
+                // 「大小」列右边界：路径列已经移到名称后面，不再是 path-x。
+                // 这一列被收成 0 宽时（此电脑的搜索结果）手柄也一起消失，否则
+                // 它会正好压在类型列的右边界上，拖那条线什么都不会动。
+                visible: root.eff-size-w > 0px;
+                x: root.col-end - 3px + flick.content-x;
                 width: 6px;
                 height: parent.height - 1px;
                 mouse-cursor: col-resize;
@@ -1103,7 +1210,7 @@ export component FileList inherits Rectangle {
                 }
             }
 
-            // 「大小」列右边（显示路径列时是路径列右边）的分隔符：
+            // 「大小」列右边（整行最后一列）的分隔符：
             // 它界定行点击区与横向滚动的边界，右侧留白从这里往后算。
             if (root.show-path-column) : Rectangle {
                 x: root.col-end - 0.5px + flick.content-x;
@@ -1358,11 +1465,27 @@ export component FileList inherits Rectangle {
                     }
                 }
 
+                // 搜索态 / 回收站：行下面再挂一行「所在目录」。
+                // 样式与图标视图的路径浮层一致（11px 次要色、单行末尾省略）；
+                // 不接鼠标事件，点它等同于点这一行（触摸区铺满整行）。
+                if (root.path-line-h > 0) : Text {
+                    x: root.col-name-x;
+                    y: root.path-block-top + 18px;
+                    width: max(0px, parent.width - root.col-name-x - 8px);
+                    height: 14px;
+                    text: row.dir-path;
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+
                 // 图标：真实缩略图（异步加载完成后）或彩色圆角方块 + 扩展名角标。
                 Rectangle {
                     x: root.col-icon-x;
                     y: 0px;
                     width: root.w-icon;
+                    // 整行居中：不能只看「名称那一格」，否则挂了路径行后图标会贴顶。
                     height: parent.height;
 
                     if (row.thumb.width > 0) : Image {
@@ -1426,7 +1549,7 @@ export component FileList inherits Rectangle {
                     x: self.box-x;
                     y: 0px;
                     width: self.box-w;
-                    height: parent.height;
+                    height: parent.height - root.path-line-h;
                     z: 10;
                     border-radius: 4px;
                     background: Theme.bg-input;
@@ -1550,7 +1673,8 @@ export component FileList inherits Rectangle {
                 if (root.rename-path != row.path && row.name-parts.length == 0) : Text {
                     x: root.col-name-x;
                     width: root.col-name-w;
-                    height: parent.height;
+                    y: root.path-line-h > 0px ? root.path-block-top : 0px;
+                    height: root.path-line-h > 0px ? 18px : parent.height;
                     text: row.name;
                     color: Theme.text-primary;
                     font-size: 13px;
@@ -1564,7 +1688,8 @@ export component FileList inherits Rectangle {
                 if (root.rename-path != row.path && row.name-parts.length > 0) : HighlightName {
                     x: root.col-name-x;
                     width: root.col-name-w;
-                    height: parent.height;
+                    y: root.path-line-h > 0px ? root.path-block-top : 0px;
+                    height: root.path-line-h > 0px ? 18px : parent.height;
                     parts: row.name-parts;
                     font-size: 13px;
                     is-dir: row.is-dir;
@@ -1583,8 +1708,10 @@ export component FileList inherits Rectangle {
                 //    正是这种情形。因此统一用 name-measure-details 实测宽度，
                 //    row.name-truncated 只当兜底（两者任一成立就弹）。
                 if (name-overlay-shown) : Rectangle {
-                    // 视口右边缘（相对行左），理由同重命名浮层。
-                    property <length> row-right: max(120px, min(parent.width, flick.width - flick.content-x) - 4px);
+                    // 视口右边缘（相对行左），有垂直滚动条时让开它（见 overlay-right-x）。
+                    // 行自己可能比视口窄（列表视图右侧留白），此时仍要让开 4px。
+                    property <length> row-right: max(120px,
+                        min(parent.width - 4px, root.overlay-right-x));
                     property <length> row-left: max(0px, -flick.content-x + 4px);
                     property <length> wanted: max(80px, name-measure-details.preferred-width + 16px);
                     property <length> box-w: min(self.wanted, self.row-right - self.row-left);
@@ -1596,7 +1723,7 @@ export component FileList inherits Rectangle {
                     x: self.box-x;
                     y: 0px;
                     width: self.box-w;
-                    height: parent.height;
+                    height: parent.height - root.path-line-h;
                     z: 20;
                     border-radius: 4px;
                     background: Theme.bg-popup;
@@ -1633,7 +1760,7 @@ export component FileList inherits Rectangle {
                     x: root.col-modified-x;
                     y: 0px;
                     width: root.w-modified;
-                    height: parent.height;
+                    height: parent.height - root.path-line-h;
 
                     Text {
                         x: 12px;
@@ -1653,7 +1780,7 @@ export component FileList inherits Rectangle {
                     x: root.col-type-x;
                     y: 0px;
                     width: root.w-type;
-                    height: parent.height;
+                    height: parent.height - root.path-line-h;
 
                     Rectangle {
                         x: 12px;
@@ -1676,13 +1803,13 @@ export component FileList inherits Rectangle {
                     }
                 }
 
-                // 大小（左对齐，与表头一致）
+                // 大小（左对齐，与表头一致）。此电脑搜索时整列不显示。
                 Rectangle {
-                    visible: root.view-mode == "details";
+                    visible: root.view-mode == "details" && root.eff-size-w > 0px;
                     x: root.col-size-x;
                     y: 0px;
                     width: root.w-size;
-                    height: parent.height;
+                    height: parent.height - root.path-line-h;
 
                     Text {
                         x: 12px;
@@ -1697,7 +1824,8 @@ export component FileList inherits Rectangle {
                     }
                 }
 
-                // 路径（仅回收站显示，见 show-path-column）
+                // 路径（回收站与搜索结果显示，见 show-path-column）。只显示所在
+                // 目录 —— 文件名就在左边的名称列，重复一遍没有意义。
                 Rectangle {
                     visible: root.view-mode == "details" && root.show-path-column;
                     x: root.col-path-x;
@@ -1709,7 +1837,7 @@ export component FileList inherits Rectangle {
                         x: 12px;
                         width: parent.width - 18px;
                         height: parent.height;
-                        text: row.path;
+                        text: row.dir-path;
                         color: Theme.text-secondary;
                         font-size: 12px;
                         vertical-alignment: center;
@@ -1728,6 +1856,7 @@ export component FileList inherits Rectangle {
                 // 小图标的名称浮层会往右伸出格子；z 只在同一父级里排序，
                 // 所以要把「整个格子」抬到邻居之上，浮层才不会被右邻盖住。
                 z: (root.rename-path == row.path || row.selected || ta-icons.has-hover) ? 10 : 0;
+
                 border-radius: 8px;
                 // 悬停与选中采用通透微光底色 + 细腻描边（深色主题下尤其需要这层边界）
                 background: (row.index == root.drop-hover-index && row.is-dir) || row.selected
@@ -1744,6 +1873,16 @@ export component FileList inherits Rectangle {
 
                     changed has-hover => {
                         root.hover-row(self.has-hover ? row.index : -1);
+                        // 搜索态：记下悬停的格子，供底部/顶部的路径浮层定位。
+                        if (root.show-path-tip) {
+                            if (self.has-hover) {
+                                root.path-tip-row = row.index;
+                                root.path-tip-text = row.dir-path;
+                            } else if (root.path-tip-row == row.index) {
+                                root.path-tip-row = -1;
+                                root.path-tip-text = "";
+                            }
+                        }
                     }
 
                     scroll-event(event) => {
@@ -1929,7 +2068,7 @@ export component FileList inherits Rectangle {
                     //   row-right 是格子左边到列表右边界的距离。
                     property <length> row-left: 4px - root.cell-x(Math.mod(row.index, root.cells-per-row));
                     property <length> row-right: max(120px,
-                        root.width - root.cell-x(Math.mod(row.index, root.cells-per-row)) - 4px);
+                        root.overlay-right-x - root.cell-x(Math.mod(row.index, root.cells-per-row)));
                     property <length> full-row-w: max(80px, self.row-right - self.row-left);
                     property <length> wanted: (root.rename-path == row.path)
                         ? max(60px, rename-measure-small.preferred-width + 18px)
@@ -2162,6 +2301,66 @@ export component FileList inherits Rectangle {
                 background: Theme.accent.transparentize(0.88);
                 border-width: 1px;
                 border-color: Theme.accent;
+            }
+            // 搜索态路径浮层（只用于图标视图）：宽度按路径实际长度伸展（不超过
+            // 可视宽度），超长时按字符换行、不省略。默认贴在悬停格子底边、压住
+            // 后面几行；下面放不下就翻到格子顶边上面。
+            if (root.show-path-tip && root.is-icons-view && root.path-tip-row >= 0
+                && root.path-tip-text != "") : Rectangle {
+                property <int> pt-col: Math.mod(max(0, root.path-tip-row), max(1, root.cells-per-row));
+                property <int> pt-row: floor(max(0, root.path-tip-row) / max(1, root.cells-per-row));
+                property <length> cell-top: self.pt-row * root.cell-h;
+                property <length> cell-bottom: self.cell-top + root.cell-h;
+                property <length> vp-top: -flick.content-y;
+                property <length> vp-bottom: flick.height - flick.content-y;
+                // 宽度：贴着文字走（自然宽 + 左右内边距），不设下限 —— 短路径
+                // 撑到固定宽度只会在右侧留一大片空白。最长到可视区边缘（两端各留 4px）。
+                property <length> box-w: min(flick.width - 8px,
+                    path-tip-measure.preferred-width + 20px);
+                property <length> want-x: root.cell-x(self.pt-col) + (root.cell-w - self.box-w) / 2;
+                // 换行后自然高度（上下各 5px 内边距）。
+                height: path-tip-body.preferred-height + 10px;
+                // 底部装不下、上方装得下 → 翻到格子上面（不压住自己的图标）。
+                property <bool> flip-up: self.cell-bottom + self.height > self.vp-bottom - 2px
+                    && self.cell-top - self.height >= self.vp-top;
+                property <length> want-y: self.flip-up
+                    ? self.cell-top - self.height
+                    : self.cell-bottom;
+
+                x: max(4px, min(self.want-x, flick.width - 4px - self.box-w));
+                // 两头都装不下时贴在视口里，绝不跑到列表外面。
+                y: max(self.vp-top + 2px,
+                    min(self.want-y, self.vp-bottom - self.height - 2px));
+                width: self.box-w;
+                z: 40;
+                border-radius: 4px;
+                background: Theme.bg-popup;
+                border-width: 1px;
+                border-color: Theme.border;
+                drop-shadow-blur: 12px;
+                drop-shadow-color: Theme.dark ? #00000070 : #00000022;
+                drop-shadow-offset-y: 3px;
+
+                // 只量自然宽度，不参与显示。
+                path-tip-measure := Text {
+                    visible: false;
+                    text: root.path-tip-text;
+                    font-size: 11px;
+                    wrap: no-wrap;
+                }
+
+                path-tip-body := Text {
+                    x: 10px;
+                    y: 5px;
+                    width: parent.width - 20px;
+                    text: root.path-tip-text;
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    // 路径里没有空格，word-wrap 断不开，必须按字符换。
+                    wrap: char-wrap;
+                    // 高度跟着内容走：不截断、不省略。
+                    height: self.preferred-height;
+                }
             }
         }
     }

@@ -633,7 +633,12 @@ fn trim_separators(hmenu: HMENU) {
             break;
         }
         let flags = unsafe { GetMenuState(hmenu, index, MF_BYPOSITION) };
-        let separator = flags != u32::MAX && flags & MF_SEPARATOR.0 != 0;
+        // 关键：带子菜单的项**不是**分隔线。`GetMenuState` 对 MF_POPUP 项会连带
+        // 报出该子菜单里最后追加的那条分隔线的标志位（子菜单有「递增 / 递减」前
+        // 那条分隔线时就是 0x800），只看 MF_SEPARATOR 会把真子菜单当成空档删掉 ——
+        // 表现就是右键菜单里偶尔少一整个子菜单（例如回收站的「排序方式」）。
+        let separator =
+            flags != u32::MAX && flags & MF_SEPARATOR.0 != 0 && flags & MF_POPUP.0 == 0;
         if separator && (previous_separator || index + 1 == count) {
             let _ = unsafe { DeleteMenu(hmenu, index, MF_BYPOSITION) };
         } else {

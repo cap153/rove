@@ -234,6 +234,15 @@ export component MainWindow inherits Window {
     /// 左右栏各自是否「恰好单选一个文件」：多选时禁止名称浮层。
     in-out property <bool> file-single-selection: false;
     in-out property <bool> file-single-selection-right: false;
+    /// 搜索态（搜索框非空）：悬停行的底部显示完整路径。
+    in-out property <bool> file-path-tip: false;
+    in-out property <bool> file-path-tip-right: false;
+    /// 详细/列表视图每行下面加一行所在目录（搜索态、且不是回收站）。
+    in-out property <bool> file-path-row: false;
+    in-out property <bool> file-path-row-right: false;
+    /// 这一栏正在显示搜索结果（搜索框非空）。
+    in-out property <bool> file-search-active: false;
+    in-out property <bool> file-search-active-right: false;
     in-out property <string> sort-key: "name";
     in-out property <bool> sort-ascending: true;
     /// 右栏自己的排序标记：分屏时两栏可能一边是此电脑（盘符）、一边是普通目录，
@@ -321,11 +330,19 @@ out property <length> row-height-out: file-list.row-height-out;
     /// 按栏下发列宽（Rust 切目录 / 自适应时调用）。列宽是每栏独立的：
     /// 两栏可能在不同目录（甚至一边此电脑、一边普通目录），共用一个宽度会让
     /// 切换焦点时两栏的列宽互相覆盖、看起来在“自己跳”。
-    public function apply-col-widths(pane: int, n: length, m: length, t: length, s: length) {
+    public function apply-col-widths(pane: int, n: length, m: length, t: length, s: length, p: length) {
         if (pane == 1) {
-            file-list-right.set-col-widths(n, m, t, s);
+            file-list-right.set-col-widths(n, m, t, s, p);
         } else {
-            file-list.set-col-widths(n, m, t, s);
+            file-list.set-col-widths(n, m, t, s, p);
+        }
+    }
+    /// 清掉某一栏的悬停路径浮层（换模型 / 切视图时调用，见 FileList.clear-path-tip）。
+    public function clear-path-tip(pane: int) {
+        if (pane == 1) {
+            file-list-right.clear-path-tip();
+        } else {
+            file-list.clear-path-tip();
         }
     }
     // 在 Slint 侧切换“名称列窗口自适应”开关（见 FileList.set-auto-col-widths 说明）。
@@ -1368,6 +1385,9 @@ out property <length> row-height-out: file-list.row-height-out;
                     }
                     mouse-left-pressed: root.mouse-left-pressed;
                     single-selection: root.file-single-selection;
+                    show-path-tip: root.file-path-tip;
+                    show-path-row: root.file-path-row;
+                    search-active: root.file-search-active;
                     is-computer-view: root.file-is-computer-view;
                     col_resized(index, width, name-w) => {
                         root.file_col_resized(0, index, width, name-w);
@@ -1538,6 +1558,9 @@ out property <length> row-height-out: file-list.row-height-out;
                         }
                         mouse-left-pressed: root.mouse-left-pressed;
                         single-selection: root.file-single-selection-right;
+                        show-path-tip: root.file-path-tip-right;
+                        show-path-row: root.file-path-row-right;
+                        search-active: root.file-search-active-right;
                         show-path-column: root.show-path-column-right;
                         is-computer-view: root.file-is-computer-view-right;
                         col_resized(index, width, name-w) => {
