@@ -136,6 +136,17 @@ cargo build --release
 
 The result is a single `rove.exe` that runs from anywhere.
 
+## Startup failure / no window
+
+Rove falls back to CPU software rendering by itself when hardware rendering fails to initialize; if that is still not enough, set it by hand:
+
+```bat
+set SLINT_BACKEND=winit-software
+rove.exe
+```
+
+To force the GPU instead, use `set SLINT_BACKEND=winit-femtovg`.
+
 ## Known limitations
 
 - Only tested on Windows 10, 64-bit.

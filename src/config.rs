@@ -209,6 +209,11 @@ pub struct Config {
     /// 关掉时完全不请求 Shell 菜单（也就不给外壳扩展执行的机会），右键只显示
     /// Rove 自己的内建项。首次启动默认关闭。
     pub system_menu: bool,
+
+    /// 是否用 GPU（硬件）渲染。默认 `true`；关掉走软件渲染（CPU）。
+    ///
+    /// 改了要重启才生效（渲染后端在创建窗口之前就定下了）。
+    pub hardware_renderer: bool,
 }
 
 /// 当前默认隐藏项的补种代次（与 `Config::load` 里的补齐逻辑对应）。
@@ -391,6 +396,7 @@ impl Default for Config {
             context_menu_hide_gen: CONTEXT_MENU_HIDE_GEN,
             archive_tool: "winrar".into(),
             system_menu: false,
+            hardware_renderer: true,
         }
     }
 }
@@ -649,6 +655,10 @@ impl Config {
             if matches!(t, "winrar" | "7zip" | "bandizip") {
                 config.archive_tool = t.to_string();
             }
+        }
+        // 硬件渲染：缺省开启（GPU）；关掉走软件渲染（CPU）。
+        if let Some(hr) = json.get("hardware_renderer").and_then(|v| v.as_bool()) {
+            config.hardware_renderer = hr;
         }
 
         if let Some(arr) = json.get("context_menu_hide").and_then(|v| v.as_array()) {
@@ -909,6 +919,8 @@ impl Config {
             "context_menu_hide_gen": self.context_menu_hide_gen,
             "system_menu": self.system_menu,
             "archive_tool": self.archive_tool,
+            // 硬件渲染开关（关 = 软件渲染），下次启动才生效。
+            "hardware_renderer": self.hardware_renderer,
         })
     }
 
@@ -970,6 +982,16 @@ mod tests {
         for key in ["show_network", "show_explorer_net", "show_quick", "show_recent"] {
             assert_eq!(json[key], serde_json::json!(true), "{key} 没写进 config");
         }
+    }
+
+    /// 硬件渲染：缺省开启（GPU）；关掉走软件渲染，配置要能往返。
+    #[test]
+    fn hardware_renderer_defaults_on() {
+        assert!(Config::default().hardware_renderer);
+        assert_eq!(Config::default().save_json()["hardware_renderer"], true);
+        let mut c = Config::default();
+        c.hardware_renderer = false;
+        assert_eq!(c.save_json()["hardware_renderer"], false);
     }
 
     /// 默认压缩软件：缺省 WinRAR，只认这三款，写进 config 才能持久。

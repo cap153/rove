@@ -387,6 +387,10 @@ pub const ZH: &[&str] = &[
     "编辑动作", // 372
     "路径不存在：{}", // 373
     "重命名失败：{}", // 374
+    "硬件渲染", // 375
+    "关闭则使用软件渲染（CPU），改动后重启 rove 生效", // 376
+    "重启 rove 后生效", // 377
+    "硬件渲染不可用，已切换到软件渲染", // 378
 ];
 
 pub const EN: &[&str] = &[
@@ -765,6 +769,10 @@ pub const EN: &[&str] = &[
     "Edit action",
     "The path does not exist: {}",
     "Rename failed: {}",
+    "Hardware rendering",
+    "Off uses software (CPU) rendering; restart rove to apply",
+    "Takes effect after you restart rove",
+    "Hardware rendering is unavailable; switched to software rendering",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -973,6 +981,19 @@ mod tests {
             (372, "编辑动作", "Edit action"),
             (373, "路径不存在：{}", "The path does not exist: {}"),
             (374, "重命名失败：{}", "Rename failed: {}"),
+            // 设置页「硬件渲染」开关。
+            (375, "硬件渲染", "Hardware rendering"),
+            (
+                376,
+                "关闭则使用软件渲染（CPU），改动后重启 rove 生效",
+                "Off uses software (CPU) rendering; restart rove to apply",
+            ),
+            (377, "重启 rove 后生效", "Takes effect after you restart rove"),
+            (
+                378,
+                "硬件渲染不可用，已切换到软件渲染",
+                "Hardware rendering is unavailable; switched to software rendering",
+            ),
         ] {
             assert_eq!(ZH[i], zh, "下标 {i} 的中文不对");
             assert_eq!(EN[i], en, "下标 {i} 的英文不对");

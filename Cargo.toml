@@ -1,6 +1,6 @@
 [package]
 name = "rove"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 description = "Rove — 极速响应、极低内存的 Windows 文件管理器 (Rust + Slint)"
 
@@ -9,7 +9,7 @@ slint = { version = "1.11", default-features = false, features = [
     # 标准库支持（TextEdit / ScrollView 等内建控件需要）。
     "std",
     # GPU 渲染（femtovg/OpenGL）；软件渲染作为后端备选，
-    # 运行时用 SLINT_BACKEND=winit-software 切换。
+    # 设置页「硬件渲染」开关关掉就走软件渲染（需重启）。
     "backend-winit",
     "renderer-femtovg",
     "renderer-software",

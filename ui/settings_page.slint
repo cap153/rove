@@ -579,6 +579,9 @@ export component SettingsPage inherits Rectangle {
     /// 默认压缩软件：0 WinRAR / 1 7-Zip / 2 Bandizip（缺省 0）。
     in-out property <int> archive-tool-index: 0;
     callback archive_tool_changed(int);
+    /// 「硬件渲染」开关（来自 config.hardware_renderer，默认开启 = GPU）。
+    in-out property <bool> hardware-renderer: true;
+    callback hardware_renderer_toggled(bool);
     /// 主题色：0 跟随系统 / 1 亮 / 2 暗。
     in-out property <int> theme-index: 0;
     callback theme_changed(int);
@@ -827,6 +830,61 @@ export component SettingsPage inherits Rectangle {
                     padding-right: 24px;
                     spacing: 12px;
                     alignment: start;
+
+                    // 是否用 GPU 渲染（关掉 = 软件渲染 / CPU，要重启生效）。
+                    Rectangle {
+                        width: 100%;
+                        background: (!Theme.dark && gen-hw-render-ta.has-hover) ? Theme.bg-hover : Theme.bg-popup;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: (Theme.dark && gen-hw-render-ta.has-hover) ? Theme.accent.transparentize(0.45) : Theme.border;
+                        animate background, border-color { duration: 100ms; easing: ease-out; }
+                        height: 58px;
+
+                        gen-hw-render-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.hardware-renderer = !root.hardware-renderer;
+                                root.hardware_renderer_toggled(root.hardware-renderer);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: I18n.strings[375];
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: I18n.strings[376];
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.hardware-renderer;
+                                toggled => {
+                                    root.hardware-renderer = !root.hardware-renderer;
+                                    root.hardware_renderer_toggled(root.hardware-renderer);
+                                }
+                            }
+                        }
+                    }
 
                     // 接管资源管理器：文件夹 / 磁盘 / 此电脑的默认打开程序改为 Rove。
                     Rectangle {

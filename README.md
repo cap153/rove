@@ -136,6 +136,17 @@ cargo build --release
 
 产物是单个 `rove.exe`，复制到哪都能跑。
 
+## 启动失败 / 窗口不出来
+
+Rove 在硬件渲染初始化失败时会自动切 CPU 软件渲染，若仍然不行，手动指定：
+
+```bat
+set SLINT_BACKEND=winit-software
+rove.exe
+```
+
+反过来强制走 GPU 就是 `set SLINT_BACKEND=winit-femtovg`。
+
 ## 已知限制
 
 - 只测试过 Windows 10，64 位。

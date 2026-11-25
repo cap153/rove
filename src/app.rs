@@ -9903,6 +9903,8 @@ impl App {
         self.ui.set_explorer_takeover(self.config.explorer_takeover);
         self.ui.set_system_menu(self.config.system_menu);
         self.ui.set_archive_tool_index(self.archive_tool_index());
+        // 「硬件渲染」开关：关掉走软件渲染（CPU），重启生效。
+        self.ui.set_hardware_renderer(self.config.hardware_renderer);
         // 开机自启动没有配置项：注册表 Run 键就是唯一真源，进设置页按实况显示，
         // 这样用户在任务管理器里停用/删掉之后，开关不会骗人。
         self.ui.set_autostart(crate::sys::autostart::enabled());
@@ -16605,6 +16607,17 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let actual = crate::sys::autostart::enabled();
             app.ui.set_autostart(actual);
         });
+        // 硬件渲染：只写配置，真正切换必须重启（渲染后端在建窗口之前就定了）。
+        let hw_app = app.clone();
+        upgrade().on_hardware_renderer_toggled(move |enabled| {
+            let Some(app) = hw_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.hardware_renderer = enabled;
+            app.config.save();
+            app.ui.set_hardware_renderer(enabled);
+            let msg = app.tr("重启 rove 后生效");
+            app.set_status_job(msg);
+        });
         upgrade().on_show_hidden_toggled(move |enabled| {
             let Some(app) = app.upgrade() else { return };
             let mut app = app.borrow_mut();
@@ -17400,12 +17413,95 @@ fn restart_marker_path() -> PathBuf {
     rove_data_dir().join("restart.ok")
 }
 
+/// 硬件渲染失败时给下一次启动留的「一句话提示」标记。
+///
+/// 重启用的是一个全新进程，没法把内存里的提示带过去；写成文件最省事，
+/// 而且启动后读完就删——不存在跨启动的自锁/记忆。
+fn renderer_fallback_notice_path() -> Option<std::path::PathBuf> {
+    let dir = crate::config::Config::config_path()?.parent()?.to_path_buf();
+    Some(dir.join("renderer-fallback.notice"))
+}
+
+fn write_renderer_fallback_notice() {
+    let Some(path) = renderer_fallback_notice_path() else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, "1");
+}
+
+fn take_renderer_fallback_notice() -> bool {
+    let Some(path) = renderer_fallback_notice_path() else { return false };
+    if !path.exists() {
+        return false;
+    }
+    let _ = std::fs::remove_file(&path);
+    true
+}
+
+/// 用软件渲染重新拉起自己，然后本进程退出。
+///
+/// 走的是已有的「接班进程」套路（`--await-pipe --await-pid`）：子进程先等本
+/// 进程放开单实例管道，再接管并显示窗口。不加 `--background`——这次是要让
+/// 用户看到窗口的，只是换了个渲染后端。
+///
+/// 必须给子进程显式换掉 `SLINT_BACKEND`：本进程的环境里写的是刚失败的那个
+/// 后端，子进程会原样继承，而环境变量优先级高于配置——那样配置里刚落盘的
+/// `hardware_renderer: false` 就等于没写，子进程再失败就直接 panic 了。
+fn respawn_in_software_mode() -> ! {
+    let exe = std::env::current_exe().expect("当前 exe 路径拿不到，无法改用软件渲染重启");
+    let mut cmd = std::process::Command::new(&exe);
+    // 原样带回用户这次的启动参数（`--shell-open <路径>` 之类），否则重启后
+    // 会掉回「启动时打开」的默认位置，用户点的那一 ☆ 等于白点。
+    let mut skip_next = false;
+    for arg in std::env::args().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--await-pipe" {
+            continue;
+        }
+        if arg == "--await-pid" {
+            skip_next = true;
+            continue;
+        }
+        cmd.arg(arg);
+    }
+    match cmd
+        .env("SLINT_BACKEND", "winit-software")
+        .arg("--await-pipe")
+        .arg("--await-pid")
+        .arg(std::process::id().to_string())
+        .spawn()
+    {
+        Ok(_) => logln!("[renderer] 已拉起软件渲染进程，本进程退出"),
+        Err(err) => {
+            logal!("!! [renderer] 软件渲染进程拉不起来：{err}");
+            panic!("failed to create UI and could not respawn: {err}");
+        }
+    }
+    hard_exit();
+}
+
+/// 硬件渲染起不来时的兜底：关掉开关落盘 → 写一句提示标记 → 用软件渲染重启自己。
+///
+/// 不返回：调用方（`create_session`）里已经没有可用的窗口了。
+fn fallback_to_software(config: &mut crate::config::Config, reason: &str) -> ! {
+    logal!("!! 硬件渲染初始化失败（{reason}），关掉开关并改用软件渲染重启");
+    config.hardware_renderer = false;
+    config.save();
+    write_renderer_fallback_notice();
+    respawn_in_software_mode();
+}
+
 /// 菜单线程卡到上限后，借「用户关窗口」这个安全时刻换一个新进程。
 ///
 /// 卡死在第三方菜单扩展里的宿主线程回收不了，只能靠换进程一次性清干净。
 /// 顺序必须是「先起新进程 → 新进程绑上管道并落标记 → 旧进程才退出」：
 /// 管道是单实例的，反过来就会两边都绑不上，托盘图标直接消失。
 /// 握手拿不到标记就把子进程杀掉，继续用旧进程 —— 宁可不重启，也不能把守护弄丢。
+///
 /// 立刻终止本进程。`std::process::exit` 要跑完所有 atexit / DLL 卸载，
 /// 在已经卡死的进程里可能**永远不返回**（真机日志：exit 之后 3 秒都没走掉，
 /// 于是新进程抢不到管道，托盘图标也还挂在这个僵尸身上）。
@@ -18187,6 +18283,35 @@ pub(crate) fn hide_dialog_jump() {
     crate::sys::dialog_jump::register_jump_window(0);
 }
 
+/// 启动时定下渲染后端（必须在创建任何 Slint 窗口之前调用）。
+///
+/// 优先级：`SLINT_BACKEND`（只认 `winit-femtovg` / `winit-software`，应急手段）
+/// > 设置页「硬件渲染」开关（默认开 = femtovg/GPU，关 = 软件渲染/CPU）。
+/// 改开关要重启才生效 —— 后端只能在事件循环启动前选，运行中切不了。
+///
+/// 走配置时**显式**写环境变量：不写就会把无效的残留值传给 Slint，
+/// 结果是窗口根本建不起来 —— 表现出来就是「双击没反应」，极难查。
+fn apply_renderer_choice(config: &crate::config::Config) {
+    // 环境变量可以强制指定后端（README 里写的应急手段：开 = winit-femtovg，
+    // 关 = winit-software）。只认这两个值：写错一个后端名会让窗口根本建不出来，
+    // 所以无效值一律忽略并记一行日志，不让它把启动搞死。
+    if let Some(raw) = std::env::var_os("SLINT_BACKEND") {
+        let raw = raw.to_string_lossy().to_string();
+        if raw == "winit-femtovg" || raw == "winit-software" {
+            logln!("[boot] 渲染后端 = {raw}（来自 SLINT_BACKEND，优先于设置里的开关）");
+            return;
+        }
+        logln!("!! [boot] 忽略无效的 SLINT_BACKEND={raw}（只认 winit-femtovg / winit-software）");
+    }
+    let backend = if config.hardware_renderer {
+        "winit-femtovg"
+    } else {
+        "winit-software"
+    };
+    logln!("[boot] 渲染后端 = {backend}");
+    std::env::set_var("SLINT_BACKEND", backend);
+}
+
 pub fn run() {
     logln!("starting, args: {:?}", std::env::args().collect::<Vec<_>>());
 
@@ -18281,6 +18406,8 @@ pub fn run() {
     // 文件对话框吸附窗：进程级常驻，和主窗口完全解耦（关了主窗口它还在）。
     // 放在转发判断之后：转发进程秒退，没必要建这一套。
     let boot_config = crate::config::Config::load();
+    // 渲染后端必须在建任何 Slint 窗口之前定下来（见 `apply_renderer_choice`）。
+    apply_renderer_choice(&boot_config);
     crate::app::init_dialog_jump(&boot_config.language, boot_config.theme);
 
     // Shell 的「选中这个条目」投递口（IShellView::SelectItem → 事件循环）。
@@ -18752,6 +18879,36 @@ mod crumb_child_tests {
 }
 
 #[cfg(test)]
+mod renderer_fallback_tests {
+    use super::{
+        renderer_fallback_notice_path, take_renderer_fallback_notice, write_renderer_fallback_notice,
+    };
+
+    /// 标记文件写一次、读一次就消失：它只用来把「切换了渲染后端」这句话
+    /// 传给它重启出来的新进程，绝对不能变成跳启动的记忆。
+    #[test]
+    fn notice_is_written_once_and_consumed_once() {
+        let old = std::env::var_os("APPDATA");
+        let dir = std::env::temp_dir().join(format!("rove-notice-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("APPDATA", &dir);
+
+        write_renderer_fallback_notice();
+        let path = renderer_fallback_notice_path().unwrap();
+        assert!(path.exists(), "标记文件没写出来：{path:?}");
+        assert!(take_renderer_fallback_notice(), "第一次要能读到");
+        assert!(!take_renderer_fallback_notice(), "读过就该删掉，不能反复提示");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match old {
+            Some(v) => std::env::set_var("APPDATA", v),
+            None => std::env::remove_var("APPDATA"),
+        }
+    }
+}
+
+#[cfg(test)]
 mod log_fold_tests {
     use super::{l1_admit, l1_tag};
 
@@ -18865,6 +19022,13 @@ fn create_session(
     let ui = match MainWindow::new() {
         Ok(ui) => ui,
         Err(e) => {
+            // 硬件渲染起不来（没 GL / 驱动异常 / 虚拟机）：把开关关掉存盘，改用
+            // 软件渲染重新拉起自己。开关写的是永久值，下次启动不会再试 GPU。
+            // 软件渲染再失败就真的没招了，照旧 panic 退出（日志里有现场）。
+            if config.hardware_renderer {
+                let reason = e.to_string();
+                fallback_to_software(&mut config, &reason);
+            }
             eprintln!("[rove] failed to create UI: {e}");
             panic!("failed to create UI: {e}");
         }
@@ -19168,6 +19332,13 @@ fn create_session(
     logln!("[boot] shell registration done");
 
     logln!("session created");
+    // 上一次启动是不是「硬件渲染起不来、自动切了软件渲染」：提示一次，提示完
+    // 就把标记文件删掉——不做任何跳启动的记忆。
+    if take_renderer_fallback_notice() {
+        let app = app.borrow();
+        let msg = app.tr("硬件渲染不可用，已切换到软件渲染");
+        app.set_status_job(msg);
+    }
     // 启动就采一条：哪怕只开几秒也能看到「地板」是多少。
     app.borrow_mut().log_memory_snapshot();
     SESSION_ALIVE.store(true, std::sync::atomic::Ordering::Release);
