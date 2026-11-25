@@ -126,6 +126,14 @@ pub struct Config {
     pub network_expanded: bool,
     /// 资源管理器里已有的网络位置（自动检测）是否展开（默认 true）。
     pub explorer_net_expanded: bool,
+    /// 侧栏分区显隐（「此电脑」标题右键菜单的勾选项，默认全部显示）。
+    ///
+    /// 取消勾选就整块不渲染（连标题一起）：这两个网络分区各自独立，`网络位置`
+    /// 是用户自己添加的，`网络位置(系统)` 是资源管理器里检测到的。
+    pub show_network: bool,
+    pub show_explorer_net: bool,
+    pub show_quick: bool,
+    pub show_recent: bool,
     /// 侧栏分区顺序（分区 key：quick / recent / computer / network / explorer-net）。
     pub sidebar_order: Vec<String>,
     /// 视图模式：details | list | icons-small | icons-medium | icons-large | icons-xl。
@@ -348,6 +356,10 @@ impl Default for Config {
             computer_expanded: true,// 默认展开
             network_expanded: true, // 默认展开
             explorer_net_expanded: true,
+            show_network: true,
+            show_explorer_net: true,
+            show_quick: true,
+            show_recent: true,
             sidebar_order: default_sidebar_order(),
             view_mode: "details".to_string(),
             language: "system".to_string(),
@@ -481,6 +493,17 @@ impl Config {
         }
         if let Some(expanded) = json.get("explorer_net_expanded").and_then(|v| v.as_bool()) {
             config.explorer_net_expanded = expanded;
+        }
+        // 侧栏分区显隐：老配置没有这几个键 → 默认显示（保持原来的界面）。
+        for (key, slot) in [
+            ("show_network", &mut config.show_network),
+            ("show_explorer_net", &mut config.show_explorer_net),
+            ("show_quick", &mut config.show_quick),
+            ("show_recent", &mut config.show_recent),
+        ] {
+            if let Some(show) = json.get(key).and_then(|v| v.as_bool()) {
+                *slot = show;
+            }
         }
         if let Some(order) = json.get("sidebar_order").and_then(|v| v.as_array()) {
             let keys: Vec<String> = order
@@ -827,6 +850,10 @@ impl Config {
             "computer_expanded": self.computer_expanded,
             "network_expanded": self.network_expanded,
             "explorer_net_expanded": self.explorer_net_expanded,
+            "show_network": self.show_network,
+            "show_explorer_net": self.show_explorer_net,
+            "show_quick": self.show_quick,
+            "show_recent": self.show_recent,
             "sidebar_order": self.sidebar_order,
             "view_mode": self.view_mode,
             "language": self.language,
@@ -931,6 +958,18 @@ mod tests {
             config.system_menu = v;
         }
         assert!(!config.system_menu);
+    }
+
+    /// 侧栏分区显隐：默认全部显示（老配置没有这几个键也必须是显示）。
+    #[test]
+    fn sidebar_sections_default_visible() {
+        let config = Config::default();
+        assert!(config.show_network && config.show_explorer_net);
+        assert!(config.show_quick && config.show_recent);
+        let json = Config::default().save_json();
+        for key in ["show_network", "show_explorer_net", "show_quick", "show_recent"] {
+            assert_eq!(json[key], serde_json::json!(true), "{key} 没写进 config");
+        }
     }
 
     /// 默认压缩软件：缺省 WinRAR，只认这三款，写进 config 才能持久。

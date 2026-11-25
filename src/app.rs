@@ -4337,6 +4337,33 @@ mod tests {
         assert_eq!(format_pulse_size(12 * 1024 * gib), "12TB");
     }
 
+    fn keys(list: &[&str]) -> Vec<String> {
+        list.iter().map(|k| k.to_string()).collect()
+    }
+
+    /// 拖侧栏标题时，可见槽位要换算成「含隐藏分区」的真实下标；否则隐藏了
+    /// 一个分区之后，拖到顶的分区会落在中间。
+    #[test]
+    fn sidebar_drop_index_skips_hidden_sections() {
+        // 全部可见（拖走的那项已经不在两个列表里）：槽位就是下标。
+        let order = keys(&["quick", "recent", "computer", "network"]);
+        let visible = keys(&["quick", "recent", "computer", "network"]);
+        assert_eq!(App::sidebar_insert_index(&order, &visible, 0), 0);
+        assert_eq!(App::sidebar_insert_index(&order, &visible, 2), 2);
+        // 拖到最下面 = 末尾。
+        assert_eq!(App::sidebar_insert_index(&order, &visible, 4), 4);
+
+        // 隐藏了 quick / recent：可见槽位 0 是 computer，它在 order 里排在 2。
+        let order = keys(&["quick", "recent", "computer", "network"]);
+        let visible = keys(&["computer", "network"]);
+        assert_eq!(App::sidebar_insert_index(&order, &visible, 0), 2);
+        assert_eq!(App::sidebar_insert_index(&order, &visible, 1), 3);
+        // 落在所有可见项之后：插在最后一个可见项之后，后面的隐藏分区不动。
+        assert_eq!(App::sidebar_insert_index(&order, &visible, 2), 4);
+        // 一个标题都没有（全隐藏）：落到末尾，不 panic。
+        assert_eq!(App::sidebar_insert_index(&order, &[], 0), 4);
+    }
+
     /// 重命名后不重排：被改名的条目回到原位置，其余条目相对顺序不变。
     #[test]
     fn rename_pin_keeps_position_without_disturbing_others() {
@@ -5383,6 +5410,11 @@ impl App {
             self.config.computer_expanded,
             self.config.network_expanded,
             self.config.explorer_net_expanded,
+            // 显隐开关也在这里：改了一项就必须重建，否则要等下次别的原因刷新。
+            self.config.show_quick,
+            self.config.show_recent,
+            self.config.show_network,
+            self.config.show_explorer_net,
         ] {
             fingerprint = fingerprint.wrapping_mul(31).wrapping_add(exp as u64);
         }
@@ -5606,6 +5638,14 @@ impl App {
         // ---- 按 config.sidebar_order 组装 ----
         for key in &self.config.sidebar_order {
             let block = match key.as_str() {
+                // 「此电脑」标题右键里取消勾选的分区整块不显示（连标题一起），
+                // 顺序表里留着位置，勾回来还是在原来的地方。
+                "quick" if !self.config.show_quick => continue,
+                "recent" if !self.config.show_recent => continue,
+                "network" if !self.config.show_network => continue,
+                // 「网络位置(系统)」原本只在真的检测到时才出现；取消勾选后
+                // 不管资源管理器有没有都隐藏。
+                "explorer-net" if !self.config.show_explorer_net => continue,
                 "quick" => &quick_items,
                 "recent" => &recent_items,
                 "computer" => &computer_items,
@@ -10291,11 +10331,16 @@ impl App {
                     .filter(|k| **k != drag_key)
                     .cloned()
                     .collect();
-                if drop_slot > order.len() {
-                    order.push(drag_key.clone());
-                } else {
-                    order.insert(drop_slot, drag_key.clone());
-                }
+                // `drop_slot` 是「看得见的标题」里的槽位，而 order 里还留着被隐藏
+                // 的分区（勾回来要回原来的位置）、以及本来就空着的分区。直接把它
+                // 当全量下标插，中间夹着几个看不见的就整体偏格，拖到顶会落在中间。
+                let visible: Vec<String> = headers
+                    .iter()
+                    .map(|(_, k)| k.clone())
+                    .filter(|k| *k != drag_key)
+                    .collect();
+                let insert_at = Self::sidebar_insert_index(&order, &visible, drop_slot);
+                order.insert(insert_at, drag_key.clone());
                 if order != self.config.sidebar_order {
                     self.config.sidebar_order = order;
                     self.config.save();
@@ -10305,6 +10350,22 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// 侧栏标题拖拽的插入下标：把「可见标题里的槽位」换算成 `order`（含隐藏分区）
+    /// 里的真实下标。
+    ///
+    /// - 槽位后面还有可见标题 → 插到那个标题在 `order` 里的位置之前（隐藏分区
+    ///   夹在它前面，所以不能直接用槽位当下标）。
+    /// - 槽位在末尾（拖到最下面）→ 插到最后一个可见标题之后，后面隐藏的分区不动。
+    fn sidebar_insert_index(order: &[String], visible: &[String], slot: usize) -> usize {
+        if let Some(next) = visible.get(slot) {
+            return order.iter().position(|k| k == next).unwrap_or(order.len());
+        }
+        visible
+            .last()
+            .and_then(|last| order.iter().position(|k| k == last).map(|p| p + 1))
+            .unwrap_or(order.len())
     }
 
     /// 分区拖拽落点：参照分区中「垂直中心在指针上方」的数量即插入槽位。
@@ -10429,6 +10490,13 @@ impl App {
     /// 侧栏右键：分区标题「网络位置」弹添加框；网络位置弹编辑/删除菜单；
     /// 「快速访问」条目弹取消固定（特殊项置灰）。
     fn sidebar_right_clicked(&mut self, id: &str) {
+        logv!("[sidebar] 右键 {id}");
+        // 「此电脑」标题右键：各分区的显示开关。隐藏分区之后恢复入口仍然在，
+        // 因为「此电脑」自己不在开关里。
+        if id == "header:computer" {
+            self.show_sidebar_sections_menu();
+            return;
+        }
         if id == "header:network" {
             self.open_network_dialog();
             return;
@@ -10441,6 +10509,82 @@ impl App {
             return;
         };
         self.show_network_item_menu(path);
+    }
+
+    /// 「此电脑」标题右键：侧栏各分区 / 托盘的显示开关。
+    ///
+    /// 5 项默认全部勾选，也就是原来的界面。取消勾选 = 那一块连标题一起不显示。
+    /// `临时暂存托盘` 不是分区显隐，它和设置页「添加到暂存盘」是同一个开关。
+    #[cfg(windows)]
+    fn show_sidebar_sections_menu(&mut self) {
+        let item = |key: &str, label: &str, checked: bool| crate::sys::menu::MenuNode::Item {
+            key: key.to_string(),
+            label: label.to_string(),
+            enabled: true,
+            checked,
+        };
+        let nodes = vec![
+            item(
+                "sidebarshow:network",
+                self.tr("网络位置").as_str(),
+                self.config.show_network,
+            ),
+            item(
+                "sidebarshow:explorer-net",
+                self.tr("网络位置(系统)").as_str(),
+                self.config.show_explorer_net,
+            ),
+            item(
+                "sidebarshow:quick",
+                self.tr("快速访问").as_str(),
+                self.config.show_quick,
+            ),
+            item(
+                "sidebarshow:recent",
+                self.tr("最近使用").as_str(),
+                self.config.show_recent,
+            ),
+            item(
+                "sidebarshow:staging",
+                self.tr("临时暂存托盘").as_str(),
+                self.staging_tray_enabled(),
+            ),
+        ];
+        if !self.open_native_menu(crate::sys::menu::Target::AppOnly, nodes, Vec::new(), false) {
+            logln!("!! 侧栏显隐菜单弹不出来");
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn show_sidebar_sections_menu(&mut self) {}
+
+    /// 侧栏开关的一次切换：立即落盘并重建侧栏。
+    ///
+    /// `staging` 走另一条线：它对应「添加到暂存盘」这个动作的开关（设置页里
+    /// 是同一个开关），托盘显隐由动作状态驱动，所以这里改动作、重排设置页。
+    fn toggle_sidebar_section(&mut self, key: &str) {
+        logv!("[sidebar] 显隐切换 {key}");
+        if key == "staging" {
+            let Some(idx) = self.actions.iter().position(|a| a.id == "builtin.stage") else {
+                return;
+            };
+            self.actions[idx].enabled = !self.actions[idx].enabled;
+            self.save_actions_and_reload();
+            self.sync_settings();
+            self.sync_staging();
+            return;
+        }
+        let slot = match key {
+            "network" => &mut self.config.show_network,
+            "explorer-net" => &mut self.config.show_explorer_net,
+            "quick" => &mut self.config.show_quick,
+            "recent" => &mut self.config.show_recent,
+            _ => return,
+        };
+        *slot = !*slot;
+        self.config.save();
+        // 显隐开关已纳入侧栏指纹，重建会自动发生（hidden → 展开状态原样保留）。
+        self.sync_sidebar();
     }
 
     /// 已添加的网络位置右键菜单（编辑 / 删除）。系统检测出的映射盘不弹。
@@ -11848,6 +11992,13 @@ impl App {
                 let path = path.to_string();
                 self.unpin_network_location(&path);
             }
+            return;
+        }
+
+        // 0.02 侧栏「此电脑」右键菜单的显示开关（不依赖选中项）。
+        if let Some(key) = id.strip_prefix("sidebarshow:") {
+            let key = key.to_string();
+            self.toggle_sidebar_section(&key);
             return;
         }
 

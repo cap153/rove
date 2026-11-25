@@ -354,6 +354,39 @@ pub const ZH: &[&str] = &[
     "关闭后不再读取系统和第三方菜单项，右键只显示 Rove 内建项", // 339
     "默认压缩软件",           // 340
     "选择解压目标文件夹",     // 341
+    "请输入服务器地址",       // 342
+    "地址应形如 \\\\服务器 或 \\\\服务器\\共享名", // 343
+    "删除失败", // 344
+    "同名文件已存在", // 345
+    "回收站不支持复制到此处；如需把这些文件放入回收站，请点「移动」", // 346
+    "回收站已清空", // 347
+    "已取消固定", // 348
+    "文件夹已在快速访问中", // 349
+    "无法将文件夹移动到自身或其子文件夹中", // 350
+    "无法将文件拖放到此电脑", // 351
+    "暂存盘为空（或文件已不存在）", // 352
+    "有任务正在进行，请稍候", // 353
+    "正在重新扫描驱动器并构建索引...", // 354
+    "清空回收站失败", // 355
+    "编辑网络地址", // 356
+    "请先进入一个文件夹", // 357
+    "请先进入目标文件夹", // 358
+    "还原失败", // 359
+    "还原失败（项目可能已被彻底删除）", // 360
+    "这些项目已在回收站中", // 361
+    "写入剪贴板失败：{}", // 362
+    "创建文件夹失败：{}", // 363
+    "已加入暂存盘 {} 项", // 364
+    "已固定 {} 个文件夹到快速访问", // 365
+    "已彻底删除 {} 项", // 366
+    "已还原 {} 项到原位置", // 367
+    "打开失败：{}", // 368
+    "打开路径失败：{}", // 369
+    "执行失败：{}", // 370
+    "无法显示属性：{}", // 371
+    "编辑动作", // 372
+    "路径不存在：{}", // 373
+    "重命名失败：{}", // 374
 ];
 
 pub const EN: &[&str] = &[
@@ -699,6 +732,39 @@ pub const EN: &[&str] = &[
     "When off, system and third-party items are not loaded; the menu shows only Rove's own items",
     "Default archive tool",
     "Extract to folder",
+    "Enter a server address",
+    "Address should look like \\\\server or \\\\server\\share",
+    "Delete failed",
+    "A file with the same name already exists",
+    "Copying to the Recycle Bin is not supported; use “Move” to put these files in the Recycle Bin",
+    "Recycle Bin emptied",
+    "Unpinned",
+    "That folder is already in Quick access",
+    "Can't move a folder into itself or its subfolder",
+    "Can't drop files onto This PC",
+    "The staging tray is empty (or the files no longer exist)",
+    "A task is running, please wait",
+    "Rescanning drives and rebuilding the index…",
+    "Couldn't empty the Recycle Bin",
+    "Edit network address",
+    "Open a folder first",
+    "Open the target folder first",
+    "Restore failed",
+    "Restore failed (the item may have been permanently deleted)",
+    "These items are already in the Recycle Bin",
+    "Couldn't write to the clipboard: {}",
+    "Couldn't create the folder: {}",
+    "Added {} item(s) to the staging tray",
+    "Pinned {} folder(s) to Quick access",
+    "Permanently deleted {} item(s)",
+    "Restored {} item(s) to the original location",
+    "Couldn't open: {}",
+    "Couldn't open the path: {}",
+    "Failed: {}",
+    "Couldn't show properties: {}",
+    "Edit action",
+    "The path does not exist: {}",
+    "Rename failed: {}",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -863,6 +929,54 @@ mod tests {
         assert_eq!(ZH[340], "默认压缩软件");
         assert_eq!(EN[340], "Default archive tool");
         assert_eq!(ZH[341], "选择解压目标文件夹");
+        // 「添加网络位置」弹窗的两条校验提示（原先没进字典，英文界面直接显示中文）。
+        assert_eq!(ZH[342], "请输入服务器地址");
+        assert_eq!(EN[342], "Enter a server address");
+        assert_eq!(ZH[343], "地址应形如 \\\\服务器 或 \\\\服务器\\共享名");
+        assert_eq!(EN[343], "Address should look like \\\\server or \\\\server\\share");
+        // 同一批漏译：这些提示以前直接用中文原串，英文界面里全是中文。
+        for (i, zh, en) in [
+            (344, "删除失败", "Delete failed"),
+            (345, "同名文件已存在", "A file with the same name already exists"),
+            (346, "回收站不支持复制到此处；如需把这些文件放入回收站，请点「移动」", "Copying to the Recycle Bin is not supported; use “Move” to put these files in the Recycle Bin"),
+            (347, "回收站已清空", "Recycle Bin emptied"),
+            (348, "已取消固定", "Unpinned"),
+            (349, "文件夹已在快速访问中", "That folder is already in Quick access"),
+            (350, "无法将文件夹移动到自身或其子文件夹中", "Can't move a folder into itself or its subfolder"),
+            (351, "无法将文件拖放到此电脑", "Can't drop files onto This PC"),
+            (352, "暂存盘为空（或文件已不存在）", "The staging tray is empty (or the files no longer exist)"),
+            (353, "有任务正在进行，请稍候", "A task is running, please wait"),
+            (354, "正在重新扫描驱动器并构建索引...", "Rescanning drives and rebuilding the index…"),
+            (355, "清空回收站失败", "Couldn't empty the Recycle Bin"),
+            (356, "编辑网络地址", "Edit network address"),
+            (357, "请先进入一个文件夹", "Open a folder first"),
+            (358, "请先进入目标文件夹", "Open the target folder first"),
+            (359, "还原失败", "Restore failed"),
+            (360, "还原失败（项目可能已被彻底删除）", "Restore failed (the item may have been permanently deleted)"),
+            (361, "这些项目已在回收站中", "These items are already in the Recycle Bin"),
+        ] {
+            assert_eq!(ZH[i], zh, "下标 {i} 的中文不对");
+            assert_eq!(EN[i], en, "下标 {i} 的英文不对");
+        }
+        // 状态栏那些 trf 模板同样漏了对照（英文界面会显示中文）。
+        for (i, zh, en) in [
+            (362, "写入剪贴板失败：{}", "Couldn't write to the clipboard: {}"),
+            (363, "创建文件夹失败：{}", "Couldn't create the folder: {}"),
+            (364, "已加入暂存盘 {} 项", "Added {} item(s) to the staging tray"),
+            (365, "已固定 {} 个文件夹到快速访问", "Pinned {} folder(s) to Quick access"),
+            (366, "已彻底删除 {} 项", "Permanently deleted {} item(s)"),
+            (367, "已还原 {} 项到原位置", "Restored {} item(s) to the original location"),
+            (368, "打开失败：{}", "Couldn't open: {}"),
+            (369, "打开路径失败：{}", "Couldn't open the path: {}"),
+            (370, "执行失败：{}", "Failed: {}"),
+            (371, "无法显示属性：{}", "Couldn't show properties: {}"),
+            (372, "编辑动作", "Edit action"),
+            (373, "路径不存在：{}", "The path does not exist: {}"),
+            (374, "重命名失败：{}", "Rename failed: {}"),
+        ] {
+            assert_eq!(ZH[i], zh, "下标 {i} 的中文不对");
+            assert_eq!(EN[i], en, "下标 {i} 的英文不对");
+        }
         assert_eq!(
             EN[315],
             "Can't drop into this pane while searching; drop it on a folder instead"
