@@ -236,6 +236,61 @@ export component HighlightName inherits Rectangle {
 
 // 关闭（×）图标：两条对角平行四边形棒（Path 填充，不依赖旋转/字体）。
 // 关闭（×）图标：纯矢量对称描边（微调坐标让交叉线充分舒展，消除视觉萎缩感）。
+/// 弹出层用的细滚动条（与列表那条浮动胶囊同款观感：4px，悬停变 6px）。
+///
+/// 给任何自带 Flickable 的弹层复用：把 `content-y` 与 Flickable.content-y
+/// 双向绑定，再把 view-h / content-h 传进来即可。条目装得下时自动不显示。
+export component PopupScrollbar inherits Rectangle {
+    /// 可视高度（= Flickable.height）。
+    in property <length> view-h: 0px;
+    /// 内容高度（= Flickable.content-height）。
+    in property <length> content-h: 0px;
+    /// 与 Flickable 的 content-y 双向绑定（向下滚动为负值）。
+    in-out property <length> content-y: 0px;
+    /// 轨道总宽（滑块贴右半边画）。
+    in property <length> track-w: 8px;
+
+    visible: content-h > view-h + 1px;
+    width: root.track-w;
+
+    private property <length> thumb-h: max(24px,
+        min(root.height, root.height * root.view-h / max(root.content-h, 1px)));
+    private property <length> travel: max(root.height - root.thumb-h, 1px);
+    /// 当前滚动位置映射到滑块的纵向偏移。
+    private property <length> thumb-y: min(root.travel,
+        max(0px, -root.content-y / max(root.content-h - root.view-h, 1px) * root.travel));
+    private property <length> drag-start: 0px;
+    private property <length> drag-thumb: 0px;
+
+    thumb := Rectangle {
+        x: parent.width - self.width;
+        y: root.thumb-y;
+        width: (sb-ta.has-hover || sb-ta.pressed) ? 6px : 4px;
+        height: root.thumb-h;
+        border-radius: self.width / 2;
+        background: sb-ta.pressed
+            ? Theme.text-primary.transparentize(0.35)
+            : (sb-ta.has-hover ? Theme.text-primary.transparentize(0.5) : Theme.text-primary.transparentize(0.72));
+        animate width, background { duration: 150ms; easing: ease-out; }
+    }
+
+    sb-ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.drag-start = self.mouse-y;
+                root.drag-thumb = root.thumb-y;
+            }
+            if ((e.kind == PointerEventKind.move || e.kind == PointerEventKind.up)
+                && self.pressed) {
+                let next = min(root.travel, max(0px, root.drag-thumb + (self.mouse-y - root.drag-start)));
+                root.content-y = -(next / root.travel) * (root.content-h - root.view-h);
+            }
+        }
+    }
+}
+
 export component IconClose inherits Rectangle {
     in property <length> size: 10px;
     in property <color> icon-color: Theme.text-secondary;

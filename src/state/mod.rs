@@ -276,6 +276,11 @@ impl PaneState {
     /// 搜索词变化：把「开始搜索」和「清空搜索」各记成一个可前进/后退的页面。
     /// 同一页里继续改词只更新本页的搜索词，不新增历史项。
     pub fn set_filter_from_search(&mut self, text: &str) {
+        // 词没变就别碰历史：后退回搜索页时 App 会重放一次同一个词，
+        // 这次重放若走下面的「就地更新」会把前进记录一起砍掉（前进按钮直接失效）。
+        if text == self.filter {
+            return;
+        }
         let was_empty = self.filter.is_empty();
         let now_empty = text.is_empty();
         if let Some(s) = self.history_scroll.get_mut(self.history_index) {
@@ -284,19 +289,78 @@ impl PaneState {
         if was_empty && !now_empty {
             // 记住搜索前的滚动位置，清空搜索框时回到这里。
             self.pre_filter_scroll_y = self.scroll_y;
-            self.push_search_page(text.to_string(), 0.0, self.type_filter.clone());
-        } else if !was_empty && now_empty {
-            self.push_search_page(
-                String::new(),
-                self.pre_filter_scroll_y,
-                self.type_filter.clone(),
-            );
-        } else if !now_empty {
-            if let Some(f) = self.history_filters.get_mut(self.history_index) {
-                *f = text.to_string();
+        }
+        let scroll = if !was_empty && now_empty {
+            self.pre_filter_scroll_y
+        } else if was_empty && !now_empty {
+            0.0
+        } else {
+            self.scroll_y
+        };
+        self.filter = text.to_string();
+        let types = self.type_filter.clone();
+        self.book_page_change(text.to_string(), types, scroll);
+    }
+
+    /// 改搜索词 / 改类型筛选之后的历史记账。
+    ///
+    /// 规则（既不能每次勾选都堆一页，也不能丢了「后退回未筛选」这一步）：
+    ///  · 新状态正好等于**上一页** → 这次改动等于把当前这页取消掉，直接丢掉它
+    ///    （典型：取消筛选后回到「普通目录、没筛选」）；
+    ///  · 当前页已经是派生页（搜索页 / 筛选页）→ 就地改它，同一段搜索里反复
+    ///    改词改筛选都不堆历史；
+    ///  · 当前页是普通目录页 → 压入一页派生页，这样才退得回未筛选的状态。
+    fn book_page_change(&mut self, filter: String, types: Vec<String>, scroll: f32) {
+        if self.history_index > 0 {
+            let i = self.history_index;
+            let same_as_prev = self.history[i] == self.history[i - 1]
+                && self
+                    .history_filters
+                    .get(i - 1)
+                    .is_some_and(|f| *f == filter)
+                && self.history_types.get(i - 1).is_some_and(|t| *t == types);
+            if same_as_prev {
+                self.history.truncate(i);
+                self.history_filters.truncate(i);
+                self.history_types.truncate(i);
+                self.history_scroll.truncate(i);
+                self.history_index = i - 1;
+                self.scroll_y = scroll;
+                if let Some(s) = self.history_scroll.get_mut(self.history_index) {
+                    *s = scroll;
+                }
+                return;
             }
         }
-        self.filter = text.to_string();
+        let derived = self
+            .history_filters
+            .get(self.history_index)
+            .is_some_and(|f| !f.is_empty())
+            || self
+                .history_types
+                .get(self.history_index)
+                .is_some_and(|t| !t.is_empty());
+        if derived {
+            // 就地改这一页：顺手砍掉前进记录 —— 用户已经从那几页走开了，
+            // 留着的旧状态只会在按前进时把人送回去。
+            let n = self.history_index + 1;
+            self.history.truncate(n);
+            self.history_filters.truncate(n);
+            self.history_types.truncate(n);
+            self.history_scroll.truncate(n);
+            if let Some(f) = self.history_filters.get_mut(self.history_index) {
+                *f = filter;
+            }
+            if let Some(t) = self.history_types.get_mut(self.history_index) {
+                *t = types;
+            }
+            self.scroll_y = scroll;
+            if let Some(s) = self.history_scroll.get_mut(self.history_index) {
+                *s = scroll;
+            }
+        } else {
+            self.push_search_page(filter, scroll, types);
+        }
     }
 
     fn push_search_page(&mut self, filter: String, scroll: f32, types: Vec<String>) {
@@ -313,8 +377,8 @@ impl PaneState {
         self.scroll_y = scroll;
     }
 
-    /// 类型筛选变化：与搜索词同样的历史规则 ——
-    /// 「开始筛」「清空筛」各记成一个可前进/后退的页面，筛选途中继续勾选只改本页。
+    /// 类型筛选变化：历史规则同搜索词（见 `book_page_change`）——
+    /// 从普通目录开始筛压一页、筛选途中反复勾选只改本页、取消筛选回到目录页。
     pub fn set_type_filter(&mut self, keys: Vec<String>) {
         if keys == self.type_filter {
             return;
@@ -327,18 +391,17 @@ impl PaneState {
         if was_empty && !now_empty {
             // 记住筛选前的滚动位置，清空筛选时回到这里。
             self.pre_type_scroll_y = self.scroll_y;
-            self.push_search_page(self.filter.clone(), 0.0, keys.clone());
-        } else if !was_empty && now_empty {
-            self.push_search_page(
-                self.filter.clone(),
-                self.pre_type_scroll_y,
-                keys.clone(),
-            );
         }
+        let scroll = if !was_empty && now_empty {
+            self.pre_type_scroll_y
+        } else if was_empty && !now_empty {
+            0.0
+        } else {
+            self.scroll_y
+        };
         self.type_filter = keys.clone();
-        if let Some(t) = self.history_types.get_mut(self.history_index) {
-            *t = keys;
-        }
+        let filter = self.filter.clone();
+        self.book_page_change(filter, keys, scroll);
     }
 
     /// 上一级目录（盘符根之上为"此电脑"）。
@@ -431,6 +494,11 @@ impl PaneState {
         }
         let local_len = self.entries.len();
         for (j, e) in self.deep_entries.iter().enumerate() {
+            // 类型筛选对搜索结果一视同仁：子目录里搜到的也要过筛选，
+            // 否则「筛了只剩 PDF」时深层命中照样往列表里塞。
+            if !self.matches_type_filter(e) {
+                continue;
+            }
             let s = self
                 .deep_pinyin
                 .get(j)
@@ -448,7 +516,11 @@ impl PaneState {
             // 深度结果由后台按查询词自己过滤，类型键不在那边判定，原样并入。
             self.display = (0..self.entries.len())
                 .filter(|&i| self.matches_type_filter(&self.entries[i]))
-                .chain(local_len..local_len + self.deep_entries.len())
+                .chain(
+                    (0..self.deep_entries.len())
+                        .map(|j| local_len + j)
+                        .filter(|&i| self.matches_type_filter(&self.deep_entries[i - local_len])),
+                )
                 .collect();
             return;
         }
@@ -480,8 +552,10 @@ impl PaneState {
         let mut present = vec![false; total];
         for &idx in &self.display {
             let hit = if idx >= local_len {
-                // 深度结果本来就是这次查询的命中。
-                true
+                // 深度结果本来就是这次查询的命中，但类型筛选照样要过。
+                self.deep_entries
+                    .get(idx - local_len)
+                    .is_some_and(|e| self.matches_type_filter(e))
             } else if !pinyin_ready {
                 true
             } else {
@@ -527,9 +601,14 @@ impl PaneState {
                 }
             }
         }
-        // 末尾接上这一批新到的深度结果（保持到达顺序）。
+        // 末尾接上这一批新到的深度结果（保持到达顺序），类型筛选同样生效。
         for idx in local_len..total {
-            if !present[idx] {
+            if !present[idx]
+                && self
+                    .deep_entries
+                    .get(idx - local_len)
+                    .is_some_and(|e| self.matches_type_filter(e))
+            {
                 keep.push(idx);
             }
         }
@@ -991,7 +1070,45 @@ mod tests {
         assert_eq!(p.display, vec![0, 1, 2]);
     }
 
-    /// 类型筛选要能前进/后退：开始筛压一页、清空筛再压一页、中途改只改本页。
+    /// 类型筛选必须同样作用在「子目录里搜到的结果」上：以前深层命中直接放行，
+    /// 筛了只剩 PDF 时深层里的 txt/mp4 照样往列表里塞，筛选看着只对当前目录有效。
+    #[test]
+    fn type_filter_applies_to_deep_search_hits() {
+        let mut p = pane();
+        let mut pdf = crate::fs::dir::test_entry("深层报告.pdf", false, 0);
+        pdf.ext = "pdf".into();
+        p.entries = vec![pdf];
+        p.pinyin_cache = vec![Default::default(); 1];
+
+        let mut deep_txt = crate::fs::dir::test_entry("深层.txt", false, 0);
+        deep_txt.ext = "txt".into();
+        let mut deep_pdf = crate::fs::dir::test_entry("深层.pdf", false, 0);
+        deep_pdf.ext = "pdf".into();
+        p.deep_entries = vec![deep_txt, deep_pdf];
+        p.deep_pinyin = vec![Default::default(); 2];
+        p.filter = "深层".into();
+
+        let sorted = |d: &Vec<usize>| {
+            let mut v = d.clone();
+            v.sort();
+            v
+        };
+        // 不筛：本目录 1 条 + 深层 2 条，共 3 条（得分顺序不在此断言）。
+        p.rebuild_display();
+        assert_eq!(sorted(&p.display), vec![0, 1, 2]);
+
+        // 只留 pdf：本目录的 pdf + 深层的 pdf，深层 txt 必须被剔掉。
+        p.type_filter = vec!["pdf".into()];
+        p.rebuild_display();
+        assert_eq!(sorted(&p.display), vec![0, 2]);
+
+        // 流式追加路径同样要过筛选：已显示的深层 txt 要被剔除。
+        p.display = vec![0, 1, 2];
+        p.extend_display_streaming();
+        assert_eq!(sorted(&p.display), vec![0, 2]);
+    }
+
+    /// 类型筛选要能前进/后退：开始筛压一页、中途改只改本页、清空筛回到目录页。
     #[test]
     fn type_filter_participates_in_history() {
         let mut p = pane();
@@ -1098,15 +1215,73 @@ mod tests {
         assert_eq!(p.history.len(), 2);
         assert_eq!(p.history_filters[1], "abcd");
         p.scroll_y = 80.0;
+        // 清空搜索框 = 回到搜索前的目录页，不再多留一页「空搜索页」。
         p.set_filter_from_search("");
-        assert_eq!(p.history.len(), 3);
-        assert_eq!(p.scroll_y, 240.0);
-        p.jump_to(1);
-        assert_eq!(p.filter, "abcd");
-        assert_eq!(p.scroll_y, 80.0);
-        p.jump_to(2);
+        assert_eq!(p.history.len(), 1);
         assert!(p.filter.is_empty());
         assert_eq!(p.scroll_y, 240.0);
+    }
+
+    /// 反复改搜索词 + 反复改筛选，历史里只应留「目录页 + 最终那一页」。
+    /// 例：搜 x → 筛 mp4 → 取消 → 筛 avi → 改词 xp。
+    #[test]
+    fn repeated_search_and_filter_changes_leave_one_page() {
+        let mut p = pane();
+        p.set_filter_from_search("x");
+        p.set_type_filter(vec!["mp4".into()]);
+        p.set_type_filter(Vec::new());
+        p.set_type_filter(vec!["avi".into()]);
+        p.set_filter_from_search("xp");
+        assert_eq!(p.history.len(), 2, "整段搜索只算一页");
+        assert_eq!(p.history_index, 1);
+        assert_eq!(p.filter, "xp");
+        assert_eq!(p.history_filters[1], "xp");
+        assert_eq!(p.history_types[1], vec!["avi".to_string()]);
+        p.jump_to(0);
+        assert!(p.filter.is_empty());
+        assert!(p.type_filter.is_empty());
+        p.jump_to(1);
+        assert_eq!(p.filter, "xp");
+        assert_eq!(p.type_filter, vec!["avi".to_string()]);
+    }
+
+    /// 后退回搜索页时 App 会重放同一次搜索：不许把前进记录砍掉。
+    #[test]
+    fn replayed_search_keeps_forward_pages() {
+        let mut p = pane();
+        p.set_filter_from_search("x");
+        p.navigate(Some(PathBuf::from("C:\\other")));
+        p.jump_to(1);
+        assert!(p.can_go_forward());
+        p.set_filter_from_search("x");
+        assert!(p.can_go_forward(), "重放同一个搜索词不该清掉前进记录");
+        assert_eq!(p.history.len(), 3);
+    }
+
+    /// 后退之后又改筛选/改词：前进记录要作废（否则前进会回到改了之前的旧状态）。
+    #[test]
+    fn editing_after_back_drops_forward_pages() {
+        let mut p = pane();
+        p.set_type_filter(vec!["mp4".into()]);
+        p.navigate(Some(PathBuf::from("C:\\other")));
+        p.jump_to(0);
+        assert!(p.can_go_forward());
+        p.set_type_filter(vec!["avi".into()]);
+        assert_eq!(p.history.len(), 2);
+        assert!(!p.can_go_forward(), "改筛选后前进记录必须作废");
+    }
+
+    /// 普通目录：筛文件夹 → 取消 → 筛 mp4，历史只应留「未筛选、筛选mp4」。
+    #[test]
+    fn plain_dir_filter_collapses_when_cancelled() {
+        let mut p = pane();
+        p.set_type_filter(vec!["文件夹".into()]);
+        assert_eq!(p.history.len(), 2);
+        p.set_type_filter(Vec::new());
+        assert_eq!(p.history.len(), 1, "取消筛选不该留下重复的目录页");
+        p.set_type_filter(vec!["mp4".into()]);
+        assert_eq!(p.history.len(), 2);
+        assert_eq!(p.history_types[1], vec!["mp4".to_string()]);
     }
 
     /// 导航到新路径仍是普通页面（搜索词为空），并丢弃前进记录。

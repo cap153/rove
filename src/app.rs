@@ -492,6 +492,7 @@ enum MenuScope {
 /// 目录列举请求。
 /// 类型筛选下拉里的一行（Rust 侧）。文案是给人看的类型名，
 /// `keys` 是它的真实筛选键集合（`dir` / 小写扩展名 / `noext`）。
+#[derive(Clone)]
 struct TypeFilterGroup {
     label: String,
     keys: Vec<String>,
@@ -1020,6 +1021,9 @@ pub struct App {
     pending_search: Option<(String, std::time::Instant)>,
     /// 类型筛选下拉当前挂在哪个窗格上（`None` = 没开）。
     type_filter_pane: Option<usize>,
+    /// 上一次下发到 Slint 的下拉内容签名：内容没变就不重发模型，
+    /// 否则每批新结果都会重建一遍行、把用户滚到一半的清单弹回顶部。
+    type_filter_menu_sig: Option<String>,
     /// 下拉每行背后的真实类型键。
     ///
     /// 下拉模型里只有「文案 / 数量 / 勾选」——文案是给人看的类型名（`PNG 图像`），
@@ -1436,6 +1440,7 @@ impl App {
             time_text_memo: std::collections::HashMap::new(),
             pending_search: None,
             type_filter_pane: None,
+            type_filter_menu_sig: None,
             type_filter_groups: Vec::new(),
             sidebar_fingerprint: 0,
             visible_cache: None,
@@ -2398,9 +2403,46 @@ impl App {
         };
         // 分组按「类型名」而不是扩展名：与列表「类型」列显示的一致，
         // jpg/jpeg 这种同名的会并成一行（资源管理器也是这么分的）。
+        //
+        // 搜索态改为按「当前搜索结果」统计：本目录的条目要先过查询词（与
+        // `rebuild_display` 同源），子目录里搜到的命中本身就是这次查询的结果，
+        // 直接算进来。否则下拉里只有当前目录出现过的类型，别的类型根本选不到。
+        let searching = !pane.filter.is_empty();
+        let query = if searching && pane.path.is_some() {
+            let (_, clean) = crate::search::parse_drive_prefix(&pane.filter);
+            clean.trim().to_lowercase()
+        } else {
+            String::new()
+        };
+        let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
+        let mut bufs = (Vec::new(), Vec::new(), Vec::new());
+        let pinyin_ready = pane.pinyin_cache.len() == pane.entries.len();
+        let no_pinyin = crate::search::PinyinFields::default();
+        // 拼音缓存没算好时不做查询判定（与 rebuild_display 的兜底一致）：
+        // 否则中文名一个都匹配不上，下拉会空掉。
+        let local: Vec<&crate::fs::entry::FileEntry> = pane
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(i, e)| {
+                query.is_empty()
+                    || !pinyin_ready
+                    || crate::search::matches_query(
+                        &e.name,
+                        pane.pinyin_cache.get(*i).unwrap_or(&no_pinyin),
+                        &query,
+                        &mut matcher,
+                        &mut bufs,
+                    )
+            })
+            .map(|(_, e)| e)
+            .collect();
         let mut groups: Vec<TypeFilterGroup> = Vec::new();
         let mut index_of: std::collections::HashMap<String, usize> = Default::default();
-        for e in &pane.entries {
+        for e in local
+            .into_iter()
+            .chain(if query.is_empty() { &[][..] } else { pane.deep_entries.as_slice() })
+        {
             let label = self.tr_type(&e.type_text).to_string();
             let key = crate::state::type_key(e).to_string();
             let slot = *index_of.entry(label.clone()).or_insert_with(|| {
@@ -2417,6 +2459,23 @@ impl App {
                 g.keys.push(key);
             }
         }
+        // 已经勾选、但当前结果里一个都没有的类型仍要留在清单里 —— 否则勾上之后
+        // 那一项就消失了，想取消都点不到。标签从上一份清单里找回来。
+        for key in &pane.type_filter {
+            if groups.iter().any(|g| g.keys.iter().any(|k| k == key)) {
+                continue;
+            }
+            if let Some(prev) = self
+                .type_filter_groups
+                .iter()
+                .find(|g| g.keys.iter().any(|k| k == key))
+            {
+                // 数量按 0 记：这一条只是「让已勾选的项还能点到」，不是真计数。
+                let mut g = prev.clone();
+                g.count = 0;
+                groups.push(g);
+            }
+        }
         // 目录行固定排最前（资源管理器一致），其余按类型名排。
         groups.sort_by(|a, b| {
             let ad = a.keys.iter().any(|k| k == "dir");
@@ -2424,17 +2483,42 @@ impl App {
             bd.cmp(&ad).then_with(|| a.label.cmp(&b.label))
         });
         let active = !pane.type_filter.is_empty();
+        // 搜索态不显示数量：搜索结果一直在变，这个数没有意义。传 -1 让 Slint
+        // 不画那个数字。
+        let hide_count = searching;
         let items: Vec<TypeFilterItem> = groups
             .iter()
             .map(|g| TypeFilterItem {
                 label: g.label.clone().into(),
-                count: g.count as i32,
+                count: if hide_count { -1 } else { g.count as i32 },
                 // 一行代表一组扩展名：整组都选中才算勾上。
                 checked: active && g.keys.iter().all(|k| pane.type_filter.contains(k)),
             })
             .collect();
-        self.ui
-            .set_type_filter_items(ModelRc::new(VecModel::from(items)));
+        // 内容签名：标签+数量+勾选状态。深搜每批都来一遍时，只要清单没变就
+        // 不用重发模型（重发会让 Slint 重建所有行，正滚到一半的清单被弹回顶部）。
+        // 两栏共用同一个 Slint 模型，签名必须带上栏号，否则切栏时会把另一栏的
+        // 清单当成「没变」而拒绝下发。
+        let mut sig = format!("p{pane_index};");
+        sig.push_str(
+            &groups
+            .iter()
+            .map(|g| {
+                format!(
+                    "{}|{}|{}",
+                    g.label,
+                    if hide_count { -1 } else { g.count as i32 },
+                    active && g.keys.iter().all(|k| pane.type_filter.contains(k))
+                )
+            })
+            .collect::<Vec<_>>()
+                .join(";"),
+        );
+        if self.type_filter_menu_sig.as_deref() != Some(sig.as_str()) {
+            self.type_filter_menu_sig = Some(sig);
+            self.ui
+                .set_type_filter_items(ModelRc::new(VecModel::from(items)));
+        }
         self.type_filter_groups = groups;
     }
 
@@ -2490,6 +2574,19 @@ impl App {
         self.visible_cache = None;
         self.visible_cache_right = None;
         self.sync_file_list();
+        // `set_type_filter` 会顺手改 `scroll_y`（勾选时归 0、清空时回筛选前的位置），
+        // 但那只改 Rust 里的数，没推给 Slint 的 Flickable。真实滚动位置仍停在旧内容上，
+        // 行模型却按新位置渲染 → 屏幕上先是一片空白，滚一下（触发 scroll-changed）才对上。
+        // 必须放在 `sync_file_list` **之后**：内容高度还没换过去就推，Slint 会按旧范围
+        // 把 content-y 夹回去，等于白推。
+        let scroll = self
+            .state
+            .active()
+            .panes
+            .get(pane_index)
+            .map(|p| p.scroll_y.max(0.0))
+            .unwrap_or(0.0);
+        push_scroll(&self.ui, pane_index, scroll);
         self.sync_status();
         // 筛选改了历史页，前进/后退按钮的可用状态要跟着变。
         self.sync_nav();
@@ -2778,6 +2875,12 @@ impl App {
             );
         }
         let added = !items.is_empty();
+        // 本批新条目的类型文案：下面（面板借用结束后）用它判断「下拉清单里有没有
+        // 出现还没列过的类型」，避免每批都为刷新下拉重算一遍全目录匹配。
+        let new_type_texts: Vec<String> = items
+            .iter()
+            .map(|i| i.entry.type_text.to_string())
+            .collect();
         pane.deep_entries.extend(items.iter().map(|i| i.entry.clone()));
         pane.deep_pinyin.extend(items.into_iter().map(|i| i.fields));
         pane.deep_searching = !result.done;
@@ -2806,6 +2909,23 @@ impl App {
             self.sync_file_list();
             if deep_is_active {
                 self.sync_status();
+            }
+            // 类型下拉正开着：深搜是流式的，新到的一批可能带来新类型，就地补进清单，
+            // 否则用户得关掉重开才看得见。
+            //
+            // 只在「这批里出现了清单上还没有的类型」或「扫描收尾」时才重建：重建要
+            // 把当前目录整个重匹配一遍，大目录上按批刷会明显卡 UI。
+            if self.type_filter_pane == Some(result.pane) {
+                let has_new_type = new_type_texts.iter().any(|t| {
+                    let label = self.tr_type(t);
+                    !self
+                        .type_filter_groups
+                        .iter()
+                        .any(|g| g.label.as_str() == label.as_str())
+                });
+                if has_new_type || result.done {
+                    self.sync_type_filter_menu(result.pane);
+                }
             }
         }
     }
@@ -12961,6 +13081,10 @@ impl App {
     /// 前进/后退的收尾：跨目录按正常导航走；同一目录内的「搜索页 ↔ 目录页」
     /// 只重建搜索结果，不能重新列举目录（会把搜索结果冲掉）。
     fn after_history_jump(&mut self, before: Option<PathBuf>) {
+        // 前进/后退换页了：类型下拉里列的是上一页的类型，必须关掉（与
+        // `sync_after_navigate` 同一处理）。否则下拉会挂在导航后的画面上，
+        // 里面还是旧页的类型清单。
+        self.close_type_filter_menu();
         let (same_path, has_filter) = {
             let p = self.state.active().active();
             (p.path == before, !p.filter.trim().is_empty())

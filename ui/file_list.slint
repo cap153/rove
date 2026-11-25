@@ -1,5 +1,5 @@
 import { I18n } from "i18n.slint";
-import { Theme, FileRow, GridLine, HighlightName, TypeFilterItem } from "common.slint";
+import { Theme, FileRow, GridLine, HighlightName, TypeFilterItem, PopupScrollbar } from "common.slint";
 import { SingleLineEdit } from "single_line_edit.slint";
 
 // 可排序表头单元格（公共部分）。
@@ -909,8 +909,9 @@ export component FileList inherits Rectangle {
                     label: I18n.strings[70];
                     active-key: root.sort-key;
                     ascending: root.sort-ascending;
-                    // 「此电脑」视图没有真实的文件类型（都是磁盘），不给筛选。
-                    show-filter: !root.is-computer-view;
+                    // 「此电脑」视图没有真实的文件类型（都是磁盘），不给筛选；
+                    // 但搜索结果都是普通文件，那时照样要有筛选下拉。
+                    show-filter: !root.is-computer-view || root.search-active;
                     filter-active: root.type-filter-active;
                     clicked(k) => {
                         root.header-clicked(k);
@@ -2927,7 +2928,7 @@ export component FileList inherits Rectangle {
         drop-shadow-offset-y: 4px;
         clip: true;
 
-        Flickable {
+        menu-flick := Flickable {
             x: 0px;
             y: parent.pad-y;
             width: parent.width;
@@ -2970,7 +2971,7 @@ export component FileList inherits Rectangle {
 
                 Text {
                     x: 34px;
-                    width: parent.width - 34px - 42px;
+                    width: parent.width - 34px - 50px;
                     height: parent.height;
                     text: item.label;
                     color: Theme.text-primary;
@@ -2980,7 +2981,10 @@ export component FileList inherits Rectangle {
                 }
 
                 Text {
-                    x: parent.width - 42px;
+                    // 搜索态的数量不可靠（只数本目录），Rust 传 -1 时直接不画。
+                    visible: item.count >= 0;
+                    // 右侧给滚动条让出 8px，否则条目多时数字会被滑块压住。
+                    x: parent.width - 50px;
                     width: 32px;
                     height: parent.height;
                     text: "\{item.count}";
@@ -3008,6 +3012,16 @@ export component FileList inherits Rectangle {
                     }
                 }
             }
+        }
+
+        // 条目多到装不下时给一条细滚动条（与列表那条同一套浮动胶囊样式）。
+        PopupScrollbar {
+            x: parent.width - 10px;
+            y: parent.pad-y;
+            height: parent.height - parent.pad-y * 2;
+            view-h: menu-flick.height;
+            content-h: menu-flick.content-height;
+            content-y <=> menu-flick.content-y;
         }
     }
 }
