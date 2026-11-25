@@ -2,7 +2,7 @@
 //! 应用状态：标签页、导航历史、暂存托盘、选择集。
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::fs::{FileEntry, SortState};
 
@@ -137,6 +137,19 @@ pub fn type_key(e: &FileEntry) -> &str {
     } else {
         e.ext.as_str()
     }
+}
+
+/// 改名后的条目：保留体积/时间/隐藏属性与目录体积统计状态，只重算名字、
+/// 扩展名、图标风格与类型徽标（`FileEntry::from_path` 干的就是这件事）。
+/// `original_path` 也照搬：那是回收站条目的还原来源，改名不该把它清掉。
+fn rebuild_renamed(old: &FileEntry, new: &Path) -> FileEntry {
+    let mut rebuilt =
+        FileEntry::from_path(new, old.is_dir, old.size, old.modified, old.is_hidden);
+    rebuilt.dir_size_loaded = old.dir_size_loaded;
+    rebuilt.dir_size_partial = old.dir_size_partial;
+    rebuilt.dir_size_deferred = old.dir_size_deferred;
+    rebuilt.original_path = old.original_path.clone();
+    rebuilt
 }
 
 impl PaneState {
@@ -402,6 +415,52 @@ impl PaneState {
         self.type_filter = keys.clone();
         let filter = self.filter.clone();
         self.book_page_change(filter, keys, scroll);
+    }
+
+    /// 改名成功后就地更新条目：路径换成新名字，重算扩展名与类型徽标。
+    ///
+    /// 搜索态不能靠「重新列举目录」来同步：此电脑的全局搜索没有目录可列，
+    /// 子目录里搜到的命中也不在当前目录的列表情单里。这里按路径把本目录条目与
+    /// 子目录命中一起改掉，并**只重算这一条**的拼音字段 —— 整体作废拼音缓存会
+    /// 让 `rebuild_display` 退回「全部条目」的兜底分支，搜索页会闪一下整目录。
+    ///
+    /// 返回是否命中；没命中说明这条结果不在本面板，调用方应退回列举刷新。
+    pub fn rename_entry(&mut self, old: &Path, new: &Path) -> bool {
+        let mut hit = false;
+        let pinyin_ok = self.pinyin_cache.len() == self.entries.len();
+        for i in 0..self.entries.len() {
+            if self.entries[i].path != old {
+                continue;
+            }
+            let rebuilt = rebuild_renamed(&self.entries[i], new);
+            let name = rebuilt.name.clone();
+            self.entries[i] = rebuilt;
+            if pinyin_ok {
+                self.pinyin_cache[i] = crate::search::pinyin_fields(&name);
+            }
+            hit = true;
+        }
+        let deep_pinyin_ok = self.deep_pinyin.len() == self.deep_entries.len();
+        for j in 0..self.deep_entries.len() {
+            if self.deep_entries[j].path != old {
+                continue;
+            }
+            let rebuilt = rebuild_renamed(&self.deep_entries[j], new);
+            let name = rebuilt.name.clone();
+            self.deep_entries[j] = rebuilt;
+            if deep_pinyin_ok {
+                self.deep_pinyin[j] = crate::search::pinyin_fields(&name);
+            }
+            hit = true;
+        }
+        if hit {
+            // 让在途的拼音任务作废：那一批是按旧名字算的，落地会把刚改好的
+            // 这一条又覆盖回旧拼音。缓存本身已经逐项齐了，不需要重算。
+            self.pinyin_seq += 1;
+            self.pinyin_pending = None;
+            self.rebuild_display();
+        }
+        hit
     }
 
     /// 上一级目录（盘符根之上为"此电脑"）。
@@ -1243,6 +1302,53 @@ mod tests {
         p.jump_to(1);
         assert_eq!(p.filter, "xp");
         assert_eq!(p.type_filter, vec!["avi".to_string()]);
+    }
+
+    /// 改名要就地更新条目与拼音缓存：搜索态不能靠重新列举（此电脑全局搜索
+    /// 没有目录可列，子目录里搜到的命中也不在列表情单里）。
+    #[test]
+    fn rename_updates_entry_in_place() {
+        let mut p = pane();
+        let mut a = crate::fs::dir::test_entry("a.txt", false, 0);
+        a.ext = "txt".into();
+        p.entries = vec![a];
+        p.pinyin_cache = vec![crate::search::pinyin_fields("a.txt")];
+        let old = p.entries[0].path.clone();
+        let new = old.with_file_name("报告.pdf");
+        assert!(p.rename_entry(&old, &new));
+        assert_eq!(p.entries[0].name, "报告.pdf");
+        assert_eq!(p.entries[0].ext, "pdf");
+        assert!(p.entries[0].path.ends_with("报告.pdf"));
+        // 拼音缓存不能整体作废（那会让搜索页闪一下整目录），只重算这一条。
+        assert_eq!(p.pinyin_cache.len(), 1);
+        let want = crate::search::pinyin_fields("报告.pdf");
+        assert_eq!(p.pinyin_cache[0].full.as_ref(), want.full.as_ref());
+        assert_eq!(p.pinyin_cache[0].full.as_ref(), "baogao.pdf");
+        assert_eq!(p.display, vec![0]);
+    }
+
+    /// 子目录里的搜索命中改名后同样要更新（名字/拼音都换），且仍留在结果里 ——
+    /// 深层命中是后台按查询词筛过的一批结果，不逐条重匹配；用户刚改完名，
+    /// 直接把那一行抽走反而更莫名其妙。
+    #[test]
+    fn rename_updates_deep_hit_and_respects_query() {
+        let mut p = pane();
+        p.entries.clear();
+        p.pinyin_cache.clear();
+        let mut d = crate::fs::dir::test_entry("deep.txt", false, 0);
+        d.ext = "txt".into();
+        let old = d.path.clone();
+        p.deep_entries = vec![d];
+        p.deep_pinyin = vec![crate::search::pinyin_fields("deep.txt")];
+        p.filter = "deep".into();
+        p.rebuild_display();
+        assert_eq!(p.display, vec![0]);
+
+        let new = old.with_file_name("zzz.txt");
+        assert!(p.rename_entry(&old, &new));
+        assert_eq!(p.deep_entries[0].name, "zzz.txt");
+        assert_eq!(p.deep_pinyin[0].full.as_ref(), "zzz.txt");
+        assert_eq!(p.display, vec![0]);
     }
 
     /// 后退回搜索页时 App 会重放同一次搜索：不许把前进记录砍掉。

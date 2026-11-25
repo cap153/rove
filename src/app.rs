@@ -7761,6 +7761,11 @@ impl App {
         // 仅更新激活项（避免整表重建）。
         let active_id = match self.state.active().active().path.as_ref() {
             None => SharedString::default(),
+            // 回收站是虚拟目录：全量重建（`sync_sidebar`）里已经认这个 id，
+            // 增量更新这条路径漏了，所以从侧边栏进回收站时那一项不高亮。
+            Some(path) if *path == fs::drives::recycle_virtual_path() => {
+                "quick:recycle".into()
+            }
             Some(path) => {
                 let s = path.to_string_lossy().into_owned();
                 // 盘符大小写不敏感：手输 / 从别处粘来的路径可能是 `c:\`，
@@ -11289,10 +11294,76 @@ impl App {
                         Instant::now() + Duration::from_secs(3),
                     ));
                 }
-                self.reload_active();
+                self.refresh_after_rename(path, &new_path);
             }
             Err(e) => self.set_status_job(self.trf("重命名失败：{}", &[e.to_string()])),
         }
+    }
+
+    /// 改名成功后的刷新策略。
+    ///
+    /// 搜索态不能靠「重新列举当前目录」：
+    ///  · 此电脑的全局搜索根本没有目录可列，重新列举还会把搜索词清掉；
+    ///  · 子目录里搜到的命中也不在当前目录的列表情单里，列举刷不到它。
+    /// 所以搜索态改成「按路径就地改名 + 按原搜索词重建结果」；普通目录仍走列举
+    /// （那是唯一能把同目录其它面板、体积统计、排序一并纠正的路径）。
+    fn refresh_after_rename(&mut self, old: &Path, new: &Path) {
+        let searching = !self.state.active().active().filter.is_empty();
+        if !searching {
+            self.reload_active();
+            return;
+        }
+        if !self.rename_entries_in_place(old, new) {
+            // 命中的条目根本不在本面板（比如另一半屏的结果）：退回列举，别卡住。
+            self.reload_active();
+            return;
+        }
+        let pane_index = self.state.active().active_pane;
+        let pos = {
+            let pane = self.state.active().active();
+            (0..pane.display.len())
+                .find(|&i| pane.display_entry(i).is_some_and(|e| e.path == new))
+        };
+        if let Some(pos) = pos {
+            self.state.active_mut().active_mut().selection = [new.to_path_buf()]
+                .into_iter()
+                .collect();
+            self.scroll_to_index = Some(pos);
+            self.scroll_to_pane = Some(pane_index);
+        }
+        // 上面已经自己选了新名字那一行并算好滚动位置；`scroll_to_paths` /
+        // `scroll_select` 是「等下一次列举回来再揭示」那套机制，搜索态不会再有
+        // 那次列举，留着会被后面某个无关的列举消费掉（凭空跳一次选择）。
+        self.scroll_to_paths.clear();
+        self.scroll_select = false;
+        self.visible_cache = None;
+        self.visible_cache_right = None;
+        self.sync_file_list();
+        self.sync_status();
+        self.sync_nav();
+        // 分屏另一半若看着同一个目录（且不在搜索态），照旧列举刷新。
+        let tab_index = self.state.active_tab;
+        let (active_pane, dir) = {
+            let tab = self.state.active();
+            (tab.active_pane, tab.active().path.clone())
+        };
+        let others: Vec<usize> = self.state.tabs[tab_index]
+            .panes
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| *i != active_pane && p.filter.is_empty() && p.path == dir)
+            .map(|(i, _)| i)
+            .collect();
+        for pi in others {
+            self.reload_pane(tab_index, pi);
+        }
+    }
+
+    /// 把「当前面板里路径为 `old` 的条目」就地改成 `new`（本目录条目与子目录命中都改）。
+    ///
+    /// 返回是否命中：没命中说明这条结果不属于本面板，调用方应退回列举。
+    fn rename_entries_in_place(&mut self, old: &Path, new: &Path) -> bool {
+        self.state.active_mut().active_mut().rename_entry(old, new)
     }
 
     /// 预测复制/移动完成后在目标目录里出现的新路径，让列表把它们滚进可视区。
