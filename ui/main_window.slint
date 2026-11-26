@@ -119,6 +119,7 @@ export component MainWindow inherits Window {
     /// 「新建标签时编辑地址栏」开关（来自 config，默认关闭）。
     in-out property <bool> auto-edit-path-on-new-tab: false;
     callback auto_edit_path_on_new_tab_toggled(bool);
+    callback low_memory_mode_toggled(bool);
     /// 「接管资源管理器」开关（来自 config.explorer_takeover，默认关闭）。
     in-out property <bool> explorer-takeover: false;
     callback explorer_takeover_toggled(bool);
@@ -140,6 +141,8 @@ export component MainWindow inherits Window {
     in-out property <bool> independent-view: false;
     callback independent_view_toggled(bool);
     /// 「硬件渲染」开关（来自 config.hardware_renderer，默认开启 = GPU）。
+    /// 低内存模式（默认开）：关到托盘后释放索引 + 清空工作集，换取常驻内存。
+    in-out property <bool> low-memory-mode: true;
     in-out property <bool> hardware-renderer: true;
     callback hardware_renderer_toggled(bool);
     callback language_changed(int);
@@ -1680,6 +1683,8 @@ out property <length> row-height-out-right: file-list-right.row-height-out;
                     mouse-pressed: root.mouse-left-pressed;
                     auto-edit-path-on-new-tab: root.auto-edit-path-on-new-tab;
                     auto_edit_path_on_new_tab_toggled(v) => { root.auto_edit_path_on_new_tab_toggled(v); }
+                    low-memory-mode: root.low-memory-mode;
+                    low_memory_mode_toggled(v) => { root.low_memory_mode_toggled(v); }
                     explorer-takeover: root.explorer-takeover;
                     explorer_takeover_toggled(v) => { root.explorer_takeover_toggled(v); }
                     system-menu: root.system-menu;

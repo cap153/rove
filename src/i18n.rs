@@ -395,6 +395,8 @@ pub const ZH: &[&str] = &[
     "每个文件夹各记自己的视图和排序；左右分屏互不影响", // 380
     "索引未加载（空闲时已让出内存）", // 381
     "未选择任何磁盘（索引为空）", // 382
+    "低内存模式", // 383
+    "关窗常驻托盘时释放索引内存，唤出时稍慢一点", // 384
 ];
 
 pub const EN: &[&str] = &[
@@ -781,6 +783,8 @@ pub const EN: &[&str] = &[
     "Each folder keeps its own view and sort; the two panes are independent",
     "Index not loaded (memory released while idle)",
     "No disk selected (index is empty)",
+    "Low memory mode",
+    "Release index memory while resident in the tray; waking up takes a moment longer",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。

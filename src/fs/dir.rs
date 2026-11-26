@@ -5,12 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::entry::FileEntry;
 
-/// 调试日志：经项目既有的 `log_write` 写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`），
-/// 与项目其它诊断日志同源、同一 `ROVE_LOG` 开关（存在即启用），不再走 stderr。
+/// 调试日志：写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`）。
+///
+/// 用 `log_write_lvl("L2", …)`：`log_write` 固定打 `L0` 标签，会让「只在 verbose
+/// 下才输出」的一行看着像常开的异常（与 `app.rs` 里同名函数保持一致）。
 #[cfg(windows)]
 fn dirsize_trace(msg: String) {
     if crate::app::log_enabled(2) {
-        crate::app::log_write(&format!("[rove:dirsize] {msg}"));
+        crate::app::log_write_lvl("L2", &format!("[rove:dirsize] {msg}"));
     }
 }
 

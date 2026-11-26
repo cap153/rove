@@ -210,6 +210,13 @@ pub struct Config {
     /// Rove 自己的内建项。首次启动默认关闭。
     pub system_menu: bool,
 
+    /// 「低内存模式」：关到托盘（会话销毁）时释放全盘索引映射 + 清空工作集。
+    ///
+    /// 默认 `true`。托盘常驻时能把占用从 ~100 MB 压到个位数 MB；代价是唤出窗口
+    /// 时首帧要重新换入被换出的页（略慢一点，换来的是常驻内存小一个数量级）。
+    /// 关掉 = 旧行为：不清内存，首帧最快。
+    pub low_memory_mode: bool,
+
     /// 是否用 GPU（硬件）渲染。默认 `true`；关掉走软件渲染（CPU）。
     ///
     /// 改了要重启才生效（渲染后端在创建窗口之前就定下了）。
@@ -402,6 +409,7 @@ impl Default for Config {
             context_menu_hide_gen: CONTEXT_MENU_HIDE_GEN,
             archive_tool: "winrar".into(),
             system_menu: false,
+            low_memory_mode: true,
             hardware_renderer: true,
             independent_view: false,
         }
@@ -664,6 +672,9 @@ impl Config {
             }
         }
         // 硬件渲染：缺省开启（GPU）；关掉走软件渲染（CPU）。
+        if let Some(lm) = json.get("low_memory_mode").and_then(|v| v.as_bool()) {
+            config.low_memory_mode = lm;
+        }
         if let Some(hr) = json.get("hardware_renderer").and_then(|v| v.as_bool()) {
             config.hardware_renderer = hr;
         }
@@ -930,6 +941,7 @@ impl Config {
             "system_menu": self.system_menu,
             "archive_tool": self.archive_tool,
             // 硬件渲染开关（关 = 软件渲染），下次启动才生效。
+            "low_memory_mode": self.low_memory_mode,
             "hardware_renderer": self.hardware_renderer,
             "independent_view": self.independent_view,
         })
@@ -1006,6 +1018,19 @@ mod tests {
     }
 
     /// 硬件渲染：缺省开启（GPU）；关掉走软件渲染，配置要能往返。
+    /// 低内存模式默认开启（= 关窗时释放索引/工作集）。老配置里没有这个键时
+    /// 也必须落到 `true`，否则升级上来的用户会莫名其妙回到「常驻 ~100 MB」。
+    #[test]
+    fn low_memory_mode_defaults_on() {
+        assert!(Config::default().low_memory_mode);
+        assert_eq!(Config::default().save_json()["low_memory_mode"], true);
+        let mut c = Config::default();
+        c.low_memory_mode = false;
+        assert_eq!(c.save_json()["low_memory_mode"], false);
+        // 老配置缺这个键时走 `Self::default()` 的值（`load()` 是逐字段覆盖的），
+        // 也就是升级上来的用户默认开启。
+    }
+
     #[test]
     fn hardware_renderer_defaults_on() {
         assert!(Config::default().hardware_renderer);

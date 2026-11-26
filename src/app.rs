@@ -629,11 +629,14 @@ struct DirSizeResult {
 /// 文件夹容量内存缓存上限（参考 Pulse folder_size_store 的 4096）。
 const DIR_SIZE_CACHE_CAP: usize = 4096;
 
-/// 调试日志：经项目既有的 `log_write` 写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`），
-/// 与项目其它诊断日志同源、同一 `ROVE_LOG` 开关（存在即启用），不再走 stderr。
+/// 调试日志：写入 exe 同目录的 `rove.log`（前缀 `[rove:dirsize]`）。
+///
+/// 走 `log_write_lvl("L2", …)` 而不是 `log_write`：后者固定打 `L0` 标签，
+/// 于是「只在 verbose 下才输出」的一行在日志里看着像常开的异常 —— 排查时
+/// 会白追一趟。级别标签必须和实际开关一致。
 fn dirsize_trace(msg: String) {
     if log_enabled(2) {
-        log_write(&format!("[rove:dirsize] {msg}"));
+        log_write_lvl("L2", &format!("[rove:dirsize] {msg}"));
     }
 }
 
@@ -5569,7 +5572,7 @@ impl App {
             return;
         }
         // 吸附窗正在搜：它依赖索引里的文件夹那一轨，别在人家搜的时候清空。
-        if jump_query_active() {
+        if jump_searching() {
             return;
         }
         // 正在构建：这时候卸载没有意义（构建完马上就要用它），还会让看板在
@@ -10440,6 +10443,8 @@ impl App {
         // 向设置页「通用」开关灌入当前状态。
         self.ui.set_show_hidden(self.config.show_hidden);
         self.ui.set_auto_edit_path_on_new_tab(self.config.auto_edit_path_on_new_tab);
+        // 「低内存模式」：关到托盘时是否释放索引 / 清空工作集。
+        self.ui.set_low_memory_mode(self.config.low_memory_mode);
         self.ui.set_explorer_takeover(self.config.explorer_takeover);
         self.ui.set_system_menu(self.config.system_menu);
         self.ui.set_archive_tool_index(self.archive_tool_index());
@@ -17289,6 +17294,15 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.config.save();
             app.ui.set_auto_edit_path_on_new_tab(enabled);
         });
+        // 「低内存模式」：只影响下一次关窗时的收尾，不用重启。
+        let lowmem_app = app.clone();
+        upgrade().on_low_memory_mode_toggled(move |enabled| {
+            let Some(app) = lowmem_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.low_memory_mode = enabled;
+            app.config.save();
+            app.ui.set_low_memory_mode(enabled);
+        });
         // 接管资源管理器：改开关立刻写/还原注册表，失败只回退开关并记日志。
         let takeover_app = app.clone();
         // 「系统菜单」开关：只影响下一次右键（不重建菜单线程、不用重启）。
@@ -18625,8 +18639,19 @@ thread_local! {
 }
 
 /// 吸附窗输入框里是否有内容（有内容才值得等全盘索引那一轨）。
+///
+/// 注意这个判据**只管「要不要补刷」**，不能拿来决定「索引能不能放掉」：
+/// 吸附窗隐藏时输入框里的文字是刻意保留的（`hide_dialog_jump` 不清空），
+/// 用它当「正在使用索引」会让一句早就不用了的搜索词把索引钉在内存里，
+/// 托盘常驻时尤其明显。释放一律用 [`jump_searching`]。
 fn jump_query_active() -> bool {
     with_jump(|state| !state.window.get_query().is_empty()).unwrap_or(false)
+}
+
+/// 吸附窗**正显示着**且输入框里有内容：真的在用索引那一轨。
+fn jump_searching() -> bool {
+    with_jump(|state| state.target.is_some() && !state.window.get_query().is_empty())
+        .unwrap_or(false)
 }
 
 /// 只读/可变访问吸附窗状态；未初始化（非 Windows 或初始化失败）时返回 None。
@@ -18774,7 +18799,7 @@ pub(crate) fn init_dialog_jump(language: &str, theme: ThemeChoice) {
         state
             .unload_timer
             .start(slint::TimerMode::Repeated, Duration::from_secs(60), || {
-                if SESSION.with(|slot| slot.borrow().is_some()) || jump_query_active() {
+                if SESSION.with(|slot| slot.borrow().is_some()) || jump_searching() {
                     return;
                 }
                 let idle = crate::search::index::idle_for();
@@ -20103,7 +20128,6 @@ fn create_session(
 
     logln!("[boot] showing window");
     app.borrow().ui.show().unwrap();
-
     // 强制立即重绘：让首次 RedrawRequested 尽快触发，及时应用首次启动 75% 居中
     // （否则首屏列表/索引等工作会把首帧推迟到数秒后，出现“先默认位置、再居中”的闪烁）。
     app.borrow().ui.window().request_redraw();
@@ -20507,6 +20531,8 @@ pub fn destroy_session() {
     // 有任务在跑就不换进程：重启会杀掉进行中的复制 / 移动。
     // `ROVE_FORCE_RESTART=1` 只为验证交接流程用。
     let jobs_running = app.borrow().jobs.is_running();
+    // 「低内存模式」关掉 = 旧行为：不释放索引、不清工作集，换唤出时最快首帧。
+    let low_memory_mode = app.borrow().config.low_memory_mode;
     let restart_wanted = !QUITTING.load(std::sync::atomic::Ordering::Acquire)
         && std::env::var_os("ROVE_FORCE_RESTART").is_some()
         && !jobs_running;
@@ -20517,6 +20543,22 @@ pub fn destroy_session() {
     spawn_destroy_guard(jobs_running);
     drop(app);
     logv!("[close] step 3/4 session dropped");
+    // 关到托盘常驻：窗口都没了，这些内存没有理由继续占着。
+    //
+    // 1) 全盘索引的映射（几十兆的 index.bin 里被读过的页）：等下次真要用
+    //    索引时再按需加载，而不是让托盘替它付整晚的内存。
+    // 2) 工作集本身：Slint / 字体 / 堆里那一批已经用不上的页还给系统
+    //    （commit 不变，物理内存立即释放；真机实测 103 MB → 2 MB）。
+    //
+    // 有任务在跑时不收拾：清空工作集会让正在复制的读写缓冲从页面文件里再读
+    // 一遍，纯属拖慢；索引正在构建时同理（构建线程刚攒出来的条目一被换出，
+    // 下一轮就得从页面文件里捞回来）。吸附窗此刻正在搜（用户开着资源对话框、
+    // 正点着吸附条）也不动：这一份索引还有用，交给它自己的空闲卸载定时器。
+    if low_memory_mode && !jobs_running && !jump_searching() && !crate::search::index::is_building() {
+        crate::search::index::unload();
+        #[cfg(windows)]
+        trim_working_set();
+    }
     // 审计：组件 drop 之后主窗口应该已经不在了（IsWindow 返回 0）。
     // 如果它还在且仍可见，就说明某个强引用把窗口留在了内存里——这正是
     // 「窗口消失了但还盖着一层透明窗口」的成因，强制藏起来并留证据。
@@ -20546,6 +20588,20 @@ pub fn destroy_session() {
     }
     CLOSING_AT.store(0, std::sync::atomic::Ordering::Release);
     logln!("session destroyed; daemon resident");
+}
+
+/// 把本进程的工作集还给系统（关到托盘后调用）。
+///
+/// `-1 / -1` 是 Windows 文档里「清空工作集」的写法：把能拿掉的页都从工作集里
+/// 移除（脏页写回、干净页丢弃），commit 与虚拟地址空间不变，用户看到的占用
+/// 立刻掉到个位数 MB，下次唤出窗口时按需重新换入。
+#[cfg(windows)]
+fn trim_working_set() {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessWorkingSetSize};
+    unsafe {
+        SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);
+    }
+    crate::logv!("[close] working set trimmed");
 }
 
 /// 把窗口前置并聚焦（WSLg/真实 Windows 均适用）。
