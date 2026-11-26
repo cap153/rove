@@ -594,6 +594,11 @@ export component SettingsPage inherits Rectangle {
 
     // ---- 搜索与索引数据与回调 ----
     in property <bool> search-ready: true;
+    // 「索引未加载（空闲时已让出内存）」是**正常**状态，不是警告：
+    // 用蓝色和「正在构建 / 未构建」的橙色区分开。
+    in property <bool> search-released: false;
+    // 一个磁盘都没纳管：索引范围是空的，用中性灰而不是绿/橙。
+    in property <bool> search-no-drives: false;
     in property <string> search-status-text: I18n.strings[71];
     in property <string> search-items-count: "0";
     in property <string> search-size-text: "0 MB";
@@ -1275,12 +1280,18 @@ export component SettingsPage inherits Rectangle {
                                     height: 8px;
                                     border-radius: 4px;
                                     y: (parent.height - self.height) / 2;
-                                    background: root.search-ready ? Theme.accent : #E67E22;
+                                    background: root.search-no-drives ? Theme.text-secondary
+                                        : root.search-ready ? Theme.accent
+                                        : root.search-released ? (Theme.dark ? #60A5FA : #2563EB)
+                                        : #E67E22;
                                 }
 
                                 Text {
                                     text: root.search-status-text;
-                                    color: root.search-ready ? Theme.accent : #E67E22;
+                                    color: root.search-no-drives ? Theme.text-secondary
+                                        : root.search-ready ? Theme.accent
+                                        : root.search-released ? (Theme.dark ? #60A5FA : #2563EB)
+                                        : #E67E22;
                                     font-size: 12px;
                                     font-weight: 600;
                                     vertical-alignment: center;

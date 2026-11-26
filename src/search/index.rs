@@ -729,6 +729,53 @@ fn open_view(path: &Path) -> Option<View> {
     })
 }
 
+/// 磁盘缓存文件里的统计信息（只读文件头，不映射、不占内存）。
+pub struct CacheMeta {
+    /// 缓存里有多少条记录。
+    pub count: usize,
+    /// 上次构建的时刻（缓存头里带的 unix 秒）。
+    pub built_at: Option<std::time::SystemTime>,
+    /// 缓存文件大小。
+    pub bytes: u64,
+}
+
+/// 读缓存文件的头，拿「有多少条 / 上次什么时候建 / 文件多大」。
+///
+/// 给设置页看板用：那里的数字是**展示**用的，不该为了让数字好看就把几十兆
+/// 索引映射进内存（更不该因此阻止空闲释放）。文件不存在 / 版本不对 → `None`。
+pub fn cache_meta() -> Option<CacheMeta> {
+    use std::io::Read;
+    let path = cache_path();
+    let bytes = std::fs::metadata(&path).ok()?.len();
+    let mut header = [0u8; HEADER_LEN];
+    std::fs::File::open(&path).ok()?.read_exact(&mut header).ok()?;
+    parse_cache_header(&header, bytes)
+}
+
+/// 校验缓存头并取出统计数据（拆出来是为了能不碰磁盘做单元测试）。
+fn parse_cache_header(header: &[u8], bytes: u64) -> Option<CacheMeta> {
+    if header.len() < HEADER_LEN || bytes < HEADER_LEN as u64 {
+        return None;
+    }
+    if header[..8] != CACHE_MAGIC || u32_at(header, 8) != CACHE_VERSION {
+        return None;
+    }
+    if u32_at(header, 16) as usize != REC_SIZE {
+        return None;
+    }
+    let mut count = u32_at(header, 12) as usize;
+    if count > MAX_ENTRIES {
+        count = MAX_ENTRIES as usize;
+    }
+    let built_unix = u64_at(header, 32);
+    let built_at = std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_secs(built_unix));
+    Some(CacheMeta {
+        count,
+        built_at,
+        bytes,
+    })
+}
+
 /// 启动 / 按需加载：把磁盘缓存**映射**进来（不读进内存）。
 pub fn load_cache(idx: &SharedIndex) -> bool {
     let path = cache_path();
@@ -770,6 +817,14 @@ pub fn try_shared() -> Option<SharedIndex> {
 /// 途也会因轮次过期而丢弃结果，不会把半成品写回 `ready`。
 pub fn rebuild() -> SharedIndex {
     let idx = shared();
+    // 检索范围为空（设置里把所有磁盘都关了）：什么都不做。
+    // 以前这里会把内存索引清空、再让构建线程写出一个 40 字节的空缓存 ——
+    // 用户只是临时关掉开关点了一次「重新扫描」，之前扫好的索引就被覆盖没了，
+    // 重新勾上磁盘还得从头全盘扫一遍。现在直接保持现状（映射和缓存都不动）。
+    if list_roots().is_empty() {
+        logln!("index: rebuild skipped, no drive in scope (cache kept)");
+        return idx;
+    }
     // 置位旧线程并等待其释放写锁：随后的 clear 不会被旧轮次覆盖。
     if let Ok(mut cur) = CURRENT_STOP.lock() {
         if let Some(old) = cur.take() {
@@ -790,6 +845,11 @@ pub fn rebuild() -> SharedIndex {
 }
 
 fn spawn_builder(idx: SharedIndex) {
+    // 没有盘在检索范围内就不构建：不拆旧映射、不写空缓存（见 `rebuild`）。
+    if list_roots().is_empty() {
+        logln!("index: build skipped, no drive in scope (cache kept)");
+        return;
+    }
     let epoch = BUILD_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     BUILDING.store(true, Ordering::Relaxed);
     let stop = Arc::new(AtomicBool::new(false));
@@ -1536,6 +1596,44 @@ mod tests {
         assert_eq!(total, n, "前缀命中不该被配额掐掉");
         assert!(!scan.hit_cap(), "这不是被上限掐停的");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 看板的「磁盘缓存统计」不能读错：魔数 / 版本 / 记录大小任一不符都当没缓存，
+    /// 否则会对着一个旧格式文件报出错误的条目数。
+    #[test]
+    fn cache_header_is_parsed_and_validated() {
+        let mut header = [0u8; HEADER_LEN];
+        header[..8].copy_from_slice(b"ROVEIDX1");
+        header[8..12].copy_from_slice(&CACHE_VERSION.to_le_bytes());
+        header[12..16].copy_from_slice(&1234u32.to_le_bytes());
+        header[16..20].copy_from_slice(&(REC_SIZE as u32).to_le_bytes());
+        header[32..40].copy_from_slice(&1_700_000_000u64.to_le_bytes());
+
+        let meta = parse_cache_header(&header, 99_999).expect("合法头应当能解析");
+        assert_eq!(meta.count, 1234);
+        assert_eq!(meta.bytes, 99_999);
+        assert!(meta.built_at.is_some());
+
+        let mut bad_magic = header;
+        bad_magic[0] = b'X';
+        assert!(parse_cache_header(&bad_magic, 99_999).is_none(), "魔数不符");
+
+        let mut bad_version = header;
+        bad_version[8..12].copy_from_slice(&(CACHE_VERSION + 1).to_le_bytes());
+        assert!(
+            parse_cache_header(&bad_version, 99_999).is_none(),
+            "版本不符"
+        );
+
+        let mut bad_rec = header;
+        bad_rec[16..20].copy_from_slice(&7u32.to_le_bytes());
+        assert!(
+            parse_cache_header(&bad_rec, 99_999).is_none(),
+            "记录大小不符"
+        );
+
+        assert!(parse_cache_header(&header[..16], 99_999).is_none(), "头太短");
+        assert!(parse_cache_header(&header, 20).is_none(), "文件比头还短");
     }
 
     /// 但绝对上限还在：搜「沾边」的词最多到 `DEEP_MAX_TOTAL` 条就收手。

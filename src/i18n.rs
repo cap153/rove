@@ -393,6 +393,8 @@ pub const ZH: &[&str] = &[
     "硬件渲染不可用，已切换到软件渲染", // 378
     "独立视图和排序", // 379
     "每个文件夹各记自己的视图和排序；左右分屏互不影响", // 380
+    "索引未加载（空闲时已让出内存）", // 381
+    "未选择任何磁盘（索引为空）", // 382
 ];
 
 pub const EN: &[&str] = &[
@@ -777,6 +779,8 @@ pub const EN: &[&str] = &[
     "Hardware rendering is unavailable; switched to software rendering",
     "Per-folder view and sort",
     "Each folder keeps its own view and sort; the two panes are independent",
+    "Index not loaded (memory released while idle)",
+    "No disk selected (index is empty)",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。

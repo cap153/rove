@@ -148,6 +148,10 @@ export component MainWindow inherits Window {
 
     // ---- 搜索与索引看板（Rust 驱动） ----
     in-out property <bool> search-ready: true;
+    // 索引未加载但缓存还在（空闲释放）：看板用蓝色而不是警告色。
+    in-out property <bool> search-released: false;
+    // 一个磁盘都没纳管（看板显示中性灰）。
+    in-out property <bool> search-no-drives: false;
     in-out property <string> search-status-text: I18n.strings[71];
     in-out property <string> search-items-count: "0";
     in-out property <string> search-size-text: "0 MB";
@@ -1695,6 +1699,8 @@ out property <length> row-height-out-right: file-list-right.row-height-out;
                     theme_changed(i) => { root.theme_changed(i); }
                     startup_changed(i) => { root.startup_changed(i); }
                     search-ready: root.search-ready;
+                    search-released: root.search-released;
+                    search-no-drives: root.search-no-drives;
                     search-status-text: root.search-status-text;
                     search-items-count: root.search-items-count;
                     search-size-text: root.search-size-text;

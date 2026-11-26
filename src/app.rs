@@ -142,8 +142,15 @@ static REINDEX_DEADLINE: OnceLock<Mutex<Option<std::time::Instant>>> = OnceLock:
 
 /// 安排一次索引重建（合并窗口内的多次调用只算一次）。
 /// 实际执行在 40ms 主轮询里检查截止时刻，到点才调 `index::rebuild()`。
-fn reindex_if_active() {
-    if crate::search::index::try_shared().is_none() {
+///
+/// `force = true`（勾选 / 取消勾选磁盘）：**允许顺手把索引建出来** —— 改「检索
+/// 范围」本身就是「我要索引」的明确意图。看板不再为了显示数字去加载索引，所以
+/// 这时索引对象可能根本还不存在，若照旧直接返回，勾上磁盘就永远等不到重建。
+///
+/// `force = false`（增删忽略路径等）：只在索引**已经在用**时重扫，不给「从不
+/// 搜索、只是调了个忽略规则」的用户平白拉起一次全盘扫描。
+fn reindex_if_active(force: bool) {
+    if !force && crate::search::index::try_shared().is_none() {
         return;
     }
     let slot = REINDEX_DEADLINE.get_or_init(|| Mutex::new(None));
@@ -166,7 +173,9 @@ fn maybe_run_pending_reindex() {
         },
         Err(_) => false,
     };
-    if due && crate::search::index::try_shared().is_some() {
+    if due {
+        // `rebuild()` 会自己创建索引对象（需要时读 mmap），随后按当前检索范围
+        // 重新扫一遍；检索范围为空时它会直接跳过、保留既有缓存。
         crate::logln!("index: rebuild (debounced {REINDEX_DEBOUNCE_MS}ms)");
         crate::search::index::rebuild();
     }
@@ -429,6 +438,23 @@ macro_rules! logal {
 static FOCUS_WINDOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static FOCUS_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 static FOCUS_LOGGED_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// 最近一次「我们自己拉起了外部程序」的时刻（ms）。
+///
+/// 打开文件必然伴随一串失焦/获焦（外部程序起来拿焦点，用户回来又还给我们），
+/// 那属于正常流程，不该被下面的抖动看门狗报成 `!!`。
+/// 「搜索与索引」看板：是否有任何磁盘被纳管（全部关掉 = 索引范围内一片空白）。
+///
+/// 由 `sync_search_stats(true)` 枚举驱动器时顺手更新；1s 轮询只读这个标记，
+/// 不重复枚举驱动器（`list_drives` 要查容量，不便宜）。
+static SEARCH_NO_DRIVES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 外部程序打开文件后的豁免窗口（ms）：这段时间内 `[focus]` 变化属正常流程。
+static EXTERNAL_OPEN_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 记一笔：马上要用外部程序打开文件。
+fn note_external_open() {
+    EXTERNAL_OPEN_MS.store(now_ms(), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// `sync_tabs` 每秒调用次数统计（标签栏闪烁取证用）。
 static SYNC_TABS_WINDOW_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1187,6 +1213,14 @@ pub struct App {
     drop_timer: Timer,
     /// 拖出待定手势：(按下时行局部 x, y, 待拖路径)。
     drag_pending: Option<(f32, f32, Vec<PathBuf>)>,
+    /// 那次「按下」的时刻：拖放要据此判断是点击还是按住拖拽。
+    drag_armed_at: Option<std::time::Instant>,
+    /// 这一次按下是不是「手还在滑的时候就按下去」（触控板点着滑最典型）。
+    /// 这种手势永远不算拖拽 —— 见 `sample_cursor_motion`。
+    drag_glide: bool,
+    /// 40ms 轮询采样的光标位置 / 最后一次看到它移动的时刻。
+    cursor_prev_pos: Option<(f32, f32)>,
+    cursor_last_move_ms: u64,
     /// 框选基线：按下时若按住 Ctrl/Shift，记录当时的选择集作为累加底本；
     /// None 表示普通替换式框选。预览与结束都基于它重算，矩形缩回时高亮也跟着缩回。
     rubber_band_base: Option<HashSet<PathBuf>>,
@@ -1198,6 +1232,8 @@ pub struct App {
     deferred_bg_menu: Option<MenuScope>,
     /// 行内右键：按下时只记下要弹的菜单，抬手才真的弹（见 `row_pointer_event`）。
     pending_row_menu: Option<MenuScope>,
+    /// 双击激活：和第二下「按下」分开，等**抬手**再打开文件。见按下处的说明。
+    pending_activate: Option<(usize, PathBuf)>,
     /// 空白处左键按下的位置（视口坐标）：抬手时用来区分「点一下」和「拖着框选」。
     blank_press: Option<(f32, f32)>,
     /// 空白处上一次单击的 (时刻, x, y, 窗格)：两次够近才算双击 → 回上一级。
@@ -1512,10 +1548,15 @@ impl App {
             dir_mtimes: HashMap::new(),
             drop_timer: Timer::default(),
             drag_pending: None,
+            drag_armed_at: None,
+            drag_glide: false,
+            cursor_prev_pos: None,
+            cursor_last_move_ms: 0,
             rubber_band_base: None,
             bg_hit_row: false,
             deferred_bg_menu: None,
             pending_row_menu: None,
+            pending_activate: None,
             pending_global_search: None,
             autofit_key: [None, None],
             cur_col_widths: [
@@ -3872,6 +3913,18 @@ fn drag_gesture_paths(
     }
 }
 
+/// 「这次移动算不算真的要拖了」——距离与按住时长同时看。
+///
+/// 只看距离是不够的：真机实测一次普通点击里手就滑了 4~9 逻辑像素，和拖拽
+/// 分不开。点击的特征是**按下到松开很快**（100 ms 量级），拖拽是按住再移动；
+/// 而真正的甩手拖拽位移很大，不该被时长门槛挡住。
+fn drag_ready(distance_sq: f32, held: std::time::Duration) -> bool {
+    use crate::sys::dnd::{DRAG_FAST_DISTANCE, DRAG_MIN_HOLD_MS, DRAG_THRESHOLD};
+    let beyond = distance_sq > DRAG_THRESHOLD * DRAG_THRESHOLD;
+    let far = distance_sq >= DRAG_FAST_DISTANCE * DRAG_FAST_DISTANCE;
+    beyond && (held.as_millis() >= DRAG_MIN_HOLD_MS || far)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4503,14 +4556,38 @@ mod tests {
         let paths = vec![PathBuf::from("C:\\a.txt")];
         let dp = Some((0.0f32, 0.0f32, paths.clone()));
 
-        // 首次微小移动（1px）：未越过 4px 阈值，不应触发，且手势保留。
+        // 微小移动（1px）：未越过阈值，不应触发，且手势保留。
         assert!(drag_gesture_paths(&dp, 1.0, 1.0).is_none());
         assert!(dp.is_some(), "手势不应被微小移动清空");
 
-        // 第二次累计到 5px：越过阈值，触发并返回路径。
-        let fired = drag_gesture_paths(&dp, 3.0, 4.0);
+        // 真机上「点一下就拖出去」那次实测位移是 dx=-4.0 dy=1.3：手点鼠标的
+        // 自然抖动，必须不触发拖放。
+        assert!(drag_gesture_paths(&dp, -4.0, 1.3).is_none());
+
+        // 累计到 5px：仍在阈值内（8px），不触发。
+        assert!(drag_gesture_paths(&dp, 3.0, 4.0).is_none());
+
+        // 越过阈值（10px）：触发并返回路径。
+        let fired = drag_gesture_paths(&dp, 6.0, 8.0);
         assert!(fired.is_some());
         assert_eq!(fired.unwrap(), paths);
+    }
+
+    /// 点击不是拖拽：位移刚过阈值时，只有「按住够久」或「位移很大」才成立。
+    #[test]
+    fn drag_ready_needs_hold_or_big_move() {
+        use std::time::Duration;
+        // 8px 阈值刚过一点（真机日志里点击时的 4~9 像素滑行）。
+        let small = 9.0f32 * 9.0;
+        assert!(!drag_ready(small, Duration::from_millis(20)));
+        assert!(!drag_ready(small, Duration::from_millis(110)), "普通点击不该拖");
+        assert!(drag_ready(small, Duration::from_millis(200)), "按住后才算拖");
+        // 甩手拖拽：距离够大就不等按住时长。
+        let big = 30.0f32 * 30.0;
+        assert!(drag_ready(big, Duration::from_millis(20)));
+        // 位移不够，按多久都不拖。
+        let tiny = 4.0f32 * 4.0;
+        assert!(!drag_ready(tiny, Duration::from_secs(5)));
     }
 
     #[test]
@@ -5495,20 +5572,19 @@ impl App {
         if jump_query_active() {
             return;
         }
+        // 正在构建：这时候卸载没有意义（构建完马上就要用它），还会让看板在
+        // 「正在构建」和「未加载」之间来回跳，用户看到的就是状态乱闪。
+        if crate::search::index::is_building() {
+            return;
+        }
         // 从没被用过（比如只是打开了索引设置页）→ 立刻可卸。
         let idle = crate::search::index::idle_for().unwrap_or(Duration::from_secs(u64::MAX / 2));
         if idle < Duration::from_secs(INDEX_UNLOAD_IDLE_MINS * 60) {
             return;
         }
-        // 正在看「搜索与索引」看板：那里显示的就是真实占用，别让它突然变 0。
-        let on_search_settings = {
-            let tab = self.state.active();
-            tab.kind == crate::state::TabKind::Settings
-                && tab.settings_subpage == crate::state::SettingsSubpage::SearchAndIndex
-        };
-        if on_search_settings {
-            return;
-        }
+        // 看板不再拦着卸载：它显示的是「缓存里有多少条 / 上次什么时候建」，
+        // 没在内存里也能照实报（见 `sync_search_stats`）。为了看一眼数字就把
+        // 几十兆索引钉在内存里，不划算。
         crate::search::index::unload();
     }
 
@@ -10049,6 +10125,23 @@ impl App {
         self.set_status_job(text);
     }
 
+    /// 40ms 轮询采样一次光标位置，维护「手是不是正在滑」。
+    ///
+    /// 拖放判定必须知道这件事：触控板用户「点着滑」（tap-click 时指针还在移动）
+    /// 和鼠标滑行中点击，位移都会迅速超过阈值，光看距离必然误判成拖拽。
+    fn sample_cursor_motion(&mut self) {
+        let scale = self.ui.window().scale_factor() as f32;
+        let Some((x, y)) = cursor_pos_logical(scale) else {
+            return;
+        };
+        if let Some((px, py)) = self.cursor_prev_pos {
+            if (x - px).abs() > CURSOR_MOVE_EPSILON || (y - py).abs() > CURSOR_MOVE_EPSILON {
+                self.cursor_last_move_ms = uptime_ms();
+            }
+        }
+        self.cursor_prev_pos = Some((x, y));
+    }
+
     /// 菜单健康检查：看门狗。
     ///
     /// 必须在 UI 线程的周期回调里（40ms 心跳）。菜单跑在子进程里，所以这里
@@ -10147,34 +10240,71 @@ impl App {
         });
         let (is_ready, entry_count, built_at, heap_bytes) = snapshot.unwrap_or((false, 0, None, 0));
 
-        self.ui.set_search_ready(is_ready);
-        let status_text = if is_ready {
-            self.tr("索引已就绪")
-        } else if crate::search::index::is_building() {
-            self.tr("正在构建索引...")
-        } else {
-            self.tr("索引未构建")
-        };
-        self.ui.set_search_status_text(status_text);
-        self.ui.set_search_items_count(format!("{entry_count}").into());
-        // 这张卡显示的是**索引文件大小**：索引现在是映射在磁盘上的定长记录，
-        // 真正驻留多少页由系统按需决定（远小于文件）。
-        let real_bytes = if heap_bytes > 0 {
-            heap_bytes as u64
-        } else {
-            (entry_count * INDEX_ENTRY_BYTES) as u64
-        };
-        self.ui.set_search_size_text(fs::format_size_bytes(real_bytes).into());
         let en = !i18n::is_chinese(&self.config.language);
-        let last_scan = if is_ready {
-            built_at
-                .map(|t| format_ago(t, en))
-                .unwrap_or_else(|| self.tr("刚刚").to_string())
-        } else if snapshot.is_some() {
-            self.tr("正在扫描...").to_string()
+        let building = crate::search::index::is_building();
+        // 索引没在内存里（从没建过 / 空闲释放了）：数字从**缓存文件头**里读。
+        // 看板只负责展示，不能为了显示漂亮就把几十兆索引映射进来，更不该因此
+        // 让空闲释放失效 —— 那时内存里没有映射，页面照样要说清「有多少条、
+        // 上次什么时候建的」。
+        let cache = if is_ready { None } else { crate::search::index::cache_meta() };
+
+        // 一个磁盘都没纳管：索引范围本来就是空的，别报成绿色「已就绪」。
+        let no_drives = SEARCH_NO_DRIVES.load(std::sync::atomic::Ordering::Relaxed);
+        // 「已释放」状态要用蓝色（正常）而不是警告橙：单独一个标志告诉界面。
+        let released = !no_drives && !is_ready && !building && cache.is_some();
+        self.ui.set_search_released(released);
+        self.ui.set_search_no_drives(no_drives);
+
+        let (status_text, count_text, size_bytes, last_scan) = if no_drives {
+            (
+                self.tr("未选择任何磁盘（索引为空）"),
+                0,
+                0,
+                self.tr("未记录").to_string(),
+            )
+        } else if is_ready {
+            (
+                self.tr("索引已就绪"),
+                entry_count,
+                if heap_bytes > 0 {
+                    heap_bytes as u64
+                } else {
+                    (entry_count * INDEX_ENTRY_BYTES) as u64
+                },
+                built_at
+                    .map(|t| format_ago(t, en))
+                    .unwrap_or_else(|| self.tr("刚刚").to_string()),
+            )
+        } else if building {
+            (
+                self.tr("正在构建索引..."),
+                entry_count,
+                (entry_count * INDEX_ENTRY_BYTES) as u64,
+                self.tr("正在扫描...").to_string(),
+            )
+        } else if let Some(meta) = cache {
+            (
+                self.tr("索引未加载（空闲时已让出内存）"),
+                meta.count,
+                meta.bytes,
+                meta.built_at
+                    .map(|t| format_ago(t, en))
+                    .unwrap_or_else(|| self.tr("未记录").to_string()),
+            )
         } else {
-            self.tr("未记录").to_string()
+            (
+                self.tr("索引未构建"),
+                0,
+                0,
+                self.tr("未记录").to_string(),
+            )
         };
+        self.ui.set_search_ready(is_ready);
+        self.ui.set_search_status_text(status_text);
+        self.ui.set_search_items_count(format!("{count_text}").into());
+        // 这张卡显示的是**索引文件大小**：索引映射在磁盘上的定长记录，
+        // 真正驻留多少页由系统按需决定（远小于文件）。
+        self.ui.set_search_size_text(fs::format_size_bytes(size_bytes).into());
         self.ui.set_search_last_scan_time(last_scan.into());
 
         if !with_drives {
@@ -10207,6 +10337,7 @@ impl App {
                 is_ssd,
             });
         }
+        SEARCH_NO_DRIVES.store(enabled_count == 0, std::sync::atomic::Ordering::Relaxed);
         self.ui.set_search_drives_count(enabled_count);
         self.ui.set_search_drives(ModelRc::new(VecModel::from(drive_items)));
 
@@ -12902,10 +13033,13 @@ impl App {
                     let mut app = app.borrow_mut();
                     if is_dir {
                         app.navigate_active(Some(path));
-                    } else if let Err(e) = crate::sys::shell::shell_open(&path) {
-                        crate::logal!("!! open {:?} failed: {}", path, e);
-                        let msg = app.trf("打开失败：{}", &[e.to_string()]);
-                        app.set_status_job(msg);
+                    } else {
+                        note_external_open();
+                        if let Err(e) = crate::sys::shell::shell_open(&path) {
+                            crate::logal!("!! open {:?} failed: {}", path, e);
+                            let msg = app.trf("打开失败：{}", &[e.to_string()]);
+                            app.set_status_job(msg);
+                        }
                     }
                 });
             });
@@ -12914,9 +13048,13 @@ impl App {
         let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
         if is_dir {
             self.navigate_active(Some(path.to_path_buf()));
-        } else if let Err(e) = crate::sys::shell::shell_open(path) {
-            crate::logal!("!! open {:?} failed: {}", path, e);
-            self.set_status_job(self.trf("打开失败：{}", &[e.to_string()]));
+        } else {
+            // 打开外部程序前后的失焦/获焦是正常流程，别让抖动看门狗报成异常。
+            note_external_open();
+            if let Err(e) = crate::sys::shell::shell_open(path) {
+                crate::logal!("!! open {:?} failed: {}", path, e);
+                self.set_status_job(self.trf("打开失败：{}", &[e.to_string()]));
+            }
         }
     }
 
@@ -13937,6 +14075,36 @@ fn async_key_down(_vk: i32) -> bool {
     false
 }
 
+/// 当前光标的**屏幕**位置，换算成界面逻辑坐标。
+///
+/// 拖出手势必须用它、不能用 Slint 给的 `x, y`：那是**行元素内**的局部坐标，
+/// 行一旦因为列表补丁 / 滚动 / 重排挪了位置，同一个指针位置算出来的局部
+/// 坐标就差出好几个像素 —— 一次「点击」就会被判成位移超阈值，凭空拖出文件
+/// （双击打开文件后回来点击触发拖动就是这么来的）。
+fn cursor_pos_logical(scale: f32) -> Option<(f32, f32)> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::POINT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos;
+        let mut point = POINT { x: 0, y: 0 };
+        if unsafe { GetCursorPos(&mut point) } == 0 {
+            return None;
+        }
+        let scale = if scale > 0.1 { scale } else { 1.0 };
+        return Some((point.x as f32 / scale, point.y as f32 / scale));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = scale;
+        None
+    }
+}
+
+/// 点击 / 拖拽判定：光标 120ms 内被看到动过，就认为「现在手在滑」。
+const CURSOR_MOVING_MS: u64 = 120;
+/// 判定「动了」的最小位移（逻辑像素）：小于它是采样噪声 / 手抖。
+const CURSOR_MOVE_EPSILON: f32 = 2.0;
+
 /// 进程级时间基准（毫秒计数用）。
 fn uptime_ms() -> u64 {
     static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -13979,6 +14147,8 @@ fn foreign_foreground_within(ms: u64) -> bool {
     last != 0 && uptime_ms().saturating_sub(last) <= ms
 }
 
+/// 物理左键（`GetAsyncKeyState` 用）。
+const VK_LBUTTON: i32 = 0x01;
 const VK_SHIFT: i32 = 0x10;
 const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
@@ -13991,7 +14161,25 @@ impl App {
         match event.kind {
             PointerEventKind::Up | PointerEventKind::Cancel => {
                 self.drag_pending = None;
+                self.drag_armed_at = None;
                 self.ui.invoke_set_drag_armed(false);
+                // 双击的激活在这一刻执行（见按下处：按下就打开会把「松开」弄丢）。
+                if let Some((pending_index, pending_path)) = self.pending_activate.take() {
+                    if event.kind == PointerEventKind::Up {
+                        let still_same = self
+                            .state
+                            .active()
+                            .active()
+                            .display_entry(pending_index)
+                            .is_some_and(|e| e.path == pending_path);
+                        if still_same {
+                            logv!("[act] 抬手执行双击激活 idx={pending_index}");
+                            self.activate_row(pending_index);
+                        } else {
+                            logv!("[act] 双击激活取消：行已不是原来那一条");
+                        }
+                    }
+                }
                 // 多选下按在已选中行、但全程没拖动：此刻才塌缩成该行单选。
                 // 若已发起拖出，pending 会在 Move 分支被清掉，这里不再改动选择集
                 // （批量拖放后保持多选是符合资源管理器语义的）。
@@ -14008,11 +14196,58 @@ impl App {
                 logv!("[drag] armed=false (up/cancel)");
             }
             PointerEventKind::Move => {
+                // 物理左键没按着就不可能有拖拽：焦点被别的程序拿走时（比如双击
+                // 打开文件）那一次「松开」我们收不到，`drag_pending` 会一直挂着。
+                // 兜底清掉，免得回到窗口随便动一下鼠标就凭空拖出文件。
+                if self.drag_pending.is_some() && !async_key_down(VK_LBUTTON) {
+                    self.drag_pending = None;
+                    self.drag_armed_at = None;
+                    self.ui.invoke_set_drag_armed(false);
+                    logv!("[drag] 左键其实已经松开，作废待定手势");
+                    return;
+                }
                 // 仅当位移越过阈值才取走待定手势并启动拖出；否则保留，
                 // 否则首次微小移动就会清空 drag_pending 导致永远拖不出（见 #2 缺陷）。
-                if let Some(paths) = drag_gesture_paths(&self.drag_pending, x, y) {
+                // 同样用屏幕坐标：两次采样同一把尺子，行重排不会伪造出位移。
+                let scale = self.ui.window().scale_factor() as f32;
+                let (gx, gy) = cursor_pos_logical(scale).unwrap_or((x, y));
+                // 按下时手还在滑：这次手势只能是点击（见按下处的 drag_glide）。
+                if self.drag_glide {
+                    return;
+                }
+                let held = self
+                    .drag_armed_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or(std::time::Duration::from_secs(3600));
+                let distance_sq = self
+                    .drag_pending
+                    .as_ref()
+                    .map(|(sx, sy, _)| {
+                        let dx = gx - *sx;
+                        let dy = gy - *sy;
+                        dx * dx + dy * dy
+                    })
+                    .unwrap_or(0.0);
+                if !drag_ready(distance_sq, held) {
+                    return;
+                }
+                if let Some(paths) = drag_gesture_paths(&self.drag_pending, gx, gy) {
+                    // 一行收尾：真机再出现「点击就拖动」时，这行能区分
+                    // 「手真的动了」和「坐标被重排带歪」。（逐帧打印会刷屏，
+                    // 只在真的要开始拖拽时记。）
+                    if let Some((sx, sy, _)) = self.drag_pending.as_ref() {
+                        logv!(
+                            "[drag] 开始拖拽 dx={:.1} dy={:.1} 按住={}ms first={:?}",
+                            gx - *sx,
+                            gy - *sy,
+                            self.drag_armed_at
+                                .map(|t| t.elapsed().as_millis())
+                                .unwrap_or(0),
+                            paths.first()
+                        );
+                    }
                     self.drag_pending = None;
-                    // 已经真正开始拖出：不要再塌缩选择集，也不要事后弹重命名。
+                    // 已经真正开始拖出：不要再塌缩选择集，也不要事后重命名。
                     self.pending_single_click = None;
                     self.cancel_rename_defer();
                     self.ui.invoke_set_drag_armed(false);
@@ -14073,6 +14308,36 @@ impl App {
                 self.pending_row_menu = Some(target);
             }
             PointerEventButton::Left => {
+                // 坐标自检（只在详细信息视图做：那里行固定 1 格高、上面有 30px 表头）。
+                //
+                // Slint 传进来的是**视口 Y**（行号 × 行高 + 行内偏移 + 滚动 + 表头），
+                // 所以拿它和「这一行本该覆盖的范围」比。差出两行以上，说明这一下
+                // 其实按在空白处，只是 Slint 的指针捕获还粘在旧行上 —— 双击打开文件
+                // 时那一次「松开」被外部程序吃掉就会出现这种局面：回到窗口在空白处
+                // 框选，事件却全派给那一行，于是拖出了刚打开的文件。
+                if self.pane_view_mode(self.state.active().active_pane) == "details" {
+                    let (_, _, row_h, _) = self.view_metrics_for(self.state.active().active_pane);
+                    let scroll = self.state.active().active().scroll_y;
+                    let top = index as f32 * row_h + 30.0 - scroll;
+                    if row_h > 1.0 && (y < top - row_h * 2.0 || y > top + row_h * 3.0) {
+                        // 这是自愈路径（丢弃一次被误路由的按下），不是故障：
+                        // 降到 L1、去掉 `!!`，别在默认日志里刷红字。
+                        logln!(
+                            "[select] 行按下被误路由 idx={} y={:.1} 期望 {:.1}~{:.1} → 丢弃",
+                            index,
+                            y,
+                            top,
+                            top + row_h
+                        );
+                        self.drag_pending = None;
+                        self.drag_armed_at = None;
+                        self.drag_glide = false;
+                        self.ui.invoke_set_drag_armed(false);
+                        self.last_click = None;
+                        self.pending_row_menu = None;
+                        return;
+                    }
+                }
                 self.pending_row_menu = None;
                 // 这一下是不是「同一行的连续第二次按下」（见 `last_left_press_row`）。
                 let second_press_on_row =
@@ -14086,10 +14351,20 @@ impl App {
                 if self.last_click.as_ref().is_some_and(|(p, t)| {
                     *p == path && t.elapsed().as_millis() < effective_double_click_ms() as u128
                 }) {
-                    // 第二次按下 = 双击 → 打开（并撤掉可能已挂起的延迟改名）。
+                    // 第二次按下 = 双击（并撤掉可能已挂起的延迟改名）。
+                    //
+                    // 打开动作**推迟到抬手**（和行内右键菜单同一个做法）：在按下时
+                    // 就打开文件会把焦点交给外部程序，随后那一次「松开」Rove 收不到，
+                    // Slint 记下的「这一下落在哪个元素上」就永远清不掉 —— 之后无论
+                    // 点哪里（包括空白处框选）事件都被派给这一行，表现就是「拖出了
+                    // 上次打开的文件」。等 Up 到了再开，指针状态由 Slint 正常收尾。
                     self.last_click = None;
                     self.cancel_rename_defer();
-                    self.activate_row(index);
+                    self.pending_activate = Some((index, path.clone()));
+                    self.drag_pending = None;
+                    self.drag_armed_at = None;
+                    self.drag_glide = false;
+                    self.ui.invoke_set_drag_armed(false);
                     return;
                 }
                 self.last_click = Some((path.clone(), now));
@@ -14113,7 +14388,18 @@ impl App {
                 if !(self.state.active().active().path.is_some()
                     && !self.ui.get_rename_path().is_empty())
                 {
-                    self.drag_pending = Some((x, y, drag_paths));
+                    // 记**屏幕**坐标（行局部坐标会随重排/滚动漂移，见 cursor_pos_logical）。
+                    let scale = self.ui.window().scale_factor() as f32;
+                    let (gx, gy) = cursor_pos_logical(scale).unwrap_or((x, y));
+                    self.drag_pending = Some((gx, gy, drag_paths));
+                    self.drag_armed_at = Some(std::time::Instant::now());
+                    // 按下那一刻光标还在滑（触控板「点着滑」/ 鼠标滑行中点击）：
+                    // 这一下是点击，不是拖拽。真拖拽一定是「停住 → 按住 → 再动」。
+                    self.drag_glide =
+                        uptime_ms().saturating_sub(self.cursor_last_move_ms) <= CURSOR_MOVING_MS;
+                    if self.drag_glide {
+                        logv!("[drag] 按下时光标还在移动 → 按点击处理（不拖出）");
+                    }
                     self.ui.invoke_set_drag_armed(true);
                     logv!("[drag] armed=true for row {}", index);
                 }
@@ -14151,8 +14437,10 @@ impl App {
                 }
                 let tab = self.state.active_mut().active_mut();
                 logv!(
-                    "[select] row down index={} ctrl={} shift={} anchor={:?} selected={}",
+                    "[select] row down index={} x={:.1} y={:.1} ctrl={} shift={} anchor={:?} selected={}",
                     index,
+                    x,
+                    y,
                     ctrl,
                     shift,
                     tab.anchor.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string()),
@@ -14552,7 +14840,27 @@ impl App {
         // 左键抬手：判「双击空白 = 回上一级」。只在这里判，是因为空白层在
         // Slint 侧被 pointer-event 全接管了，`double-clicked` 不会触发。
         if event.kind == PointerEventKind::Up && event.button == PointerEventButton::Left {
+            // 双击的激活挂在抬手（见 `row_pointer_event`）：那一下「松开」偶尔会
+            // 落到空白层而不是行上，这里也接住，别让双击白点一次。
+            if let Some((pending_index, pending_path)) = self.pending_activate.take() {
+                let still_same = self
+                    .state
+                    .active()
+                    .active()
+                    .display_entry(pending_index)
+                    .is_some_and(|e| e.path == pending_path);
+                if still_same {
+                    logv!("[act] 空白层抬手执行双击激活 idx={pending_index}");
+                    self.activate_row(pending_index);
+                    return;
+                }
+            }
             self.on_blank_click(x, y);
+            return;
+        }
+        if event.kind == PointerEventKind::Cancel {
+            // 手势被系统取消（例如触控板手势转成滚动）：待激活的双击一并作废。
+            self.pending_activate = None;
             return;
         }
         if event.kind != PointerEventKind::Down {
@@ -14873,6 +15181,11 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
         if app.tab_drag.is_some() && !app.ui.get_mouse_left_pressed() {
             app.cancel_tab_drag("poll");
         }
+    }
+
+    // 光标是否正在移动（拖放判定要区分「点着滑」与「按住拖」）。
+    if let Ok(mut app) = app.try_borrow_mut() {
+        app.sample_cursor_motion();
     }
 
     // 读失败的目录（网络共享慎一下）自动重试，同样搭这趟 40ms 轮询。
@@ -15322,7 +15635,12 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
             {
                 use std::sync::atomic::Ordering;
                 let now = now_ms();
-                if crate::sys::menu::recently_active(1_500) {
+                if now.saturating_sub(EXTERNAL_OPEN_MS.load(Ordering::Relaxed)) <= 3_000 {
+                    // 刚由我们自己拉起外部程序（双击/回车打开文件）：这一串
+                    // 失焦/获焦是正常流程，清零重来，不报。
+                    FOCUS_WINDOW_MS.store(now, Ordering::Relaxed);
+                    FOCUS_COUNT.store(0, Ordering::Relaxed);
+                } else if crate::sys::menu::recently_active(1_500) {
                     // 原生菜单刚抢过 / 还过前台：这时的失焦/获焦是用户右键了，
                     // 不是窗口在抖，重新起窗别算进来。
                     FOCUS_WINDOW_MS.store(now, Ordering::Relaxed);
@@ -15371,6 +15689,21 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                     app.ui.set_mouse_left_pressed(false);
                     // 同一原因：标签拖拽也收不到那一次 `up`，状态得一并清掉。
                     app.cancel_tab_drag("blur");
+                    // 拖出文件的手势同理：按下时已登记好待拖路径，`up` 落在别的
+                    // 窗口就永远等不到。不清掉的话，回到窗口随便移动一下鼠标就
+                    // 会凭空拖出文件（双击打开文件后回来点击就触发拖动）。
+                    app.drag_pending = None;
+                    app.drag_armed_at = None;
+                    app.drag_glide = false;
+                    // 待激活的双击同理：抬手收不到就一直挂着，之后任何一次抬手
+                    // 都会去打开那个早已过去的文件。
+                    app.pending_activate = None;
+                    app.ui.invoke_set_drag_armed(false);
+                    // Slint 的指针捕获也可能粘住（那一次「松开」被别的程序吃了）：
+                    // 补一条合成的 up 放掉它，否则回来后点空白处的事件仍被派给
+                    // 旧的那一行 —— 既框选不了，又会拖出旧文件。
+                    #[cfg(windows)]
+                    reset_pointer_press(&app.ui);
                 }
             }
             return EventResult::Propagate;
@@ -16665,10 +16998,9 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 _ => crate::state::SettingsSubpage::General,
             };
             app.state.active_mut().settings_subpage = subpage;
-            if subpage == crate::state::SettingsSubpage::SearchAndIndex {
-                // 看板要显示真实条目数：进这个子页才把索引加载起来（后台线程）。
-                crate::search::index::warm_up_async();
-            }
+            // 注意：进「搜索与索引」**不**加载索引。那里的数字来自缓存文件头
+            // （`index::cache_meta`），看一眼统计不该占几十兆内存；真正要用索引
+            // 的是全盘搜索和吸附窗，它们各自会触发加载。
             app.sync_settings();
             app.sync_tabs(); // 修复核心：点击后立即刷新标签栏标题，无需切标签！
         });
@@ -16699,7 +17031,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 app.config.search_excluded_drives.push(letter);
             }
             app.config.save();
-            reindex_if_active();
+            reindex_if_active(true);
             app.sync_settings();
         });
     }
@@ -16717,7 +17049,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                             // 头插：新加的排在最左侧，避免被横向滚动条遮挡
                             app.config.search_excluded_paths.insert(0, folder);
                             app.config.save();
-                            reindex_if_active();
+                            reindex_if_active(false);
                             app.sync_settings();
                         }
                     });
@@ -16740,7 +17072,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
                 // 头插：新加的排在最左侧
                 app.config.search_excluded_paths.insert(0, text);
                 app.config.save();
-                reindex_if_active();
+                reindex_if_active(false);
                 app.sync_settings();
             }
             // 添加后清空输入框。
@@ -16756,7 +17088,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             if !app.config.search_excluded_paths.is_empty() {
                 app.config.search_excluded_paths.clear();
                 app.config.save();
-                reindex_if_active();
+                reindex_if_active(false);
                 app.sync_settings();
             }
         });
@@ -16769,7 +17101,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             let p_str = path.to_string();
             app.config.search_excluded_paths.retain(|p| p != &p_str);
             app.config.save();
-            reindex_if_active();
+            reindex_if_active(false);
             app.sync_settings();
         });
     }
