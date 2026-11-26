@@ -1945,7 +1945,13 @@ impl App {
             self.list_retry = None;
             // 「读成功但一条都没有」也要留证据：如果下次出现的空白不属于读失败，
             // 这一行就能证明它是一份空结果，指向另一条 bug 路径。
-            if raw_count == 0 && pane.path.is_some() {
+            //
+            // 回收站除外：清空之后它就是空的，这是**正常结果**，不是异常。
+            // 以前不分视图一律按异常记，每清空一次回收站就多一条 `!!`，
+            // 把真正的异常淹掉了。
+            let is_recycle = pane.path.as_deref()
+                == Some(crate::fs::drives::recycle_virtual_path().as_path());
+            if raw_count == 0 && pane.path.is_some() && !is_recycle {
                 logal!(
                     "!! [list] empty result: tab={} pane={} path={:?} raw={}",
                     result.tab_id,
