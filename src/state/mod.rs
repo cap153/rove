@@ -72,6 +72,11 @@ pub struct PaneState {
     /// 过滤后可见条目在 entries 中的下标。
     pub display: Vec<usize>,
     pub sort: SortState,
+    /// 本窗格使用的视图模式（details / list / icons-*）。
+    ///
+    /// 「独立视图和排序」打开后每栏各记各的（同一路径的两栏也可以不同）；
+    /// 关掉时全部分栏统一取 `config.view_mode`。
+    pub view_mode: String,
     pub filter: String,
     /// 类型筛选（表头「类型」右侧的小箭头下拉）：空 = 不过滤。
     /// 元素是类型键 —— 目录统一为 `"dir"`，文件是小写扩展名（无扩展名为 `"noext"`）。
@@ -166,6 +171,7 @@ impl PaneState {
             entries: Vec::new(),
             display: Vec::new(),
             sort, // 核心修改：使用传入的排序状态
+            view_mode: "details".to_string(),
             filter: String::new(),
             type_filter: Vec::new(),
             history_types: vec![Vec::new()],

@@ -214,6 +214,12 @@ pub struct Config {
     ///
     /// 改了要重启才生效（渲染后端在创建窗口之前就定下了）。
     pub hardware_renderer: bool,
+
+    /// 「独立视图和排序」：每个文件夹各记自己的视图 + 排序，左右分屏互不影响。
+    ///
+    /// 关掉时回到全局设置（各视图一套）。每路径的数据单独存
+    /// `%APPDATA%\Rove\views.json`，关掉开关不会清空。
+    pub independent_view: bool,
 }
 
 /// 当前默认隐藏项的补种代次（与 `Config::load` 里的补齐逻辑对应）。
@@ -397,6 +403,7 @@ impl Default for Config {
             archive_tool: "winrar".into(),
             system_menu: false,
             hardware_renderer: true,
+            independent_view: false,
         }
     }
 }
@@ -660,6 +667,9 @@ impl Config {
         if let Some(hr) = json.get("hardware_renderer").and_then(|v| v.as_bool()) {
             config.hardware_renderer = hr;
         }
+        if let Some(iv) = json.get("independent_view").and_then(|v| v.as_bool()) {
+            config.independent_view = iv;
+        }
 
         if let Some(arr) = json.get("context_menu_hide").and_then(|v| v.as_array()) {
             config.context_menu_hide = arr
@@ -921,6 +931,7 @@ impl Config {
             "archive_tool": self.archive_tool,
             // 硬件渲染开关（关 = 软件渲染），下次启动才生效。
             "hardware_renderer": self.hardware_renderer,
+            "independent_view": self.independent_view,
         })
     }
 
@@ -982,6 +993,16 @@ mod tests {
         for key in ["show_network", "show_explorer_net", "show_quick", "show_recent"] {
             assert_eq!(json[key], serde_json::json!(true), "{key} 没写进 config");
         }
+    }
+
+    /// 独立视图和排序：缺省关闭，配置要能往返。
+    #[test]
+    fn independent_view_defaults_off() {
+        assert!(!Config::default().independent_view);
+        assert_eq!(Config::default().save_json()["independent_view"], false);
+        let mut c = Config::default();
+        c.independent_view = true;
+        assert_eq!(c.save_json()["independent_view"], true);
     }
 
     /// 硬件渲染：缺省开启（GPU）；关掉走软件渲染，配置要能往返。

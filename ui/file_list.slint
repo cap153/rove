@@ -326,9 +326,13 @@ export component FileList inherits Rectangle {
     /// 名称行 18px、路径行 14px，合计 32px，上下各留 (row-h - 32) / 2。
     /// 这样文字块的中心正好落在行中心，图标（整行居中）也在同一条线上。
     private property <length> path-block-top: max(0px, (root.row-h - 32px) / 2);
-    /// 行高：details 30 / list 24 / icons = cell-h（详细/列表要再加一行路径）。
+    /// 行高：details 30 / list 30 / icons = cell-h（详细/列表要再加一行路径）。
+    ///
+    /// 列表视图原来是 24px，比详细信息紧 6px，每项上下几乎没有余量；现在与详细
+    /// 信息一样高。**但挂了路径行的列表视图保持原样**（24 + 16 = 40px），
+    /// 那套「名称 + 路径」整体居中的排版已经定稿，不要跟着变。
     private property <length> view-row-h: root.view-mode == "details" ? 30px + root.path-line-h
-        : root.view-mode == "list" ? 24px + root.path-line-h
+        : root.view-mode == "list" ? (root.path-line-h > 0px ? 24px + root.path-line-h : 30px)
         : root.cell-h;
     /// 格子 AABB 宽度（可点击 / 高亮区），与下方 Repeater 的 width 一致。
     private property <length> item-w: root.cell-w - 8px;

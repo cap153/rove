@@ -32,6 +32,7 @@ use crate::ops::{
     self, clipboard, jobs::{JobKind, JobManager, JobSummary, status_text},
 };
 use crate::state::AppState;
+use crate::views::ViewPref;
 
 slint::include_modules!();
 #[path = "i18n.rs"]
@@ -838,6 +839,9 @@ fn global_dir_sizes() -> &'static Mutex<DirSizeStore> {
 /// 悬停项索引, 悬停框宽, 悬停行哈希)。
 type ExpandSig = (i32, u32, u64, u64, i32, u32, u64);
 
+/// 「独立视图和排序」打开后，没记过的目录默认用哪种视图。
+const DEFAULT_VIEW: &str = "details";
+
 /// 面板所在的「视图种类」：决定它用哪一套排序状态。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ViewSort {
@@ -1008,6 +1012,8 @@ pub struct App {
     mtime_probe_rx: std::sync::mpsc::Receiver<Vec<DirMtimeProbe>>,
     /// 已有一轮探测在跑：1 秒定时器到点时直接跳过，不排队。
     mtime_probe_busy: bool,
+    /// 每个文件夹自己的视图/排序记忆（「独立视图和排序」打开时才用）。
+    view_mem: crate::views::ViewMemory,
     /// 修改时间文本的记忆表（`SystemTime` → "yyyy-MM-dd HH:mm"）。
     ///
     /// `fs::format_time` 每次都要走一遍 Win32 的 `SystemTimeToTzSpecificLocalTime`，
@@ -1278,7 +1284,7 @@ pub struct App {
     /// 启动首帧布局未完成时这几个值还不可用（list_height=0 / cells_per_row=1），
     /// 此时算出的可见窗口偏小，必须等布局落定后重算一次，否则只渲染前几行
     /// （表现为「此电脑」部分盘符空白，直到切标签/重开窗口才恢复）。
-    list_geom: (f32, usize, f32, bool, f32, f32),
+    list_geom: (f32, usize, f32, bool, f32, f32, usize, f32),
     /// actions.toml 驱动的右键动作（内置动作开关 + 自定义）。
     actions: Vec<crate::ops::actions::ActionEntry>,
     /// 缩略图 LRU 缓存（Key 包含 mtime/size，防止旧图）。
@@ -1407,7 +1413,12 @@ impl App {
         };
         // 拼音缓存的后台通道：只有"有搜索词且缓存还没算好"时才用得上。
         let (pinyin_tx, pinyin_rx) = mpsc::channel();
-        let state = AppState::new(None, sort);
+        let mut state = AppState::new(None, sort);
+        for tab in &mut state.tabs {
+            for pane in &mut tab.panes {
+                pane.view_mode = config.view_mode.clone();
+            }
+        }
         let keymap = crate::ops::keymap::Keymap::new(&config.shortcuts);
         let (path_probe_tx, path_probe_rx) = mpsc::channel::<PathProbe>();
         let (sidebar_probe_tx, sidebar_probe_req_rx) = mpsc::channel::<()>();
@@ -1437,6 +1448,7 @@ impl App {
             mtime_probe_tx,
             mtime_probe_rx,
             mtime_probe_busy: false,
+            view_mem: crate::views::ViewMemory::load(),
             time_text_memo: std::collections::HashMap::new(),
             pending_search: None,
             type_filter_pane: None,
@@ -1513,7 +1525,7 @@ impl App {
             size_sort_pending: false,
             undo: crate::ops::undo::UndoStack::new(),
             last_scroll: None,
-            list_geom: (-1.0, 0, -1.0, false, -1.0, -1.0),
+            list_geom: (-1.0, 0, -1.0, false, -1.0, -1.0, 0, -1.0),
             recording_shortcut: None,
             path_probe_tx,
             path_probe_rx,
@@ -1714,8 +1726,9 @@ impl App {
     fn reload_active(&mut self) {
         // 列举请求会带上 pane.sort：新建标签 / 添加网络位置 / 切换到设置页再回来这类
         // 不经过 navigate 的路径，pane.sort 可能是从上一个视图（比如此电脑的盘符）
-        // 继承来的，直接发出去会用错排序。这里统一对齐到当前视图自己的状态。
-        self.sync_view_sort();
+        // 继承来的，直接发出去会用错排序。这里把**这一栏**对齐到自己的状态；
+        // 另一栏不碰（同路径两栏可以各是各的视图/排序）。
+        self.align_active_pane();
         let tab_index = self.state.active_tab;
         let Some(tab) = self.state.tabs.get(tab_index) else {
             return;
@@ -2337,7 +2350,7 @@ impl App {
             .set_filter_from_search(text);
         let clearing = text.trim().is_empty();
         // 排序状态跟着视图走：搜索态与回收站共用一套，清空搜索回到该视图自己那套。
-        self.sync_view_sort();
+        self.align_active_pane();
         // 「此电脑」视图：搜索框 = 全局拼音秒搜（Phase 5 索引）。
         if is_root {
             let query = text.trim().to_string();
@@ -4934,7 +4947,8 @@ impl App {
             "icons-large",
             "icons-xl",
         ];
-        let Some(cur) = ORDER.iter().position(|m| *m == self.config.view_mode) else {
+        let current = self.active_view_mode();
+        let Some(cur) = ORDER.iter().position(|m| *m == current.as_str()) else {
             return;
         };
         let next = if up {
@@ -4947,8 +4961,23 @@ impl App {
         }
     }
 
+    /// 某一栏当前的视图模式。分屏时左右两栏可以不同（见 `PaneState::view_mode`）。
+    fn pane_view_mode(&self, pane: usize) -> String {
+        let tab = self.state.active();
+        tab.panes
+            .get(pane)
+            .or_else(|| tab.panes.first())
+            .map(|p| p.view_mode.clone())
+            .unwrap_or_else(|| "details".to_string())
+    }
+
+    /// 当前聚焦那一栏的视图模式。
+    fn active_view_mode(&self) -> String {
+        self.pane_view_mode(self.state.active().active_pane)
+    }
+
     fn set_view_mode(&mut self, mode: &str) {
-        if self.config.view_mode == mode {
+        if self.active_view_mode() == mode {
             return;
         }
 
@@ -4964,12 +4993,166 @@ impl App {
         // 2. 记录到待定状态，交给 refresh_visible_rows 去换算成新像素位置。
         self.pending_scroll_index = Some(first_index);
 
-        // 3. 更新视图配置（注意：不再这里清 scroll_y / 滚到顶部）
-        self.config.view_mode = mode.to_string();
-        self.config.save();
+        // 3. 更新视图（注意：不再这里清 scroll_y / 滚到顶部）
+        self.apply_view_mode(mode);
+        // 切视图后格子布局全变，旧的悬停浮层不能再指下去。
+        self.ui.invoke_clear_path_tip(0);
+        self.ui.invoke_clear_path_tip(1);
+        self.visible_cache = None;
+        self.visible_cache_right = None;
+        self.sync_file_list();
+    }
+
+    /// 把每一栏的视图模式推给 Slint（分屏时左右可以不同）。
+    fn push_view_modes(&self) {
+        self.ui
+            .set_view_mode(self.pane_view_mode(0).into());
+        let right = if self.state.active().is_split {
+            self.pane_view_mode(1)
+        } else {
+            self.pane_view_mode(0)
+        };
+        self.ui.set_view_mode_right(right.into());
+    }
+
+    /// 当前聚焦那一栏在记忆里对应的键（此电脑 / 回收站各有伪键）。
+    fn active_memory_key(&self) -> Option<String> {
+        // 设置页的窗格没有真实路径，它的 path 是 None —— 不挡住就会被当成
+        // 「此电脑」，把 `::thispc` 的记忆冲掉。
+        if self.state.active().kind != crate::state::TabKind::Explorer {
+            return None;
+        }
+        let pane = self.state.active().active();
+        if !pane.filter.is_empty() {
+            // 搜索态：排序是全局的（回收站那套），视图继承搜索前的目录 ——
+            // 没有"这个搜索结果的文件夹"可以写，所以不记。
+            return None;
+        }
+        match ViewSort::of(pane.path.as_deref()) {
+            ViewSort::ThisPc => Some(crate::views::KEY_THIS_PC.to_string()),
+            ViewSort::Recycle => Some(crate::views::KEY_RECYCLE.to_string()),
+            ViewSort::Normal => pane.path.as_deref().map(crate::views::path_key),
+        }
+    }
+
+    /// 把当前聚焦那一栏的视图 / 排序记到它所属的路径名下（独立模式才写）。
+    ///
+    /// `sort_changed` 只是用来决定"顺带把另一边也补上默认值"的语义：
+    /// 改视图时不覆盖已记的排序，反之亦然。
+    fn remember_pane(&mut self, sort_changed: bool) {
+        if !self.config.independent_view {
+            return;
+        }
+        let Some(key) = self.active_memory_key() else { return };
+        let pane = self.state.active().active();
+        let view = pane.view_mode.clone();
+        let sort_key = sort_key_id(pane.sort.key);
+        let ascending = pane.sort.ascending;
+        // 此电脑 / 回收站的排序仍是全局那两套，这里只记视图。
+        let sort_is_global = matches!(
+            ViewSort::of(pane.path.as_deref()),
+            ViewSort::ThisPc | ViewSort::Recycle
+        );
+        let base = ViewPref::new(DEFAULT_VIEW, "name", true);
+        if sort_changed && !sort_is_global {
+            if self
+                .view_mem
+                .set_sort(&key, sort_key, ascending, base.clone())
+            {
+                schedule_views_flush();
+            }
+        } else if !sort_changed {
+            if self.view_mem.set_view(&key, &view, base) {
+                schedule_views_flush();
+            }
+        }
+    }
+
+    /// 打开「独立视图和排序」的那一刻：把正在用的全局设置记到各路径名下，
+    /// 画面因此不跳；其它路径一律回到默认（详细信息 + 名称递增）。
+    ///
+    /// 必须遍历**所有浏览标签**：这个开关只能在设置页点，此刻活动标签是设置页，
+    /// 只种活动标签等于一个都没种，切回浏览页时画面会跳成默认视图。
+    fn seed_view_memory(&mut self) {
+        let global_sort = ViewPref::new(
+            &self.config.view_mode,
+            &self.config.sort_key,
+            self.config.sort_ascending,
+        );
+        let this_pc = ViewPref::new(
+            &self.config.view_mode,
+            &self.config.this_pc_sort_key,
+            self.config.this_pc_sort_ascending,
+        );
+        let recycle = ViewPref::new(
+            &self.config.view_mode,
+            &self.config.recycle_sort_key,
+            self.config.recycle_sort_ascending,
+        );
+        // 只种「正开着的标签里真的在显示」的那几个键：视图不跳是为它们服务的；
+        // 没有任何标签显示的目录（以及没在显示的此电脑 / 回收站）保留旧记忆，
+        // 不能因为开关被点了一下就把以前记好的东西冲掉。
+        let mut seeds: Vec<(String, ViewPref)> = Vec::new();
+        for tab in self.state.tabs.iter() {
+            if tab.kind != crate::state::TabKind::Explorer {
+                continue;
+            }
+            for pane in &tab.panes {
+                if !pane.filter.is_empty() {
+                    continue;
+                }
+                let pref = |view: &str, sort: &ViewPref| {
+                    ViewPref::new(view, &sort.sort_key, sort.sort_ascending)
+                };
+                let view = pane.view_mode.clone();
+                match ViewSort::of(pane.path.as_deref()) {
+                    ViewSort::ThisPc => seeds.push((
+                        crate::views::KEY_THIS_PC.to_string(),
+                        pref(&view, &this_pc),
+                    )),
+                    ViewSort::Recycle => seeds.push((
+                        crate::views::KEY_RECYCLE.to_string(),
+                        pref(&view, &recycle),
+                    )),
+                    ViewSort::Normal => {
+                        if let Some(path) = pane.path.as_deref() {
+                            seeds.push((crate::views::path_key(path), pref(&view, &global_sort)));
+                        }
+                    }
+                }
+            }
+        }
+        let mut touched = false;
+        for (key, pref) in seeds {
+            if self.view_mem.set(&key, pref) {
+                touched = true;
+            }
+        }
+        if touched {
+            schedule_views_flush();
+        }
+    }
+
+    /// 切换视图模式（按栏落地）。
+    fn apply_view_mode(&mut self, mode: &str) {
         // 表头只在详细信息视图存在：切走就没人能再操作这个下拉了。
         self.close_type_filter_menu();
-        self.ui.set_view_mode(mode.into());
+        if self.config.independent_view {
+            // 独立模式：只改这一栏，并把结果记到这个路径名下。
+            let pane = self.state.active().active_pane;
+            if let Some(p) = self.state.active_mut().panes.get_mut(pane) {
+                p.view_mode = mode.to_string();
+            }
+            self.remember_pane(false);
+        } else {
+            self.config.view_mode = mode.to_string();
+            self.config.save();
+            for tab in &mut self.state.tabs {
+                for pane in &mut tab.panes {
+                    pane.view_mode = mode.to_string();
+                }
+            }
+        }
         // 切视图后格子布局全变，旧的悬停浮层不能再指下去。
         self.ui.invoke_clear_path_tip(0);
         self.ui.invoke_clear_path_tip(1);
@@ -5007,18 +5190,31 @@ impl App {
         }
         self.config.save();
 
-        for tab in &mut self.state.tabs {
-            if tab.kind == crate::state::TabKind::Settings { continue; }
-            for pane in &mut tab.panes {
-                // 别的视图的面板保持自己的排序，不被本次操作带走。
-                if ViewSort::of_pane(pane.path.as_deref(), !pane.filter.is_empty()) != view {
-                    continue;
-                }
+        if self.config.independent_view {
+            // 独立模式：只动当前栏。分屏的另一栏哪怕在同一路径上也不跟——
+            // 用户要的就是"两栏各管各的"。
+            let pane_index = self.state.active().active_pane;
+            if let Some(pane) = self.state.active_mut().panes.get_mut(pane_index) {
                 pane.sort.key = key;
                 pane.sort.ascending = ascending;
-                // 重排时把拼音缓存一起搬过去，不用重算。
                 pane.resort();
                 pane.rebuild_display();
+            }
+            self.remember_pane(true);
+        } else {
+            for tab in &mut self.state.tabs {
+                if tab.kind == crate::state::TabKind::Settings { continue; }
+                for pane in &mut tab.panes {
+                    // 别的视图的面板保持自己的排序，不被本次操作带走。
+                    if ViewSort::of_pane(pane.path.as_deref(), !pane.filter.is_empty()) != view {
+                        continue;
+                    }
+                    pane.sort.key = key;
+                    pane.sort.ascending = ascending;
+                    // 重排时把拼音缓存一起搬过去，不用重算。
+                    pane.resort();
+                    pane.rebuild_display();
+                }
             }
         }
 
@@ -5028,42 +5224,163 @@ impl App {
         self.sync_status();
     }
 
-    /// 把每个面板的排序对齐到它所在视图的保存值。
-    /// 切目录（前进/后退/跳转/启动）后必须调用：`pane.sort` 是从上一个目录
-    /// 继承来的，进出「此电脑」/「回收站」时要替换成该视图自己的状态。
-    fn sync_view_sort(&mut self) {
-        // 配置文件可能被手改或来自旧版本：用不存在的列排序就退回兼底值。
-        let (this_pc, recycle, global) = (
-            SortState {
-                key: ViewSort::ThisPc
-                    .fallback(parse_sort_key(&self.config.this_pc_sort_key, SortKey::Drive)),
-                ascending: self.config.this_pc_sort_ascending,
-            },
-            SortState {
-                key: ViewSort::Recycle
-                    .fallback(parse_sort_key(&self.config.recycle_sort_key, SortKey::Modified)),
-                ascending: self.config.recycle_sort_ascending,
-            },
-            SortState {
-                key: ViewSort::Normal
-                    .fallback(parse_sort_key(&self.config.sort_key, SortKey::Name)),
-                ascending: self.config.sort_ascending,
-            },
-        );
-        let want = |path: Option<&std::path::Path>, searching: bool| match ViewSort::of_pane(path, searching) {
-            ViewSort::ThisPc => this_pc,
-            ViewSort::Recycle => recycle,
-            ViewSort::Normal => global,
+    /// 只把**某一栏**对齐到它当前路径的记忆（排序 + 视图）。
+    ///
+    /// 「重新进入目录」时才调用（导航 / 新建标签 / 开分屏）：同路径的另一栏
+    /// 允许暂时不一样，绝不能因为这边进了一次就把那边也改掉。
+    fn align_pane(&mut self, tab_index: usize, pane_index: usize) {
+        let (path, searching, view_now) = match self
+            .state
+            .tabs
+            .get(tab_index)
+            .and_then(|t| t.panes.get(pane_index))
+        {
+            Some(p) => (p.path.clone(), !p.filter.is_empty(), p.view_mode.clone()),
+            None => return,
         };
-        let mut changed = false;
-        for tab in &mut self.state.tabs {
-            if tab.kind == crate::state::TabKind::Settings { continue; }
-            for pane in &mut tab.panes {
-                let s = want(pane.path.as_deref(), !pane.filter.is_empty());
-                if pane.sort.key == s.key && pane.sort.ascending == s.ascending {
-                    continue;
+        let (want_sort, want_view) = self.want_view_sort(path.as_deref(), searching, &view_now);
+        let pane = &mut self.state.tabs[tab_index].panes[pane_index];
+        pane.view_mode = want_view;
+        let sort_differs =
+            pane.sort.key != want_sort.key || pane.sort.ascending != want_sort.ascending;
+        pane.sort = want_sort;
+        if sort_differs && !pane.loading && !pane.entries.is_empty() {
+            pane.resort();
+            pane.rebuild_display();
+        }
+        self.push_view_modes();
+    }
+
+    /// 把当前聚焦的那一栏对齐到记忆（导航 / 换搜索词 / 重新列举用）。
+    fn align_active_pane(&mut self) {
+        if self.state.active().kind != crate::state::TabKind::Explorer {
+            return;
+        }
+        let (ti, pi) = (self.state.active_tab, self.state.active().active_pane);
+        self.align_pane(ti, pi);
+    }
+
+    /// 某一栏「应该」用的排序 + 视图：独立模式下查路径记忆，否则用全局配置。
+    fn want_view_sort(
+        &self,
+        path: Option<&std::path::Path>,
+        searching: bool,
+        current_view: &str,
+    ) -> (SortState, String) {
+        // 配置文件可能被手改或来自旧版本：用不存在的列排序就退回兼底值。
+        let this_pc = SortState {
+            key: ViewSort::ThisPc
+                .fallback(parse_sort_key(&self.config.this_pc_sort_key, SortKey::Drive)),
+            ascending: self.config.this_pc_sort_ascending,
+        };
+        let recycle = SortState {
+            key: ViewSort::Recycle
+                .fallback(parse_sort_key(&self.config.recycle_sort_key, SortKey::Modified)),
+            ascending: self.config.recycle_sort_ascending,
+        };
+        let global = SortState {
+            key: ViewSort::Normal
+                .fallback(parse_sort_key(&self.config.sort_key, SortKey::Name)),
+            ascending: self.config.sort_ascending,
+        };
+        // 「独立视图和排序」：每个目录（以及此电脑 / 回收站）各记各的；
+        // 关掉时全部回到上面这三套全局值。
+        let independent = self.config.independent_view;
+        let default_view = if independent {
+            DEFAULT_VIEW.to_string()
+        } else {
+            self.config.view_mode.clone()
+        };
+        let remembered = |key: &str| {
+            self.view_mem.get(key).map(|p| {
+                (
+                    SortState {
+                        key: parse_sort_key(&p.sort_key, SortKey::Name),
+                        ascending: p.sort_ascending,
+                    },
+                    crate::views::normalize_view(&p.view).to_string(),
+                )
+            })
+        };
+        match ViewSort::of_pane(path, searching) {
+            ViewSort::ThisPc => (
+                this_pc,
+                if independent {
+                    self.view_mem
+                        .get(crate::views::KEY_THIS_PC)
+                        .map(|p| crate::views::normalize_view(&p.view).to_string())
+                        .unwrap_or_else(|| default_view.clone())
+                } else {
+                    default_view.clone()
+                },
+            ),
+            // 搜索态与回收站共用一套排序：跨目录的结果列表没有"所在文件夹"，
+            // 视图则沿用搜索前那一栏的样子（不动它）。
+            ViewSort::Recycle => (
+                recycle,
+                if searching {
+                    current_view.to_string()
+                } else if independent {
+                    self.view_mem
+                        .get(crate::views::KEY_RECYCLE)
+                        .map(|p| crate::views::normalize_view(&p.view).to_string())
+                        .unwrap_or_else(|| default_view.clone())
+                } else {
+                    default_view.clone()
+                },
+            ),
+            ViewSort::Normal => {
+                if !independent {
+                    (global, default_view.clone())
+                } else {
+                    match path.and_then(|p| remembered(&crate::views::path_key(p))) {
+                        // 没记过的目录：详细信息 + 名称递增。
+                        Some((sort, view)) => (
+                            SortState {
+                                key: ViewSort::Normal.fallback(sort.key),
+                                ascending: sort.ascending,
+                            },
+                            view,
+                        ),
+                        None => (SortState::default(), DEFAULT_VIEW.to_string()),
+                    }
                 }
-                pane.sort = s;
+            }
+        }
+    }
+
+    /// 把**所有**标签的所有面板对齐到各自路径的记忆。
+    ///
+    /// 只有两个时刻该用：启动恢复（每个窗格都是重新进入）和「独立视图和排序」
+    /// 开关切换（记忆整体接管 / 整体让位）。日常导航、切标签、重新列举都用
+    /// `align_active_pane`，别在这里把另一栏也改掉。
+    fn sync_view_sort(&mut self) {
+        // 先把「每一栏该是什么」算出来（只读 self.view_mem），再统一写回状态。
+        let mut plan: Vec<(usize, usize, SortState, String)> = Vec::new();
+        for (ti, tab) in self.state.tabs.iter().enumerate() {
+            if tab.kind == crate::state::TabKind::Settings {
+                continue;
+            }
+            for (pi, pane) in tab.panes.iter().enumerate() {
+                let (want_sort, want_view) = self.want_view_sort(
+                    pane.path.as_deref(),
+                    !pane.filter.is_empty(),
+                    &pane.view_mode,
+                );
+                plan.push((ti, pi, want_sort, want_view));
+            }
+        }
+        let mut changed = false;
+        for (ti, pi, want_sort, want_view) in plan {
+            let pane = &mut self.state.tabs[ti].panes[pi];
+            let sort_differs = pane.sort.key != want_sort.key || pane.sort.ascending != want_sort.ascending;
+            let view_differs = pane.view_mode != want_view;
+            if view_differs {
+                pane.view_mode = want_view;
+                changed = true;
+            }
+            if sort_differs {
+                pane.sort = want_sort;
                 // 列表结果还没到（loading 中）时不动旧数据：worker 会用新排序重算。
                 if !pane.loading && !pane.entries.is_empty() {
                     pane.resort();
@@ -5076,6 +5393,8 @@ impl App {
             self.visible_cache = None;
             self.visible_cache_right = None;
         }
+        // 视图模式是按栏下发的：这里统一推一次，省得每个调用点自己记得。
+        self.push_view_modes();
     }
 
     /// 全局拼音秒搜：查询后台索引，结果写入当前标签（此电脑视图）。
@@ -5825,6 +6144,9 @@ impl App {
         self.ui.set_type_filter_active_right(type_active1);
         self.ui.set_sort_key(sort_key.into());
         self.ui.set_sort_ascending(sort_asc);
+        self.ui.set_view_mode(self.pane_view_mode(0).into());
+        self.ui
+            .set_view_mode_right(self.pane_view_mode(if is_split { 1 } else { 0 }).into());
         self.ui.set_sort_key_right(sort_key_right.unwrap_or(sort_key).into());
         self.ui
             .set_sort_ascending_right(sort_asc_right.unwrap_or(sort_asc));
@@ -5958,6 +6280,20 @@ impl App {
     /// 取某路径的缩略图：命中缓存直接返回；否则对候选路径发起后台加载
     /// （去重），返回空图（UI 显示占位色块，加载完成后经事件循环刷新）。
     /// 当前视图对应的缩略图边长。
+    /// 某一栏该按多大边长取图（分屏时两栏视图可能不同）。
+    #[cfg(windows)]
+    fn thumb_size_for_pane(&mut self, pane: usize) -> u32 {
+        let scale = self.ui_scale();
+        let view = self.pane_view_mode(pane);
+        let logical_size = match view.as_str() {
+            "icons-xl" => 132.0,
+            "icons-large" => 88.0,
+            "icons-medium" => 60.0,
+            _ => crate::ops::thumbs::THUMB_SIZE as f32,
+        };
+        (logical_size * scale).ceil() as u32
+    }
+
     #[cfg(windows)]
     fn thumb_size_for_view(&mut self) -> u32 {
         // 获取当前窗口的真实物理缩放比例（如 125% -> 1.25, 150% -> 1.5）
@@ -5967,7 +6303,7 @@ impl App {
         // 结果一半图标是低分辨率放大出来的（日志里 `req=132` / `req=264` 混着出现）。
         let scale = self.ui_scale();
 
-        let logical_size = match self.config.view_mode.as_str() {
+        let logical_size = match self.active_view_mode().as_str() {
             "icons-xl" => 132.0,
             "icons-large" => 88.0,
             "icons-medium" => 60.0,
@@ -5986,7 +6322,7 @@ impl App {
     #[cfg(windows)]
     fn drag_icon_px(&mut self) -> u32 {
         let scale = self.ui_scale();
-        let logical = match self.config.view_mode.as_str() {
+        let logical = match self.active_view_mode().as_str() {
             "details" | "list" => 24.0,
             "icons-xl" => 132.0,
             "icons-large" => 88.0,
@@ -6172,6 +6508,11 @@ impl App {
         44
     }
 
+    #[cfg(not(windows))]
+    fn thumb_size_for_pane(&mut self, _pane: usize) -> u32 {
+        44
+    }
+
     /// 取图/拖拽图用的缩放系数：**会话内只增不减**。
     ///
     /// `window().scale_factor()` 在 `show()` 之后、窗口真正落到显示器之前仍是 1.0，
@@ -6264,7 +6605,7 @@ impl App {
     /// 末两项是左右分屏的名称列宽：列宽变化（拖分隔符 / 自适应）不会改变
     /// 列表高度等几何，若不纳入签名，行模型里的 `name-truncated`（浮层弹出的
     /// 依据）会一直用拖动前的旧预算判定，浮层表现为"按之前的列宽截断"。
-    fn current_list_geom(&self) -> (f32, usize, f32, bool, f32, f32) {
+    fn current_list_geom(&self) -> (f32, usize, f32, bool, f32, f32, usize, f32) {
         (
             self.ui.get_list_height(),
             self.ui.get_cells_per_row().max(1) as usize,
@@ -6272,6 +6613,10 @@ impl App {
             self.ui.get_is_icons_view_out(),
             self.ui.get_file_name_area_w(),
             self.ui.get_file_name_area_w_right(),
+            // 右栏自己的格子几何：两栏视图不同时，右栏行高/列数变化也必须
+            // 算作「布局变了」，否则右栏的行不会重建。
+            self.ui.get_cells_per_row_right().max(1) as usize,
+            self.ui.get_row_height_out_right(),
         )
     }
 
@@ -6279,15 +6624,23 @@ impl App {
     ///
     /// 启动首帧布局未落定时用占位值兜底（视口 600 / 默认行高），否则只能渲染
     /// 前两行（表现为「此电脑」部分盘符空白）。
-    fn view_metrics(&self) -> (f32, usize, f32, usize) {
+    ///
+    /// 某一栏的视口几何。行高/每行列数按该栏自己的视图取。
+    fn view_metrics_for(&self, pane: usize) -> (f32, usize, f32, usize) {
         let raw_h = self.ui.get_list_height();
         let list_height = if raw_h > 1.0 { raw_h } else { 600.0 };
-        let cells = self.ui.get_cells_per_row().max(1) as usize;
-        let row_h = if self.ui.get_row_height_out() > 0.0 {
-            self.ui.get_row_height_out()
+        let (cells, row_h) = if pane == 1 {
+            (
+                self.ui.get_cells_per_row_right().max(1) as usize,
+                self.ui.get_row_height_out_right(),
+            )
         } else {
-            ROW_HEIGHT
+            (
+                self.ui.get_cells_per_row().max(1) as usize,
+                self.ui.get_row_height_out(),
+            )
         };
+        let row_h = if row_h > 0.0 { row_h } else { ROW_HEIGHT };
         let rows_visible = (list_height / row_h).ceil() as usize + OVERSCAN * 2;
         (list_height, cells, row_h, rows_visible)
     }
@@ -6295,7 +6648,7 @@ impl App {
     /// 某栏此刻应该渲染的条目窗口 `(first, count)`（与 `refresh_visible_rows` 同源）。
     /// 只用于判断「渲染窗口变了没有」：行是绝对定位的，窗口没变就不必重建整表。
     fn pane_window_now(&self, pane_index: usize) -> Option<(usize, usize)> {
-        let (_, cells, row_h, rows_visible) = self.view_metrics();
+        let (_, cells, row_h, rows_visible) = self.view_metrics_for(pane_index);
         let pane = self.state.active().panes.get(pane_index)?;
         Some(pane_view_range(
             pane.display.len(),
@@ -6307,7 +6660,10 @@ impl App {
     }
 
     fn refresh_visible_rows(&mut self) {
-        let (list_height, cells_per_row, row_h, rows_visible) = self.view_metrics();
+        let (list_height, cells_per_row, row_h, rows_visible) = self.view_metrics_for(0);
+        // 右栏自己的格子几何：「独立视图和排序」下两栏可以是不同视图，
+        // 行高和每行列数都不一样，共用一个值会把右栏的行算错。
+        let (_, cells1, row_h1, rows_visible1) = self.view_metrics_for(1);
 
         // 「此电脑」视图（pane 没有路径）：详细信息要隐藏修改时间列，
         // 大小列改为只显示剩余容量、表头文字改成「剩余」。
@@ -6338,23 +6694,22 @@ impl App {
         // 新的像素位置。必须放在下方的 clamp 块“之前”——否则残留的旧像素大偏移
         // 会先被 clamp 到内容底部，再恢复就已经晚了。
         if let Some(first_index) = self.pending_scroll_index.take() {
-            let new_row = first_index / cells_per_row;
-            let new_scroll_y = (new_row as f32) * row_h;
-            for pane in &mut self.state.active_mut().panes {
-                pane.scroll_y = new_scroll_y;
-            }
-            push_scroll(&self.ui, 0, new_scroll_y);
-            if self.state.active().is_split {
-                push_scroll(&self.ui, 1, new_scroll_y);
+            // 两栏格子可能不同：各自按自己的行高换算，否则切视图后另一半会偏。
+            let pane_count = self.state.active().panes.len();
+            for (idx, cells, rh) in [(0usize, cells_per_row, row_h), (1usize, cells1, row_h1)] {
+                if idx >= pane_count {
+                    break;
+                }
+                let new_row = first_index / cells;
+                let new_scroll_y = (new_row as f32) * rh;
+                self.state.active_mut().panes[idx].scroll_y = new_scroll_y;
+                push_scroll(&self.ui, idx, new_scroll_y);
             }
         }
 
         // 新建文件夹后把对应条目滚进可视区（最小位移：已在视口内则不动）。
         // 必须在下面计算 first0/count0 之前做，否则新行不在本帧渲染窗口里。
         if let Some(index) = self.scroll_to_index.take() {
-            let row = index / cells_per_row;
-            let item_top = row as f32 * row_h;
-            let item_bottom = item_top + row_h;
             let pane_idx = {
                 let tab = self.state.active();
                 self.scroll_to_pane
@@ -6362,6 +6717,15 @@ impl App {
                     .unwrap_or(tab.active_pane)
                     .min(tab.panes.len().saturating_sub(1))
             };
+            // 按目标那一栏自己的格子换算：两栏视图可以不同。
+            let (cells, rh) = if pane_idx == 1 {
+                (cells1, row_h1)
+            } else {
+                (cells_per_row, row_h)
+            };
+            let row = index / cells;
+            let item_top = row as f32 * rh;
+            let item_bottom = item_top + rh;
             let current = self.state.active().panes[pane_idx].scroll_y.max(0.0);
             let target = if item_top < current {
                 item_top
@@ -6396,9 +6760,9 @@ impl App {
         // pane_view_range 会把它 clamp 到最后一行，只渲染 1 行 → 白屏/盘符空白。
         // 这里在每次重建可视窗口前先修正状态并回推 UI，保证视图与内容一致。
         {
-            let max_scroll_for = |total: usize| -> f32 {
-                let total_rows = total.div_ceil(cells_per_row);
-                (total_rows as f32 * row_h - list_height).max(0.0)
+            let max_scroll_for = |total: usize, cells: usize, rh: f32| -> f32 {
+                let total_rows = total.div_ceil(cells.max(1));
+                (total_rows as f32 * rh - list_height).max(0.0)
             };
             let pane_count = self.state.active().panes.len();
             for idx in 0..pane_count {
@@ -6406,12 +6770,17 @@ impl App {
                     let pane = &self.state.active().panes[idx];
                     (pane.display.len(), pane.scroll_y.max(0.0), pane.pending_scroll_restore)
                 };
+                let (cells, rh) = if idx == 1 {
+                    (cells1, row_h1)
+                } else {
+                    (cells_per_row, row_h)
+                };
                 // 核心修复：如果正在等待加载历史记录（后退/前进），跳过 clamp。
                 // 否则此时 display 还是空的（旧目录已卸载/新目录未到），scroll_y 会被夹到 0 → 跳顶。
                 if pending {
                     continue;
                 }
-                let clamped = scroll.min(max_scroll_for(total));
+                let clamped = scroll.min(max_scroll_for(total, cells, rh));
                 if (clamped - scroll).abs() > 0.5 {
                     // 排查：重命名期间任何“程序改滚动位置”都是嫌疑犯（会把行模型推出
                     // 可见窗口 → 重建 → 行内 TextInput 被销毁 → 焦点丢失）。
@@ -6421,10 +6790,10 @@ impl App {
                             idx,
                             scroll,
                             clamped,
-                            max_scroll_for(total),
+                            max_scroll_for(total, cells, rh),
                             total,
                             list_height,
-                            row_h
+                            rh
                         );
                     }
                     self.state.active_mut().panes[idx].scroll_y = clamped;
@@ -6487,7 +6856,7 @@ impl App {
                     first0,
                     count0,
                     scroll0,
-                    self.config.view_mode,
+                    self.active_view_mode(),
                     is_split,
                     expect_px,
                     self.thumb_cache.len(),
@@ -6638,7 +7007,7 @@ impl App {
                     (0, 0.0)
                 }
             };
-            let (first1, count1) = pane_view_range(total1, cells_per_row, row_h, rows_visible, scroll1);
+            let (first1, count1) = pane_view_range(total1, cells1, row_h1, rows_visible1, scroll1);
             let batch1 =
                 self.build_rows_for_pane(self.state.active_tab, 1, first1, count1, list_height);
             self.ui.set_file_total_right(total1 as i32);
@@ -6746,8 +7115,11 @@ impl App {
     /// 另外顺带下发“重命名行号”（详细信息 / 列表 / 小图标的固定浮层要用）。
     fn sync_expand_targets(&mut self) {
         self.sync_rename_row();
-        let icons_big = is_grid_icons_view(&self.config.view_mode);
-        if !icons_big {
+        let grid = [
+            is_grid_icons_view(&self.pane_view_mode(0)),
+            is_grid_icons_view(&self.pane_view_mode(1)),
+        ];
+        if !grid[0] && !grid[1] {
             self.ui.set_file_expand_index(-1);
             self.ui.set_file_expand_name(SharedString::default());
             self.ui.set_file_expand_box_w(0.0);
@@ -6805,6 +7177,10 @@ impl App {
         for pane in 0..2 {
             if pane == 1 && !is_split {
                 break;
+            }
+            // 这一栏不是「网格图标」视图：它没有名称浮层，不必算目标。
+            if !grid[pane] {
+                continue;
             }
             let tab = self.state.active();
             let Some(p) = tab.panes.get(pane) else { continue };
@@ -6904,7 +7280,7 @@ impl App {
             let mut hover_sig = (-1i32, 0u32, 0u64);
             let mut hover_plan = (0.0f32, GridLines::new(), Vec::new());
             if !hover_same {
-                let (needs, box_w, lines) = expand_layout(&self.ui, &ht.2);
+                let (needs, box_w, lines) = expand_layout(&self.ui, pane == 1, &ht.2);
                 let index = if needs { ht.0 } else { -1 };
                 hover_sig = (index, box_w.to_bits(), hash_lines(&lines));
                 let ws = line_widths(&lines);
@@ -6931,7 +7307,7 @@ impl App {
             } else {
                 t.2.clone()
             };
-            let (needs, box_w, lines) = expand_layout(&self.ui, &parts);
+            let (needs, box_w, lines) = expand_layout(&self.ui, pane == 1, &parts);
             // 重命名必须弹浮层（输入框就在浮层里），与「名字是否超过 3 行」无关：
             // 超大图标视图格子宽，名字基本都在 3 行内，之前会因 needs=false
             // 拿不到 expand-index，于是完全无法重命名。
@@ -7067,7 +7443,7 @@ impl App {
                 path: p.path.clone(),
                 generation: p.generation,
                 filter: p.filter.clone(),
-                view_mode: self.config.view_mode.clone(),
+                view_mode: p.view_mode.clone(),
                 name_w_q: batch.name_w_q,
                 total: p.display.len(),
                 computer: p.path.is_none(),
@@ -7150,7 +7526,7 @@ impl App {
             // 搜索态的高亮分段走 HighlightName：它把前几段宽度钉死、最后一段
             // 被压到 0 宽，overflow:elide 画不出省略号。这里按格宽预算做一次
             // 单行切分，超宽时末段腾位补 `…`（保留命中高亮），与竖排 grid-lines 同源。
-            let view_mode = self.config.view_mode.clone();
+            let view_mode = self.pane_view_mode(pane_index);
             let small_icons = view_mode == "icons-small";
             // 名称区真实宽度直接取 UI 导出的值（含自适应压缩结果），
             // 左右分屏各用自己那一栏，避免用下发列宽粗估导致漏判截断。
@@ -7166,7 +7542,9 @@ impl App {
             let small_name_w = if name_area_w > 24.0 {
                 name_area_w
             } else {
-                (self.ui.get_cell_w_out() as f32 - 66.0).max(24.0)
+                // 导出值为 0（首帧）时按「这一栏」的格宽估算：分屏 + 独立视图
+                // 时两栏格宽不同，用左栏的会把右栏的小图标名称算错。
+                (cell_metrics(&self.ui, pane_index == 1).0 - 66.0).max(24.0)
             };
             let details_name_w = name_area_w;
             let grid_name_w = name_area_w;
@@ -7340,12 +7718,8 @@ impl App {
         // 此时 first 已经是屏幕首行、**没有任何上方缓冲**。以前这里无条件
         // 跳过 OVERSCAN(=4) 行，等于把屏幕最前 4 行算成了缓冲行 —— 表现就是
         // 「滚动条在开头，缩略图却从第 4 行才开始渲染」。改为按 clamp 前的行数算实际缓冲。
-        let row_h = if self.ui.get_row_height_out() > 0.0 {
-            self.ui.get_row_height_out()
-        } else {
-            ROW_HEIGHT
-        };
-        let cells_per_row = (self.ui.get_cells_per_row().max(1)) as usize;
+        // 按这一栏自己的格子上报（分屏 + 独立视图时两栏行高/列数不同）。
+        let (_, cells_per_row, row_h, _) = self.view_metrics_for(pane_index);
         let scroll = self.state.tabs[tab_index].panes[pane_index]
             .scroll_y
             .max(0.0);
@@ -7385,12 +7759,14 @@ impl App {
             );
         }
 
-        let thumb_px = self.thumb_size_for_view();
+        // 取图边长按「这一栏」的视图算：分屏两栏视图不同时，非活动栏
+        // 用活动栏的尺寸取图会拿到糊掉（或过度放大）的缩略图。
+        let thumb_px = self.thumb_size_for_pane(pane_index);
         // 关键诊断（ROVE_LOG=1）：验收「存在截断就弹浮层」时记录一次汇总。
         // 按签名节流，避免滚动/40ms 轮询每次都刷日志。
         let truncated_count = collected.iter().filter(|p| p.name_truncated).count();
         let single = self.state.tabs[tab_index].panes[pane_index].selection.len() <= 1;
-        let mode = self.config.view_mode.clone();
+        let mode = self.pane_view_mode(pane_index);
         let budget = if pane_index == 0 {
             self.ui.get_file_name_area_w()
         } else {
@@ -7605,6 +7981,11 @@ impl App {
             push_scroll(&self.ui, 1, 0.0);
         }
 
+        // 这里**不**按记忆重新对齐视图：切标签只是换了一屏，两栏并没有重新
+        // 进入目录。同一路径的两个窗格允许各是各的视图，若在这里对齐，另一栏
+        // 会在换标签时莫名跳成记忆里的样子（用户实测报告过）。
+        // 记忆只在真正「进入目录」时读：导航 / 新建标签 / 开分屏 / 重启恢复。
+
         // 再更新数据和列表
         self.visible_cache = None;
         self.visible_cache_right = None;
@@ -7638,6 +8019,18 @@ impl App {
         // 关分屏会直接删掉右栏：挂在右栏上的类型下拉必须先收，
         // 否则遮罩层还盖在左栏上、看起来像卡死了。
         self.close_type_filter_menu();
+        // 要开分屏时，右栏该用的视图/排序先算好：它取「这个路径的记忆」，
+        // 不是左栏此刻的样子（同路径两栏允许临时不同，重建时按记忆统一）。
+        // 进了下面的可变借用就查不了记忆了。
+        let split_wants = {
+            let tab = self.state.active();
+            if tab.kind == crate::state::TabKind::Explorer && !tab.is_split {
+                let src = tab.active();
+                Some(self.want_view_sort(src.path.as_deref(), false, &src.view_mode))
+            } else {
+                None
+            }
+        };
         {
             let tab = self.state.active_mut();
             if tab.kind != crate::state::TabKind::Explorer {
@@ -7645,9 +8038,13 @@ impl App {
             }
             if !tab.is_split {
                 let src = tab.active();
-                // 右栏从干净状态新建：同路径 + 同排序，但不继承左栏的搜索词与历史，
+                // 右栏从干净状态新建：同路径，但不继承左栏的搜索词与历史，
                 // 否则左栏正在进行的搜索会随分屏混入右栏（含前进/后退导航里的历史搜索词）。
                 let mut pane = crate::state::PaneState::new(src.path.clone(), src.sort);
+                if let Some((want_sort, want_view)) = split_wants {
+                    pane.sort = want_sort;
+                    pane.view_mode = want_view;
+                }
                 pane.loading = true;
                 tab.panes.push(pane);
                 tab.is_split = true;
@@ -8405,8 +8802,8 @@ fn group_parts(chars: &[(char, bool)]) -> Vec<(String, bool)> {
 /// 浮层布局：先按格宽判断是否需要浮层（名字超过 3 行），需要时把框放宽到
 /// 1.4 倍尽量压到 4 行内，仍放不下就继续往下长。行分段与框宽由同一处算出，
 /// 保证高亮分段与真实换行位置一致。
-fn expand_layout(ui: &MainWindow, parts: &[(String, bool)]) -> (bool, f32, GridLines) {
-    let base_box = (ui.get_cell_w_out() as f32 - 8.0).max(24.0);
+fn expand_layout(ui: &MainWindow, right: bool, parts: &[(String, bool)]) -> (bool, f32, GridLines) {
+    let base_box = (cell_metrics(ui, right).0 - 8.0).max(24.0);
     let cap = (ui.get_view_width() as f32 - 12.0).max(base_box);
     let at_cell = grid_display_lines(parts, (base_box - 8.0).max(20.0), 64);
     let needs = at_cell.len() > 3;
@@ -8800,8 +9197,12 @@ fn grid_display_name(name: &str, width_px: f32, max_lines: usize) -> String {
         .join("\n")
 }
 
-fn cell_metrics(ui: &MainWindow) -> (f32, f32) {
-    (ui.get_cell_w_out() as f32, ui.get_cell_h_out() as f32)
+fn cell_metrics(ui: &MainWindow, right: bool) -> (f32, f32) {
+    if right {
+        (ui.get_cell_w_right_out() as f32, ui.get_cell_h_right_out() as f32)
+    } else {
+        (ui.get_cell_w_out() as f32, ui.get_cell_h_out() as f32)
+    }
 }
 
 /// 与视口**相交**的行数（首尾被截一半的行也算一行）。
@@ -9321,7 +9722,7 @@ impl App {
     /// 「视图」子菜单：当前模式打勾。
     #[cfg(windows)]
     fn view_menu_nodes(&self) -> Vec<crate::sys::menu::MenuNode> {
-        let current = self.config.view_mode.as_str();
+        let current = self.active_view_mode();
         use crate::sys::menu::MenuNode;
         [
             ("icons-xl", "超大图标"),
@@ -9905,6 +10306,7 @@ impl App {
         self.ui.set_archive_tool_index(self.archive_tool_index());
         // 「硬件渲染」开关：关掉走软件渲染（CPU），重启生效。
         self.ui.set_hardware_renderer(self.config.hardware_renderer);
+        self.ui.set_independent_view(self.config.independent_view);
         // 开机自启动没有配置项：注册表 Run 键就是唯一真源，进设置页按实况显示，
         // 这样用户在任务管理器里停用/删掉之后，开关不会骗人。
         self.ui.set_autostart(crate::sys::autostart::enabled());
@@ -13168,7 +13570,7 @@ impl App {
                 return;
             }
         }
-        // 新标签继承的排序会被 sync_view_sort 按目标视图（普通/此电脑/回收站）
+        // 新标签继承的排序会被 align_active_pane 按目标视图（普通/此电脑/回收站）
         // 覆盖成对应视图自己的状态，这里只用当前排序占个位。
         // 当前标签可能是设置页（没有目录），此时用全局排序做种子。
         let sort = self.state.active().active().sort;
@@ -13181,7 +13583,7 @@ impl App {
             select
         );
         // 与「普通导航」走完全相同的链路：sync_after_navigate 内部会
-        // sync_view_sort → sync_tabs/nav/... → reload_active。
+        // align_active_pane → sync_tabs/nav/... → reload_active。
         // 这里不能用 sync_active_tab：那是「切换已有标签」用的，不发起列举，
         // 新标签会一直停在空状态（表现为「此文件夹为空」）。
         self.sync_after_navigate();
@@ -13210,8 +13612,9 @@ impl App {
         // 否则几百毫秒后会在新页面里误弹出重命名。
         self.cancel_rename_defer();
         // 进出「此电脑」/「回收站」时，把该视图自己的排序状态装回面板，
-        // 普通目录则用全局排序。必须在下发列举请求（reload_active）之前做。
-        self.sync_view_sort();
+        // 普通目录则用全局排序。只对齐刚进入的这一栏，另一栏不动。
+        // 必须在下发列举请求（reload_active）之前做。
+        self.align_active_pane();
         // 导航后退出地址栏编辑态。
         self.ui.set_path_editing(false);
         self.sync_tabs();
@@ -13461,11 +13864,26 @@ struct RubberGeom {
 impl RubberGeom {
     /// right=true 时读右分屏的间隙：两栏宽度可能不同，gap 也各自不同。
     fn read(ui: &MainWindow, right: bool) -> Self {
-        let (cell_w, cell_h) = cell_metrics(ui);
+        let (cell_w, cell_h) = cell_metrics(ui, right);
+        // 两栏视图可能不同：几何必须取自己那一栏的，否则右栏的框选/悬停
+        // 会按左栏的行高和格宽算位置。
+        let (is_icons, cells_per_row, row_h) = if right {
+            (
+                ui.get_is_icons_view_out_right(),
+                ui.get_cells_per_row_right().max(1) as usize,
+                ui.get_row_height_out_right(),
+            )
+        } else {
+            (
+                ui.get_is_icons_view_out(),
+                ui.get_cells_per_row().max(1) as usize,
+                ui.get_row_height_out(),
+            )
+        };
         Self {
-            is_icons: ui.get_is_icons_view_out(),
-            cells_per_row: ui.get_cells_per_row().max(1) as usize,
-            row_h: ui.get_row_height_out(),
+            is_icons,
+            cells_per_row,
+            row_h,
             cell_w,
             cell_h,
             grid_gap: if right {
@@ -14235,7 +14653,7 @@ impl App {
                     x,
                     y,
                     self.state.active().active().display.len(),
-                    self.config.view_mode
+                    self.active_view_mode()
                 );
                 if !additive {
                     let tab = self.state.active_mut().active_mut();
@@ -15022,7 +15440,7 @@ fn setup_keyboard(app: &Rc<RefCell<App>>) {
                 // name-truncated（浮层弹出依据）是按旧几何算的，行内文字的
                 // 省略号由 Slint 实时画、两者会割裂（表现为「浮层按旧窗口宽
                 // 判断截断」）。置哨兵值让轮询的几何比较必定命中一次。
-                evt_app.borrow_mut().list_geom = (-1.0, 0, -1.0, false, -1.0, -1.0);
+                evt_app.borrow_mut().list_geom = (-1.0, 0, -1.0, false, -1.0, -1.0, 0, -1.0);
             }
             return EventResult::Propagate;
         }
@@ -15702,10 +16120,7 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             app.hover_display_index[p] = effective;
             // 重算图标视图的名称浮层目标（选中 / 悬停 / 重命名）。
             // 小图标视图有自己的行内浮层，不需要这里重建嵌套模型。
-            let icons_big = matches!(
-                app.config.view_mode.as_str(),
-                "icons-medium" | "icons-large" | "icons-xl"
-            );
+            let icons_big = is_grid_icons_view(&app.pane_view_mode(p));
             if icons_big {
                 app.expand_sig = None;
                 app.sync_expand_targets();
@@ -16606,6 +17021,25 @@ fn wire_callbacks(app: &Rc<RefCell<App>>) {
             // 无论成败都按注册表实况回填（可能被别的程序占用而维持原状）。
             let actual = crate::sys::autostart::enabled();
             app.ui.set_autostart(actual);
+        });
+        // 独立视图和排序：立刻生效。打开时把正在用的全局设置记到当前路径，
+        // 画面不跳；关掉时两栏一起回到全局设置（每路径的数据保留）。
+        let indep_app = app.clone();
+        upgrade().on_independent_view_toggled(move |enabled| {
+            let Some(app) = indep_app.upgrade() else { return };
+            let mut app = app.borrow_mut();
+            app.config.independent_view = enabled;
+            app.config.save();
+            app.ui.set_independent_view(enabled);
+            if enabled {
+                app.seed_view_memory();
+            }
+            app.sync_view_sort();
+            // 视图可能变了（关掉时回到全局），行布局要整表重算。
+            app.visible_cache = None;
+            app.visible_cache_right = None;
+            app.sync_file_list();
+            app.sync_status();
         });
         // 硬件渲染：只写配置，真正切换必须重启（渲染后端在建窗口之前就定了）。
         let hw_app = app.clone();
@@ -18283,6 +18717,24 @@ pub(crate) fn hide_dialog_jump() {
     crate::sys::dialog_jump::register_jump_window(0);
 }
 
+/// 视图记忆的写盘防抖：连点排序/切视图时不要把 views.json 写上百遍。
+fn schedule_views_flush() {
+    thread_local! {
+        static PENDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if PENDING.with(|p| p.replace(true)) {
+        return;
+    }
+    slint::Timer::single_shot(Duration::from_millis(500), || {
+        PENDING.with(|p| p.set(false));
+        SESSION.with(|slot| {
+            if let Some(app) = slot.borrow().as_ref() {
+                app.borrow_mut().view_mem.flush();
+            }
+        });
+    });
+}
+
 /// 启动时定下渲染后端（必须在创建任何 Slint 窗口之前调用）。
 ///
 /// 优先级：`SLINT_BACKEND`（只认 `winit-femtovg` / `winit-software`，应急手段）
@@ -19572,10 +20024,12 @@ pub fn destroy_session() {
     // 销毁本该在一瞬间做完。卡住时进程既没有窗口、事件循环也不再转，托盘点了
     // 没反应，用户只能去任务管理器杀 —— 记下开始时刻，看门狗超时后自己换进程。
     CLOSING_AT.store(now_ms().max(1), std::sync::atomic::Ordering::Release);
+    // 视图记忆是防抖写盘的：退出时补一次，别把最后 500ms 内的改动丢掉。
     // 退出存档：窗口几何（逻辑像素）+ 最大化状态 + 上次标签页快照。
     // 统一在销毁出口完成，保证「窗口 X」与「托盘退出」两条路径都能落盘。
     {
         let mut app = app.borrow_mut();
+        app.view_mem.flush();
         // 注意：size() 是物理像素，配置里的窗口尺寸按逻辑像素保存，
         // 否则在高 DPI 下每次会话窗口都会按缩放系数膨胀。
         let window = app.ui.window();

@@ -391,6 +391,8 @@ pub const ZH: &[&str] = &[
     "关闭则使用软件渲染（CPU），改动后重启 rove 生效", // 376
     "重启 rove 后生效", // 377
     "硬件渲染不可用，已切换到软件渲染", // 378
+    "独立视图和排序", // 379
+    "每个文件夹各记自己的视图和排序；左右分屏互不影响", // 380
 ];
 
 pub const EN: &[&str] = &[
@@ -773,6 +775,8 @@ pub const EN: &[&str] = &[
     "Off uses software (CPU) rendering; restart rove to apply",
     "Takes effect after you restart rove",
     "Hardware rendering is unavailable; switched to software rendering",
+    "Per-folder view and sort",
+    "Each folder keeps its own view and sort; the two panes are independent",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。
@@ -993,6 +997,12 @@ mod tests {
                 378,
                 "硬件渲染不可用，已切换到软件渲染",
                 "Hardware rendering is unavailable; switched to software rendering",
+            ),
+            (379, "独立视图和排序", "Per-folder view and sort"),
+            (
+                380,
+                "每个文件夹各记自己的视图和排序；左右分屏互不影响",
+                "Each folder keeps its own view and sort; the two panes are independent",
             ),
         ] {
             assert_eq!(ZH[i], zh, "下标 {i} 的中文不对");

@@ -573,6 +573,9 @@ export component SettingsPage inherits Rectangle {
     /// 「开机自启动」开关（真源是注册表 Run 键，由 Rust 读实况下发）。
     in-out property <bool> autostart: false;
     callback autostart_toggled(bool);
+    /// 「独立视图和排序」：每个文件夹各记自己的视图 + 排序。
+    in-out property <bool> independent-view: false;
+    callback independent_view_toggled(bool);
     /// 显示语言：0 跟随系统 / 1 简体中文 / 2 English。
     in-out property <int> language-index: 0;
     callback language_changed(int);
@@ -993,6 +996,61 @@ export component SettingsPage inherits Rectangle {
                                 toggled => {
                                     root.autostart = !root.autostart;
                                     root.autostart_toggled(root.autostart);
+                                }
+                            }
+                        }
+                    }
+
+                    // 独立视图和排序：每个文件夹各记自己的视图 + 排序（左右分屏互不影响）。
+                    Rectangle {
+                        width: 100%;
+                        background: (!Theme.dark && gen-indep-ta.has-hover) ? Theme.bg-hover : Theme.bg-popup;
+                        border-radius: 10px;
+                        border-width: 1px;
+                        border-color: (Theme.dark && gen-indep-ta.has-hover) ? Theme.accent.transparentize(0.45) : Theme.border;
+                        animate background, border-color { duration: 100ms; easing: ease-out; }
+                        height: 58px;
+
+                        gen-indep-ta := TouchArea {
+                            width: 100%;
+                            height: 100%;
+                            clicked => {
+                                root.independent-view = !root.independent-view;
+                                root.independent_view_toggled(root.independent-view);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 16px;
+                            padding-right: 16px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+
+                                Text {
+                                    text: I18n.strings[379];
+                                    color: Theme.text-primary;
+                                    font-size: 13px;
+                                    font-weight: 500;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: I18n.strings[380];
+                                    color: Theme.text-secondary;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Toggle {
+                                y: (parent.height - self.height) / 2;
+                                checked: root.independent-view;
+                                toggled => {
+                                    root.independent-view = !root.independent-view;
+                                    root.independent_view_toggled(root.independent-view);
                                 }
                             }
                         }
