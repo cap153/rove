@@ -1,0 +1,43 @@
+name: 功能需求
+description: 想要一个现在没有的功能 / 改掉不顺手的地方
+title: "[需求] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        说清「你现在怎么做这件事、卡在哪」比只写「加个 XX」有用得多。
+
+  - type: textarea
+    id: want
+    attributes:
+      label: 想要什么
+      description: 一句话说清。
+      placeholder: 例：希望鼠标侧键能前进后退。
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: 为什么需要 / 现在哪里不顺手
+      description: 你现在的操作流程，以及它麻烦在哪。
+      placeholder: 例：用侧键习惯了很多年，现在每次都要去点工具栏的箭头。
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图 / 示意图（可选）
+      description: 别家软件怎么做的、你想放在哪儿，画一下或截个图最省事。截图后按 Ctrl+V 直接粘贴到这个框里（也可以把图片文件拖进来）。
+      placeholder: （在这里按 Ctrl+V 粘贴截图）
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 补充（可选）
+      description: 你考虑过的做法、会不会影响别的功能。
+    validations:
+      required: false

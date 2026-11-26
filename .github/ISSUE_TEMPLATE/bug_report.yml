@@ -1,0 +1,80 @@
+name: Bug 报告
+description: 有东西不正常工作了
+title: "[Bug] "
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: 问题是什么
+      description: 一句话说清哪里不对。
+      placeholder: 例：分屏后右栏的「路径」列不显示。
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: 怎么复现
+      description: 从打开 rove 开始按顺序写几步。偶发的也请说大概多久出现一次。
+      placeholder: |
+        1. 打开 rove，进入 D:\
+        2. 打开分屏
+        3. 右栏还在 D:\，但「路径」列是空的
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望 vs 实际（可选）
+      placeholder: |
+        期望：两栏都显示「路径」列
+        实际：只有左栏有
+    validations:
+      required: false
+
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: 截图
+      description: 界面上看得出的问题请截图，比文字描述清楚。截图后按 Ctrl+V 直接粘贴到这个框里（也可以把图片文件拖进来）。
+      placeholder: （在这里按 Ctrl+V 粘贴截图）
+    validations:
+      required: false
+
+  - type: dropdown
+    id: windows
+    attributes:
+      label: Windows 版本
+      options:
+        - Windows 11
+        - Windows 10
+        - 其他（写在「其他」里）
+    validations:
+      required: true
+
+  - type: dropdown
+    id: renderer
+    attributes:
+      label: 渲染方式（设置 → 通用 → 硬件渲染）
+      options:
+        - 开着（GPU，默认）
+        - 关掉了（软件渲染）
+        - 不知道
+    validations:
+      required: false
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他（可选）
+      description: |
+        版本号或 exe 名字。
+
+        闪退 / 卡住 / 画面错乱时请附日志（默认不写日志，要手动打开）：
+        1. 打开「命令提示符」（cmd）
+        2. 先执行 `set ROVE_LOG=2`
+        3. 在同一个窗口里启动 rove：把 `rove.exe` 拖进这个窗口后回车
+        4. 复现问题、退出 rove，把 exe 旁边的 `rove.log` 拖到这里
+    validations:
+      required: false
