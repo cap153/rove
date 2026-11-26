@@ -17,6 +17,9 @@ mod state;
 mod views;
 // 系统级辅助（原生对话框 / 拖放）。
 mod sys;
+// 静态守卫：禁止「条件里借用 RefCell、块内再 borrow_mut」，只在测试里编进来。
+#[cfg(test)]
+mod refcell_guard;
 // 托盘仅 Windows（Linux 宿主测试无需 GTK 依赖）。
 #[cfg(windows)]
 mod tray;

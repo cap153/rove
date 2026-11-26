@@ -14878,8 +14878,16 @@ fn setup_timers(app: &Rc<RefCell<App>>) {
 
     // 压缩软件「更新」：后台线程扫完就把结果并回配置。搭这趟 40ms 轮询，
     // 不额外起定时器，也不让界面线程去碰开始菜单。
-    if app.borrow().archive_scan_pending {
-        if let Some(found) = crate::sys::archive::take_result(app.borrow().archive_scan_gen) {
+    //
+    // 判定值必须先落到**单独一条语句**里：写成 `if app.borrow().x { …borrow_mut()… }`
+    // 时，条件里那个 `Ref` 会活到整个 if 块结束，块内再借可变引用就直接
+    // panic「RefCell already borrowed」（切换默认压缩软件时 100% 崩）。
+    let (scan_pending, scan_gen) = {
+        let a = app.borrow();
+        (a.archive_scan_pending, a.archive_scan_gen)
+    };
+    if scan_pending {
+        if let Some(found) = crate::sys::archive::take_result(scan_gen) {
             let mut app = app.borrow_mut();
             app.archive_scan_pending = false;
             app.apply_archive_tool(found);
@@ -19146,7 +19154,9 @@ fn apply_deferred_geometry(app: &Rc<RefCell<App>>) {
     // 直接生效（不依赖 HWND / 首帧 redraw）。否则首帧 RedrawRequested 会被首屏
     // 索引/列表渲染拖到数秒后才触发，期间窗口停在默认位置、造成明显闪烁。
     // 首次启动 75% 居中：此刻 scale_factor() 才是真实值（仍须等 realize 后）。
-    if app.borrow().first_run_pending {
+    // 同上：条件里的 `Ref` 会活到块尾，这块里还有 borrow_mut，必须先取值。
+    let center_pending = app.borrow().first_run_pending;
+    if center_pending {
         app.borrow_mut().first_run_pending = false;
         let s2 = app.borrow().ui.window().scale_factor() as f32;
         if let Some((sw, sh)) = screen_size_logical(s2) {
