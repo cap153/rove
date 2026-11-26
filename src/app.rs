@@ -7942,6 +7942,8 @@ impl App {
     fn sync_active_tab(&mut self) {
         // 类型下拉属于上一个标签的那个窗格，切标签就关掉。
         self.close_type_filter_menu();
+        // 切走再切回来不是「连着待在这个目录里」，快照一并作废（同上）。
+        self.shell_new_watch = None;
         // 打开保护伞：切换标签时，Slint 会因内容高度变化对 Flickable 自动 Clamp，
         // 触发残留的 scroll-changed 事件；此刻置位可避免其把旧标签的巨大坐标
         // 写进新标签的 scroll_y（否则表现为切标签白屏）。
@@ -12745,18 +12747,15 @@ impl App {
         match id {
             "recycle-restore" => {
                 if let MenuScope::Selection(paths) = &target {
-                    let mut restored = 0;
-                    for p in paths {
-                        restored += fs::drives::restore_recycle_entry(p);
+                    // 还原会在原目录凭空多出一个文件：作废「Shell 新建」快照，
+                    // 否则回到那个目录时它会被当成新建、直接进重命名。
+                    self.shell_new_watch = None;
+                    // 交给后台任务：还原要走 Shell 的「还原」动词（原位置有同名
+                    // 文件时由 Windows 弹「替换 / 跳过 / 比较」），而且回收站
+                    // 整个任务只枚举两次 —— 以前是每个条目枚举一次。
+                    if !paths.is_empty() {
+                        self.submit_job(JobKind::RestoreRecycle { keys: paths.clone() });
                     }
-                    if restored > 0 {
-                        self.set_status_job(
-                            self.trf("已还原 {} 项到原位置", &[restored.to_string()]),
-                        );
-                    } else {
-                        self.set_status_job(self.tr("还原失败"));
-                    }
-                    self.reload_active();
                     self.sidebar_fingerprint = 0;
                 }
             }
@@ -12922,14 +12921,12 @@ impl App {
             return;
         };
         if self.state.active().active().path.as_deref() == Some(fs::drives::recycle_virtual_path().as_path()) {
-            let n = fs::drives::restore_recycle_entry(&entry.path);
-            if n > 0 {
-                self.set_status_job(self.trf("已还原 {} 项到原位置", &[n.to_string()]));
-                self.reload_active();
-                self.sidebar_fingerprint = 0;
-            } else {
-                self.set_status_job(self.tr("还原失败"));
-            }
+            // 同「还原」菜单项：还原动作放后台任务里做。
+            self.shell_new_watch = None;
+            self.submit_job(JobKind::RestoreRecycle {
+                keys: vec![entry.path.clone()],
+            });
+            self.sidebar_fingerprint = 0;
             return;
         }
         self.open_path(&entry.path);
@@ -13054,52 +13051,22 @@ impl App {
 
         // 场景 2：从回收站剪切后粘贴到常规目录 -> 先还原，再移动到目标目录。
         if self.state.clipboard_from_recycle && !self.state.clipboard_paths.is_empty() {
-            let paths = std::mem::take(&mut self.state.clipboard_paths);
+            // 同样是「文件凭空出现在原目录」，作废「Shell 新建」快照。
+            self.shell_new_watch = None;
+            let keys = std::mem::take(&mut self.state.clipboard_paths);
             self.state.clipboard_from_recycle = false;
             self.state.cut_paths.clear();
             self.visible_cache = None;
             self.visible_cache_right = None;
-
-            let mut restored = Vec::new();
-            for p in &paths {
-                // 先记下删除前的位置，再按唯一 id 精确还原这一条；
-                // 同名条目各有自己的 id，不会互相牵连。
-                if let Some(original) = fs::drives::recycle_original_path(p) {
-                    if fs::drives::restore_recycle_entry(p) > 0 {
-                        restored.push(original);
-                    }
-                }
-            }
-
-            if restored.is_empty() {
-                self.set_status_job(self.tr("还原失败（项目可能已被彻底删除）"));
+            // 还原 + 移动整条链都在后台任务里：还原会弹 Windows 的替换/跳过
+            // 对话框，不能在 UI 线程上等。
+            if keys.is_empty() {
                 return;
             }
-
-            // 还原位置与目标目录不一致的项目需要移动过去。
-            let restored_paths = restored.clone();
-            let to_move: Vec<PathBuf> = restored
-                .into_iter()
-                .filter(|p| p.parent() != Some(dest.as_path()))
-                .collect();
-
-            if !to_move.is_empty() {
-                let pane = self.state.active().active_pane;
-                self.expect_new_entries(&to_move, &dest, pane);
-                self.submit_job(JobKind::Move {
-                    sources: to_move,
-                    dest_dir: dest,
-                });
-            } else {
-                self.set_status_job(self.trf(
-                    "已从回收站还原 {} 个项目到当前目录",
-                    &[paths.len().to_string()],
-                ));
-                self.scroll_to_paths = restored_paths;
-                self.scroll_select = true;
-                self.reveal_pane = Some(self.state.active().active_pane);
-                self.reload_active();
-            }
+            self.submit_job(JobKind::RestoreMove {
+                keys,
+                dest_dir: dest,
+            });
             self.sidebar_fingerprint = 0;
             return;
         }
@@ -13330,10 +13297,19 @@ impl App {
         if summary.clear_undo {
             self.undo.clear();
         }
-        if let Some((redo, _)) = summary.history.take() {
+        if let Some((redo, entry)) = summary.history.take() {
+            // 任务里可能回填了新信息（重做删除会产生**新的**回收站条目 id），
+            // 必须写回栈顶：只在任务里更新的那份会被扔掉，下一次撤消就会拿着
+            // 已经消失的旧 id 去回收站里找，报「找不到这些项目」。
+            if summary.failed == 0 || summary.cancelled {
+                if redo {
+                    self.undo.update_undo(entry);
+                } else {
+                    self.undo.update_redo(entry);
+                }
+            }
             if summary.failed > 0 && !summary.cancelled {
-                // 用户取消：什么都没动，记录放回去还能再试。
-                // 真正的失败（比如回收站里已经找不到那批文件）就把它扔掉 ——
+                // 真正的失败（比如回收站里已经找不到那批文件）就把记录扔掉 ——
                 // 留在栈顶会让之后每一次 Ctrl+Z 都重试同一条、次次失败，
                 // 更早的历史等于永远撤不到。
                 logv!("[undo] 这次记录失败，作废 redo={}", redo);
@@ -13343,6 +13319,7 @@ impl App {
                     self.undo.drop_redo();
                 }
             } else if summary.failed > 0 {
+                // 用户取消：什么都没动，记录放回原来那一侧，下次还能再试。
                 if redo {
                     self.undo.restore_redo();
                 } else {
@@ -13426,6 +13403,13 @@ impl App {
         if self.state.tabs.iter().any(|t| t.active().loading) {
             self.sync_file_list();
             self.sync_status();
+        }
+
+        // 任务里才确定的落地路径（「从回收站剪切粘贴」）：滚进视野并选中。
+        if !summary.select.is_empty() {
+            self.reveal_pane = Some(self.state.active().active_pane);
+            self.scroll_to_paths = summary.select.clone();
+            self.scroll_select = true;
         }
 
         // 移动操作会消耗剪贴板：系统剪贴板里仍是「剪切」语义时一并清掉，
@@ -13608,6 +13592,11 @@ impl App {
     fn sync_after_navigate(&mut self) {
         // 换目录了：类型下拉里列的是上一个目录的类型，必须关掉。
         self.close_type_filter_menu();
+        // 「Shell 新建」快照只对**连着待在这一个目录里**的这一小段时间有效。
+        // 以前它跟着时间窗走，跨目录也照样算数：空白处右键（快照记下当时的文件）
+        // → 去回收站还原一个文件 → 回到这个目录，列举看到多出来的那 1 个文件，
+        // 就被当成「用 Shell 新建」→ 刚还原的文件莫名其妙进了重命名。
+        self.shell_new_watch = None;
         // 导航时取消挂起的延迟重命名：导航会换目录/选择集，原路径可能不再有效，
         // 否则几百毫秒后会在新页面里误弹出重命名。
         self.cancel_rename_defer();

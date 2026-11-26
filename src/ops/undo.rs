@@ -96,7 +96,14 @@ pub fn capture_dir_id(_path: &Path) -> Option<DirId> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Kind {
     /// 删除到回收站。
-    Trash { paths: Vec<PathBuf> },
+    ///
+    /// `ids` 与 `paths` 一一对应：删除后回填的回收站条目唯一 id（拿不到是
+    /// `None`，比如删除刚好失败、或回收站枚举失败）。撤消时优先用它精确找回
+    /// 「这一次」删的那一条 —— 同一路径删过多次时，光凭原始路径会认错条目。
+    Trash {
+        paths: Vec<PathBuf>,
+        ids: Vec<Option<PathBuf>>,
+    },
     /// 复制：`sources` 复制到 `dest`，落地后是 `created`。
     Copy {
         sources: Vec<PathBuf>,
@@ -115,7 +122,7 @@ impl Kind {
     /// 这条记录一共涉及多少个路径（用于决定要不要记）。
     pub fn path_count(&self) -> usize {
         match self {
-            Kind::Trash { paths } => paths.len(),
+            Kind::Trash { paths, .. } => paths.len(),
             Kind::Create { dirs } => dirs.len(),
             Kind::Copy { created, .. } => created.len(),
             Kind::Move { pairs } | Kind::Rename { pairs } => pairs.len(),
@@ -133,7 +140,7 @@ impl Kind {
             }
         };
         match self {
-            Kind::Trash { paths } => {
+            Kind::Trash { paths, .. } => {
                 for p in paths {
                     add(p.parent());
                 }
@@ -180,13 +187,16 @@ impl Kind {
     }
 
     /// 同上，重做那一侧。
+    ///
+    /// 用「重做 X」而不是「恢复 X」：这个应用里「还原 / 恢复」已经是「从回收站
+    /// 放回原位置」的意思，两个词撞在一起，菜单上就分不清按下会发生什么。
     pub fn redo_label(&self) -> &'static str {
         match self {
-            Kind::Trash { .. } => "恢复删除",
-            Kind::Copy { .. } => "恢复复制",
-            Kind::Move { .. } => "恢复移动",
-            Kind::Rename { .. } => "恢复重命名",
-            Kind::Create { .. } => "恢复新建",
+            Kind::Trash { .. } => "重做删除",
+            Kind::Copy { .. } => "重做复制",
+            Kind::Move { .. } => "重做移动",
+            Kind::Rename { .. } => "重做重命名",
+            Kind::Create { .. } => "重做新建",
         }
     }
 }
@@ -263,6 +273,21 @@ impl UndoStack {
     pub fn restore_redo(&mut self) {
         if let Some(kind) = self.undo.pop() {
             self.redo.push(kind);
+        }
+    }
+
+    /// 任务里回填了记录的新信息（比如重做删除之后新产生的回收站条目 id）：
+    /// 写回栈顶。不写回去，下一次撤消就会拿着过期的 id，在回收站里找不到条目。
+    pub fn update_undo(&mut self, kind: Kind) {
+        if let Some(top) = self.undo.last_mut() {
+            *top = kind;
+        }
+    }
+
+    /// 同上，重做那一侧。
+    pub fn update_redo(&mut self, kind: Kind) {
+        if let Some(top) = self.redo.last_mut() {
+            *top = kind;
         }
     }
 
@@ -479,9 +504,53 @@ mod tests {
         let huge: Vec<PathBuf> = (0..MAX_ENTRY_PATHS + 1)
             .map(|i| PathBuf::from(format!("C:\\x\\{i}.txt")))
             .collect();
-        stack.record(Kind::Trash { paths: huge });
+        stack.record(Kind::Trash {
+            paths: huge.clone(),
+            ids: vec![None; huge.len()],
+        });
         assert!(!stack.can_redo(), "丢弃记录也必须清掉重做栈");
         let _ = stack;
+    }
+
+    /// 任务里回填的信息必须写回栈顶：否则「删除 → 撤消 → 重做删除」之后
+    /// 栈里留的还是**上一批**回收站条目 id，下一次撤消会在回收站里找不到东西。
+    #[test]
+    fn updated_entry_is_written_back_to_the_top() {
+        let path = PathBuf::from("C:\\x\\a.txt");
+        let old_id = PathBuf::from("C:\\$Recycle.Bin\\S-1\\$RAAA.txt");
+        let new_id = PathBuf::from("C:\\$Recycle.Bin\\S-1\\$RBBB.txt");
+        let mut stack = UndoStack::new();
+        stack.record(Kind::Trash {
+            paths: vec![path.clone()],
+            ids: vec![Some(old_id.clone())],
+        });
+
+        // 按下撤消：记录从撤消栈搬到重做栈。
+        let taken = stack.take_undo().unwrap();
+        assert!(!stack.can_undo());
+        assert!(stack.can_redo());
+        // 撤消任务回填了信息（这里空转，用同一份）→ 写回**重做**那一侧。
+        stack.update_redo(taken);
+        assert!(stack.can_redo(), "写回后重做那一侧还在");
+        match stack.peek_redo() {
+            Some(Kind::Trash { ids, .. }) => assert_eq!(ids, &vec![Some(old_id.clone())]),
+            other => panic!("重做栈顶写回失败：{other:?}"),
+        }
+
+        // 按下重做删除：记录搬回撤消栈，任务产生了**新的**回收站条目 id。
+        let taken = stack.take_redo().unwrap();
+        let mut updated = taken;
+        if let Kind::Trash { ids, .. } = &mut updated {
+            *ids = vec![Some(new_id.clone())];
+        }
+        stack.update_undo(updated);
+        match stack.peek_undo() {
+            Some(Kind::Trash { paths: kept, ids }) => {
+                assert_eq!(kept, &vec![path.clone()]);
+                assert_eq!(ids, &vec![Some(new_id)], "栈顶必须是回填后的新 id");
+            }
+            other => panic!("撤消栈顶写回失败：{other:?}"),
+        }
     }
 
     /// 身份必须是「对象」的身份，不是「路径」的身份：同名文件夹删了重建，

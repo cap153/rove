@@ -148,6 +148,116 @@ mod imp {
         )
     }
 
+    /// 一条还原请求：回收站里的条目 + 它删除前所在的目录和名字。
+    pub struct RestoreRequest {
+        /// 条目在回收站里的 desktop-absolute parsing name（`trash` 的 `id`）。
+        pub item: PathBuf,
+        /// 删除前所在的目录。
+        pub parent: PathBuf,
+        /// 删除前的名字。
+        pub name: std::ffi::OsString,
+    }
+
+    /// 还原回收站条目：走 `IFileOperation`（资源管理器「还原」内部就是它），
+    /// 关键是**不设 `FOF_NO_UI`**。
+    ///
+    /// `trash` crate 的 `restore_all` 写死了 `FOF_NO_UI | FOFX_EARLYFAILURE`，
+    /// 原位置有同名文件时只会静默失败；这里放开 UI，多个条目共用一个还原进度框，
+    /// 冲突时由 Windows 弹「替换 / 跳过 / 比较文件信息」。
+    ///
+    /// **会阻塞**（进度框是模态的），调用方必须在后台线程上跑。
+    /// 返回值只反映「有没有排队成功 / 整批操作有没有报错」，逐条的真实结果由
+    /// 调用方按「条目还在不在回收站里」复核。
+    /// 返回 `(用户在复制引擎里点了取消, 逐条结果)`。
+    pub fn restore_recycle_items(
+        requests: &[RestoreRequest],
+        hwnd: isize,
+    ) -> (bool, Vec<(PathBuf, Result<(), String>)>) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
+        };
+        use windows::Win32::UI::Shell::{
+            FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+            FOF_NOCONFIRMMKDIR,
+        };
+
+        // 后台线程：自己初始化成 STA（Shell 的进度框 / 复制引擎要求）。
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok();
+        }
+
+        let wide = |text: &std::ffi::OsStr| -> Vec<u16> {
+            text.encode_wide().chain(Some(0)).collect()
+        };
+
+        let op: IFileOperation = match unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_ALL) }
+        {
+            Ok(op) => op,
+            Err(e) => {
+                let msg = format!("创建文件操作失败（0x{:08X}）", e.code().0 as u32);
+                return (
+                    false,
+                    requests.iter().map(|r| (r.item.clone(), Err(msg.clone()))).collect(),
+                );
+            }
+        };
+        // 只关掉「是否新建文件夹」的确认框（原目录被删掉时才有；资源管理器也
+        // 是不问的）。进度框、冲突框（替换 / 跳过 / 比较文件信息）一概保留。
+        unsafe {
+            let _ = op.SetOperationFlags(FOF_NOCONFIRMMKDIR);
+            let _ = op.SetOwnerWindow(HWND(hwnd as *mut core::ffi::c_void));
+        }
+
+        let mut out: Vec<(PathBuf, Result<(), String>)> = Vec::with_capacity(requests.len());
+        for request in requests {
+            let queued = (|| -> windows::core::Result<()> {
+                let item_wide = wide(request.item.as_os_str());
+                let parent_wide = wide(request.parent.as_os_str());
+                let name_wide = wide(&request.name);
+                let src: IShellItem =
+                    unsafe { SHCreateItemFromParsingName(PCWSTR(item_wide.as_ptr()), None) }?;
+                let dest: IShellItem =
+                    unsafe { SHCreateItemFromParsingName(PCWSTR(parent_wide.as_ptr()), None) }?;
+                unsafe { op.MoveItem(&src, &dest, PCWSTR(name_wide.as_ptr()), None) }
+            })();
+            match queued {
+                Ok(()) => out.push((request.item.clone(), Ok(()))),
+                Err(e) => {
+                    let msg = format!("排队还原失败（0x{:08X}）", e.code().0 as u32);
+                    crate::logal!("!! [restore] {} 失败：{msg}", request.item.display());
+                    out.push((request.item.clone(), Err(msg)));
+                }
+            }
+        }
+
+        let mut aborted = false;
+        if out.iter().any(|(_, result)| result.is_ok()) {
+            match unsafe { op.PerformOperations() } {
+                Ok(()) => crate::logv!("[restore] Shell 还原完成 n={}", requests.len()),
+                Err(e) => {
+                    // 用户在进度框里点「取消」也走这里（HRESULT 是复制引擎的错误）。
+                    let msg = format!("还原被中止（0x{:08X}）", e.code().0 as u32);
+                    crate::logal!("!! [restore] {msg}");
+                    for (_, result) in out.iter_mut() {
+                        if result.is_ok() {
+                            *result = Err(msg.clone());
+                        }
+                    }
+                }
+            }
+            // 复制引擎自己的「用户取消」标记：只有它能区分「取消」和「失败」，
+            // 两者的后果完全不同 —— 取消要把历史记录留着，失败要扔掉。
+            aborted = matches!(unsafe { op.GetAnyOperationsAborted() }, Ok(flag) if flag.as_bool());
+            if aborted {
+                crate::logv!("[restore] 用户在还原进度框里点了取消");
+            }
+        }
+        (aborted, out)
+    }
+
     pub fn shell_delete(from: &[PathBuf], to_trash: bool, hwnd: isize) -> Result<bool, String> {
         let mut flags = 0u32;
         if to_trash {
@@ -485,6 +595,26 @@ mod imp {
     ) -> Result<bool, String> {
         Err("原生 Shell 操作仅在 Windows 支持".into())
     }
+    /// 非 Windows：只为让上层代码能编译（真正的还原只有 Windows 有）。
+    pub struct RestoreRequest {
+        pub item: PathBuf,
+        pub parent: PathBuf,
+        pub name: std::ffi::OsString,
+    }
+
+    pub fn restore_recycle_items(
+        requests: &[RestoreRequest],
+        _hwnd: isize,
+    ) -> (bool, Vec<(PathBuf, Result<(), String>)>) {
+        (
+            false,
+            requests
+                .iter()
+                .map(|r| (r.item.clone(), Err("当前平台不支持还原".to_string())))
+                .collect(),
+        )
+    }
+
     pub fn shell_delete(
         _from: &[PathBuf],
         _to_trash: bool,

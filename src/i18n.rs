@@ -318,11 +318,11 @@ pub const ZH: &[&str] = &[
     "撤消删除",                 // 307
     "撤消新建",                 // 308
     "撤消重命名",               // 309
-    "恢复复制",                 // 310
-    "恢复移动",                 // 311
-    "恢复删除",                 // 312
-    "恢复新建",                 // 313
-    "恢复重命名",               // 314
+    "重做复制",                 // 310
+    "重做移动",                 // 311
+    "重做删除",                 // 312
+    "重做新建",                 // 313
+    "重做重命名",               // 314
     "搜索中不能拖放到当前分屏，请拖到具体的文件夹上", // 315
     // ---- 自建的「属性 / 重命名 / 快捷方式」（316 起，追加在末尾）----
     "创建快捷方式",           // 316
@@ -879,15 +879,15 @@ mod tests {
         assert_eq!(EN[308], "Undo new folder");
         assert_eq!(ZH[309], "撤消重命名");
         assert_eq!(EN[309], "Undo rename");
-        assert_eq!(ZH[310], "恢复复制");
+        assert_eq!(ZH[310], "重做复制");
         assert_eq!(EN[310], "Redo copy");
-        assert_eq!(ZH[311], "恢复移动");
+        assert_eq!(ZH[311], "重做移动");
         assert_eq!(EN[311], "Redo move");
-        assert_eq!(ZH[312], "恢复删除");
+        assert_eq!(ZH[312], "重做删除");
         assert_eq!(EN[312], "Redo delete");
-        assert_eq!(ZH[313], "恢复新建");
+        assert_eq!(ZH[313], "重做新建");
         assert_eq!(EN[313], "Redo new folder");
-        assert_eq!(ZH[314], "恢复重命名");
+        assert_eq!(ZH[314], "重做重命名");
         assert_eq!(EN[314], "Redo rename");
         // 搜索状态下拖回本栏的拒绝提示。
         assert_eq!(ZH[315], "搜索中不能拖放到当前分屏，请拖到具体的文件夹上");
@@ -1016,7 +1016,10 @@ mod tests {
         // 空白处右键菜单的撤消 / 重做文字是 Rust 侧按记录类型拼出来的，
         // 每种记录都得能在字典里查到，否则英文界面会冒出中文。
         let kinds = [
-            crate::ops::undo::Kind::Trash { paths: vec![] },
+            crate::ops::undo::Kind::Trash {
+                paths: vec![],
+                ids: vec![],
+            },
             crate::ops::undo::Kind::Copy {
                 sources: vec![],
                 dest: std::path::PathBuf::new(),

@@ -269,31 +269,151 @@ fn trash_item_matches(item: &trash::TrashItem, key: &std::path::Path) -> bool {
     std::path::Path::new(&item.id) == key || item.original_path().as_path() == key
 }
 
-/// 查回收站条目的删除前原始路径（还原前调用，用于判断是否还需要移到目标目录）。
-pub fn recycle_original_path(key: &std::path::Path) -> Option<std::path::PathBuf> {
-    trash::os_limited::list()
-        .ok()?
+/// 从回收站条目里挑出这次要处理的那一条 / 那几条。
+///
+/// 键有两种来源：
+/// - **唯一 Shell id**（回收站视图里的条目 path、内部剪贴板里的键）→ 精确命中一条；
+/// - **原始路径**（「撤消删除」的历史记录里存的是它）→ 同一位置可能被删过好几次，
+///   回收站里就有多条原路径完全相同的条目。这时只能取**删除时间最新**的那一条：
+///   把它们一起交给 `restore_all`，会因为目标位置重名而整体失败（表现为
+///   「撤销删除按了没反应」，而回收站里明明还有这一条）。
+fn select_trash_targets(
+    items: &[trash::TrashItem],
+    key: &std::path::Path,
+) -> Vec<trash::TrashItem> {
+    let by_id: Vec<trash::TrashItem> = items
         .iter()
-        .find(|it| trash_item_matches(it, key))
-        .map(|it| it.original_path())
+        .filter(|it| std::path::Path::new(&it.id) == key)
+        .cloned()
+        .collect();
+    if !by_id.is_empty() {
+        return by_id;
+    }
+    items
+        .iter()
+        .filter(|it| it.original_path().as_path() == key)
+        .max_by_key(|it| it.time_deleted)
+        .cloned()
+        .into_iter()
+        .collect()
 }
 
-/// 按唯一 id（或兼容的原始路径）还原回收站条目，成功返回还原数量。
-/// 按 id 命中只还原那一条，不会把同名条目一起还原。
-pub fn restore_recycle_entry(key: &std::path::Path) -> usize {
-    let Ok(items) = trash::os_limited::list() else {
-        return 0;
-    };
-    let targets: Vec<_> = items
-        .into_iter()
-        .filter(|it| trash_item_matches(it, key))
-        .collect();
-    let count = targets.len();
-    if count > 0 && trash::os_limited::restore_all(targets).is_ok() {
-        count
-    } else {
-        0
+/// 一次还原的结果。
+#[derive(Default, Debug)]
+pub struct RestoreReport {
+    /// 真的回到原位置的条目（删除前的原始路径）。
+    pub restored: Vec<std::path::PathBuf>,
+    /// 还原后仍在回收站里的条目（用户点了「跳过」/ 还原失败）。
+    pub left: Vec<std::path::PathBuf>,
+    /// 回收站里压根找不到的键（多半已经被彻底删除）。
+    pub missing: Vec<std::path::PathBuf>,
+    /// 用户在 Windows 的还原进度框里点了「取消」。
+    ///
+    /// 必须和「失败」分开：取消什么都没动，历史记录要留着还能再试；
+    /// 真正的失败会把记录扔掉。
+    pub cancelled: bool,
+}
+
+/// 还原一批回收站条目。
+///
+/// 键可以是：唯一 Shell id（回收站视图条目、内部剪贴板、删除时记下的 id），
+/// 或删除前的原始路径（老的历史记录，按「最新一条」匹配）。
+///
+/// 回收站只枚举两次（还原前挑条目、还原后复核），不再逐条枚举。
+/// **会阻塞**：Windows 上走 Shell 的「还原」动词，原位置有同名文件时由
+/// Windows 自己弹「替换 / 跳过 / 比较文件信息」，所以调用方必须是后台线程。
+pub fn restore_recycle_entries(keys: &[std::path::PathBuf]) -> RestoreReport {
+    let mut report = RestoreReport::default();
+    if keys.is_empty() {
+        return report;
     }
+    let Ok(items) = trash::os_limited::list() else {
+        report.missing = keys.to_vec();
+        return report;
+    };
+    // 键 → 条目。同一原路径有多条时只能挑一条（见 select_trash_targets）。
+    let mut picked: Vec<(std::path::PathBuf, trash::TrashItem)> = Vec::new();
+    for key in keys {
+        let found = select_trash_targets(&items, key);
+        if found.is_empty() {
+            report.missing.push(key.clone());
+            continue;
+        }
+        for item in found {
+            picked.push((key.clone(), item));
+        }
+    }
+    if picked.is_empty() {
+        return report;
+    }
+
+    // 1) 交给 Shell 的 IFileOperation（资源管理器「还原」就是它，放开 UI 才会
+    //    弹「替换 / 跳过 / 比较文件信息」）。逐条只排队一次，最后统一执行，
+    //    多个条目共用一个进度框。
+    let requests: Vec<crate::sys::shell::RestoreRequest> = picked
+        .iter()
+        .map(|(_, item)| crate::sys::shell::RestoreRequest {
+            item: std::path::PathBuf::from(item.id.clone()),
+            parent: item.original_parent.clone(),
+            // 目录名可能带尾部分隔符（`list_recycle_entries` 里也要 trim 同一个
+            // 东西才显得正常）：带着它交给 IFileOperation，名字会被当成子路径。
+            name: std::ffi::OsString::from(
+                item.name.to_string_lossy().trim_end_matches(['\\', '/']),
+            ),
+        })
+        .collect();
+    // 主人窗口交给 Shell：冲突框 / 进度框归在主窗上，不会跑到它后面去。
+    let owner = crate::sys::shell::current_owner_hwnd();
+    let (cancelled, _) = crate::sys::shell::restore_recycle_items(&requests, owner);
+    report.cancelled = cancelled;
+
+    // 2) 复核：真的还原成功的条目已经不在回收站里了。用户点「跳过」的还留着。
+    match trash::os_limited::list() {
+        Ok(after) => {
+            let still: std::collections::HashSet<std::ffi::OsString> =
+                after.iter().map(|item| item.id.clone()).collect();
+            for (_, item) in &picked {
+                if still.contains(&item.id) {
+                    report.left.push(item.original_path());
+                } else {
+                    report.restored.push(item.original_path());
+                }
+            }
+        }
+        // 复核不了（枚举失败）：一律按「没还原」报，宁可少报告成功 ——
+        // 谎报成功会让「撤消删除」把一条其实还在回收站里的记录扔掉。
+        Err(_) => {
+            for (_, item) in &picked {
+                report.left.push(item.original_path());
+            }
+        }
+    }
+    report
+}
+
+/// 删除之后回填回收站条目的唯一 id。
+///
+/// 「撤消删除」拿原始路径去还原，碰上同一路径删过多次时会认错条目；把这次
+/// 删除产生的条目 id 记进历史记录，撤消就能精确还原「这一次」删的那一条。
+/// `deleted_after` = 删除开始时刻（unix 秒），用来排除以前删的同名条目。
+pub fn resolve_trash_ids(
+    paths: &[std::path::PathBuf],
+    deleted_after: i64,
+) -> Vec<Option<std::path::PathBuf>> {
+    let Ok(items) = trash::os_limited::list() else {
+        return vec![None; paths.len()];
+    };
+    paths
+        .iter()
+        .map(|path| {
+            items
+                .iter()
+                .filter(|item| item.original_path().as_path() == path.as_path())
+                .filter(|item| item.time_deleted >= deleted_after)
+                .max_by_key(|item| item.time_deleted)
+                .map(|item| std::path::PathBuf::from(item.id.clone()))
+        })
+        .collect()
 }
 
 /// 这批键里还有几条留在回收站（彻底删除后用它判断真实结果）。
@@ -796,7 +916,40 @@ pub fn list_network_places() -> Vec<(String, String)> {
 }
 #[cfg(test)]
 mod tests {
-    use super::{lnk_target_from_bytes, normalize_network_path, scan_bytes_for_unc};
+    use super::{
+        lnk_target_from_bytes, normalize_network_path, scan_bytes_for_unc, select_trash_targets,
+    };
+
+    /// 同一路径在回收站里有好几条时（删过不止一次），「撤消删除」只能挑最后删除
+    /// 的那一条。以前按原路径把命中的全部交给 `restore_all`，目标位置重名 →
+    /// 整批失败，用户看到的就是「撤销删除没反应」。
+    #[test]
+    fn select_targets_picks_newest_among_duplicate_original_path() {
+        let parent = std::path::PathBuf::from(r"C:\Users\a\Downloads");
+        let item = |id: &str, time: i64| trash::TrashItem {
+            id: id.into(),
+            name: "dup.txt".into(),
+            original_parent: parent.clone(),
+            time_deleted: time,
+        };
+        let items = vec![
+            item(r"C:\$Recycle.Bin\S-1\$RAAA.txt", 100),
+            item(r"C:\$Recycle.Bin\S-1\$RBBB.txt", 200),
+        ];
+        let original = parent.join("dup.txt");
+        let picked = select_trash_targets(&items, &original);
+        assert_eq!(picked.len(), 1, "同原路径只能挑一条");
+        assert_eq!(picked[0].time_deleted, 200, "应挑最后删除的那条");
+
+        // 传唯一 id 时精确命中，哪怕它不是最新的。
+        let key = std::path::Path::new(&items[0].id);
+        let by_id = select_trash_targets(&items, key);
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].time_deleted, 100);
+
+        // 找不到就别硬凑。
+        assert!(select_trash_targets(&items, std::path::Path::new(r"C:\nope.txt")).is_empty());
+    }
 
     fn put_u32(buf: &mut [u8], at: usize, value: u32) {
         buf[at..at + 4].copy_from_slice(&value.to_le_bytes());

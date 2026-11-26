@@ -30,6 +30,10 @@ pub enum JobKind {
         redo: bool,
         entry: crate::ops::undo::Kind,
     },
+    /// 还原回收站条目（键 = 条目的唯一 id，也兼容原始路径）。
+    RestoreRecycle { keys: Vec<PathBuf> },
+    /// 从回收站剪切后粘贴：先还原，再把落回原位置的条目移进目标目录。
+    RestoreMove { keys: Vec<PathBuf>, dest_dir: PathBuf },
 }
 
 impl JobKind {
@@ -37,6 +41,8 @@ impl JobKind {
         match self {
             JobKind::Copy { sources, .. } | JobKind::Move { sources, .. } => sources.len(),
             JobKind::Delete { paths, .. } => paths.len(),
+            JobKind::RestoreRecycle { keys } => keys.len(),
+            JobKind::RestoreMove { keys, .. } => keys.len(),
             JobKind::History { .. } => 1,
         }
     }
@@ -73,10 +79,21 @@ pub struct JobSummary {
     /// 撤消 / 重做任务是被**用户取消**的（不是失败）：记录要退回原栈，
     /// 别的失败则把记录扔掉（见 `UndoStack::drop_undo`）。
     pub cancelled: bool,
+    /// 任务完成后要选中 / 滚进视野的条目（目前只有「从回收站剪切粘贴」
+    /// 用得上：那些路径是还原之后才知道的，UI 提交任务时拿不到）。
+    pub select: Vec<PathBuf>,
 }
 
 /// 用户取消了操作（Shell 进度框点了「取消」）。
 pub const CANCELLED: &str = "操作已取消";
+
+/// 当前 unix 秒（回收站条目时间戳用同一把尺子）。
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
 
 /// 状态栏文案的中英选择（en = 当前界面为英文）。
 fn t(en: bool, zh: &str, english: &str) -> String {
@@ -198,6 +215,10 @@ fn run_job(
         }
         JobKind::Delete { paths, to_trash } => run_delete(paths, *to_trash, status, cancel, en),
         JobKind::History { redo, entry } => run_history(entry, *redo, en),
+        JobKind::RestoreRecycle { keys } => run_restore_recycle(keys, en),
+        JobKind::RestoreMove { keys, dest_dir } => {
+            run_restore_move(keys, dest_dir, status, cancel, en)
+        }
     }
 }
 
@@ -377,13 +398,19 @@ fn run_delete(
 
     #[cfg(windows)]
     {
+        // 记下删除开始的时刻：回填回收站条目 id 时用它排除以前删的同名条目。
+        let started = unix_now() - 3;
         let res = crate::sys::shell::shell_delete(paths, to_trash, 0);
         return match res {
             Ok(aborted) => JobSummary {
                 // 彻底删除不进撤消栈：它本来就没有反向动作。
                 recorded: (to_trash && !aborted && !paths.is_empty()).then(|| {
+                    // 回填这次删除产生的回收站条目 id：「撤消删除」靠它精确找回
+                    // 这一条，同一路径删过多次也不会认错。
+                    let ids = crate::fs::drives::resolve_trash_ids(paths, started);
                     crate::ops::undo::Kind::Trash {
                         paths: paths.to_vec(),
+                        ids,
                     }
                 }),
                 message: if aborted {
@@ -535,24 +562,51 @@ fn new_entries(dir: &Path, before: &std::collections::HashSet<std::ffi::OsString
 fn apply_history(entry: &mut crate::ops::undo::Kind, redo: bool) -> Result<usize, String> {
     use crate::ops::undo::Kind;
     match entry {
-        Kind::Trash { paths } => {
+        Kind::Trash { paths, ids } => {
             if redo {
                 // 重做删除 = 再删一次。仍然进回收站，所以还能再撤消。
-                if crate::sys::shell::shell_delete(paths, true, 0)? {
+                // 只删**现在还在**的：撤消时被「跳过」的、或已经被别人挪走的
+                // 那些路径不存在，整批发给 Shell 会直接报「找不到文件」。
+                let existing: Vec<PathBuf> = paths.iter().filter(|p| p.exists()).cloned().collect();
+                if existing.is_empty() {
+                    return Err("这些项目已经不在原位置了（撤消时可能没有还原成功）".into());
+                }
+                let started = unix_now() - 3;
+                if crate::sys::shell::shell_delete(&existing, true, 0)? {
                     return Err(CANCELLED.into());
                 }
-                Ok(paths.len())
+                // 新删出来的是**另一批**回收站条目：id 要重新回填，否则下一次
+                // 撤消还拿着上一批的 id，回收站里早就没有了。
+                // id 按 `paths` 对齐（找不到的就是 None），撤消那一侧靠长度判断。
+                *ids = crate::fs::drives::resolve_trash_ids(paths, started);
+                Ok(existing.len())
             } else {
-                // 撤消删除 = 从回收站还原。按「删除前的原路径」匹配条目，
-                // 同名文件各有自己的 id，不会互相牵连。
-                let restored: usize = paths
-                    .iter()
-                    .map(|p| crate::fs::drives::restore_recycle_entry(p))
-                    .sum();
-                if restored == 0 {
-                    return Err("回收站里已经找不到这些项目（可能已被彻底删除）".into());
+                // 撤消删除 = 从回收站还原。优先用删除时记下的唯一 id（同名条目
+                // 各有自己的 id）；老记录没有 id，退回原始路径。
+                let keys: Vec<PathBuf> = if ids.len() == paths.len() {
+                    paths
+                        .iter()
+                        .zip(ids.iter())
+                        .map(|(path, id)| id.clone().unwrap_or_else(|| path.clone()))
+                        .collect()
+                } else {
+                    paths.clone()
+                };
+                let report = crate::fs::drives::restore_recycle_entries(&keys);
+                if report.restored.is_empty() {
+                    // 用户在进度框里点了「取消」：什么都没动，记录必须留着，
+                    // 否则一次取消就把这条撤消历史扔了（以前就是这样丢的）。
+                    if report.cancelled {
+                        return Err(CANCELLED.into());
+                    }
+                    // 分清「回收站里没有了」和「还原时被跳过」：前者是真的没了，
+                    // 后者还能再试一次（在冲突框里选「替换」）。
+                    if report.missing.len() >= keys.len() {
+                        return Err("回收站里已经找不到这些项目（可能已被彻底删除）".into());
+                    }
+                    return Err("没有还原（原位置有同名项目时可以在提示框里选「替换」）".into());
                 }
-                Ok(restored)
+                Ok(report.restored.len())
             }
         }
         Kind::Create { dirs } => {
@@ -808,11 +862,16 @@ fn history_message(entry: &crate::ops::undo::Kind, redo: bool, count: usize, en:
     use crate::ops::undo::Kind;
     let n = count.to_string();
     match (entry, redo) {
-        (Kind::Trash { .. }, false) => tf(en, "已还原 {} 项", "Restored {} items", &[n]),
+        (Kind::Trash { .. }, false) => tf(
+            en,
+            "已撤消删除：{} 项已还原到原位置",
+            "Undid delete: {} items restored",
+            &[n],
+        ),
         (Kind::Trash { .. }, true) => tf(
             en,
-            "已重新删除 {} 项到回收站",
-            "Deleted {} items to the Recycle Bin again",
+            "已重做删除：{} 项已放回回收站",
+            "Redid delete: {} items back in the Recycle Bin",
             &[n],
         ),
         (Kind::Create { .. }, false) => t(en, "已撤消新建", "Undid new folder").to_string(),
@@ -833,6 +892,116 @@ fn history_message(entry: &crate::ops::undo::Kind, redo: bool, count: usize, en:
             &[n],
         ),
         (Kind::Copy { .. }, true) => tf(en, "已重做复制：{} 项", "Redid copy: {} items", &[n]),
+    }
+}
+
+/// 还原结果的统一文案。
+fn restore_message(report: &crate::fs::drives::RestoreReport, en: bool) -> String {
+    let n = report.restored.len();
+    let left = report.left.len() + report.missing.len();
+    if n == 0 && report.cancelled {
+        return t(en, "已取消还原", "Restore cancelled");
+    }
+    if n == 0 {
+        if report.left.is_empty() && !report.missing.is_empty() {
+            // 回收站里根本没有这些条目：是被彻底删掉了，不是还原失败。
+            return t(
+                en,
+                "回收站里已经找不到这些项目（可能已被彻底删除）",
+                "Those items are no longer in the Recycle Bin (already deleted)",
+            );
+        }
+        // 条目还在回收站里：多半是在「替换 / 跳过」里点了跳过，还能再试。
+        return t(
+            en,
+            "没有还原（原位置有同名项目时，可以在提示框里选「替换」）",
+            "Nothing was restored (choose Replace in the prompt if a file already exists)",
+        );
+    }
+    if left > 0 {
+        return tf(
+            en,
+            "已还原 {} 项，{} 项仍在回收站",
+            "Restored {} items, {} still in the Recycle Bin",
+            &[n.to_string(), left.to_string()],
+        );
+    }
+    tf(
+        en,
+        "已还原 {} 项到原位置",
+        "Restored {} items to their original location",
+        &[n.to_string()],
+    )
+}
+
+/// 「还原到原位置」任务。
+fn run_restore_recycle(keys: &[PathBuf], en: bool) -> JobSummary {
+    let report = crate::fs::drives::restore_recycle_entries(keys);
+    let mut affected: Vec<PathBuf> = Vec::new();
+    for path in &report.restored {
+        if let Some(parent) = path.parent() {
+            if !affected.iter().any(|d| d == parent) {
+                affected.push(parent.to_path_buf());
+            }
+        }
+    }
+    JobSummary {
+        message: restore_message(&report, en),
+        affected_dirs: affected,
+        failed: report.left.len() + report.missing.len(),
+        outcome: JobOutcome::Other,
+        cancelled: report.cancelled,
+        ..Default::default()
+    }
+}
+
+/// 「回收站剪切 → 粘贴到普通目录」任务：先还原，再移动。
+fn run_restore_move(
+    keys: &[PathBuf],
+    dest_dir: &Path,
+    status: &Arc<Mutex<JobStatus>>,
+    cancel: &Arc<AtomicBool>,
+    en: bool,
+) -> JobSummary {
+    let report = crate::fs::drives::restore_recycle_entries(keys);
+    if report.restored.is_empty() {
+        return JobSummary {
+            message: restore_message(&report, en),
+            failed: keys.len().max(1),
+            outcome: JobOutcome::Other,
+            cancelled: report.cancelled,
+            ..Default::default()
+        };
+    }
+    // 已经落回目标目录里的不用再动。
+    let to_move: Vec<PathBuf> = report
+        .restored
+        .iter()
+        .filter(|path| path.parent() != Some(dest_dir))
+        .cloned()
+        .collect();
+    if to_move.is_empty() {
+        return JobSummary {
+            message: tf(
+                en,
+                "已从回收站还原 {} 个项目到当前目录",
+                "Restored {} items from the Recycle Bin",
+                &[report.restored.len().to_string()],
+            ),
+            affected_dirs: vec![dest_dir.to_path_buf()],
+            outcome: JobOutcome::Moved,
+            select: report.restored.clone(),
+            ..Default::default()
+        };
+    }
+    let mut moved = run_transfer(&to_move, dest_dir, true, status, cancel, en);
+    // 落地的路径只有任务里才知道：交给 UI 去选中 / 滚进视野。
+    if let Some(crate::ops::undo::Kind::Move { pairs }) = &moved.recorded {
+        moved.select = pairs.iter().map(|(_, new)| new.clone()).collect();
+    }
+    JobSummary {
+        message: format!("{}；{}", restore_message(&report, en), moved.message),
+        ..moved
     }
 }
 
@@ -960,6 +1129,41 @@ pub fn status_text(status: &JobStatus, en: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 还原失败的原因必须分开说：**回收站里没有了**（被彻底删掉）和
+    /// **还原时被跳过**（原位置有同名文件）是两回事，前者再试也没用，
+    /// 后者还能在冲突框里选「替换」重来。
+    #[test]
+    fn restore_message_separates_missing_from_skipped() {
+        let mut missing = crate::fs::drives::RestoreReport::default();
+        missing.missing.push(PathBuf::from("C:\\x\\a.txt"));
+        let msg = restore_message(&missing, false);
+        assert!(msg.contains("已经找不到"), "{msg}");
+
+        let mut skipped = crate::fs::drives::RestoreReport::default();
+        skipped.left.push(PathBuf::from("C:\\x\\a.txt"));
+        let msg = restore_message(&skipped, false);
+        assert!(msg.contains("替换"), "{msg}");
+        assert!(!msg.contains("已经找不到"), "{msg}");
+
+        let mut partial = crate::fs::drives::RestoreReport::default();
+        partial.restored.push(PathBuf::from("C:\\x\\a.txt"));
+        partial.left.push(PathBuf::from("C:\\x\\b.txt"));
+        let msg = restore_message(&partial, false);
+        assert!(msg.starts_with("已还原 1 项"), "{msg}");
+        assert!(msg.contains("1 项仍在回收站"), "{msg}");
+
+        let mut all = crate::fs::drives::RestoreReport::default();
+        all.restored.push(PathBuf::from("C:\\x\\a.txt"));
+        assert_eq!(restore_message(&all, false), "已还原 1 项到原位置");
+
+        // 用户在还原进度框里点了取消：不能报成「同名项目 / 选替换」。
+        let cancelled = crate::fs::drives::RestoreReport {
+            cancelled: true,
+            ..Default::default()
+        };
+        assert_eq!(restore_message(&cancelled, false), "已取消还原");
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rove-{name}-{}", std::process::id()));
