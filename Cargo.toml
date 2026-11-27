@@ -1,6 +1,6 @@
 [package]
 name = "rove"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Rove — 极速响应、极低内存的 Windows 文件管理器 (Rust + Slint)"
 
