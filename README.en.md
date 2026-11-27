@@ -154,6 +154,7 @@ To force the GPU instead, use `set SLINT_BACKEND=winit-femtovg`.
 - Dragging files to copy them onto the desktop blocks the UI; for large files use `Ctrl+C` / `Ctrl+V` instead.
 - By default, indexing covers only local solid-state drives (HDDs can be included by enabling them in the settings); network drives and removable drives are not indexed.
 - Explorer takeover only changes the current user's settings, so it may fight with other tools of the same kind.
+- If the window was maximized when you last closed Rove, a brief white flash appears on startup or when waking from the tray.
 
 ## License
 
