@@ -336,6 +336,85 @@ mod imp {
         invoke_verb_on_idlist(path, "openas", "「打开方式」")
     }
 
+    /// 解出快捷方式（`.lnk`）指向的目标路径。
+    ///
+    /// 会碰磁盘 + COM（网络盘上的 .lnk 解析还能卡住），调用方必须放到后台线程上。
+    /// 目标不存在时**不报错**：`GetPath` 照样能拿到记录的路径，由调用方去判断
+    /// 「到底还在不在」，这样坏快捷方式也能给用户一句「目标已不存在」而不是
+    /// 一个 COM 错误码。
+    pub fn shortcut_target(link_path: &Path) -> Result<PathBuf, String> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::Interface as _;
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CoUninitialize, IPersistFile, CLSCTX_INPROC_SERVER,
+            COINIT_APARTMENTTHREADED,
+        };
+        use windows::Win32::UI::Shell::{IShellLinkW, ShellLink, SLGP_RAWPATH};
+
+        let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+        let result = (|| -> Result<PathBuf, String> {
+            let link: IShellLinkW =
+                unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
+                    .map_err(|e| format!("创建 Shell 链接失败（0x{:08X}）", e.code().0 as u32))?;
+            let file: IPersistFile = link
+                .cast()
+                .map_err(|_| "Shell 链接不支持 IPersistFile".to_string())?;
+            let wide: Vec<u16> = link_path.as_os_str().encode_wide().chain([0]).collect();
+            unsafe { file.Load(PCWSTR(wide.as_ptr()), windows::Win32::System::Com::STGM_READ) }
+                .map_err(|e| format!("读取快捷方式失败（0x{:08X}）", e.code().0 as u32))?;
+            let mut buf = [0u16; 1024];
+            let mut find = unsafe { std::mem::zeroed() };
+            // RAWPATH：拿记录里的原路径，不去做「按名字在磁盘上搜一遍」的解析，
+            // 免得在慢盘上卡好几秒；存不存在由调用方判断。
+            // 参数是 u32（SLGP_FLAGS 只是指定位掩码的枚举）。
+            unsafe { link.GetPath(&mut buf, &mut find, SLGP_RAWPATH.0 as u32) }
+                .map_err(|e| format!("解析快捷方式目标失败（0x{:08X}）", e.code().0 as u32))?;
+            let len = buf.iter().position(|c| *c == 0).unwrap_or(buf.len());
+            if len == 0 {
+                return Err("这个快捷方式没有记录目标".to_string());
+            }
+            let text = String::from_utf16_lossy(&buf[..len]);
+            // 有些 .lnk 存的是带环境变量的形式（%SystemRoot%\…），这里展开它。
+            let expanded = expand_env(&text);
+            Ok(PathBuf::from(expanded.unwrap_or(text)))
+        })();
+        if initialized {
+            unsafe { CoUninitialize() };
+        }
+        result
+    }
+
+    /// 展开 `%VAR%` 形式的路径（不进注册表，只查进程环境变量）。
+    fn expand_env(text: &str) -> Option<String> {
+        if !text.contains('%') {
+            return None;
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(start) = rest.find('%') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('%') else {
+                out.push_str(&rest[start..]);
+                return Some(out);
+            };
+            let name = &after[..end];
+            match std::env::var(name) {
+                Ok(value) => out.push_str(&value),
+                // 认不出来的变量原样保留，别把路径拼坏。
+                Err(_) => {
+                    out.push('%');
+                    out.push_str(name);
+                    out.push('%');
+                }
+            }
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+
     /// 把路径解析成绝对 PIDL，再用 `SEE_MASK_INVOKEIDLIST` 调一个 Shell 动词。
     ///
     /// 走 IDList 而不是 `lpFile`：回收站的条目只有 parsing name（`$R` 临时文件
@@ -635,7 +714,49 @@ mod imp {
     ) -> Result<usize, String> {
         Err("创建快捷方式仅在 Windows 支持".into())
     }
+    pub fn shortcut_target(_link_path: &Path) -> Result<PathBuf, String> {
+        Err("解析快捷方式仅在 Windows 支持".into())
+    }
 }
 
 #[cfg(not(windows))]
 pub use imp::*;
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    /// 真建一个 `.lnk` 再解回目标路径：验证 COM 那条链是通的。
+    #[test]
+    fn shortcut_target_round_trips() {
+        let dir = std::env::temp_dir().join(format!("rove-lnk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let target = dir.join("target-file.txt");
+        std::fs::write(&target, b"x").expect("写目标文件");
+        // 建快捷方式不带扩展名参数：让它按默认后缀自己落到目录里。
+        create_shortcuts(&[target.clone()], false, " - 快捷方式").expect("建快捷方式");
+        let link = std::fs::read_dir(&dir)
+            .expect("读目录")
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+            })
+            .expect("找不到生成的 .lnk");
+        let got = shortcut_target(&link).expect("解析快捷方式");
+        assert_eq!(
+            got.to_string_lossy().to_lowercase(),
+            target.to_string_lossy().to_lowercase()
+        );
+        // 目标删掉之后仍然要能解析出路径（由上层判断「已不存在」）。
+        std::fs::remove_file(&target).expect("删目标");
+        let gone = shortcut_target(&link).expect("目标不在也要解析出来");
+        assert_eq!(
+            gone.to_string_lossy().to_lowercase(),
+            target.to_string_lossy().to_lowercase()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

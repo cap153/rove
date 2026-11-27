@@ -2325,12 +2325,37 @@ export component FileList inherits Rectangle {
                 property <length> want-x: root.cell-x(self.pt-col) + (root.cell-w - self.box-w) / 2;
                 // 换行后自然高度（上下各 5px 内边距）。
                 height: path-tip-body.preferred-height + 10px;
-                // 底部装不下、上方装得下 → 翻到格子上面（不压住自己的图标）。
-                property <bool> flip-up: self.cell-bottom + self.height > self.vp-bottom - 2px
-                    && self.cell-top - self.height >= self.vp-top;
-                property <length> want-y: self.flip-up
-                    ? self.cell-top - self.height
+                // ---- 与名称浮层（多行完整文件名）排在一起 ----
+                // 名称浮层画在 FileList 最上层（在 Flickable 之外），不管 z 多少都
+                // 压在本层上面；所以本层不能还按「格子底边」定位，否则长文件名一
+                // 撑开就被整个盖住。这里改成：紧贴名称浮层底边往下排，下方装不下
+                // 就翻到名称浮层顶上。
+                // 名称浮层的坐标是 FileList 根坐标，本层是 Flickable 内容坐标。
+                // 视口内的 y = 内容 y + content-y（向下滚 content-y 为负），
+                // 再叠上 flick 自身在根里的偏移：根 y = flick.y + 内容 y + content-y。
+                // 反过来：内容 y = 根 y - flick.y - content-y。
+                property <length> to-local: -flick.y - flick.content-y;
+                property <bool> same-as-ex: root.expand-active && root.ex-row == self.pt-row;
+                property <bool> same-as-hv: !self.same-as-ex && root.hover-expand-active
+                    && root.hv-row == self.pt-row;
+                property <bool> has-name-box: self.same-as-ex || self.same-as-hv;
+                property <length> name-top: self.same-as-ex
+                    ? root.ex-box-y
+                    : (self.same-as-hv ? root.hv-box-y : 0px);
+                property <length> name-bottom: self.same-as-ex
+                    ? root.ex-box-y + root.ex-box-h
+                    : (self.same-as-hv ? root.hv-box-y + root.hv-box-h : 0px);
+                // 有名称浮层时贴它底部（留 3px），没有就照旧贴格子底边。
+                property <length> below-y: self.has-name-box
+                    ? self.name-bottom + self.to-local + 3px
                     : self.cell-bottom;
+                property <length> above-y: self.has-name-box
+                    ? self.name-top + self.to-local - self.height - 3px
+                    : self.cell-top - self.height;
+                // 底部装不下、上方装得下 → 翻到上面（不压住自己的图标）。
+                property <bool> flip-up: self.below-y + self.height > self.vp-bottom - 2px
+                    && self.above-y >= self.vp-top;
+                property <length> want-y: self.flip-up ? self.above-y : self.below-y;
 
                 x: max(4px, min(self.want-x, flick.width - 4px - self.box-w));
                 // 两头都装不下时贴在视口里，绝不跑到列表外面。

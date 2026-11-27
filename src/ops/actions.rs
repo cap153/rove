@@ -438,7 +438,22 @@ pub fn builtin_actions() -> Vec<ActionEntry> {
             group: "".into(),
             builtin: true,
         },
-        // 两个快捷方式动作紧跟在「批量重命名」下面：都是「对一个/一组文件产出一个
+        // 「打开目标位置」紧跟「批量重命名」：只对**单个** `.lnk` 出现 ——
+        // 快捷方式本身没有「内容」，用户点它往往是想去它指向的那个东西。
+        ActionEntry {
+            id: "builtin.open_shortcut_target".into(),
+            label: "打开目标位置".into(),
+            tool: "".into(),
+            program: "".into(),
+            args: "".into(),
+            working_dir: "".into(),
+            target: "file".into(),
+            extensions: vec!["lnk".into()],
+            enabled: true,
+            group: "".into(),
+            builtin: true,
+        },
+        // 两个快捷方式动作紧跟在「打开目标位置」下面：都是「对一个/一组文件产出一个
         // 新东西」的操作，摆在一起更好认。
         ActionEntry {
             id: "builtin.create_shortcut".into(),
@@ -1772,7 +1787,7 @@ tool = "winrar"
         assert!(!entry.matches_selection(&dir, |_| Some(true)));
     }
 
-    /// 两个快捷方式动作必须紧跟在「批量重命名」下面。
+    /// 「打开目标位置」夹在「批量重命名」和两个快捷方式动作中间。
     #[test]
     fn shortcuts_sit_right_below_batch_rename() {
         let actions = builtin_actions();
@@ -1781,7 +1796,23 @@ tool = "winrar"
             .iter()
             .position(|id| *id == "builtin.batch_rename")
             .expect("批量重命名项不见了");
-        assert_eq!(ids[batch + 1], "builtin.create_shortcut");
-        assert_eq!(ids[batch + 2], "builtin.send_to_desktop");
+        assert_eq!(ids[batch + 1], "builtin.open_shortcut_target");
+        assert_eq!(ids[batch + 2], "builtin.create_shortcut");
+        assert_eq!(ids[batch + 3], "builtin.send_to_desktop");
+    }
+
+    /// 「打开目标位置」只认 `.lnk`，而且必须**单选**（多选时菜单里不该出现）。
+    #[test]
+    fn open_shortcut_target_only_for_single_lnk() {
+        let actions = builtin_actions();
+        let entry = actions
+            .iter()
+            .find(|a| a.id == "builtin.open_shortcut_target")
+            .expect("打开目标位置项不见了");
+        let not_dir = |_: &Path| Some(false);
+        assert!(entry.matches_selection(&[PathBuf::from(r"C:\a.lnk")], not_dir));
+        assert!(entry.matches_selection(&[PathBuf::from(r"C:\a.LNK")], not_dir));
+        assert!(!entry.matches_selection(&[PathBuf::from(r"C:\a.txt")], not_dir));
+        assert!(!entry.matches_selection(&[PathBuf::from(r"C:\folder")], not_dir));
     }
 }

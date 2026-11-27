@@ -2005,6 +2005,13 @@ impl App {
                 );
             }
             pane.rebuild_display();
+            // 后退/前进恢复出来的选中项里，可能有不存在的条目（文件被删、
+            // 改名，或者搜索页结果变了）：核对一遍，别让状态栏报一个点不动的
+            // 「1 项已选择」。只在「刚恢复过」时做，普通选择集一律不动。
+            if pane.prune_pending {
+                pane.prune_pending = false;
+                pane.prune_selection();
+            }
             // Shell 系统菜单「新建 → 文本文档」：菜单前的快照 diff 出唯一新增文件。
             // 只在限期内、同一目录、恰好新增 1 个「文件」时生效，避免把粘贴 /
             // 批量新建 / 无关的后台创建误判成一次新建。zsdesk 用 IFileOperation
@@ -9671,9 +9678,13 @@ impl App {
                         a.enabled
                             && a.matches_selection(paths, |p| self.loaded_is_dir(p))
                             && !dup(&a.id)
-                            // 重命名一次只改一个条目（行内编辑）：多选时直接不出现，
-                            // 比留一个点不动的灰项干净。
-                            && !(a.id == "builtin.rename" && paths.len() != 1)
+                            // 重命名一次只改一个条目（行内编辑），「打开目标位置」
+                            // 也一样：都是单条目操作，多选时直接不出现，比留一个
+                            // 点不动的灰项干净。
+                            && !(matches!(
+                                a.id.as_str(),
+                                "builtin.rename" | "builtin.open_shortcut_target"
+                            ) && paths.len() != 1)
                     })
                 {
                     if !groups.contains_key(&a.group) {
@@ -10352,9 +10363,11 @@ impl App {
             "$Recycle.Bin".into(),
             "System Volume Information".into(),
             "node_modules".into(),
-            ".git".into(),
             "target".into(),
             "my_program".into(),
+            // 点开头目录不是逐个列举，而是「一律忽略」这条规则：用 `.*` 表示，
+            // 免得列表看起来像个需要用户自己维护的名单。
+            ".*".into(),
         ];
         self.ui
             .set_search_builtin_exclusions(ModelRc::new(VecModel::from(builtin)));
@@ -12632,6 +12645,53 @@ impl App {
                                 })
                             }
                             Err(e) => self.set_status_job(e),
+                        }
+                    }
+                    return;
+                }
+                "builtin.open_shortcut_target" => {
+                    // 只对单个 .lnk 出现（菜单层已按扩展名 + 单选过滤）。
+                    // 解析要碰磁盘 + COM，网络盘上的快捷方式还能卡住，所以整个
+                    // 过程放到后台线程，结果回事件循环再导航。
+                    if let MenuScope::Selection(paths) = &target {
+                        if let Some(link) = paths.first().cloned() {
+                            std::thread::spawn(move || {
+                                // 存在性判断也得碰磁盘（目标可能在断开的网络盘上），
+                                // 和解析一起在后台做完，别在界面线程上 stat。
+                                let resolved = crate::sys::shell::shortcut_target(&link).map(|t| {
+                                    let exists = t.exists();
+                                    (t, exists)
+                                });
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    let Some(app) = SESSION.with(|slot| slot.borrow().clone())
+                                    else {
+                                        return;
+                                    };
+                                    let mut app = app.borrow_mut();
+                                    let msg = match resolved {
+                                        Err(e) => Some(app.trf("打开失败：{}", &[e])),
+                                        Ok((target, exists)) => {
+                                            if !exists {
+                                                Some(app.trf(
+                                                    "这个快捷方式的目标已不存在：{}",
+                                                    &[target.display().to_string()],
+                                                ))
+                                            } else {
+                                                let dir =
+                                                    target.parent().map(std::path::Path::to_path_buf);
+                                                app.navigate_active_reveal(
+                                                    dir,
+                                                    Some(target.clone()),
+                                                );
+                                                None
+                                            }
+                                        }
+                                    };
+                                    if let Some(msg) = msg {
+                                        app.set_status_job(msg);
+                                    }
+                                });
+                            });
                         }
                     }
                     return;

@@ -397,6 +397,8 @@ pub const ZH: &[&str] = &[
     "未选择任何磁盘（索引为空）", // 382
     "低内存模式", // 383
     "关窗常驻托盘时释放索引内存，唤出时稍慢一点", // 384
+    "打开目标位置", // 385
+    "这个快捷方式的目标已不存在：{}", // 386
 ];
 
 pub const EN: &[&str] = &[
@@ -785,6 +787,8 @@ pub const EN: &[&str] = &[
     "No disk selected (index is empty)",
     "Low memory mode",
     "Release index memory while resident in the tray; waking up takes a moment longer",
+    "Open target location",
+    "This shortcut's target no longer exists: {}",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。

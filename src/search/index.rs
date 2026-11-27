@@ -1025,16 +1025,19 @@ pub(crate) fn list_roots() -> Vec<PathBuf> {
 /// 跳过的目录名(大小写不敏感比较)。
 /// 系统噪声目录名（小写形式）。命中即整棵剪枝，避免索引被系统文件占满。
 const NOISE_DIR_NAMES: &[&str] = &[
+    // 系统目录
     "windows",
     "program files",
     "program files (x86)",
     "$recycle.bin",
     "system volume information",
     "appdata",
+    // 构建产物 / 依赖目录
     "node_modules",
-    ".git",
     "target",
     "my_program",
+    // 注：**以 '.' 开头的目录不用在这里列举** —— `is_skipped` 里有统一规则，
+    // `.git` / `.cargo` / `.rustup` / `.cache` / `.npm` / `.local` 这些一次覆盖。
 ];
 
 /// 是否系统噪声目录（大小写不敏感）。
@@ -1047,6 +1050,14 @@ const NOISE_DIR_NAMES: &[&str] = &[
 /// `"windowſ"`（含长 s U+017F）这类 Unicode 怪字符：旧版会被误判为
 /// `"windows"` 而剪掉，新版不会。而那种名字本就不该被当作系统目录。
 pub(crate) fn is_skipped(name: &str) -> bool {
+    // 以 '.' 开头的目录**一律**当噪声：开发工具缓存（.cargo / .rustup / .npm /
+    // .deno / .cache / .local / .codebuddy…）与版本库元数据（.git/.hg/.svn）全落在
+    // 这一类，逐个维护名单既维护不完，也总会漏。用户真要看这些目录，直接进目录
+    // 看或者用当前目录的筛选就行 —— 受影响的只有「全盘索引搜得到搜不到」。
+    // 点开头的**文件**不受影响（剪枝只看目录名）。
+    if name.starts_with('.') {
+        return true;
+    }
     NOISE_DIR_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n))
 }
 
@@ -1079,9 +1090,6 @@ fn walk(
             continue;
         };
         let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') && name.len() > 1 && ft.is_dir() {
-            continue;
-        }
         let sub_path = entry.path();
         if ft.is_dir() {
             if is_skipped(&name) || filter.is_skipped_dir(&sub_path) {
@@ -1410,9 +1418,7 @@ fn is_walkable_dir(entry: &std::fs::DirEntry, name: &str) -> bool {
     if entry.file_type().map(|t| !t.is_dir()).unwrap_or(true) {
         return false;
     }
-    if name.starts_with('.') && name.len() > 1 {
-        return false;
-    }
+    // 点开头与系统噪声名单都在 `is_skipped` 里，这里不必重复判断。
     !is_skipped(name)
 }
 
@@ -1702,6 +1708,31 @@ mod tests {
             "System",
             "",
         ] {
+            assert!(!is_skipped(n), "{n} 不应被判为噪音目录");
+        }
+    }
+
+    /// 点开头的目录一律剪掉：开发工具缓存与版本库元数据都落这一类，
+    /// 逐个维护名单维护不完。点开头的**文件**不受影响（剪枝只看目录名）。
+    #[test]
+    fn dot_directories_are_always_skipped() {
+        for n in [
+            ".git",
+            ".cargo",
+            ".rustup",
+            ".cache",
+            ".npm",
+            ".deno",
+            ".local",
+            ".zcompcache",
+            ".codebuddy",
+            ".codebuddy-server-cn",
+            ".vscode",
+            ".某个新工具的缓存",
+        ] {
+            assert!(is_skipped(n), "{n} 应被判为噪音目录");
+        }
+        for n in ["git", "cargo", "rustup", "cache", "vscode"] {
             assert!(!is_skipped(n), "{n} 不应被判为噪音目录");
         }
     }

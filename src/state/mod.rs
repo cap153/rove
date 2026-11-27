@@ -85,8 +85,19 @@ pub struct PaneState {
     /// 与 `history` 平行：每个页面各自的类型筛选。
     /// 与 `history_filters` 同理 —— 筛选也要能前进/后退。
     pub history_types: Vec<Vec<String>>,
+    /// 与 `history` 平行：每个页面离开时的选中项 + 锚点。
+    ///
+    /// 资源管理器的行为：后退/前进回到某个目录，之前单选的那个条目还是选中的。
+    /// 只记在**历史页面**上（不按路径全局记忆）：没走过这条路的新导航仍然从
+    /// 空选择开始，免得「用面包屑进目录，忽然有个东西自己选上了」。
+    pub history_selection: Vec<PageSelection>,
     /// 进入类型筛选前的滚动位置（清空筛选时回到这里，而不是弹回顶部）。
     pub pre_type_scroll_y: f32,
+    /// 刚恢复过历史页面的选中项、还没跟新列表核对过（见 `prune_selection`）。
+    ///
+    /// 只对「恢复」这一件事生效：普通的选择集依旧原样保留（比如把「显示隐藏的
+    /// 文件」关掉时，那些被藏起来的条目不会被悄悄踢出选择 —— 那是既有行为）。
+    pub prune_pending: bool,
     /// 选择集（按路径，跨排序/过滤稳定）。
     pub selection: HashSet<PathBuf>,
     /// 范围选择锚点（路径）。
@@ -157,6 +168,13 @@ fn rebuild_renamed(old: &FileEntry, new: &Path) -> FileEntry {
     rebuilt
 }
 
+/// 一个历史页面里记着的选择状态。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PageSelection {
+    pub sel: HashSet<PathBuf>,
+    pub anchor: Option<PathBuf>,
+}
+
 impl PaneState {
     pub fn new(path: Option<PathBuf>, sort: SortState) -> Self {
         Self {
@@ -175,6 +193,8 @@ impl PaneState {
             filter: String::new(),
             type_filter: Vec::new(),
             history_types: vec![Vec::new()],
+            history_selection: vec![PageSelection::default()],
+            prune_pending: false,
             pre_type_scroll_y: 0.0,
             selection: HashSet::new(),
             anchor: None,
@@ -193,6 +213,44 @@ impl PaneState {
             deep_scanned: 0,
             deep_sort_pending: false,
             search_total: None,
+        }
+    }
+
+    /// 把当前选中项记进当前历史页面（离开这一页之前调用）。
+    fn save_page_selection(&mut self) {
+        if let Some(slot) = self.history_selection.get_mut(self.history_index) {
+            slot.sel.clone_from(&self.selection);
+            slot.anchor.clone_from(&self.anchor);
+        }
+    }
+
+    /// 列表变化后清掉已经不存在的选中项（文件被删/改名、搜索结果变了）。
+    ///
+    /// 选择是按路径记的，跨排序/过滤稳定；但恢复出来的路径可能早就不在了，
+    /// 留着会让状态栏报一个点不动的「1 项已选择」。
+    pub fn prune_selection(&mut self) {
+        if self.selection.is_empty() && self.anchor.is_none() {
+            return;
+        }
+        // 「此电脑」根视图的 entries 只是驱动器列表，搜索态下还可能是结果子集，
+        // 没有可以下结论的依据 —— 一律不动。
+        let Some(dir) = self.path.clone() else {
+            return;
+        };
+        // 成员判断先建一份集合：选择集与条目表都可能上万（Ctrl+A 之后每次列举
+        // 都会走到这里），逐个线性查找是 O(选择数 × 条目数)，大目录能把界面线程
+        // 卡住好几秒。
+        let existing: HashSet<&PathBuf> = self.entries.iter().map(|e| &e.path).collect();
+        // 只清理「本目录直接子项」的失效选中项。搜索结果里的深层条目本来就不在
+        // entries 里，不能因为它们此刻没列出来就当成不存在。
+        let stale = |p: &PathBuf| -> bool {
+            p.parent()
+                .is_some_and(|par| crate::fs::dir::same_path_loose(&dir, par))
+                && !existing.contains(p)
+        };
+        self.selection.retain(|p| !stale(p));
+        if self.anchor.as_ref().is_some_and(stale) {
+            self.anchor = None;
         }
     }
 
@@ -223,21 +281,25 @@ impl PaneState {
         if let Some(s) = self.history_scroll.get_mut(self.history_index) {
             *s = self.scroll_y;
         }
+        self.save_page_selection();
 
         let n = self.history_index + 1;
         self.history.truncate(n);
         self.history_filters.truncate(n);
         self.history_types.truncate(n);
+        self.history_selection.truncate(n);
         self.history_scroll.truncate(n);
         self.history.push(path.clone());
         self.history_filters.push(String::new());
         self.history_types.push(Vec::new());
+        self.history_selection.push(PageSelection::default());
         let restored = self.path_scroll_memo.get(&path).copied().unwrap_or(0.0);
         self.history_scroll.push(restored);
         self.history_index = self.history.len() - 1;
         self.path = path.clone();
         self.selection.clear();
         self.anchor = None;
+        self.prune_pending = false;
 
         // 检查是否有记忆，有则恢复，无则顶部
         self.scroll_y = restored;
@@ -262,6 +324,7 @@ impl PaneState {
         if let Some(s) = self.history_scroll.get_mut(self.history_index) {
             *s = self.scroll_y;
         }
+        self.save_page_selection();
 
         let same_path = self.path == self.history[index];
         self.history_index = index;
@@ -274,8 +337,17 @@ impl PaneState {
             .unwrap_or_default();
         // 类型筛选同样按页面恢复：后退能回到「筛之前」的全量列表。
         self.type_filter = self.history_types.get(index).cloned().unwrap_or_default();
-        self.selection.clear();
-        self.anchor = None;
+        // 选中项也按页面恢复（资源管理器同款）：后退回来还是刚才单选的那个。
+        // 条目已经不在的情况由 `prune_selection` 在列表到达后核对。
+        let page = self
+            .history_selection
+            .get(index)
+            .cloned()
+            .unwrap_or_default();
+        self.selection = page.sel;
+        self.anchor = page.anchor;
+        // 恢复出来的路径可能早就不在了：等这次列举的结果回来核对一遍。
+        self.prune_pending = !self.selection.is_empty() || self.anchor.is_some();
 
         self.scroll_y = self
             .history_scroll
@@ -342,6 +414,7 @@ impl PaneState {
                 self.history.truncate(i);
                 self.history_filters.truncate(i);
                 self.history_types.truncate(i);
+                self.history_selection.truncate(i);
                 self.history_scroll.truncate(i);
                 self.history_index = i - 1;
                 self.scroll_y = scroll;
@@ -366,6 +439,7 @@ impl PaneState {
             self.history.truncate(n);
             self.history_filters.truncate(n);
             self.history_types.truncate(n);
+            self.history_selection.truncate(n);
             self.history_scroll.truncate(n);
             if let Some(f) = self.history_filters.get_mut(self.history_index) {
                 *f = filter;
@@ -387,10 +461,12 @@ impl PaneState {
         self.history.truncate(n);
         self.history_filters.truncate(n);
         self.history_types.truncate(n);
+        self.history_selection.truncate(n);
         self.history_scroll.truncate(n);
         self.history.push(self.path.clone());
         self.history_filters.push(filter);
         self.history_types.push(types);
+        self.history_selection.push(PageSelection::default());
         self.history_scroll.push(scroll);
         self.history_index = self.history.len() - 1;
         self.scroll_y = scroll;
@@ -910,6 +986,7 @@ impl AppState {
                 pane.history = vec![Some(current)];
                 pane.history_filters = vec![String::new()];
                 pane.history_types = vec![Vec::new()];
+                pane.history_selection = vec![PageSelection::default()];
                 pane.history_scroll = vec![0.0];
             }
         }
@@ -1263,6 +1340,71 @@ mod tests {
         // 往回送，必须让它对不上号而被丢弃，否则会用错位的拼音去匹配。
         assert_eq!(p.pinyin_seq, seq + 1, "重排要让在途结果作废");
         assert!(p.pinyin_pending.is_none());
+    }
+
+    /// 后退/前进回到某个历史页面时，那一页的选中项要跟着回来（资源管理器同款），
+    /// 而没走过的路径仍然是空选择。
+    #[test]
+    fn history_pages_remember_selection() {
+        let mut p = pane();
+        p.navigate(Some(PathBuf::from(r"C:\a")));
+        p.selection.insert(PathBuf::from(r"C:\a\picked.txt"));
+        p.anchor = Some(PathBuf::from(r"C:\a\picked.txt"));
+
+        // 侧边栏 / 面包屑切走：新页面从空选择开始。
+        p.navigate(Some(PathBuf::from(r"C:\b")));
+        assert!(p.selection.is_empty(), "新导航不该带上一页的选择");
+        assert!(p.anchor.is_none());
+        assert!(!p.prune_pending);
+
+        // 后退：回到 C:\a，之前单选的条目必须还在选择里。
+        p.jump_to(p.history_index - 1);
+        assert_eq!(p.path, Some(PathBuf::from(r"C:\a")));
+        assert_eq!(
+            p.selection.iter().collect::<Vec<_>>(),
+            vec![&PathBuf::from(r"C:\a\picked.txt")]
+        );
+        assert_eq!(p.anchor, Some(PathBuf::from(r"C:\a\picked.txt")));
+        assert!(p.prune_pending, "恢复后要等列表核对一次");
+
+        // 再前进：C:\b 那时是空选择，回来也该是空的。
+        p.jump_to(p.history_index + 1);
+        assert!(p.selection.is_empty(), "前进回去也不该凭空选中");
+        assert!(!p.prune_pending, "没有恢复出东西就不用核对");
+    }
+
+    /// 恢复出来的选中项若指向已经不存在的条目，列表到齐后要清掉。
+    #[test]
+    fn prune_selection_drops_missing_entries() {
+        let mut p = pane();
+        let dir = PathBuf::from(r"C:\work");
+        p.entries = vec![
+            crate::fs::dir::test_entry("a.txt", false, 0),
+            crate::fs::dir::test_entry("b.txt", false, 0),
+        ];
+        for e in p.entries.iter_mut() {
+            e.path = dir.join(&e.name);
+        }
+        p.selection.insert(dir.join("a.txt"));
+        p.selection.insert(dir.join("gone.txt"));
+        p.anchor = Some(dir.join("gone.txt"));
+        p.prune_selection();
+        assert_eq!(p.selection.len(), 1, "只剩还存在的那个");
+        assert!(p.selection.contains(&dir.join("a.txt")));
+        assert!(p.anchor.is_none(), "锚点没了也要清掉");
+
+        // 深层（子目录）的选中项不能因为不在 entries 里就被清掉：
+        // 搜索结果正是这个形态。
+        let deep = dir.join("sub").join("deep.txt");
+        p.selection.insert(deep.clone());
+        p.prune_selection();
+        assert!(p.selection.contains(&deep), "深层结果不算失效");
+
+        // 「此电脑」根视图（path 为 None）没有可下结论的依据，什么都不动。
+        p.path = None;
+        p.selection.insert(PathBuf::from(r"Z:\gone-drive"));
+        p.prune_selection();
+        assert!(p.selection.contains(&PathBuf::from(r"Z:\gone-drive")));
     }
 
     /// 搜索页 ↔ 目录页要能前进/后退，且清空搜索时回到搜索前的滚动位置。

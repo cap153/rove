@@ -259,6 +259,8 @@ pub fn try_list_directory(path: &Path) -> Result<Vec<FileEntry>, std::io::Error>
 
     for entry in read_dir.flatten() {
         let path = entry.path();
+        // 只有非 Windows 才用 '.' 前缀判隐藏，别的平台照旧保留文件名。
+        #[cfg(not(windows))]
         let name = entry.file_name().to_string_lossy().into_owned();
 
         // 核心修复：网络路径下直接使用 entry.metadata()，避免二次跨网络请求；
@@ -275,11 +277,16 @@ pub fn try_list_directory(path: &Path) -> Result<Vec<FileEntry>, std::io::Error>
         let size = if is_dir { 0 } else { meta.len() };
         let modified = meta.modified().ok();
 
-        // Windows 隐藏属性（FILE_ATTRIBUTE_HIDDEN = 2）或以 '.' 开头的 Unix 隐藏文件。
+        // 隐藏与否只看**文件系统自己的属性**：Windows 上就是
+        // FILE_ATTRIBUTE_HIDDEN（= 2），与资源管理器一致。
+        //
+        // 以前还额外把「以 '.' 开头」当成隐藏 —— 那是 Unix 的约定，在 Windows
+        // 上 `.git` / `.vscode` / `.env` 只是普通名字，一律藏起来会让用户找不到
+        // 自己的东西。
         #[cfg(windows)]
         let is_hidden = {
             use std::os::windows::fs::MetadataExt;
-            (meta.file_attributes() & 2) != 0 || name.starts_with('.')
+            (meta.file_attributes() & 2) != 0
         };
         #[cfg(not(windows))]
         let is_hidden = name.starts_with('.');
