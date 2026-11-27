@@ -111,18 +111,18 @@ It only writes the current user's registry (`HKCU`), needs no administrator righ
 - **Almost every shortcut is rebindable,** and you can add extra bindings per action, with per-item or global reset to defaults. (`Esc` to clear the filter is fixed.)
 - **Sort state is kept separately** for This PC, the Recycle Bin, and normal folders, so they never leak into each other. (There is no grouping.)
 - Thumbnails for images, videos and PDFs are cached in **memory and on disk**, so large folders stay smooth. (Network paths are not cached.)
-- Detail-view column widths can be dragged; icon view has extra-large / large / medium / small sizes.
-- Hidden-file toggle, invert selection, copy path, open a terminal (cmd) here, pin to Quick Access.
 - Network locations are synced with the ones added in Explorer; you can also add your own by right-clicking the sidebar header.
+- You can customize the sidebar by right-clicking on "This PC".
 
 ## Where the data lives
 
-| What | Where |
-| --- | --- |
-| Settings, network locations | `%APPDATA%\Rove\config.json` |
-| Context-menu actions (hand-editable, comments kept) | `%APPDATA%\Rove\actions.toml` |
-| Search index | `%LOCALAPPDATA%\Rove\index.bin` |
-| Registry backup taken before Explorer takeover | `%APPDATA%\Rove\shell_integration.json` |
+| What                                                  | Where                                   |
+|-------------------------------------------------------|-----------------------------------------|
+| Settings, network locations                           | `%APPDATA%\Rove\config.json`            |
+| Context-menu actions (hand-editable, comments kept)   | `%APPDATA%\Rove\actions.toml`           |
+| Search index                                          | `%LOCALAPPDATA%\Rove\index.bin`         |
+| The memory kept when "Per-folder view and sort" is on | `%APPDATA%\Rove\views.json`             |
+| Registry backup taken before Explorer takeover        | `%APPDATA%\Rove\shell_integration.json` |
 
 Deleting these files resets Rove to a fresh state. (Turning off Explorer takeover or autostart deletes the corresponding registry values automatically.)
 
