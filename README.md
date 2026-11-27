@@ -137,6 +137,22 @@ cargo build --release
 
 产物是单个 `rove.exe`，复制到哪都能跑。
 
+仓库里带了 `justfile`，装了 [just](https://github.com/casey/just) 之后不用记长命令：
+
+```bash
+just        # 不带参数 = 列出可用命令
+just rel    # femtovg（OpenGL）release 构建
+just skia   # Skia（Direct3D 12）release 构建
+```
+
+`just skia` 需要在 Linux/WSL 上交叉编译 msvc 目标：
+
+```bash
+sudo pacman -S --needed clang lld llvm   # 其它发行版换成对应的包
+rustup target add x86_64-pc-windows-msvc
+cargo install cargo-xwin --locked
+```
+
 ## 启动失败 / 窗口不出来
 
 Rove 在硬件渲染初始化失败时会自动切 CPU 软件渲染，若仍然不行，手动指定：

@@ -137,6 +137,22 @@ cargo build --release
 
 The result is a single `rove.exe` that runs from anywhere.
 
+The repo ships a `justfile`, so with [just](https://github.com/casey/just) installed you don't have to remember the long commands:
+
+```bash
+just        # no arguments = list the available recipes
+just rel    # release build with femtovg (OpenGL)
+just skia   # release build with Skia (Direct3D 12)
+```
+
+`just skia` cross-compiles the msvc target from Linux/WSL:
+
+```bash
+sudo pacman -S --needed clang lld llvm   # use your distro's package names
+rustup target add x86_64-pc-windows-msvc
+cargo install cargo-xwin --locked
+```
+
 ## Startup failure / no window
 
 Rove falls back to CPU software rendering by itself when hardware rendering fails to initialize; if that is still not enough, set it by hand:

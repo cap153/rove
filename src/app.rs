@@ -19176,7 +19176,13 @@ fn apply_renderer_choice(config: &crate::config::Config) {
         logln!("!! [boot] 忽略无效的 SLINT_BACKEND={raw}（只认 winit-femtovg / winit-software）");
     }
     let backend = if config.hardware_renderer {
-        "winit-femtovg"
+        // 编了 `skia` 特性就用 Skia（Windows 上优先 Direct3D 12），否则 femtovg/OpenGL。
+        // 特性默认关着：只有 msvc 目标有 skia 预编译二进制，gnu 目标编不出来。
+        if cfg!(feature = "skia") {
+            "winit-skia"
+        } else {
+            "winit-femtovg"
+        }
     } else {
         "winit-software"
     };

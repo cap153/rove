@@ -4,6 +4,16 @@ version = "0.1.4"
 edition = "2021"
 description = "Rove — 极速响应、极低内存的 Windows 文件管理器 (Rust + Slint)"
 
+# 可选的 Skia 渲染器（Windows 上优先 Direct3D 12）。
+#
+# 默认不编：官方只提供 x86_64-pc-windows-**msvc** 的 skia 预编译二进制，gnu 目标
+# 会退化成从源码编译 Skia（要 Visual C++ 工具链，本机编不出来）。所以日常开发和
+# 跑单测照旧走 gnu + femtovg，想试 Skia 时加特性并换目标：
+#   cargo xwin build --target x86_64-pc-windows-msvc --features skia
+[features]
+default = []
+skia = ["slint/renderer-skia"]
+
 [dependencies]
 slint = { version = "1.11", default-features = false, features = [
     # 标准库支持（TextEdit / ScrollView 等内建控件需要）。
