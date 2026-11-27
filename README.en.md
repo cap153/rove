@@ -103,7 +103,7 @@ It only writes the current user's registry (`HKCU`), needs no administrator righ
 
 - Autostart starts Rove **in the background**: no window at login, only a tray icon, with the dialog search bar and a warm index ready to go. (It uses a Run-key entry, not a shortcut in the Startup folder.)
 - Running `rove.exe` a second time, or using "open file location" from elsewhere, does not start a second process — it opens a new tab in the window you already have.
-- **Low memory mode** `(Settings → General, on by default)` decides what happens to memory when you close the window to the tray: on, Rove releases the search index mapping and gives the working set back to the system, taking the tray-resident footprint from around a hundred megabytes down to single digits (the price is that the next wake-up has to fault that memory back in, so it feels a touch slower).
+- **Low Memory Mode** Switch (On by default): When closing the window to the tray, the mapping of the entire disk index is released and the working set is returned to the system. **The memory resident in the tray is reduced from hundreds of MB to single digits MB** (at the cost that the frame needs to be re-swiped when it is brought up again, which is slightly slower).
 
 ## 9. Smaller differences worth knowing
 
