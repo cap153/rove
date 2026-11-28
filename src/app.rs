@@ -20081,6 +20081,11 @@ fn create_session(
         // 否则直接把默认那个「此电脑」标签换成目标目录 —— 早先这里是
         // 「再多 push 一个标签」，默认的「此电脑」标签就既没列举也没人切过去，
         // 表现为最左侧多出一个显示「此文件夹为空」的此电脑标签。
+        // 初始路径落在**新标签**（或原地导航）上时，那一栏从来没被列举过 ——
+        // 上面的循环只给「恢复出来的标签」发了请求。漏了这一枪，新标签会一直停在
+        // loading（界面一片空白），只有用户点一下那个标签才补发；网络路径上这个
+        // 空窗能长达几十秒，看起来像「网络很慢」。命中已有标签则不用再列。
+        let mut initial_needs_listing = false;
         if let Some(path) = initial_path {
             // 恢复出来的标签里已经有这个目录：切过去就好，别再开一个一模一样的。
             // 热会话的 reveal 走 locate_folder 去重，冷启动这条路径也要一致，
@@ -20098,8 +20103,10 @@ fn create_session(
                 // inherit=false：路径是明确给的，新标签不该再继承当前目录。
                 let sort = app.state.active().active().sort;
                 app.state.new_tab_ex(Some(path), sort, false);
+                initial_needs_listing = true;
             } else {
                 app.state.active_mut().active_mut().navigate(Some(path));
+                initial_needs_listing = true;
             }
         }
         // 目录已经定下来了就把窗格登记给 Shell —— 不要等下面那一串 UI 同步
@@ -20130,8 +20137,9 @@ fn create_session(
         app.arm_reveal(initial_reveal);
         // 恢复会话时上面已经给每个面板都发过列举请求，这里再刷一次就是同一目录
         // 列两遍（网络盘上等于双倍等待 + 双倍 IO，日志里表现为同一 tab 两条
-        // request_listing）。新开的标签/navigate 分支自己会请求，不必兜底。
-        if !restored_last_tabs {
+        // request_listing）。但接管/命令行带来的初始路径若新开了标签（或原地
+        // 导航），那一栏根本没被列举过，必须在这里补一次。
+        if !restored_last_tabs || initial_needs_listing {
             app.reload_active();
         }
         // 启动即预热全盘索引：懒加载会让首次搜索撞上冷启动（等待扫描），
