@@ -143,6 +143,7 @@ cargo build --release
 just        # 不带参数 = 列出可用命令
 just rel    # femtovg（OpenGL）release 构建
 just skia   # Skia（Direct3D 12）release 构建
+just all    # 两个渲染器的 release 都编译
 ```
 
 `just skia` 需要在 Linux/WSL 上交叉编译 msvc 目标：

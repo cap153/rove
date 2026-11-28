@@ -143,6 +143,7 @@ The repo ships a `justfile`, so with [just](https://github.com/casey/just) insta
 just        # no arguments = list the available recipes
 just rel    # release build with femtovg (OpenGL)
 just skia   # release build with Skia (Direct3D 12)
+just all    # build both renderer releases
 ```
 
 `just skia` cross-compiles the msvc target from Linux/WSL:
