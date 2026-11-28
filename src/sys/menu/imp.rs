@@ -181,12 +181,52 @@ pub(crate) fn open(
 /// 阻塞点。交给 `rove-menu-ipc` 线程去做，UI 线程只负责 `CreateProcess`。
 fn launch() -> std::io::Result<(Child, ChildStdin, ChildStdout)> {
     let exe = std::env::current_exe()?;
-    let mut child = std::process::Command::new(exe)
-        .arg("--menu-host")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+    let spawn = || {
+        std::process::Command::new(&exe)
+            .arg("--menu-host")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+    };
+    // 失败重试几次：杀毒软件扫描、别的进程短暂占用镜像文件都会让 CreateProcess
+    // 报「找不到指定的文件」，几毫秒后又能起来。以前一次失败就整次右键作废。
+    let mut last_err = None;
+    let mut child = None;
+    for attempt in 0..3 {
+        match spawn() {
+            Ok(c) => {
+                child = Some(c);
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                // 这段 sleep 跑在 UI 线程上（右键那一帧），总停顿控制在 100ms 内：
+                // 再长用户能感觉到「按右键卡了一下」。
+                if attempt < 2 {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+    // 三次都失败时只报「系统找不到指定的文件」毫无信息量：把当时的完整路径、
+    // 文件是否还在、工作目录一起带上。这条只在失败路径上执行，不会刷屏。
+    let mut child = child.ok_or_else(|| {
+        let e = last_err.unwrap_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "菜单子进程启动失败")
+        });
+        std::io::Error::new(
+            e.kind(),
+            format!(
+                "{e} | exe={:?} exists={} cwd={:?}",
+                exe.display().to_string(),
+                exe.exists(),
+                std::env::current_dir()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default()
+            ),
+        )
+    })?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     match (stdin, stdout) {

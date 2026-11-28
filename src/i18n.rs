@@ -399,6 +399,8 @@ pub const ZH: &[&str] = &[
     "关窗常驻托盘时释放索引内存，唤出时稍慢一点", // 384
     "打开目标位置", // 385
     "这个快捷方式的目标已不存在：{}", // 386
+    "不能移动、改名或删除 Rove 自己", // 387
+    "右键菜单不可用：请重启 Rove（可执行文件已被移动或删除）", // 388
 ];
 
 pub const EN: &[&str] = &[
@@ -789,6 +791,8 @@ pub const EN: &[&str] = &[
     "Release index memory while resident in the tray; waking up takes a moment longer",
     "Open target location",
     "This shortcut's target no longer exists: {}",
+    "Rove can't move, rename or delete itself",
+    "Context menu unavailable: restart Rove (its executable was moved or deleted)",
 ];
 
 /// 把设置里的语言选项解析成实际使用的字典。

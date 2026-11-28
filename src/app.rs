@@ -1218,8 +1218,8 @@ pub struct App {
     drag_pending: Option<(f32, f32, Vec<PathBuf>)>,
     /// 那次「按下」的时刻：拖放要据此判断是点击还是按住拖拽。
     drag_armed_at: Option<std::time::Instant>,
-    /// 这一次按下是不是「手还在滑的时候就按下去」（触控板点着滑最典型）。
-    /// 这种手势永远不算拖拽 —— 见 `sample_cursor_motion`。
+    /// 这一次按下时光标还在滑（高 DPI 鼠标的常态）：拖拽门槛抬高，但不禁止
+    /// 拖拽 —— 见 `drag_ready_from_glide`。
     drag_glide: bool,
     /// 40ms 轮询采样的光标位置 / 最后一次看到它移动的时刻。
     cursor_prev_pos: Option<(f32, f32)>,
@@ -3935,6 +3935,20 @@ fn drag_ready(distance_sq: f32, held: std::time::Duration) -> bool {
     beyond && (held.as_millis() >= DRAG_MIN_HOLD_MS || far)
 }
 
+/// 按下瞬间光标还在滑的时候用的门槛（比普通门槛严格，但不禁止拖拽）。
+///
+/// 目的只保住一种误触：**光标还在滑行时点了一下** —— 手继续滑出去十来个像素，
+/// 不该把文件拖走。所以滑动中的前 250 ms 里，只接受「位移已经很明显的甩手拖拽」；
+/// 超过 250 ms 说明用户是老老实实按住不放，之后按普通门槛判定即可。
+fn drag_ready_from_glide(distance_sq: f32, held: std::time::Duration) -> bool {
+    use crate::sys::dnd::{DRAG_FAST_DISTANCE, DRAG_GLIDE_GRACE_MS};
+    if held.as_millis() >= DRAG_GLIDE_GRACE_MS {
+        return drag_ready(distance_sq, held);
+    }
+    // 只认甩手：24px 已经蕴含了普通门槛的 8px。
+    distance_sq >= DRAG_FAST_DISTANCE * DRAG_FAST_DISTANCE
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4598,6 +4612,36 @@ mod tests {
         // 位移不够，按多久都不拖。
         let tiny = 4.0f32 * 4.0;
         assert!(!drag_ready(tiny, Duration::from_secs(5)));
+    }
+
+    /// 自己的镜像文件与它所在目录不能被拖走、剪切、删除、改名：
+    /// 那会让 `current_exe()` 变成死路径，之后所有 `--menu-host` 子进程都起不来，
+    /// 右键菜单彻底失效（真机日志：exe=... exists=false）。
+    #[test]
+    fn self_image_and_its_dir_are_protected() {
+        let exe = std::env::current_exe().expect("current_exe");
+        assert!(is_self_path(&exe), "镜像文件自己要挡住");
+        assert!(is_self_path(exe.parent().expect("有父目录")), "所在目录也要挡住");
+        // 路径比较走 loose（大小写不敏感），Windows 上否则会漏。
+        let upper = std::path::PathBuf::from(exe.to_string_lossy().to_uppercase());
+        assert!(is_self_path(&upper));
+        assert!(!is_self_path(&exe.join("x.txt")), "目录里的其它文件不挡");
+        assert!(!is_self_path(std::path::Path::new(r"D:\other\file.txt")));
+    }
+
+    /// 按下时鼠标还在滑（高 DPI 鼠标的常态）：不许直接判成点击，
+    /// 只把门槛抬高 —— 甩手或按住够久都要能拖出来。
+    #[test]
+    fn glide_gesture_still_drags_on_flick_or_hold() {
+        use std::time::Duration;
+        // 刚按下、滑了 10px：仍是点击。
+        assert!(!drag_ready_from_glide(10.0 * 10.0, Duration::from_millis(40)));
+        // 同一时刻明显甩手（30px）：立刻拖。
+        assert!(drag_ready_from_glide(30.0 * 30.0, Duration::from_millis(40)));
+        // 按住过 250ms 之后恢复普通门槛：15px + 按住就够了。
+        assert!(drag_ready_from_glide(15.0 * 15.0, Duration::from_millis(300)));
+        // 按住够久但基本没动：还是不拖。
+        assert!(!drag_ready_from_glide(5.0 * 5.0, Duration::from_millis(300)));
     }
 
     #[test]
@@ -9934,6 +9978,9 @@ impl App {
             let extended = key_down(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_SHIFT as i32);
             if !self.open_native_menu(native_target.clone(), nodes, fallback, extended) {
                 logln!("[menu] 原生菜单不可用，本次右键被忽略");
+                // 菜单全靠 --menu-host 子进程，起不来时不能再默默无反应：
+                // 最常见的成因是可执行文件被移走/删掉（current_exe() 会变成死路径）。
+                self.set_status_job(self.tr("右键菜单不可用：请重启 Rove（可执行文件已被移动或删除）"));
             }
         }
         #[cfg(not(windows))]
@@ -12225,6 +12272,10 @@ impl App {
         self.ui.invoke_set_drag_armed(false);
 
         let paths = self.state.active().active().selected_paths();
+        if paths.len() == 1 && is_self_path(&paths[0]) {
+            self.set_status_job(self.tr("不能移动、改名或删除 Rove 自己"));
+            return;
+        }
         if paths.len() == 1 {
             logv!("[rename] start_rename for {:?}", paths[0]);
             let path = paths[0].clone();
@@ -12457,6 +12508,10 @@ impl App {
             return;
         }
         if !paths.is_empty() {
+            if paths.iter().any(|p| is_self_path(p)) {
+                self.set_status_job(self.tr("不能移动、改名或删除 Rove 自己"));
+                return;
+            }
             // 低频、关键时刻：Shell 确认框会在此期间拦截打开/删除类按键。
             logln!(
                 "[delete] submit n={} to_trash={}",
@@ -13165,6 +13220,11 @@ impl App {
     fn copy_selection(&mut self, is_move: bool) {
         let paths = self.state.active().active().selected_paths();
         if paths.is_empty() {
+            return;
+        }
+        // 剪切 = 之后某次粘贴会把它移走，同样会废掉 current_exe()。
+        if is_move && paths.iter().any(|p| is_self_path(p)) {
+            self.set_status_job(self.tr("不能移动、改名或删除 Rove 自己"));
             return;
         }
 
@@ -14276,10 +14336,6 @@ impl App {
                 // 同样用屏幕坐标：两次采样同一把尺子，行重排不会伪造出位移。
                 let scale = self.ui.window().scale_factor() as f32;
                 let (gx, gy) = cursor_pos_logical(scale).unwrap_or((x, y));
-                // 按下时手还在滑：这次手势只能是点击（见按下处的 drag_glide）。
-                if self.drag_glide {
-                    return;
-                }
                 let held = self
                     .drag_armed_at
                     .map(|t| t.elapsed())
@@ -14293,7 +14349,14 @@ impl App {
                         dx * dx + dy * dy
                     })
                     .unwrap_or(0.0);
-                if !drag_ready(distance_sq, held) {
+                // 按下瞬间光标在滑（高 DPI 鼠标的常态）→ 用更严格的门槛，
+                // 但绝不直接禁止拖拽：按住够久或甩得够远都算真拖拽。
+                let ready = if self.drag_glide {
+                    drag_ready_from_glide(distance_sq, held)
+                } else {
+                    drag_ready(distance_sq, held)
+                };
+                if !ready {
                     return;
                 }
                 if let Some(paths) = drag_gesture_paths(&self.drag_pending, gx, gy) {
@@ -14458,12 +14521,13 @@ impl App {
                     let (gx, gy) = cursor_pos_logical(scale).unwrap_or((x, y));
                     self.drag_pending = Some((gx, gy, drag_paths));
                     self.drag_armed_at = Some(std::time::Instant::now());
-                    // 按下那一刻光标还在滑（触控板「点着滑」/ 鼠标滑行中点击）：
-                    // 这一下是点击，不是拖拽。真拖拽一定是「停住 → 按住 → 再动」。
+                    // 按下那一刻光标还在滑（触控板「点着滑」/ 高 DPI 鼠标的常态）。
+                    // 只把这个当「门槛抬高」的信号，不当「这是点击」的判决：
+                    // 现在的鼠标几乎一直在动，判死会把大量真实拖拽废掉。
                     self.drag_glide =
                         uptime_ms().saturating_sub(self.cursor_last_move_ms) <= CURSOR_MOVING_MS;
                     if self.drag_glide {
-                        logv!("[drag] 按下时光标还在移动 → 按点击处理（不拖出）");
+                        logv!("[drag] 按下时光标还在移动 → 拖拽门槛抬高（250ms 或 24px）");
                     }
                     self.ui.invoke_set_drag_armed(true);
                     logv!("[drag] armed=true for row {}", index);
@@ -14579,6 +14643,17 @@ impl App {
             self.state.active().active().selection.len()
         );
         if paths.is_empty() {
+            return;
+        }
+        // 自己（或自己所在目录）不能被拖走：拖出去落下就是一次移动。
+        let wanted = paths.len();
+        let paths: Vec<PathBuf> = paths.into_iter().filter(|p| !is_self_path(p)).collect();
+        if paths.len() != wanted {
+            logln!("!! [drag] 已排除 Rove 自己的镜像文件/目录");
+            self.set_status_job(self.tr("不能移动、改名或删除 Rove 自己"));
+        }
+        if paths.is_empty() {
+            self.set_status_job(self.tr("不能移动、改名或删除 Rove 自己"));
             return;
         }
 
@@ -19627,6 +19702,33 @@ fn is_address_bar_command(text: &str) -> bool {
     matches!(text.trim().to_ascii_lowercase().as_str(), "cmd" | "cmd.exe")
 }
 
+/// 本进程的镜像路径（启动时取一次）。
+///
+/// 必须缓存：`current_exe()` 每次调用都要打开 exe 文件，而删除/剪切一次能带上万
+/// 个路径；另外 exe 被移走之后 `current_exe()` 返回的反而是那条**死路径**，
+/// 缓存下来正好保住「要保护的是哪个路径」这个语义。
+fn self_image() -> Option<&'static std::path::Path> {
+    static SELF_IMAGE: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    SELF_IMAGE.get_or_init(|| std::env::current_exe().ok()).as_deref()
+}
+
+/// 这个路径是不是 Rove 自己的镜像文件、或它所在的目录？
+///
+/// 移动/改名/删除它会让镜像路径失效，之后每次弹菜单都要去启动 `--menu-host`
+/// 子进程，全部报「系统找不到指定的文件」，右键菜单彻底失效（只能重启恢复）。
+/// 所以这几类操作一律挡下 —— 拷贝/查看不受影响。
+fn is_self_path(path: &std::path::Path) -> bool {
+    let Some(exe) = self_image() else {
+        return false;
+    };
+    if crate::fs::dir::same_path_loose(path, exe) {
+        return true;
+    }
+    // exe 所在目录也不能整体搬走/改名：路径一样会失效。
+    exe.parent()
+        .is_some_and(|dir| crate::fs::dir::same_path_loose(path, dir))
+}
+
 /// 初始化路径该「新开标签」还是「占用当前（默认）标签」。
 ///
 /// 只看 `restored_last_tabs`：`create_session` 永远是从空会话开始的，此时
@@ -20874,6 +20976,10 @@ fn batch_lookup(id: u64) -> Option<(BatchRenameWindow, Rc<RefCell<BatchSession>>
 impl App {
     fn open_batch_rename(&mut self, paths: Vec<PathBuf>) {
         if paths.is_empty() || self.pane_is_recycle() {
+            return;
+        }
+        if paths.iter().any(|p| is_self_path(p)) {
+            self.set_status_job(self.tr("不能移动、改名或删除 Rove 自己"));
             return;
         }
         let pane = self.state.active().active();
